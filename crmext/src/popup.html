@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CRM Activity Tracker</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="hero">
+        <div>
+          <p class="eyebrow">Assistly CRM</p>
+          <h1>Activity Tracker</h1>
+        </div>
+        <span id="statusPill" class="pill">Loading</span>
+      </header>
+
+      <section class="notice">
+        This extension auto-connects from the logged-in CRM employee session. It visibly logs browser activity for work accountability and does not collect passwords, typed text, cookies, or private field values.
+      </section>
+
+      <section class="panel">
+        <div class="panel-title">
+          <h2>Employee</h2>
+          <span id="employeeName">Auto connecting</span>
+        </div>
+        <div class="readonly-grid">
+          <div>
+            <span>Connection</span>
+            <strong id="connectionStatus">Checking CRM session</strong>
+          </div>
+          <div>
+            <span>CRM API</span>
+            <strong id="apiBaseUrl">-</strong>
+          </div>
+        </div>
+        <p class="managed-note">Connection is automatic from the logged-in CRM account. Logout and manual connection are disabled by company policy.</p>
+      </section>
+
+      <section class="panel">
+        <div class="panel-title">
+          <h2>Tracking</h2>
+          <span><strong id="queueCount">0</strong> queued</span>
+        </div>
+        <div class="locked-list">
+          <div class="locked-row">
+            <span>
+              Track browser activity
+              <small>Tabs, URLs, link clicks, page actions, idle state</small>
+            </span>
+            <strong id="trackingEnabled">Locked on</strong>
+          </div>
+          <div class="locked-row">
+            <span>
+              Capture screenshots
+              <small>Visible active tab only, uploaded to CRM</small>
+            </span>
+            <strong id="screenshotsEnabled">Locked on</strong>
+          </div>
+          <div class="locked-row">
+            <span>
+              Screenshot mode
+              <small>Company managed screenshot capture rule</small>
+            </span>
+            <strong id="captureNonWorkOnly">Non-work only</strong>
+          </div>
+          <div class="locked-row compact">
+            <span>Screenshot interval</span>
+            <strong id="screenshotIntervalMinutes">3 min</strong>
+          </div>
+          <div class="readonly-field">
+            <span>Work domains</span>
+            <strong id="workDomains">-</strong>
+          </div>
+          <div class="readonly-field">
+            <span>Ignore domains</span>
+            <strong id="ignoreDomains">-</strong>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-title">
+          <h2>Recent</h2>
+          <span id="lastUpdated">-</span>
+        </div>
+        <div id="recentList" class="recent"></div>
+      </section>
+
+      <p id="message" class="message" role="status"></p>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

@@ -22,6 +22,7 @@ import {
     FiRotateCcw,
     FiSave,
     FiSearch,
+    FiShield,
     FiSquare,
     FiTrash2,
     FiUpload,
@@ -36,8 +37,8 @@ import { getEmployees, type Employee } from "../../../api/employees";
 import {
     archiveLead,
     addLeadComment,
-    archiveAllActiveLeads,
-    autoSearchGooglePlacesLeads,
+    assignLead,
+    autoSearchTomTomPlacesLeads,
     autoAssignLead,
     bulkAssignLeads,
     bulkArchiveLeads,
@@ -48,18 +49,17 @@ import {
     getAdminLeadCounts,
     getAdminLeads,
     getLead,
+    getTomTomUsage,
     importLeads,
-    permanentlyDeleteAllArchivedLeads,
     permanentlyDeleteLead,
     reassignNewLeads,
-    restoreAllArchivedLeads,
     restoreLead,
     scheduleLeadFollowUp,
-    searchAndImportGooglePlaces,
+    searchAndImportTomTomPlaces,
     scoreLeadsByHighestPotential,
     updateLead,
     updateLeadStatus,
-    type GooglePlaceLead,
+    type BusinessPlaceLead,
     type AdminLeadApiTab,
     type AdminLeadsPage,
     type Lead,
@@ -75,6 +75,44 @@ import { getSystemSettings } from "../../../api/systemSettings";
 type AdminLeadTab = LeadStatus | "Unassigned" | "ALL";
 type LeadQueueFilter = "ALL" | "NEW" | "Follow up";
 type AllStatusFilter = "ALL" | Exclude<LeadStatus, "Archived">;
+type LeadActionName = "archive" | "assignment" | "details" | "schedule" | "status";
+type PlacesManualSearchInput = {
+    textQuery: string;
+    category: string;
+    location: string;
+    radiusMiles: number;
+    maxResults?: number;
+    maxRequests?: number;
+};
+type PlacesAutoSearchInput = {
+    product: string;
+    location: string;
+    radiusMiles: number;
+    maxResults: number;
+    maxRequests?: number;
+};
+
+type LeadActionVerification =
+    | {
+        kind: "tomtom-manual";
+        input: PlacesManualSearchInput;
+    }
+    | {
+        kind: "tomtom-auto";
+        input: PlacesAutoSearchInput;
+    }
+    | {
+        kind: "reassign-new";
+        leadCount: number;
+    };
+
+function getApiErrorStatus(error: unknown) {
+    return Number((error as { response?: { status?: number } } | null)?.response?.status || 0);
+}
+
+function isAuthorizationError(error: unknown) {
+    return [401, 403].includes(getApiErrorStatus(error));
+}
 
 const tabs: AdminLeadTab[] = [
     "NEW",
@@ -345,15 +383,9 @@ function getEditableLeadStatusLabel(status: LeadStatus) {
     return status.toUpperCase();
 }
 
-function isSalesRepresentative(employee: Pick<Employee, "role">) {
-    const role = (employee.role || "").trim().toLowerCase().replace(/\./g, "");
-    const compactRole = role.replace(/[^a-z]/g, "");
-
-    return (
-        role.includes("sales representative") ||
-        role.includes("sales rep") ||
-        compactRole === "salesrepresentative" ||
-        compactRole === "salesrep"
+function isSalesAssignableEmployee(employee: Pick<Employee, "role" | "team">) {
+    return [employee.role, employee.team].some((value) =>
+        String(value || "").trim().toLowerCase().includes("sales")
     );
 }
 
@@ -1068,8 +1100,8 @@ export default function AdminLeads() {
         );
     }, [activeEmployees, leads]);
 
-    const salesRepEmployees = useMemo(
-        () => activeEmployees.filter(isSalesRepresentative).sort((first, second) => first.name.localeCompare(second.name)),
+    const salesAssignableEmployees = useMemo(
+        () => activeEmployees.filter(isSalesAssignableEmployee).sort((first, second) => first.name.localeCompare(second.name)),
         [activeEmployees]
     );
 
@@ -1089,18 +1121,57 @@ export default function AdminLeads() {
     const [isPlacesOpen, setIsPlacesOpen] = useState(false);
     const [leadForm, setLeadForm] = useState<LeadInput>(emptyLead);
     const [placesQuery, setPlacesQuery] = useState("");
-    const [placesProduct, setPlacesProduct] = useState("Popcorn vending machine");
+    const [placesProduct, setPlacesProduct] = useState("");
     const [placesCity, setPlacesCity] = useState("");
     const [placesState, setPlacesState] = useState("");
     const [placesRadiusMiles, setPlacesRadiusMiles] = useState("50");
-    const [placeResults, setPlaceResults] = useState<GooglePlaceLead[]>([]);
-    const [autoSearchQueries, setAutoSearchQueries] = useState<string[]>([]);
+    const [placesTargetLeads, setPlacesTargetLeads] = useState("all");
+    const [placeResults, setPlaceResults] = useState<BusinessPlaceLead[]>([]);
+    const [placesRejectedIrrelevantCount, setPlacesRejectedIrrelevantCount] = useState(0);
+    const placesLocation = [placesCity.trim(), placesState.trim()].filter(Boolean).join(", ");
+    const isAllMatchingLeadsTarget = placesTargetLeads === "all";
+    const targetLeadCount = isAllMatchingLeadsTarget ? 10000 : Number(placesTargetLeads) || 1000;
+    const tomTomUsageQuery = useQuery({
+        queryKey: ["tomtom-usage"],
+        queryFn: () => getTomTomUsage(),
+        enabled: isPlacesOpen,
+        staleTime: 30_000,
+        retry: (failureCount, error) => !isAuthorizationError(error) && failureCount < 3,
+        retryDelay: (attemptIndex) => Math.min(1_000 * 2 ** attemptIndex, 5_000),
+        refetchInterval: (query) => isAuthorizationError(query.state.error) ? 10_000 : 15_000,
+        refetchOnReconnect: true,
+        refetchOnWindowFocus: true,
+    });
+    const bufferedTargetLeadCount = Math.ceil(targetLeadCount * 1.25);
+    const tomTomEstimatedRequests = Math.min(
+        Math.ceil(bufferedTargetLeadCount / 4),
+        400
+    );
+    const tomTomManualEstimatedRequests = tomTomEstimatedRequests;
+    const tomTomAutoEstimatedRequests = tomTomEstimatedRequests;
+    const tomTomRemainingRequests = tomTomUsageQuery.data?.remaining;
+    const tomTomGeocodingRemainingRequests = tomTomUsageQuery.data?.products.geocoding.remaining;
+    const isTomTomBusinessSearchBudgetInsufficient = tomTomRemainingRequests !== undefined
+        && tomTomEstimatedRequests > tomTomRemainingRequests;
+    const isTomTomGeocodingBudgetInsufficient = Boolean(placesLocation)
+        && tomTomGeocodingRemainingRequests !== undefined
+        && tomTomGeocodingRemainingRequests < 1;
+    const isTomTomBudgetInsufficient = isTomTomBusinessSearchBudgetInsufficient || isTomTomGeocodingBudgetInsufficient;
+    const isTomTomUsageCheckUnavailable = tomTomUsageQuery.isError
+        || Boolean(tomTomUsageQuery.data && !tomTomUsageQuery.data.configured);
+    const isTomTomAuthorizationError = isAuthorizationError(tomTomUsageQuery.error);
+    const isTomTomSearchBlocked = tomTomUsageQuery.isLoading
+        || isTomTomUsageCheckUnavailable
+        || isTomTomBudgetInsufficient;
     const [autoSearchLocations, setAutoSearchLocations] = useState<string[]>([]);
     const [isAiSorted, setIsAiSorted] = useState(false);
     const [aiSortUsedOpenAI, setAiSortUsedOpenAI] = useState(false);
     const [isScoreSaved, setIsScoreSaved] = useState(false);
     const [followUpDateTime, setFollowUpDateTime] = useState("");
     const [commentDraft, setCommentDraft] = useState("");
+    const pendingCommentSaveRef = useRef<{ leadId: string; body: string; promise: Promise<Lead> } | null>(null);
+    const leadActionPendingRef = useRef<LeadActionName | null>(null);
+    const [activeLeadAction, setActiveLeadAction] = useState<LeadActionName | null>(null);
     const [isAssignEditing, setIsAssignEditing] = useState(false);
     const [assignmentEmployeeId, setAssignmentEmployeeId] = useState("");
     const [statusDraft, setStatusDraft] = useState<LeadStatus>("NEW");
@@ -1109,10 +1180,13 @@ export default function AdminLeads() {
     const [deleteTarget, setDeleteTarget] = useState<Lead | null>(null);
     const [importMessage, setImportMessage] = useState("");
     const [selectedBulkLeadIds, setSelectedBulkLeadIds] = useState<string[]>([]);
-    const [bulkAction, setBulkAction] = useState<null | "archive" | "archive-all" | "delete-active-selected" | "restore" | "delete-selected" | "restore-all" | "delete-all">(null);
+    const [bulkAction, setBulkAction] = useState<null | "archive" | "delete-active-selected" | "restore" | "delete-selected">(null);
     const [isBulkMenuOpen, setIsBulkMenuOpen] = useState(false);
     const [isBulkAssignMenuOpen, setIsBulkAssignMenuOpen] = useState(false);
-    const [isAllDatabaseSelected, setIsAllDatabaseSelected] = useState(false);
+    const [verificationAction, setVerificationAction] = useState<LeadActionVerification | null>(null);
+    const [isVerificationAcknowledged, setIsVerificationAcknowledged] = useState(false);
+    const [isVerificationChecking, setIsVerificationChecking] = useState(false);
+    const [verificationError, setVerificationError] = useState("");
     const bulkMenuRef = useRef<HTMLDivElement>(null);
     useClickOutside(bulkMenuRef, () => {
         setIsBulkMenuOpen(false);
@@ -1215,7 +1289,13 @@ export default function AdminLeads() {
 
     const archiveLeadMutation = useMutation({
         mutationFn: (leadId: string) => archiveLead(leadId),
-        onSuccess: invalidateLeads,
+        onSuccess: () => {
+            invalidateLeads();
+            showToast({ tone: "success", message: "Lead archived." });
+        },
+        onError: (error) => {
+            showToast({ tone: "error", message: getRequestErrorMessage(error, "Could not archive the lead.") });
+        },
     });
     const restoreLeadMutation = useMutation({
         mutationFn: restoreLead,
@@ -1229,15 +1309,6 @@ export default function AdminLeads() {
         mutationFn: bulkArchiveLeads,
         onSuccess: () => {
             setSelectedBulkLeadIds([]);
-            setIsAllDatabaseSelected(false);
-            invalidateLeads();
-        },
-    });
-    const archiveAllActiveLeadsMutation = useMutation({
-        mutationFn: archiveAllActiveLeads,
-        onSuccess: () => {
-            setSelectedBulkLeadIds([]);
-            setIsAllDatabaseSelected(false);
             invalidateLeads();
         },
     });
@@ -1245,7 +1316,6 @@ export default function AdminLeads() {
         mutationFn: bulkRestoreLeads,
         onSuccess: () => {
             setSelectedBulkLeadIds([]);
-            setIsAllDatabaseSelected(false);
             invalidateLeads();
         },
     });
@@ -1253,7 +1323,6 @@ export default function AdminLeads() {
         mutationFn: bulkAssignLeads,
         onSuccess: () => {
             setSelectedBulkLeadIds([]);
-            setIsAllDatabaseSelected(false);
             setIsBulkAssignMenuOpen(false);
             invalidateLeads();
         },
@@ -1262,7 +1331,6 @@ export default function AdminLeads() {
         mutationFn: bulkPermanentlyDeleteArchivedLeads,
         onSuccess: () => {
             setSelectedBulkLeadIds([]);
-            setIsAllDatabaseSelected(false);
             invalidateLeads();
         },
     });
@@ -1270,23 +1338,6 @@ export default function AdminLeads() {
         mutationFn: bulkPermanentlyDeleteActiveLeads,
         onSuccess: () => {
             setSelectedBulkLeadIds([]);
-            setIsAllDatabaseSelected(false);
-            invalidateLeads();
-        },
-    });
-    const restoreAllArchivedLeadsMutation = useMutation({
-        mutationFn: restoreAllArchivedLeads,
-        onSuccess: () => {
-            setSelectedBulkLeadIds([]);
-            setIsAllDatabaseSelected(false);
-            invalidateLeads();
-        },
-    });
-    const permanentlyDeleteAllArchivedLeadsMutation = useMutation({
-        mutationFn: permanentlyDeleteAllArchivedLeads,
-        onSuccess: () => {
-            setSelectedBulkLeadIds([]);
-            setIsAllDatabaseSelected(false);
             invalidateLeads();
         },
     });
@@ -1306,7 +1357,12 @@ export default function AdminLeads() {
             permanentlyDeleteLeadMutation.mutate(deleteTarget._id, { onSuccess: closeDeletePrompt });
             return;
         }
-        archiveLeadMutation.mutate(deleteTarget._id, { onSuccess: closeDeletePrompt });
+
+        const leadId = deleteTarget._id;
+        void runLeadActionAfterComment(leadId, "archive", async () => {
+            await archiveLeadMutation.mutateAsync(leadId);
+            closeDeletePrompt();
+        });
     };
 
     const autoAssignLeadMutation = useMutation({
@@ -1329,6 +1385,12 @@ export default function AdminLeads() {
                 return currentLeads.map((lead) => reassignedLeadsById.get(lead._id) || lead);
             }));
             invalidateLeads();
+            showToast({
+                tone: "success",
+                message: result.reassignedCount > 0
+                    ? `Reassigned ${result.reassignedCount.toLocaleString()} new lead${result.reassignedCount === 1 ? "" : "s"}.`
+                    : "There were no new leads to reassign.",
+            });
         },
     });
 
@@ -1343,19 +1405,54 @@ export default function AdminLeads() {
             );
             setFollowUpDateTime(formatCstDateTimeInput(lead.followUpAt) || getCurrentCstDateTimeInput());
         },
+        onError: (error) => {
+            showToast({ tone: "error", message: getRequestErrorMessage(error, "Could not schedule the follow-up.") });
+        },
     });
 
     const addCommentMutation = useMutation({
         mutationFn: ({ leadId, body }: { leadId: string; body: string }) =>
             addLeadComment(leadId, { body, authorName: "Admin", authorType: "admin" }),
-        onSuccess: (lead) => {
+        onMutate: (variables) => {
+            const previousLeadPage = queryClient.getQueryData<AdminLeadsPage>(leadQueryKey);
+            const optimisticComment = {
+                _id: `pending-${Date.now()}`,
+                authorName: "Admin",
+                authorType: "admin" as const,
+                body: variables.body,
+                createdAt: new Date().toISOString(),
+            };
+
+            queryClient.setQueryData<AdminLeadsPage>(leadQueryKey, (current) =>
+                updateLeadPageData(current, (currentLeads) =>
+                    currentLeads.map((lead) =>
+                        lead._id === variables.leadId
+                            ? { ...lead, comments: [...(lead.comments || []), optimisticComment] }
+                            : lead
+                    )
+                )
+            );
+            setCommentDraft((current) => (current.trim() === variables.body ? "" : current));
+
+            return { previousLeadPage };
+        },
+        onSuccess: (lead, variables) => {
             queryClient.setQueryData<AdminLeadsPage>(leadQueryKey, (current) =>
                 updateLeadPageData(current, (currentLeads) =>
                     currentLeads.map((currentLead) => (currentLead._id === lead._id ? lead : currentLead))
                 )
             );
-            setCommentDraft("");
-            void invalidateLeads();
+            setCommentDraft((current) => (current.trim() === variables.body ? "" : current));
+            void queryClient.invalidateQueries({ queryKey: ["admin-lead-counts"] });
+            void queryClient.invalidateQueries({ queryKey: ["lead-counts"] });
+            showToast({ tone: "success", message: "Note added to the lead." });
+        },
+        onError: (error, variables, context) => {
+            if (context?.previousLeadPage) {
+                queryClient.setQueryData(leadQueryKey, context.previousLeadPage);
+            }
+            setCommentDraft((current) => current || variables.body);
+            showToast({ tone: "error", message: getRequestErrorMessage(error, "Could not add the note. Please try again.") });
         },
     });
 
@@ -1366,13 +1463,14 @@ export default function AdminLeads() {
             assignedAgentName,
         }: {
             lead: Lead;
-            assignedAgent: string | null;
+            assignedAgent: string;
             assignedAgentName: string;
         }) =>
-            updateLead(lead._id, {
-                ...toLeadInput(lead, lead.notes || ""),
+            assignLead(lead._id, {
                 assignedAgent,
                 assignedAgentName,
+                activityActorName: "Admin",
+                activityActorType: "admin",
             }),
         onSuccess: (lead) => {
             queryClient.setQueryData<AdminLeadsPage>(leadQueryKey, (current) =>
@@ -1381,6 +1479,10 @@ export default function AdminLeads() {
                 )
             );
             setIsAssignEditing(false);
+            showToast({ tone: "success", message: `Lead assigned to ${lead.assignedAgent?.name || lead.assignedAgentName}.` });
+        },
+        onError: (error) => {
+            showToast({ tone: "error", message: getRequestErrorMessage(error, "Could not assign the lead.") });
         },
     });
 
@@ -1397,15 +1499,19 @@ export default function AdminLeads() {
             setFollowUpDateTime(formatCstDateTimeInput(lead.followUpAt) || getCurrentCstDateTimeInput());
             void invalidateLeads();
         },
+        onError: (error) => {
+            showToast({ tone: "error", message: getRequestErrorMessage(error, "Could not update the lead status.") });
+        },
     });
 
     const updateDetailsMutation = useMutation({
-        mutationFn: ({ lead, draft }: { lead: Lead; draft: LeadDetailDraft }) =>
-            updateLead(
-                lead._id,
+        mutationFn: async ({ lead, draft }: { lead: Lead; draft: LeadDetailDraft }) => {
+            const currentLead = await getLead(lead._id);
+            return updateLead(
+                currentLead._id,
                 toLeadInput(
-                    lead,
-                    lead.notes || "",
+                    currentLead,
+                    currentLead.notes || "",
                     {
                         ...draft,
                         businessName: draft.businessName.trim(),
@@ -1413,7 +1519,8 @@ export default function AdminLeads() {
                         activityActorType: "admin",
                     }
                 )
-            ),
+            );
+        },
         onSuccess: (lead) => {
             queryClient.setQueryData<AdminLeadsPage>(leadQueryKey, (current) =>
                 updateLeadPageData(current, (currentLeads) =>
@@ -1423,23 +1530,34 @@ export default function AdminLeads() {
             setDetailDraft(createLeadDetailDraft(lead));
             setIsDetailEditing(false);
         },
+        onError: (error) => {
+            showToast({ tone: "error", message: getRequestErrorMessage(error, "Could not save the lead details.") });
+        },
     });
 
     const searchAndImportPlacesMutation = useMutation({
-        mutationFn: searchAndImportGooglePlaces,
+        mutationFn: (input: PlacesManualSearchInput) => searchAndImportTomTomPlaces(input),
         onSuccess: (result) => {
             setPlaceResults(result.places);
-            setAutoSearchQueries(result.searchedQueries || []);
+            setPlacesRejectedIrrelevantCount(result.rejectedIrrelevantCount || 0);
             setAutoSearchLocations(result.searchedLocations || []);
             invalidateLeads();
+            void tomTomUsageQuery.refetch();
+            showToast({
+                tone: "success",
+                message: `Saved ${result.places.length.toLocaleString()} relevant lead${result.places.length === 1 ? "" : "s"}${result.rejectedIrrelevantCount ? ` and excluded ${result.rejectedIrrelevantCount.toLocaleString()} unrelated result${result.rejectedIrrelevantCount === 1 ? "" : "s"}` : ""}.`,
+            });
+        },
+        onError: () => {
+            void tomTomUsageQuery.refetch();
         },
     });
 
     const autoSearchPlacesMutation = useMutation({
-        mutationFn: autoSearchGooglePlacesLeads,
+        mutationFn: (input: PlacesAutoSearchInput) => autoSearchTomTomPlacesLeads(input),
         onSuccess: (result) => {
             setPlaceResults(result.places);
-            setAutoSearchQueries(result.searchedQueries);
+            setPlacesRejectedIrrelevantCount(result.rejectedIrrelevantCount || 0);
             setAutoSearchLocations(result.searchedLocations || []);
             setActiveCategoryTab(formatFilterLabel(result.product));
             invalidateLeads();
@@ -1450,6 +1568,14 @@ export default function AdminLeads() {
             );
             setIsAiSorted(true);
             setIsScoreSaved(true);
+            void tomTomUsageQuery.refetch();
+            showToast({
+                tone: "success",
+                message: `Saved ${result.places.length.toLocaleString()} relevant lead${result.places.length === 1 ? "" : "s"}${result.rejectedIrrelevantCount ? ` and excluded ${result.rejectedIrrelevantCount.toLocaleString()} unrelated result${result.rejectedIrrelevantCount === 1 ? "" : "s"}` : ""}.`,
+            });
+        },
+        onError: () => {
+            void tomTomUsageQuery.refetch();
         },
     });
 
@@ -1519,6 +1645,12 @@ export default function AdminLeads() {
     const { data: leadCounts = {} } = useQuery({
         queryKey: ["admin-lead-counts", leadCountParams],
         queryFn: () => getAdminLeadCounts(leadCountParams),
+    });
+
+    const reassignLeadCountsQuery = useQuery({
+        queryKey: ["admin-lead-counts", "reassign-verification"],
+        queryFn: () => getAdminLeadCounts(),
+        staleTime: 15_000,
     });
 
     const filteredLeads = useMemo(() => {
@@ -1593,7 +1725,6 @@ export default function AdminLeads() {
 
         return [];
     }, [activeTab, filteredLeads]);
-    const archivedLeadCount = leadCounts.Archived || 0;
     const getTabLabel = (tab: AdminLeadTab) => (tab === "NEW" ? "Leads" : tab);
     const getLeadQueueFilterLabel = (filter: LeadQueueFilter) => {
         if (filter === "ALL") {
@@ -1629,12 +1760,10 @@ export default function AdminLeads() {
 
         return leadCounts[tab] || 0;
     };
-    const selectableLeadCount =
-        activeTab === "ALL" ? leadCounts.ALL || selectableLeadIds.length : activeTab === "Archived" ? archivedLeadCount || selectableLeadIds.length : selectableLeadIds.length;
-    const selectedBulkCount = isAllDatabaseSelected ? leadCounts.ALL || selectableLeadIds.length : selectedBulkLeadIds.length;
-    const selectedBulkLabel = isAllDatabaseSelected ? "All" : String(selectedBulkCount);
-    const areAllVisibleLeadsSelected =
-        isAllDatabaseSelected || (selectableLeadIds.length > 0 && selectableLeadIds.every((leadId) => selectedBulkLeadIds.includes(leadId)));
+    const selectableLeadCount = selectableLeadIds.length;
+    const selectedBulkCount = selectedBulkLeadIds.length;
+    const selectedBulkLabel = String(selectedBulkCount);
+    const areAllVisibleLeadsSelected = selectableLeadIds.length > 0 && selectableLeadIds.every((leadId) => selectedBulkLeadIds.includes(leadId));
 
     const selectedRouteLead = routeLead?._id === selectedLeadId ? routeLead : null;
     const selectedLead = leads.find((lead) => lead._id === selectedLeadId) || selectedRouteLead || filteredLeads[0] || null;
@@ -1671,7 +1800,6 @@ export default function AdminLeads() {
 
     useEffect(() => {
         setSelectedBulkLeadIds([]);
-        setIsAllDatabaseSelected(false);
         setIsBulkMenuOpen(false);
     }, [activeTab, activeCategoryTab, assignedAgentFilter, leadSearch]);
 
@@ -1682,23 +1810,10 @@ export default function AdminLeads() {
     }, [activeTabTotalCount, isLoading, leads.length]);
 
     const toggleBulkLead = (leadId: string) => {
-        setIsAllDatabaseSelected(false);
         setSelectedBulkLeadIds((current) => (current.includes(leadId) ? current.filter((id) => id !== leadId) : [...current, leadId]));
     };
 
     const toggleAllVisibleLeads = () => {
-        if (activeTab === "ALL") {
-            if (isAllDatabaseSelected) {
-                setIsAllDatabaseSelected(false);
-                setSelectedBulkLeadIds([]);
-                return;
-            }
-
-            setIsAllDatabaseSelected(true);
-            setSelectedBulkLeadIds(selectableLeadIds);
-            return;
-        }
-
         setSelectedBulkLeadIds((current) => {
             if (areAllVisibleLeadsSelected) {
                 return current.filter((leadId) => !selectableLeadIds.includes(leadId));
@@ -1713,18 +1828,10 @@ export default function AdminLeads() {
     const confirmBulkAction = () => {
         if (
             bulkArchiveLeadsMutation.isPending ||
-            archiveAllActiveLeadsMutation.isPending ||
             bulkRestoreLeadsMutation.isPending ||
             bulkPermanentDeleteActiveMutation.isPending ||
-            bulkPermanentDeleteMutation.isPending ||
-            restoreAllArchivedLeadsMutation.isPending ||
-            permanentlyDeleteAllArchivedLeadsMutation.isPending
+            bulkPermanentDeleteMutation.isPending
         ) {
-            return;
-        }
-
-        if (bulkAction === "archive-all") {
-            archiveAllActiveLeadsMutation.mutate(undefined, { onSuccess: closeBulkPrompt });
             return;
         }
 
@@ -1748,14 +1855,6 @@ export default function AdminLeads() {
             return;
         }
 
-        if (bulkAction === "restore-all") {
-            restoreAllArchivedLeadsMutation.mutate(undefined, { onSuccess: closeBulkPrompt });
-            return;
-        }
-
-        if (bulkAction === "delete-all") {
-            permanentlyDeleteAllArchivedLeadsMutation.mutate(undefined, { onSuccess: closeBulkPrompt });
-        }
     };
 
     const openLeadModal = () => {
@@ -1893,34 +1992,168 @@ export default function AdminLeads() {
         }
     };
 
+    const openActionVerification = (action: LeadActionVerification) => {
+        setVerificationError("");
+        setIsVerificationAcknowledged(false);
+        setVerificationAction(action);
+    };
+
+    const closeActionVerification = () => {
+        if (isVerificationChecking) return;
+        setVerificationAction(null);
+        setVerificationError("");
+        setIsVerificationAcknowledged(false);
+    };
+
+    const handleOpenReassignVerification = async () => {
+        if (reassignNewLeadsMutation.isPending || reassignLeadCountsQuery.isFetching) return;
+
+        const countResult = await reassignLeadCountsQuery.refetch();
+        const leadCount = countResult.data?.NEW || 0;
+
+        if (countResult.isError) {
+            showToast({ tone: "error", message: "Could not verify the current new-lead count. Please try again." });
+            return;
+        }
+
+        if (leadCount === 0) {
+            showToast({ tone: "info", message: "There are no new leads to reassign." });
+            return;
+        }
+
+        openActionVerification({ kind: "reassign-new", leadCount });
+    };
+
+    const confirmVerifiedAction = async () => {
+        if (!verificationAction || !isVerificationAcknowledged || isVerificationChecking) return;
+
+        setIsVerificationChecking(true);
+        setVerificationError("");
+
+        try {
+            if (verificationAction.kind === "reassign-new") {
+                const countResult = await reassignLeadCountsQuery.refetch();
+                const leadCount = countResult.data?.NEW || 0;
+
+                if (countResult.isError) {
+                    setVerificationError("The current new-lead count could not be verified. No assignments were changed.");
+                    return;
+                }
+
+                if (leadCount === 0) {
+                    setVerificationError("There are no new leads left to reassign.");
+                    return;
+                }
+
+                setVerificationAction(null);
+                setIsVerificationAcknowledged(false);
+                reassignNewLeadsMutation.mutate();
+                return;
+            }
+
+            const usageResult = await tomTomUsageQuery.refetch();
+            const requiredRequests = verificationAction.input.maxRequests || 0;
+
+            if (usageResult.isError || !usageResult.data?.configured) {
+                setVerificationError("TomTom usage could not be verified. The search was not started.");
+                return;
+            }
+
+            if (usageResult.data.remaining < requiredRequests) {
+                setVerificationError(
+                    `Only ${usageResult.data.remaining.toLocaleString()} requests remain, but this search can use up to ${requiredRequests.toLocaleString()}. Choose a smaller target.`
+                );
+                return;
+            }
+
+            const verifiedAction = verificationAction;
+            setVerificationAction(null);
+            setIsVerificationAcknowledged(false);
+            setPlaceResults([]);
+            setPlacesRejectedIrrelevantCount(0);
+            setAutoSearchLocations([]);
+
+            if (verifiedAction.kind === "tomtom-manual") {
+                setActiveCategoryTab(verifiedAction.input.category);
+                searchAndImportPlacesMutation.mutate(verifiedAction.input);
+                return;
+            }
+
+            setActiveCategoryTab(formatFilterLabel(verifiedAction.input.product));
+            autoSearchPlacesMutation.mutate(verifiedAction.input);
+        } finally {
+            setIsVerificationChecking(false);
+        }
+    };
+
     const handlePlacesSearch = (event: FormEvent<HTMLFormElement>) => {
         event.preventDefault();
+        if (isTomTomSearchBlocked) return;
 
-        const location = [placesCity.trim(), placesState.trim()].filter(Boolean).join(", ");
-        const radiusMiles = Number(placesRadiusMiles) || 0;
-        const category = formatFilterLabel(placesQuery.trim() || "businesses");
+        const requestedCategory = placesQuery.trim();
+        const location = placesLocation;
+        const radiusMiles = Number(placesRadiusMiles);
+
+        if (!requestedCategory) {
+            showToast({ tone: "error", message: "Enter a business type before searching." });
+            return;
+        }
+
+        if (!Number.isFinite(radiusMiles) || radiusMiles < 1 || radiusMiles > 50) {
+            showToast({ tone: "error", message: "Use a search radius from 1 to 50 miles." });
+            return;
+        }
+
+        const category = formatFilterLabel(requestedCategory);
         const textQuery = [category, location].filter(Boolean).join(" in ");
 
         if (textQuery.trim()) {
-            setPlaceResults([]);
-            setActiveCategoryTab(category);
-            setAutoSearchLocations([]);
-            searchAndImportPlacesMutation.mutate({ textQuery, category, location, radiusMiles, maxPages: 120 });
+            openActionVerification({
+                kind: "tomtom-manual",
+                input: {
+                textQuery,
+                category,
+                location,
+                radiusMiles,
+                maxResults: targetLeadCount,
+                maxRequests: tomTomManualEstimatedRequests,
+                },
+            });
         }
     };
 
     const handleAutoPlacesSearch = () => {
-        const product = placesProduct.trim() || "Popcorn vending machine";
-        const location = [placesCity.trim(), placesState.trim()].filter(Boolean).join(", ");
-        const radiusMiles = Number(placesRadiusMiles) || 0;
+        if (isTomTomSearchBlocked) return;
 
-        setPlaceResults([]);
-        setAutoSearchQueries([]);
-        setAutoSearchLocations([]);
-        setPlacesQuery(product);
-        setActiveCategoryTab(formatFilterLabel(product));
-        autoSearchPlacesMutation.mutate({ product, location, radiusMiles, maxResults: 10000, maxPages: 120 });
+        const product = placesProduct.trim();
+        const location = placesLocation;
+        const radiusMiles = Number(placesRadiusMiles);
+
+        if (!product) {
+            showToast({ tone: "error", message: "Enter a product before finding matching leads." });
+            return;
+        }
+
+        if (!Number.isFinite(radiusMiles) || radiusMiles < 1 || radiusMiles > 50) {
+            showToast({ tone: "error", message: "Use a search radius from 1 to 50 miles." });
+            return;
+        }
+
+        openActionVerification({
+            kind: "tomtom-auto",
+            input: {
+                product,
+                location,
+                radiusMiles,
+                maxResults: targetLeadCount,
+                maxRequests: tomTomAutoEstimatedRequests,
+            },
+        });
     };
+
+    const placesMutationError = searchAndImportPlacesMutation.error || autoSearchPlacesMutation.error;
+    const placesErrorMessage = (placesMutationError as { response?: { data?: { message?: string } } } | null)?.response?.data?.message;
+    const isTomTomUnavailable = isTomTomUsageCheckUnavailable;
 
     const leadPhone = selectedLead?.phone || "";
     const whatsappPhone = leadPhone.replace(/\D/g, "");
@@ -1929,16 +2162,82 @@ export default function AdminLeads() {
     const shouldClearQualifiedFollowUp = Boolean(selectedLead && selectedLead.status === "Qualified" && selectedLead.followUpAt);
     const hasStatusUpdate = Boolean(selectedLead && (statusDraft !== selectedLead.status || (isQualifiedStatusDraft && selectedLead.followUpAt)));
 
+    const startCommentSave = (leadId: string, body: string) => {
+        const currentPendingSave = pendingCommentSaveRef.current;
+
+        if (currentPendingSave?.leadId === leadId) {
+            return currentPendingSave.promise;
+        }
+
+        const promise = addCommentMutation.mutateAsync({ leadId, body });
+        pendingCommentSaveRef.current = { leadId, body, promise };
+        void promise.then(
+            () => {
+                if (pendingCommentSaveRef.current?.promise === promise) pendingCommentSaveRef.current = null;
+            },
+            () => {
+                if (pendingCommentSaveRef.current?.promise === promise) pendingCommentSaveRef.current = null;
+            }
+        );
+        return promise;
+    };
+
+    const runLeadActionAfterComment = async (
+        leadId: string,
+        actionName: LeadActionName,
+        action: () => Promise<unknown>
+    ) => {
+        if (leadActionPendingRef.current) {
+            return;
+        }
+
+        leadActionPendingRef.current = actionName;
+        setActiveLeadAction(actionName);
+
+        try {
+            const pendingCommentSave = pendingCommentSaveRef.current;
+            let savedCommentBody = "";
+
+            if (pendingCommentSave) {
+                await pendingCommentSave.promise;
+                if (pendingCommentSave.leadId === leadId) {
+                    savedCommentBody = pendingCommentSave.body.trim();
+                }
+            }
+
+            const unsavedComment = selectedLead?._id === leadId ? commentDraft.trim() : "";
+            if (unsavedComment && unsavedComment !== savedCommentBody) {
+                await startCommentSave(leadId, unsavedComment);
+            }
+
+            await action();
+        } catch {
+            // Each mutation reports its own error and a failed note prevents the queued action.
+        } finally {
+            leadActionPendingRef.current = null;
+            setActiveLeadAction(null);
+        }
+    };
+
     useEffect(() => {
         setCommentDraft("");
         setIsAssignEditing(false);
         setIsDetailEditing(false);
         setDetailDraft(createLeadDetailDraft(selectedLead));
-        const selectedSalesRep = salesRepEmployees.find((employee) => employee._id === selectedLead?.assignedAgent?._id);
-        setAssignmentEmployeeId(selectedSalesRep?._id || "");
+    }, [selectedLead?._id]);
+
+    useEffect(() => {
+        const selectedSalesEmployee = salesAssignableEmployees.find((employee) => employee._id === selectedLead?.assignedAgent?._id);
+        setAssignmentEmployeeId(selectedSalesEmployee?._id || "");
+    }, [salesAssignableEmployees, selectedLead?._id, selectedLead?.assignedAgent?._id]);
+
+    useEffect(() => {
         setStatusDraft(selectedLead?.status || "NEW");
+    }, [selectedLead?._id, selectedLead?.status]);
+
+    useEffect(() => {
         setFollowUpDateTime(formatCstDateTimeInput(selectedLead?.followUpAt) || getCurrentCstDateTimeInput());
-    }, [salesRepEmployees, selectedLead?._id, selectedLead?.notes, selectedLead?.status, selectedLead?.followUpAt]);
+    }, [selectedLead?._id, selectedLead?.followUpAt]);
 
     const handleAiSort = () => {
         if (scoreLeadsMutation.isPending) {
@@ -1972,10 +2271,13 @@ export default function AdminLeads() {
             return;
         }
 
-        scheduleFollowUpMutation.mutate({ id: selectedLead._id, followUpAt: scheduledDate.toISOString() });
+        const leadId = selectedLead._id;
+        void runLeadActionAfterComment(leadId, "schedule", () =>
+            scheduleFollowUpMutation.mutateAsync({ id: leadId, followUpAt: scheduledDate.toISOString() })
+        );
     };
     const handleSaveComment = () => {
-        if (addCommentMutation.isPending) {
+        if (addCommentMutation.isPending || pendingCommentSaveRef.current) {
             return;
         }
 
@@ -1989,29 +2291,31 @@ export default function AdminLeads() {
             return;
         }
 
-        setCommentDraft("");
-        addCommentMutation.mutate({ leadId: selectedLead._id, body });
+        void startCommentSave(selectedLead._id, body).catch(() => undefined);
     };
     const handleSaveAssignment = () => {
         if (saveAssignmentMutation.isPending) {
             return;
         }
 
-        const selectedSalesRep = salesRepEmployees.find((employee) => employee._id === assignmentEmployeeId);
+        const selectedSalesEmployee = salesAssignableEmployees.find((employee) => employee._id === assignmentEmployeeId);
 
-        if (!selectedLead || !selectedSalesRep) {
+        if (!selectedLead || !selectedSalesEmployee) {
             return;
         }
 
-        saveAssignmentMutation.mutate({
+        const assignment = {
             lead: selectedLead,
-            assignedAgent: selectedSalesRep._id,
-            assignedAgentName: selectedSalesRep.name,
-        });
+            assignedAgent: selectedSalesEmployee._id,
+            assignedAgentName: selectedSalesEmployee.name,
+        };
+        void runLeadActionAfterComment(selectedLead._id, "assignment", () =>
+            saveAssignmentMutation.mutateAsync(assignment)
+        );
     };
     const cancelAssignmentEdit = () => {
-        const selectedSalesRep = salesRepEmployees.find((employee) => employee._id === selectedLead?.assignedAgent?._id);
-        setAssignmentEmployeeId(selectedSalesRep?._id || "");
+        const selectedSalesEmployee = salesAssignableEmployees.find((employee) => employee._id === selectedLead?.assignedAgent?._id);
+        setAssignmentEmployeeId(selectedSalesEmployee?._id || "");
         setIsAssignEditing(false);
     };
 
@@ -2020,7 +2324,11 @@ export default function AdminLeads() {
             return;
         }
 
-        updateStatusMutation.mutate({ id: selectedLead._id, status: statusDraft });
+        const leadId = selectedLead._id;
+        const nextStatus = statusDraft;
+        void runLeadActionAfterComment(leadId, "status", () =>
+            updateStatusMutation.mutateAsync({ id: leadId, status: nextStatus })
+        );
     };
 
     const updateDetailDraft = (field: keyof LeadDetailDraft, value: string) => {
@@ -2041,7 +2349,11 @@ export default function AdminLeads() {
             return;
         }
 
-        updateDetailsMutation.mutate({ lead: selectedLead, draft: detailDraft });
+        const lead = selectedLead;
+        const draft = { ...detailDraft };
+        void runLeadActionAfterComment(lead._id, "details", () =>
+            updateDetailsMutation.mutateAsync({ lead, draft })
+        );
     };
 
     const handleActivityAction = (action?: string) => {
@@ -2190,20 +2502,33 @@ export default function AdminLeads() {
                             <button
                                 className="flat-action-button flat-action-reassign flex h-9 items-center gap-2 rounded-lg border border-[#2e86de] bg-[#2e86de] px-3 text-xs font-semibold text-white shadow-sm shadow-[#2e86de]/20 transition hover:border-[#1f6fbf] hover:bg-[#1f6fbf] disabled:cursor-not-allowed disabled:opacity-100"
                                 type="button"
-                                onClick={() => reassignNewLeadsMutation.mutate()}
-                                disabled={reassignNewLeadsMutation.isPending || leads.every((lead) => lead.status !== "NEW")}
+                                onClick={() => void handleOpenReassignVerification()}
+                                disabled={reassignNewLeadsMutation.isPending || reassignLeadCountsQuery.isFetching || (reassignLeadCountsQuery.data?.NEW || 0) === 0}
                                 title="Reassign all new leads"
                             >
                                 <FiRefreshCw
                                     className={["size-4", reassignNewLeadsMutation.isPending ? "animate-spin" : ""].join(" ")}
                                     aria-hidden="true"
                                 />
-                                {reassignNewLeadsMutation.isPending ? "Assigning" : "Reassign new"}
+                                {reassignNewLeadsMutation.isPending
+                                    ? "Assigning"
+                                    : reassignLeadCountsQuery.isFetching
+                                        ? "Verifying"
+                                        : "Reassign new"}
                             </button>
                             <button
                                 className="flat-action-button flat-action-auto-update flex h-9 items-center gap-2 rounded-lg border border-[#ff9f43] bg-[#ff9f43] px-3 text-xs font-semibold text-white shadow-sm shadow-[#ff9f43]/20 transition hover:border-[#e67f1d] hover:bg-[#e67f1d]"
                                 type="button"
-                                onClick={() => setIsPlacesOpen(true)}
+                                onClick={() => {
+                                    setPlacesProduct("");
+                                    setPlacesQuery("");
+                                    setPlaceResults([]);
+                                    setPlacesRejectedIrrelevantCount(0);
+                                    setAutoSearchLocations([]);
+                                    searchAndImportPlacesMutation.reset();
+                                    autoSearchPlacesMutation.reset();
+                                    setIsPlacesOpen(true);
+                                }}
                             >
                                 <FiMapPin className="size-4" aria-hidden="true" />
                                 Auto update leads
@@ -2313,10 +2638,10 @@ export default function AdminLeads() {
                                                                         <span className="mt-0.5 text-[0.65rem] font-medium !text-slate-500">Clear assigned agent</span>
                                                                     </button>
                                                                     <div className="my-1 h-px bg-slate-200" />
-                                                                    {salesRepEmployees.length === 0 && (
-                                                                        <p className="px-3 py-2 text-xs font-semibold !text-slate-500">No active Sales Reps</p>
+                                                                    {salesAssignableEmployees.length === 0 && (
+                                                                        <p className="px-3 py-2 text-xs font-semibold !text-slate-500">No Sales employees available</p>
                                                                     )}
-                                                                    {salesRepEmployees.map((employee) => (
+                                                                    {salesAssignableEmployees.map((employee) => (
                                                                         <button
                                                                             key={employee._id}
                                                                             className="flex min-h-9 w-full flex-col items-start justify-center rounded-md px-3 py-2 text-left text-xs font-semibold !text-slate-950 transition hover:bg-sky-50 disabled:cursor-not-allowed disabled:opacity-50"
@@ -2344,20 +2669,20 @@ export default function AdminLeads() {
                                                         <button
                                                             className="flex h-9 w-full items-center gap-2 rounded-md px-3 text-left text-xs font-semibold text-white/70 transition hover:bg-red-500/10 hover:text-red-100 disabled:cursor-not-allowed disabled:opacity-40"
                                                             type="button"
-                                                            disabled={selectedBulkCount === 0 || bulkArchiveLeadsMutation.isPending || archiveAllActiveLeadsMutation.isPending}
+                                                            disabled={selectedBulkCount === 0 || bulkArchiveLeadsMutation.isPending}
                                                             onClick={() => {
-                                                                setBulkAction(isAllDatabaseSelected ? "archive-all" : "archive");
+                                                                setBulkAction("archive");
                                                                 setIsBulkMenuOpen(false);
                                                                 setIsBulkAssignMenuOpen(false);
                                                             }}
                                                         >
                                                             <FiArchive className="size-3.5" aria-hidden="true" />
-                                                            {isAllDatabaseSelected ? "Archive all" : "Archive selected"}
+                                                            Archive selected
                                                         </button>
                                                         <button
                                                             className="flex h-9 w-full items-center gap-2 rounded-md px-3 text-left text-xs font-semibold text-white/70 transition hover:bg-red-500/10 hover:text-red-100 disabled:cursor-not-allowed disabled:opacity-40"
                                                             type="button"
-                                                            disabled={selectedBulkCount === 0 || isAllDatabaseSelected || bulkPermanentDeleteActiveMutation.isPending}
+                                                            disabled={selectedBulkCount === 0 || bulkPermanentDeleteActiveMutation.isPending}
                                                             onClick={() => {
                                                                 setBulkAction("delete-active-selected");
                                                                 setIsBulkMenuOpen(false);
@@ -2394,29 +2719,6 @@ export default function AdminLeads() {
                                                         >
                                                             <FiTrash2 className="size-3.5" aria-hidden="true" />
                                                             Delete selected
-                                                        </button>
-                                                        <div className="my-1 h-px bg-white/10" />
-                                                        <button
-                                                            className="flex h-9 w-full items-center gap-2 rounded-md px-3 text-left text-xs font-semibold text-white/70 transition hover:bg-white/[0.06] hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
-                                                            type="button"
-                                                            disabled={archivedLeadCount === 0 || restoreAllArchivedLeadsMutation.isPending}
-                                                            onClick={() => {
-                                                                setBulkAction("restore-all");
-                                                                setIsBulkMenuOpen(false);
-                                                            }}
-                                                        >
-                                                            Restore all
-                                                        </button>
-                                                        <button
-                                                            className="flex h-9 w-full items-center gap-2 rounded-md px-3 text-left text-xs font-semibold text-white/70 transition hover:bg-red-500/10 hover:text-red-100 disabled:cursor-not-allowed disabled:opacity-40"
-                                                            type="button"
-                                                            disabled={archivedLeadCount === 0 || permanentlyDeleteAllArchivedLeadsMutation.isPending}
-                                                            onClick={() => {
-                                                                setBulkAction("delete-all");
-                                                                setIsBulkMenuOpen(false);
-                                                            }}
-                                                        >
-                                                            Delete all
                                                         </button>
                                                     </>
                                                 )}
@@ -2560,9 +2862,10 @@ export default function AdminLeads() {
                                         activeTab === "NEW") &&
                                         lead.status !== "Archived") ||
                                     (activeTab === "Archived" && lead.status === "Archived");
-                                const isBulkSelected = (isAllDatabaseSelected && activeTab === "ALL" && lead.status !== "Archived") || selectedBulkLeadIds.includes(lead._id);
+                                const isBulkSelected = selectedBulkLeadIds.includes(lead._id);
                                 const isCallPriority = isCallPriorityLead(lead);
                                 const isScheduledToday = isScheduledForToday(lead);
+                                const wasCommentedToday = hasManualCommentToday(lead);
 
                                 return (
                                     <div
@@ -2583,28 +2886,31 @@ export default function AdminLeads() {
                                             </button>
                                         )}
                                         <button
-                                            className="flex min-w-0 flex-1 items-center justify-between gap-4 text-left"
+                                            className="flex min-w-0 flex-1 items-center justify-between gap-3 text-left"
                                             type="button"
                                             onClick={() => selectLead(lead._id)}
                                         >
-                                            <span className="min-w-0">
+                                            <span className="min-w-0 flex-1">
                                                 <span className="block truncate text-sm font-semibold text-white">
                                                     {lead.leadName || lead.businessName}
                                                 </span>
                                                 <span className="mt-1 block truncate text-xs text-white/45">{lead.businessName}</span>
                                             </span>
-                                            <span className="shrink-0 text-right">
-                                                <span className="block text-xs font-semibold text-white/45">
+                                            <span className="w-[42%] min-w-0 max-w-[7.5rem] shrink-0 text-right">
+                                                <span className="block truncate text-xs font-semibold text-white/45" title={lead.category || lead.source}>
                                                     {lead.category || lead.source}
                                                 </span>
-                                                <span className="mt-1 flex items-center justify-end gap-1.5 text-xs text-[#9b5cff]">
-                                                    {isCallPriority && (
-                                                        <FiCheckCircle className="size-3.5 text-sky-400" aria-hidden="true" />
-                                                    )}
-                                                    {isScheduledToday && (
-                                                        <FiClock className="size-3.5 text-red-400" aria-hidden="true" />
-                                                    )}
-                                                    <span>{lead.status}</span>
+                                                <span className="mt-1 grid grid-cols-[0.875rem_minmax(0,1fr)] items-center gap-1.5 text-left text-xs text-[#9b5cff]">
+                                                    <span className="flex size-3.5 items-center justify-center" aria-hidden="true">
+                                                        {isCallPriority ? (
+                                                            <FiCheckCircle className="size-3.5 text-sky-400" />
+                                                        ) : isScheduledToday ? (
+                                                            <FiClock className="size-3.5 text-red-400" />
+                                                        ) : wasCommentedToday ? (
+                                                            <FiCheckCircle className="size-3.5 text-sky-400" />
+                                                        ) : null}
+                                                    </span>
+                                                    <span className="truncate">{lead.status}</span>
                                                 </span>
                                                 {isAiSorted && (
                                                     <span className="mt-1 block text-xs font-semibold text-[#9df6b7]">
@@ -2658,9 +2964,10 @@ export default function AdminLeads() {
                                         </>
                                     ) : (
                                         <button
-                                            className="archive-lead-button flex h-10 items-center gap-2 rounded-lg border border-[#ee5253] bg-[#ee5253] px-3 text-sm font-semibold text-white shadow-sm shadow-[#ee5253]/20 transition hover:border-[#d94546] hover:bg-[#d94546]"
+                                            className="archive-lead-button flex h-10 items-center gap-2 rounded-lg border border-[#ee5253] bg-[#ee5253] px-3 text-sm font-semibold text-white shadow-sm shadow-[#ee5253]/20 transition hover:border-[#d94546] hover:bg-[#d94546] disabled:cursor-not-allowed disabled:opacity-60"
                                             type="button"
                                             onClick={() => openDeletePrompt(selectedLead)}
+                                            disabled={Boolean(activeLeadAction)}
                                         >
                                             <FiArchive className="size-4" aria-hidden="true" />
                                             Archive
@@ -2771,6 +3078,7 @@ export default function AdminLeads() {
                                                         setDetailDraft(createLeadDetailDraft(selectedLead));
                                                         setIsDetailEditing(true);
                                                     }}
+                                                    disabled={Boolean(activeLeadAction)}
                                                 >
                                                     <FiEdit2 className="size-4" aria-hidden="true" />
                                                 </button>
@@ -2862,7 +3170,7 @@ export default function AdminLeads() {
                                                         className="h-10 rounded-lg border border-[#576574] bg-[#576574] px-3 text-sm font-semibold text-white transition hover:border-[#3f4b55] hover:bg-[#3f4b55]"
                                                         type="button"
                                                         onClick={cancelDetailEdit}
-                                                        disabled={updateDetailsMutation.isPending}
+                                                        disabled={updateDetailsMutation.isPending || Boolean(activeLeadAction)}
                                                     >
                                                         Cancel
                                                     </button>
@@ -2870,9 +3178,9 @@ export default function AdminLeads() {
                                                         className="h-10 rounded-lg border border-[#10ac84] bg-[#10ac84] px-3 text-sm font-semibold text-white transition hover:border-[#0b8f6e] hover:bg-[#0b8f6e] disabled:cursor-not-allowed disabled:opacity-80"
                                                         type="button"
                                                         onClick={handleSaveDetails}
-                                                        disabled={updateDetailsMutation.isPending || !detailDraft.businessName.trim()}
+                                                        disabled={updateDetailsMutation.isPending || Boolean(activeLeadAction) || !detailDraft.businessName.trim()}
                                                     >
-                                                        {updateDetailsMutation.isPending ? "Saving" : "Save"}
+                                                        {activeLeadAction === "details" ? "Saving" : "Save"}
                                                     </button>
                                                 </div>
                                             </div>
@@ -2891,6 +3199,7 @@ export default function AdminLeads() {
                                                             className="rounded-md border border-[#2e86de] bg-[#2e86de] px-2 py-1 text-xs font-semibold text-white transition hover:border-[#1f6fbf] hover:bg-[#1f6fbf]"
                                                             type="button"
                                                             onClick={() => setIsAssignEditing(true)}
+                                                            disabled={Boolean(activeLeadAction)}
                                                         >
                                                             {selectedLead.assignedAgent || selectedLead.assignedAgentName ? "Edit" : "Assign"}
                                                         </button>
@@ -2909,25 +3218,26 @@ export default function AdminLeads() {
                                                                 const employeeId = event.target.value;
                                                                 setAssignmentEmployeeId(employeeId);
                                                             }}
+                                                            disabled={Boolean(activeLeadAction)}
                                                         >
                                                             <option value="" disabled>
-                                                                {salesRepEmployees.length ? "Select Sales Rep" : "No Sales Reps available"}
+                                                                {salesAssignableEmployees.length ? "Select Sales employee" : "No Sales employees available"}
                                                             </option>
-                                                            {salesRepEmployees.map((employee) => (
+                                                            {salesAssignableEmployees.map((employee) => (
                                                                 <option key={employee._id} value={employee._id}>
-                                                                    {employee.name}
+                                                                    {employee.name} ({employee.role || employee.team || "Sales"})
                                                                 </option>
                                                             ))}
                                                         </select>
                                                         <p className="text-xs font-medium text-white/35">
-                                                            Only active Sales Rep employees can be assigned.
+                                                            Employees with Sales in their role or department can be assigned.
                                                         </p>
                                                         <div className="flex gap-2">
                                                             <button
                                                                 className="h-9 rounded-lg border border-[#576574] bg-[#576574] px-3 text-xs font-semibold text-white transition hover:border-[#3f4b55] hover:bg-[#3f4b55]"
                                                                 type="button"
                                                                 onClick={cancelAssignmentEdit}
-                                                                disabled={saveAssignmentMutation.isPending}
+                                                                disabled={saveAssignmentMutation.isPending || Boolean(activeLeadAction)}
                                                             >
                                                                 Cancel
                                                             </button>
@@ -2935,9 +3245,9 @@ export default function AdminLeads() {
                                                                 className="h-9 rounded-lg border border-[#10ac84] bg-[#10ac84] px-3 text-xs font-semibold text-white transition hover:border-[#0b8f6e] hover:bg-[#0b8f6e] disabled:cursor-not-allowed disabled:opacity-80"
                                                                 type="button"
                                                                 onClick={handleSaveAssignment}
-                                                                disabled={saveAssignmentMutation.isPending || !assignmentEmployeeId}
+                                                                disabled={saveAssignmentMutation.isPending || Boolean(activeLeadAction) || !assignmentEmployeeId}
                                                             >
-                                                                {saveAssignmentMutation.isPending ? "Saving" : "Save"}
+                                                                {activeLeadAction === "assignment" ? "Saving" : "Save"}
                                                             </button>
                                                         </div>
                                                     </div>
@@ -2954,6 +3264,7 @@ export default function AdminLeads() {
                                                             className="h-11 w-full min-w-0 rounded-lg border border-white/10 bg-[#0d1018] px-3 text-sm font-semibold text-white outline-none transition focus:border-[#842cff] focus:ring-2 focus:ring-[#842cff]/20"
                                                             value={statusDraft}
                                                             onChange={(event) => setStatusDraft(event.target.value as LeadStatus)}
+                                                            disabled={Boolean(activeLeadAction)}
                                                         >
                                                             {Array.from(new Set([...editableLeadStatuses, selectedLead.status])).map((status) => (
                                                                 <option key={status} value={status}>
@@ -2965,9 +3276,9 @@ export default function AdminLeads() {
                                                             className="h-11 rounded-lg border border-[#10ac84] bg-[#10ac84] px-3 text-xs font-semibold text-white transition hover:border-[#0b8f6e] hover:bg-[#0b8f6e] disabled:cursor-not-allowed disabled:opacity-70"
                                                             type="button"
                                                             onClick={handleSaveStatus}
-                                                            disabled={updateStatusMutation.isPending || !hasStatusUpdate}
+                                                            disabled={updateStatusMutation.isPending || Boolean(activeLeadAction) || !hasStatusUpdate}
                                                         >
-                                                            {updateStatusMutation.isPending ? "Saving" : shouldClearQualifiedFollowUp ? "Reset" : "Save"}
+                                                            {activeLeadAction === "status" ? "Saving" : shouldClearQualifiedFollowUp ? "Reset" : "Save"}
                                                         </button>
                                                     </div>
                                                 </div>
@@ -2984,15 +3295,15 @@ export default function AdminLeads() {
                                                             value={isQualifiedStatusDraft ? "" : followUpDateTime}
                                                             min={getCurrentCstDateTimeInput()}
                                                             onChange={(event) => setFollowUpDateTime(event.target.value)}
-                                                            disabled={isQualifiedStatusDraft}
+                                                            disabled={isQualifiedStatusDraft || Boolean(activeLeadAction)}
                                                         />
                                                         <button
                                                             className="admin-follow-up-schedule-button flex h-11 min-w-0 items-center justify-center rounded-lg border border-[#ff9f43] bg-[#ff9f43] px-3 text-sm font-semibold text-white transition hover:border-[#e67f1d] hover:bg-[#e67f1d] disabled:cursor-not-allowed disabled:opacity-80"
                                                             type="button"
                                                             onClick={handleScheduleFollowUp}
-                                                            disabled={!followUpDateTime || scheduleFollowUpMutation.isPending || isQualifiedStatusDraft}
+                                                            disabled={!followUpDateTime || scheduleFollowUpMutation.isPending || isQualifiedStatusDraft || Boolean(activeLeadAction)}
                                                         >
-                                                            {scheduleFollowUpMutation.isPending ? "Saving" : "Schedule"}
+                                                            {activeLeadAction === "schedule" ? "Saving" : "Schedule"}
                                                         </button>
                                                     </div>
                                                     <p className="mt-2 text-xs text-white/45">
@@ -3042,17 +3353,24 @@ export default function AdminLeads() {
                                             className="mt-4 min-h-24 w-full resize-y rounded-lg border border-white/10 bg-black/20 p-3 text-sm leading-6 text-white outline-none transition placeholder:text-white/30 focus:border-[#842cff] focus:ring-2 focus:ring-[#842cff]/20"
                                             value={commentDraft}
                                             onChange={(event) => setCommentDraft(event.target.value)}
-                                            placeholder="Add a new comment..."
+                                            onKeyDown={(event) => {
+                                                if (event.ctrlKey && event.key === "Enter") {
+                                                    event.preventDefault();
+                                                    handleSaveComment();
+                                                }
+                                            }}
+                                            placeholder="Add a new note..."
+                                            disabled={addCommentMutation.isPending || Boolean(activeLeadAction)}
                                         />
                                         <div className="mt-3 flex justify-end">
                                             <button
                                                 className="flex h-9 items-center gap-2 rounded-lg border border-[#2e86de] bg-[#2e86de] px-3 text-xs font-semibold text-white transition hover:border-[#1f6fbf] hover:bg-[#1f6fbf] disabled:cursor-not-allowed disabled:opacity-80"
                                                 type="button"
                                                 onClick={handleSaveComment}
-                                                disabled={!selectedLead || addCommentMutation.isPending || !commentDraft.trim()}
+                                                disabled={!selectedLead || addCommentMutation.isPending || Boolean(activeLeadAction) || !commentDraft.trim()}
                                             >
                                                 <FiSave className="size-3.5" aria-hidden="true" />
-                                                {addCommentMutation.isPending ? "Saving" : "Add Comment"}
+                                                {addCommentMutation.isPending ? "Saving..." : "Add Note"}
                                             </button>
                                         </div>
                                     </div>
@@ -3166,8 +3484,8 @@ export default function AdminLeads() {
                     <section className="modal-panel-enter flex max-h-[88vh] w-full max-w-[50rem] flex-col rounded-lg border border-white/10 bg-[#0d1018] shadow-2xl shadow-black/40">
                         <div className="flex items-center justify-between border-b border-white/10 px-5 py-3.5">
                             <div>
-                                <h3 className="text-base font-semibold text-white">Google Places</h3>
-                                <p className="mt-1 text-sm text-white/45">Find businesses and import them as leads.</p>
+                                <h3 className="text-base font-semibold text-white">Business search</h3>
+                                <p className="mt-1 text-sm text-white/45">Find call-ready businesses and save unique leads.</p>
                             </div>
                             <button
                                 className="flex size-8 items-center justify-center rounded-lg border border-white/10 bg-white/[0.06] text-white/70 transition hover:bg-white/10 hover:text-white"
@@ -3180,29 +3498,102 @@ export default function AdminLeads() {
                         </div>
 
                         <form className="grid gap-3 border-b border-white/10 p-4" onSubmit={handlePlacesSearch}>
+                            <div className={`grid min-h-[6.5rem] gap-3 rounded-lg border p-3 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)] md:items-center ${isTomTomUnavailable ? "border-red-400/30 bg-red-400/10" : isTomTomBudgetInsufficient ? "border-amber-400/35 bg-amber-400/10" : "border-sky-400/25 bg-sky-400/10"}`}>
+                                <div className="min-w-0">
+                                    <div className="flex min-h-6 flex-wrap items-center gap-2">
+                                        <span className="text-xs font-semibold uppercase tracking-[0.14em] text-sky-200">TomTom free requests this month</span>
+                                        {tomTomUsageQuery.data?.evaluationMode && (
+                                            <span className="rounded-md border border-amber-300/25 bg-amber-300/10 px-2 py-0.5 text-[0.68rem] font-semibold text-amber-100">Free-tier guard</span>
+                                        )}
+                                    </div>
+                                    <p className="mt-1 min-h-5 text-sm font-semibold tabular-nums text-white">
+                                        {tomTomUsageQuery.isLoading
+                                            ? "Checking allowance..."
+                                            : tomTomUsageQuery.data
+                                                ? `${tomTomUsageQuery.data.remaining.toLocaleString()} lead-search requests remaining`
+                                                : "Usage unavailable"}
+                                    </p>
+                                    <p className="mt-1 break-words text-xs leading-5 text-white/45">
+                                        {tomTomUsageQuery.isError
+                                            ? isTomTomAuthorizationError
+                                                ? "This admin session could not be verified. Retry after signing in again."
+                                                : "Usage check was interrupted. Retrying automatically; searches resume after it reconnects."
+                                            : isTomTomUnavailable
+                                            ? "Add TOMTOM_API_KEY to backend/.env before searching."
+                                            : tomTomUsageQuery.data
+                                                ? `Discover: ${tomTomUsageQuery.data.products.discover.remaining.toLocaleString()} / Search: ${tomTomUsageQuery.data.products.search.remaining.toLocaleString()} / Suggest: ${tomTomUsageQuery.data.products.suggest.remaining.toLocaleString()} / Details: ${tomTomUsageQuery.data.products.details.remaining.toLocaleString()} / Geocoding: ${tomTomUsageQuery.data.products.geocoding.remaining.toLocaleString()}.`
+                                                : "Hard free-tier caps reset monthly in UTC; paid overage is blocked."}
+                                    </p>
+                                    {tomTomUsageQuery.isError && (
+                                        <button
+                                            className="mt-2 inline-flex h-8 items-center gap-2 rounded-lg border border-red-300/25 bg-red-300/10 px-3 text-xs font-semibold text-red-100 transition hover:bg-red-300/15 disabled:cursor-wait disabled:opacity-60"
+                                            type="button"
+                                            disabled={tomTomUsageQuery.isFetching}
+                                            onClick={() => void tomTomUsageQuery.refetch()}
+                                        >
+                                            <FiRefreshCw className={`size-3.5 ${tomTomUsageQuery.isFetching ? "animate-spin" : ""}`} aria-hidden="true" />
+                                            {tomTomUsageQuery.isFetching ? "Reconnecting..." : "Retry now"}
+                                        </button>
+                                    )}
+                                </div>
+                                <div className="min-w-0 text-left md:text-right">
+                                    <p className="text-xs uppercase tracking-[0.14em] text-white/35">Next search estimate</p>
+                                    <p className="mt-1 min-h-5 break-words text-sm font-semibold leading-5 tabular-nums text-white">
+                                        Filter: up to {tomTomManualEstimatedRequests} business search{placesLocation ? " + 1 Geocoding" : ""} / Best leads: up to {tomTomAutoEstimatedRequests} business search{placesLocation ? " + 1 Geocoding" : ""}
+                                    </p>
+                                </div>
+                                <p className={`min-h-5 text-xs font-semibold sm:col-span-2 ${isTomTomBudgetInsufficient ? "text-amber-200" : "text-transparent"}`} aria-live="polite">
+                                    {isTomTomBudgetInsufficient
+                                        ? isTomTomGeocodingBudgetInsufficient
+                                            ? "The monthly Geocoding allowance is exhausted. Wait for the UTC monthly reset."
+                                            : `Only ${tomTomRemainingRequests?.toLocaleString()} lead-search requests remain across the free TomTom pools. Select a smaller target or wait for the UTC monthly reset.`
+                                        : "\u00a0"}
+                                </p>
+                            </div>
+
                             <div className="rounded-lg border border-[#842cff]/20 bg-[#842cff]/10 p-3">
-                                <div className="grid gap-3 md:grid-cols-[1fr_auto]">
+                                <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_12rem_minmax(10rem,auto)]">
                                     <label>
                                         <span className="text-xs font-medium uppercase tracking-[0.14em] text-white/35">Product</span>
                                         <input
                                             className="mt-2 h-10 w-full rounded-lg border border-white/10 bg-black/20 px-3 text-sm font-semibold text-white outline-none transition placeholder:text-white/30 focus:border-[#842cff] focus:ring-2 focus:ring-[#842cff]/20"
                                             value={placesProduct}
                                             onChange={(event) => setPlacesProduct(event.target.value)}
-                                            placeholder="Popcorn vending machine"
+                                            placeholder="Enter a product or business type"
                                         />
                                     </label>
+                                    <label>
+                                        <span className="text-xs font-medium uppercase tracking-[0.14em] text-white/35">Lead target</span>
+                                        <select
+                                            className="mt-2 h-10 w-full rounded-lg border border-white/10 bg-black/20 px-3 text-sm font-semibold text-white outline-none transition focus:border-[#842cff] focus:ring-2 focus:ring-[#842cff]/20"
+                                            value={placesTargetLeads}
+                                            onChange={(event) => setPlacesTargetLeads(event.target.value)}
+                                        >
+                                            <option value="250">250 leads</option>
+                                            <option value="500">500 leads</option>
+                                            <option value="1000">1,000 leads</option>
+                                            <option value="1500">1,500 leads</option>
+                                            <option value="all">All matching leads</option>
+                                        </select>
+                                    </label>
                                     <button
-                                        className="mt-6 flex h-10 items-center justify-center gap-2 rounded-lg border border-[#842cff]/40 bg-[#842cff]/25 px-4 text-sm font-semibold text-white transition hover:bg-[#842cff]/35 disabled:cursor-not-allowed disabled:opacity-60"
+                                        className="mt-6 flex min-h-10 min-w-0 items-center justify-center gap-2 rounded-lg border border-[#842cff]/40 bg-[#842cff]/25 px-3 py-2 text-center text-sm font-semibold leading-5 text-white transition hover:bg-[#842cff]/35 disabled:cursor-not-allowed disabled:opacity-60"
                                         type="button"
-                                        disabled={autoSearchPlacesMutation.isPending || searchAndImportPlacesMutation.isPending}
+                                        disabled={autoSearchPlacesMutation.isPending || searchAndImportPlacesMutation.isPending || isTomTomSearchBlocked}
                                         onClick={handleAutoPlacesSearch}
                                     >
                                         <FiZap className="size-4" aria-hidden="true" />
-                                        {autoSearchPlacesMutation.isPending ? "Finding best leads..." : "Best leads"}
+                                        {autoSearchPlacesMutation.isPending
+                                            ? isAllMatchingLeadsTarget
+                                                ? "Finding all matching leads..."
+                                                : `Finding ${targetLeadCount.toLocaleString()} leads...`
+                                            : isAllMatchingLeadsTarget
+                                                ? "Find all matching leads"
+                                                : `Find ${targetLeadCount.toLocaleString()} leads`}
                                     </button>
                                 </div>
                                 <p className="mt-2 text-xs leading-5 text-white/45">
-                                    Auto-search checks the best venue types for your product, saves matches, removes duplicates, and ranks likely buyers.
+                                    Auto-search strictly checks each TomTom name and category against your product before saving, removes duplicates, and ranks likely buyers.
                                 </p>
                             </div>
 
@@ -3219,10 +3610,14 @@ export default function AdminLeads() {
                                 <button
                                     className="flex h-11 items-center justify-center gap-2 rounded-lg bg-[linear-gradient(135deg,#842cff,#4a0ebd)] px-4 text-sm font-semibold text-white transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60"
                                     type="submit"
-                                    disabled={searchAndImportPlacesMutation.isPending || autoSearchPlacesMutation.isPending}
+                                    disabled={searchAndImportPlacesMutation.isPending || autoSearchPlacesMutation.isPending || isTomTomSearchBlocked}
                                 >
                                     <FiMapPin className="size-4" aria-hidden="true" />
-                                    {searchAndImportPlacesMutation.isPending ? "Saving..." : "Search & save"}
+                                    {searchAndImportPlacesMutation.isPending
+                                        ? "Saving matches..."
+                                        : isAllMatchingLeadsTarget
+                                            ? "Save all matches"
+                                            : `Save up to ${targetLeadCount.toLocaleString()}`}
                                 </button>
                             </div>
 
@@ -3268,8 +3663,16 @@ export default function AdminLeads() {
                         <div className="content-scroll overflow-y-auto overflow-x-hidden p-4">
                             {(searchAndImportPlacesMutation.isError || autoSearchPlacesMutation.isError) && (
                                 <p className="text-sm text-red-200">
-                                    Google Places search failed. Check `GOOGLE_PLACES_API_KEY` in `backend/.env`.
+                                    {placesErrorMessage || "TomTom search failed. Check TOMTOM_API_KEY in backend/.env."}
                                 </p>
+                            )}
+                            {placesRejectedIrrelevantCount > 0 && (
+                                <div className="mb-3 flex items-start gap-3 rounded-lg border border-sky-300/20 bg-sky-300/10 p-3">
+                                    <FiShield className="mt-0.5 size-4 shrink-0 text-white/65" aria-hidden="true" />
+                                    <p className="text-sm leading-5 text-white/70">
+                                        Excluded {placesRejectedIrrelevantCount.toLocaleString()} unrelated TomTom result{placesRejectedIrrelevantCount === 1 ? "" : "s"} before saving.
+                                    </p>
+                                </div>
                             )}
                             {autoSearchLocations.length > 0 && (
                                 <div className="mb-3 rounded-lg border border-white/10 bg-white/[0.035] p-3">
@@ -3291,7 +3694,7 @@ export default function AdminLeads() {
                             <div className="grid gap-3">
                                 {placeResults.map((place) => (
                                     <article
-                                        key={place.googlePlaceId || place.businessName}
+                                        key={place.providerPlaceId || place.googlePlaceId || `${place.businessName}-${place.businessAddress}`}
                                         className="rounded-lg border border-white/10 bg-white/[0.04] p-4"
                                     >
                                         <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-start">
@@ -3304,8 +3707,11 @@ export default function AdminLeads() {
                                                 Saved
                                             </span>
                                         </div>
-                                        <div className="mt-3 flex flex-wrap gap-3 text-xs text-white/45">
-                                            {place.phone && <span>{place.phone}</span>}
+                                         <div className="mt-3 flex flex-wrap gap-3 text-xs text-white/45">
+                                            {place.providerCategory && <span>{place.providerCategory}</span>}
+                                            {place.matchedQuery && <span>Matched: {place.matchedQuery}</span>}
+                                            {place.relevanceScore !== undefined && <span>{place.relevanceScore}% relevance</span>}
+                                             {place.phone && <span>{place.phone}</span>}
                                             {place.website && (
                                                 <a
                                                     className="flex items-center gap-1 transition hover:text-white"
@@ -3324,11 +3730,151 @@ export default function AdminLeads() {
                             {placeResults.length > 0 && (
                                 <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-white/10 pt-4">
                                     <p className="text-xs text-white/45">Saved {placeResults.length} result{placeResults.length === 1 ? "" : "s"} to leads</p>
-                                    <p className="text-xs text-white/35">{autoSearchQueries.length > 0 ? "Best-fit leads were ranked and saved." : "All available Google pages were imported."}</p>
+                                    <p className="text-xs text-white/35">Strict name, category, phone, and location checks were applied.</p>
                                 </div>
                             )}
                         </div>
                     </section>
+                </div>
+            )}
+
+            {verificationAction && (
+                <div
+                    className="modal-backdrop-enter fixed inset-0 z-[60] flex items-center justify-center bg-black/70 px-4 backdrop-blur-sm"
+                    onMouseDown={(event) => {
+                        if (event.target === event.currentTarget) {
+                            closeActionVerification();
+                        }
+                    }}
+                >
+                    <form
+                        className="modal-panel-enter w-full max-w-[34rem] overflow-hidden rounded-lg border border-sky-300/20 bg-[#0d1018] shadow-2xl shadow-black/50"
+                        onSubmit={(event) => {
+                            event.preventDefault();
+                            void confirmVerifiedAction();
+                        }}
+                    >
+                        <div className="border-b border-white/10 bg-sky-400/[0.08] px-5 py-4">
+                            <div className="flex items-start justify-between gap-4">
+                                <div className="flex min-w-0 items-start gap-3">
+                                    <span className="flex size-11 shrink-0 items-center justify-center rounded-lg border border-sky-300/20 bg-sky-400/10 text-sky-100">
+                                        <FiShield className="size-5" aria-hidden="true" />
+                                    </span>
+                                    <div className="min-w-0">
+                                        <p className="text-xs font-medium uppercase tracking-[0.14em] text-white/55">Verification required</p>
+                                        <h3 className="mt-1 text-lg font-semibold text-white">
+                                            {verificationAction.kind === "reassign-new" ? "Verify lead reassignment" : "Verify business search"}
+                                        </h3>
+                                        <p className="mt-1 text-sm leading-5 text-white/55">
+                                            Review the details below before this action is sent to the server.
+                                        </p>
+                                    </div>
+                                </div>
+                                <button
+                                    className="flex size-8 shrink-0 items-center justify-center rounded-lg border border-white/10 bg-black/20 text-white/60 transition hover:bg-white/10 hover:text-white disabled:cursor-wait disabled:opacity-50"
+                                    type="button"
+                                    onClick={closeActionVerification}
+                                    disabled={isVerificationChecking}
+                                    aria-label="Close verification"
+                                >
+                                    <FiX className="size-4" aria-hidden="true" />
+                                </button>
+                            </div>
+                        </div>
+
+                        <div className="grid gap-3 p-5">
+                            {verificationAction.kind === "reassign-new" ? (
+                                <>
+                                    <div className="grid gap-3 sm:grid-cols-2">
+                                        <div className="rounded-lg border border-white/10 bg-white/[0.035] p-4">
+                                            <p className="text-xs font-semibold uppercase tracking-[0.14em] text-white/35">New leads</p>
+                                            <p className="mt-2 text-xl font-semibold tabular-nums text-white">{verificationAction.leadCount.toLocaleString()}</p>
+                                        </div>
+                                        <div className="rounded-lg border border-white/10 bg-white/[0.035] p-4">
+                                            <p className="text-xs font-semibold uppercase tracking-[0.14em] text-white/35">Action</p>
+                                            <p className="mt-2 text-sm font-semibold text-white">Reassign all NEW leads</p>
+                                        </div>
+                                    </div>
+                                    <p className="rounded-lg border border-amber-300/20 bg-amber-300/10 p-3 text-sm leading-6 text-white/70">
+                                        Current assignments for every NEW lead will be replaced using the active auto-assignment rules.
+                                    </p>
+                                </>
+                            ) : (
+                                <>
+                                    <div className="grid gap-3 sm:grid-cols-2">
+                                        <div className="rounded-lg border border-white/10 bg-white/[0.035] p-4">
+                                            <p className="text-xs font-semibold uppercase tracking-[0.14em] text-white/35">
+                                                {verificationAction.kind === "tomtom-auto" ? "Product" : "Business type"}
+                                            </p>
+                                            <p className="mt-2 break-words text-sm font-semibold text-white">
+                                                {verificationAction.kind === "tomtom-auto" ? verificationAction.input.product : verificationAction.input.category}
+                                            </p>
+                                            <p className="mt-1 break-words text-xs text-white/45">{verificationAction.input.location || "No city or state filter"}</p>
+                                        </div>
+                                        <div className="rounded-lg border border-white/10 bg-white/[0.035] p-4">
+                                            <p className="text-xs font-semibold uppercase tracking-[0.14em] text-white/35">Maximum impact</p>
+                                            <p className="mt-2 text-sm font-semibold tabular-nums text-white">
+                                                Up to {(verificationAction.input.maxRequests || 0).toLocaleString()} requests
+                                            </p>
+                                            <p className="mt-1 text-xs tabular-nums text-white/45">
+                                                {verificationAction.input.maxResults === 10000
+                                                    ? "All matching leads"
+                                                    : `Up to ${(verificationAction.input.maxResults || 0).toLocaleString()} leads`}
+                                            </p>
+                                        </div>
+                                    </div>
+                                    <p className="rounded-lg border border-sky-300/20 bg-sky-300/10 p-3 text-sm leading-6 text-white/70">
+                                        The remaining TomTom allowance will be checked again before the search begins. Duplicate leads will not be added again.
+                                    </p>
+                                </>
+                            )}
+
+                            <label className="flex cursor-pointer items-start gap-3 rounded-lg border border-white/10 bg-black/20 p-3">
+                                <input
+                                    className="mt-0.5 size-4 shrink-0 accent-[#2e86de]"
+                                    type="checkbox"
+                                    checked={isVerificationAcknowledged}
+                                    onChange={(event) => {
+                                        setIsVerificationAcknowledged(event.target.checked);
+                                        setVerificationError("");
+                                    }}
+                                    disabled={isVerificationChecking}
+                                />
+                                <span className="text-sm leading-5 text-white/70">
+                                    I verified these details and understand the action will update CRM data.
+                                </span>
+                            </label>
+
+                            {verificationError && (
+                                <p className="rounded-lg border border-red-300/20 bg-red-300/10 p-3 text-sm leading-5 text-red-100" role="alert">
+                                    {verificationError}
+                                </p>
+                            )}
+                        </div>
+
+                        <div className="flex justify-end gap-2 border-t border-white/10 px-5 py-3.5">
+                            <button
+                                className="h-10 rounded-lg border border-white/10 bg-white/[0.05] px-4 text-sm font-semibold text-white/60 transition hover:bg-white/10 hover:text-white disabled:cursor-wait disabled:opacity-50"
+                                type="button"
+                                onClick={closeActionVerification}
+                                disabled={isVerificationChecking}
+                            >
+                                Cancel
+                            </button>
+                            <button
+                                className="flex h-10 items-center gap-2 rounded-lg bg-[#2e86de] px-4 text-sm font-semibold text-white transition hover:bg-[#1f6fbf] disabled:cursor-not-allowed disabled:opacity-50"
+                                type="submit"
+                                disabled={!isVerificationAcknowledged || isVerificationChecking}
+                            >
+                                <FiCheckCircle className={`size-4 ${isVerificationChecking ? "animate-pulse" : ""}`} aria-hidden="true" />
+                                {isVerificationChecking
+                                    ? "Verifying..."
+                                    : verificationAction.kind === "reassign-new"
+                                        ? "Verify and reassign"
+                                        : "Verify and search"}
+                            </button>
+                        </div>
+                    </form>
                 </div>
             )}
 
@@ -3439,7 +3985,7 @@ export default function AdminLeads() {
                 <div
                     className="modal-backdrop-enter fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4 backdrop-blur-sm"
                     onMouseDown={(event) => {
-                        if (event.target === event.currentTarget) {
+                        if (event.target === event.currentTarget && !activeLeadAction) {
                             closeDeletePrompt();
                         }
                     }}
@@ -3465,7 +4011,7 @@ export default function AdminLeads() {
                                         </p>
                                     </div>
                                 </div>
-                                <button className="flex size-8 shrink-0 items-center justify-center rounded-lg border border-white/10 bg-black/20 text-white/60 transition hover:bg-white/10 hover:text-white" type="button" onClick={closeDeletePrompt} aria-label="Close delete confirmation">
+                                <button className="flex size-8 shrink-0 items-center justify-center rounded-lg border border-white/10 bg-black/20 text-white/60 transition hover:bg-white/10 hover:text-white disabled:cursor-not-allowed disabled:opacity-60" type="button" onClick={closeDeletePrompt} disabled={Boolean(activeLeadAction)} aria-label="Close delete confirmation">
                                     <FiX className="size-4" aria-hidden="true" />
                                 </button>
                             </div>
@@ -3483,14 +4029,18 @@ export default function AdminLeads() {
                             </div>
                         </div>
                         <div className="flex justify-end gap-2 border-t border-white/10 px-5 py-3">
-                            <button className="h-10 rounded-lg border border-white/10 bg-white/[0.05] px-4 text-sm font-semibold text-white/60 transition hover:bg-white/10 hover:text-white" type="button" onClick={closeDeletePrompt}>Cancel</button>
+                            <button className="h-10 rounded-lg border border-white/10 bg-white/[0.05] px-4 text-sm font-semibold text-white/60 transition hover:bg-white/10 hover:text-white disabled:cursor-not-allowed disabled:opacity-60" type="button" onClick={closeDeletePrompt} disabled={Boolean(activeLeadAction)}>Cancel</button>
                             <button
                                 className="h-10 rounded-lg bg-red-500 px-4 text-sm font-semibold text-white transition hover:bg-red-400 disabled:opacity-60"
                                 type="button"
                                 onClick={confirmDelete}
-                                disabled={archiveLeadMutation.isPending || permanentlyDeleteLeadMutation.isPending}
+                                disabled={archiveLeadMutation.isPending || permanentlyDeleteLeadMutation.isPending || Boolean(activeLeadAction)}
                             >
-                                {deleteTarget.status === "Archived" ? "Delete Permanently" : "Archive Lead"}
+                                {deleteTarget.status === "Archived"
+                                    ? "Delete Permanently"
+                                    : activeLeadAction === "archive"
+                                        ? "Saving note & archiving..."
+                                        : "Archive Lead"}
                             </button>
                         </div>
                     </div>
@@ -3518,12 +4068,9 @@ export default function AdminLeads() {
                                         <h3 className="mt-1 text-lg font-semibold text-white">Are you sure?</h3>
                                         <p className="mt-1 text-sm text-red-50/60">
                                             {bulkAction === "archive" && `This will move ${selectedBulkCount} selected lead${selectedBulkCount === 1 ? "" : "s"} to Archive.`}
-                                            {bulkAction === "archive-all" && "This will move every non-archived lead in the database to Archive."}
                                             {bulkAction === "delete-active-selected" && `This will permanently delete ${selectedBulkCount} selected lead${selectedBulkCount === 1 ? "" : "s"}. This cannot be undone.`}
                                             {bulkAction === "restore" && `This will restore ${selectedBulkCount} selected archived lead${selectedBulkCount === 1 ? "" : "s"} to NEW.`}
                                             {bulkAction === "delete-selected" && `This will permanently delete ${selectedBulkCount} selected archived lead${selectedBulkCount === 1 ? "" : "s"}.`}
-                                            {bulkAction === "restore-all" && `This will restore all ${archivedLeadCount} archived lead${archivedLeadCount === 1 ? "" : "s"} to NEW.`}
-                                            {bulkAction === "delete-all" && `This will permanently delete all ${archivedLeadCount} archived lead${archivedLeadCount === 1 ? "" : "s"}.`}
                                         </p>
                                     </div>
                                 </div>
@@ -3537,12 +4084,9 @@ export default function AdminLeads() {
                                 <p className="text-xs font-semibold uppercase tracking-[0.14em] text-white/35">Selected Action</p>
                                 <p className="mt-2 text-sm font-semibold text-white">
                                     {bulkAction === "archive" && "Archive selected leads"}
-                                    {bulkAction === "archive-all" && "Archive all non-archived leads"}
                                     {bulkAction === "delete-active-selected" && "Permanently delete selected leads"}
                                     {bulkAction === "restore" && "Restore selected leads"}
                                     {bulkAction === "delete-selected" && "Permanently delete selected archived leads"}
-                                    {bulkAction === "restore-all" && "Restore all archived leads"}
-                                    {bulkAction === "delete-all" && "Permanently delete all archived leads"}
                                 </p>
                             </div>
                             <div className="mt-3 rounded-lg border border-yellow-300/20 bg-yellow-300/10 p-3">
@@ -3557,12 +4101,9 @@ export default function AdminLeads() {
                                 onClick={confirmBulkAction}
                                 disabled={
                                     bulkArchiveLeadsMutation.isPending ||
-                                    archiveAllActiveLeadsMutation.isPending ||
                                     bulkPermanentDeleteActiveMutation.isPending ||
                                     bulkRestoreLeadsMutation.isPending ||
-                                    bulkPermanentDeleteMutation.isPending ||
-                                    restoreAllArchivedLeadsMutation.isPending ||
-                                    permanentlyDeleteAllArchivedLeadsMutation.isPending
+                                    bulkPermanentDeleteMutation.isPending
                                 }
                             >
                                 Confirm

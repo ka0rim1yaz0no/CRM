@@ -4,10 +4,13 @@ import { Employee, normalizeEmployeeAvailabilityStatus } from "../models/Employe
 import { Lead } from "../models/Lead";
 import { scoreLeadsByPotential } from "../services/leadScoringService";
 import { geocodeLocation, reverseGeocodeLocality, searchAllGooglePlaces, searchGooglePlaces, searchGooglePlacesPages, type GooglePlaceLead, type GooglePlacesLocationBias } from "../services/googlePlacesService";
+import { getTomTomUsage, searchTomTomPlaceQueries, type TomTomPlaceLead } from "../services/tomTomSearchService";
+import { isSpecificTomTomSearchQuery } from "../services/tomTomRelevance";
+import { getPlaceSearchAuditModel } from "../models/PlaceSearchUsage";
 import { isLeadAutoAssignmentEnabled } from "./systemSettingsController";
 import { formatPhDate } from "../utils/dateTime";
 import { emitLeadChanged } from "../socket";
-import { runForEachBusiness } from "../config/tenancy";
+import { getCurrentBusinessId, runForEachBusiness } from "../config/tenancy";
 
 const populateLead = [
   { path: "assignedAgent", select: "name employeeCode aliases role team status" },
@@ -16,6 +19,9 @@ const populateLead = [
 const AUTO_ASSIGNMENT_BATCH_SIZE = 100;
 const AUTO_ASSIGNMENT_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const GOOGLE_AUTO_SEARCH_PAGE_LIMIT = 20;
+const TOMTOM_AUTO_SEARCH_REQUEST_LIMIT = 400;
+const TOMTOM_CALLABLE_LEADS_PER_REQUEST_ESTIMATE = 4;
+const TOMTOM_DUPLICATE_BUFFER_MULTIPLIER = 1.25;
 const PH_TIME_OFFSET_HOURS = 8;
 let leadAutoAssignmentTimer: NodeJS.Timeout | null = null;
 
@@ -25,8 +31,10 @@ type AssignmentCandidate = {
   assignedCount: number;
 };
 
+type ImportablePlaceLead = GooglePlaceLead & Partial<Pick<TomTomPlaceLead, "provider" | "providerPlaceId" | "providerCategory">>;
+
 const leadStatuses = ["NEW", "Follow up", "Ongoing comms", "Qualified", "Ongoing Negotiation", "Completed", "Dead", "Archived"] as const;
-const salesRepresentativeRoleRegex = /sales\s*(rep\.?|representative)/i;
+const salesAssignmentTextRegex = /sales/i;
 
 type ImportedLead = {
   leadName: string;
@@ -57,16 +65,8 @@ type ImportedLead = {
   updatedAt?: Date;
 };
 
-function isSalesRepresentativeRole(role: unknown) {
-  const normalizedRole = String(role || "").trim().toLowerCase().replace(/\./g, "");
-  const compactRole = normalizedRole.replace(/[^a-z]/g, "");
-
-  return (
-    normalizedRole.includes("sales representative") ||
-    normalizedRole.includes("sales rep") ||
-    compactRole === "salesrepresentative" ||
-    compactRole === "salesrep"
-  );
+function isSalesAssignableEmployee(employee: { role?: unknown; team?: unknown }) {
+  return salesAssignmentTextRegex.test(String(employee.role || "")) || salesAssignmentTextRegex.test(String(employee.team || ""));
 }
 
 function normalizeLeadValue(value: string) {
@@ -273,6 +273,80 @@ function flexibleWebsiteRegex(value: string) {
 }
 
 type LeadActivityActor = { actorName: string; actorType: "admin" | "employee" | "system" };
+type PlacesAdminActor = { actorCode: string; actorName: string; actorType: "admin" | "poc" };
+
+async function requirePlacesAdmin(request: Request, response: Response): Promise<PlacesAdminActor | null> {
+  const actorCode = String(request.header("x-crm-user-code") || "").trim();
+  const requestedName = String(request.header("x-crm-user-name") || "").trim();
+  const requestedType = String(request.header("x-crm-user-type") || "").trim().toLowerCase();
+
+  if (requestedType === "admin" && (actorCode || requestedName)) {
+    return {
+      actorCode: actorCode || "admin",
+      actorName: requestedName || "Administrator",
+      actorType: "admin",
+    };
+  }
+
+  if (actorCode) {
+    const employee = await Employee.findOne({ employeeCode: actorCode, status: { $ne: "Archived" } })
+      .select("name employeeCode role")
+      .lean();
+    const normalizedRole = String(employee?.role || "").trim().toLowerCase();
+
+    if (employee && (normalizedRole === "poc" || normalizedRole === "admin" || normalizedRole === "administrator")) {
+      return {
+        actorCode: String(employee.employeeCode || actorCode),
+        actorName: String(employee.name || requestedName || "Administrator"),
+        actorType: normalizedRole === "poc" ? "poc" : "admin",
+      };
+    }
+  }
+
+  response.status(403).json({ message: "Only an authorized admin or POC can search external business providers." });
+  return null;
+}
+
+function requestIpAddress(request: Request) {
+  const forwardedAddress = String(request.header("x-forwarded-for") || "").split(",")[0]?.trim();
+  return forwardedAddress || request.socket.remoteAddress || request.ip || "";
+}
+
+async function recordTomTomSearchAudit(input: {
+  request: Request;
+  actor: PlacesAdminActor;
+  mode: "manual" | "auto";
+  query: string;
+  location: string;
+  radiusMiles: number;
+  requestCount: number;
+  returnedCount: number;
+  importedCount: number;
+  duplicateCount: number;
+  skippedNoPhoneCount: number;
+  status: "completed" | "partial" | "failed";
+  errorMessage?: string;
+}) {
+  await getPlaceSearchAuditModel().create({
+    provider: "tomtom",
+    businessId: getCurrentBusinessId(),
+    actorCode: input.actor.actorCode,
+    actorName: input.actor.actorName,
+    actorType: input.actor.actorType,
+    ipAddress: requestIpAddress(input.request),
+    mode: input.mode,
+    query: input.query,
+    location: input.location,
+    radiusMiles: input.radiusMiles,
+    requestCount: input.requestCount,
+    returnedCount: input.returnedCount,
+    importedCount: input.importedCount,
+    duplicateCount: input.duplicateCount,
+    skippedNoPhoneCount: input.skippedNoPhoneCount,
+    status: input.status,
+    errorMessage: input.errorMessage || "",
+  });
+}
 
 function getActivityActor(request?: Request): LeadActivityActor {
   const actorType = request?.body?.activityActorType === "employee" ? "employee" : request?.body?.activityActorType === "system" ? "system" : "admin";
@@ -1020,6 +1094,8 @@ function getImportPhoneDedupKey(lead: { phone?: string }, fallbackKey: string) {
 
 function getLeadDedupKey(lead: {
   googlePlaceId?: string;
+  providerPlaceId?: string;
+  placeProvider?: string;
   businessName?: string;
   businessAddress?: string;
   source?: string;
@@ -1028,6 +1104,10 @@ function getLeadDedupKey(lead: {
 }) {
   if (lead.googlePlaceId) {
     return `place:${lead.googlePlaceId}`;
+  }
+
+  if (lead.providerPlaceId) {
+    return `place:${lead.placeProvider || "provider"}:${lead.providerPlaceId}`;
   }
 
   const phone = normalizePhoneDigits(lead.phone || "");
@@ -1062,8 +1142,8 @@ function dedupeLeads<T extends PopulatedLead>(leads: T[]) {
   return Array.from(leadsByKey.values());
 }
 
-function dedupePlaces(places: GooglePlaceLead[]) {
-  const placesByKey = new Map<string, GooglePlaceLead>();
+function dedupePlaces(places: ImportablePlaceLead[]) {
+  const placesByKey = new Map<string, ImportablePlaceLead>();
 
   places.forEach((place) => {
     const key = getGooglePlaceDedupKey(place);
@@ -1076,11 +1156,11 @@ function dedupePlaces(places: GooglePlaceLead[]) {
   return Array.from(placesByKey.values());
 }
 
-function onlyPlacesWithPhone(places: GooglePlaceLead[]) {
+function onlyPlacesWithPhone(places: ImportablePlaceLead[]) {
   return places.filter((place) => String(place.businessName || "").trim() && hasUsablePhone(place.phone));
 }
 
-function getGooglePlaceDedupKey(place: GooglePlaceLead) {
+function getGooglePlaceDedupKey(place: ImportablePlaceLead) {
   const phoneKeys = phoneDedupKeys(place.phone);
 
   if (phoneKeys.length > 0) {
@@ -1088,37 +1168,74 @@ function getGooglePlaceDedupKey(place: GooglePlaceLead) {
   }
 
   const googlePlaceId = place.googlePlaceId || "";
+  const providerPlaceId = place.providerPlaceId || "";
   const businessName = normalizeLeadValue(place.businessName || "");
   const businessAddress = normalizeLeadValue(place.businessAddress || "");
+
+  if (providerPlaceId) {
+    return `place:${place.provider || "provider"}:${providerPlaceId}`;
+  }
 
   return googlePlaceId ? `place:${googlePlaceId}` : `business:${businessName}|${businessAddress}|google places`;
 }
 
 function getAutoSearchTargets(product: string) {
-  const normalizedProduct = normalizeLeadValue(product);
-
-  if (normalizedProduct.includes("popcorn") && normalizedProduct.includes("vending")) {
-    return [
-      { query: "movie theaters", fit: "cinemas already sell popcorn and have heavy snack traffic" },
-      { query: "shopping malls", fit: "malls have repeat foot traffic and unattended vending placement areas" },
-      { query: "arcades", fit: "arcades attract families and impulse snack buyers" },
-      { query: "bowling alleys", fit: "bowling venues have long dwell time and snack demand" },
-      { query: "family entertainment centers", fit: "family entertainment centers match casual snack vending" },
-      { query: "trampoline parks", fit: "trampoline parks attract kids and parents with concession demand" },
-      { query: "roller skating rinks", fit: "skating rinks have snack breaks and group visits" },
-      { query: "event venues", fit: "event venues support grab-and-go concessions" },
-      { query: "college student centers", fit: "student centers have high daily vending traffic" },
-      { query: "laundromats", fit: "laundromats have wait time and unattended vending potential" },
-    ];
-  }
-
   return [
-    { query: `${product} buyers`, fit: "direct product match" },
-    { query: "shopping malls", fit: "high foot traffic" },
-    { query: "family entertainment centers", fit: "consumer venue fit" },
-    { query: "event venues", fit: "commercial placement opportunity" },
-    { query: "retail stores", fit: "retail buyer profile" },
+    { query: product, fit: "exact product or business match" },
+    { query: `${product} stores`, fit: "retailers explicitly matching the product" },
+    { query: `${product} suppliers`, fit: "suppliers explicitly matching the product" },
+    { query: `${product} dealers`, fit: "dealers explicitly matching the product" },
+    { query: `${product} distributors`, fit: "distributors explicitly matching the product" },
   ];
+}
+
+function getTomTomSearchRequestEstimate(targetLeads: number) {
+  const bufferedTarget = Math.ceil(targetLeads * TOMTOM_DUPLICATE_BUFFER_MULTIPLIER);
+  const searchRequests = Math.ceil(bufferedTarget / TOMTOM_CALLABLE_LEADS_PER_REQUEST_ESTIMATE);
+  return Math.min(searchRequests, TOMTOM_AUTO_SEARCH_REQUEST_LIMIT);
+}
+
+async function rejectTomTomSearchWithInsufficientBudget(input: {
+  request: Request;
+  response: Response;
+  actor: PlacesAdminActor;
+  mode: "manual" | "auto";
+  query: string;
+  location: string;
+  radiusMiles: number;
+  requiredRequests: number;
+  remainingRequests: number;
+  quotaName?: string;
+}) {
+  if (input.remainingRequests >= input.requiredRequests) return false;
+
+  const quotaName = input.quotaName || "Places Discover";
+  const message = `This search can use up to ${input.requiredRequests} TomTom ${quotaName} requests, but only ${input.remainingRequests} remain this month. Choose a smaller lead target or wait for the UTC monthly reset.`;
+
+  await recordTomTomSearchAudit({
+    request: input.request,
+    actor: input.actor,
+    mode: input.mode,
+    query: input.query,
+    location: input.location,
+    radiusMiles: input.radiusMiles,
+    requestCount: 0,
+    returnedCount: 0,
+    importedCount: 0,
+    duplicateCount: 0,
+    skippedNoPhoneCount: 0,
+    status: "failed",
+    errorMessage: message,
+  }).catch((error) => console.error("Unable to record blocked TomTom search", error));
+
+  input.response.status(429).json({
+    message,
+    code: "TOMTOM_MONTHLY_BUDGET_INSUFFICIENT",
+    requiredRequests: input.requiredRequests,
+    remainingRequests: input.remainingRequests,
+    resetTimeZone: "UTC",
+  });
+  return true;
 }
 
 function getAutoSearchQueryVariants(targetQuery: string, location: string) {
@@ -1242,12 +1359,11 @@ function extractLeadStateFromAddress(address: unknown) {
       return fullPartState;
     }
 
-    for (const word of part.split(/\s+/)) {
-      const wordState = normalizeLeadState(word.replace(/[^a-z]/gi, ""));
+    const stateCodeTokens = partWithoutZip.match(/\b[A-Z]{2}\b/g) || [];
+    const stateCode = stateCodeTokens.find((token) => usStateCodes.has(token));
 
-      if (wordState) {
-        return wordState;
-      }
+    if (stateCode) {
+      return stateCode;
     }
   }
 
@@ -1866,6 +1982,19 @@ function createContactedTodayFilter() {
   };
 }
 
+function createEmployeeCommentedTodayFilter() {
+  const { start, end } = getCurrentPhDayRange();
+
+  return {
+    comments: {
+      $elemMatch: {
+        authorType: "employee",
+        createdAt: { $gte: start, $lt: end },
+      },
+    },
+  };
+}
+
 function createHiddenFromEmployeeQueueTodayFilter() {
   return {
     $and: [
@@ -1919,10 +2048,20 @@ function sortLeadsForAgentWorkQueue<
     if (firstWorkedAt !== null || secondWorkedAt !== null) {
       if (firstWorkedAt === null) return -1;
       if (secondWorkedAt === null) return 1;
-      return firstWorkedAt - secondWorkedAt;
+      const workedAtDelta = firstWorkedAt - secondWorkedAt;
+
+      if (workedAtDelta !== 0) {
+        return workedAtDelta;
+      }
     }
 
-    return new Date(second.createdAt || 0).getTime() - new Date(first.createdAt || 0).getTime();
+    const createdAtDelta = new Date(second.createdAt || 0).getTime() - new Date(first.createdAt || 0).getTime();
+
+    if (createdAtDelta !== 0) {
+      return createdAtDelta;
+    }
+
+    return String((first as { _id?: unknown })._id || "").localeCompare(String((second as { _id?: unknown })._id || ""));
   });
 }
 
@@ -1930,7 +2069,7 @@ async function createAssignmentCandidates(excludedAgentIds: string[] = []): Prom
   const excludedIds = excludedAgentIds.filter(Boolean);
   const employees = await Employee.find({
     status: "Active",
-    role: salesRepresentativeRoleRegex,
+    $or: [{ role: salesAssignmentTextRegex }, { team: salesAssignmentTextRegex }],
     ...(excludedIds.length > 0 ? { _id: { $nin: excludedIds } } : {}),
   }).sort({ createdAt: 1 });
 
@@ -2168,11 +2307,17 @@ export function startLeadAutoAssignmentScheduler() {
   }, AUTO_ASSIGNMENT_INTERVAL_MS);
 }
 
-async function upsertPlacesAsLeads(places: GooglePlaceLead[], category = "") {
+async function upsertPlacesAsLeads(
+  places: ImportablePlaceLead[],
+  category = "",
+  options: { provider?: "google" | "tomtom"; actor?: PlacesAdminActor } = {}
+) {
   const placesWithBusiness = places.filter((place) => String(place.businessName || "").trim());
   const placesWithPhone = placesWithBusiness.filter((place) => hasUsablePhone(place.phone));
   const validPlaces = dedupePlaces(placesWithPhone);
   const placeCategory = String(category || "").trim();
+  const placeProvider = options.provider || (validPlaces[0]?.provider === "tomtom" ? "tomtom" : "google");
+  const sourceName = placeProvider === "tomtom" ? "TomTom Search" : "Google Places";
 
   if (validPlaces.length === 0) {
     return {
@@ -2197,16 +2342,21 @@ async function upsertPlacesAsLeads(places: GooglePlaceLead[], category = "") {
     await Lead.bulkWrite(
       newPlaces.map((place) => {
         const googlePlaceId = place.googlePlaceId || "";
+        const providerPlaceId = place.providerPlaceId || googlePlaceId;
         const businessName = String(place.businessName).trim();
         const businessAddress = place.businessAddress || "";
         const phoneFilters = flexiblePhoneRegexes(place.phone).map((phoneRegex) => ({ phone: phoneRegex }));
-        const duplicateFilters = [...phoneFilters, ...(googlePlaceId ? [{ googlePlaceId }] : [])];
+        const duplicateFilters = [
+          ...phoneFilters,
+          ...(googlePlaceId ? [{ googlePlaceId }] : []),
+          ...(providerPlaceId ? [{ placeProvider, providerPlaceId }] : []),
+        ];
         const assignedAgent = autoAssignmentEnabled ? pickAssignmentCandidate(assignmentCandidates) : null;
         const autoAssignedAt = autoAssignmentEnabled && assignedAgent ? new Date() : null;
 
         return {
           updateOne: {
-            filter: duplicateFilters.length > 0 ? { $or: duplicateFilters } : { businessName, businessAddress, source: "Google Places" },
+            filter: duplicateFilters.length > 0 ? { $or: duplicateFilters } : { businessName, businessAddress, source: sourceName },
             update: {
               $set: {
                 businessName,
@@ -2214,16 +2364,18 @@ async function upsertPlacesAsLeads(places: GooglePlaceLead[], category = "") {
                 phone: place.phone || "",
                 website: place.website || "",
                 googlePlaceId,
-                source: "Google Places",
-                category: placeCategory,
+                placeProvider,
+                providerPlaceId,
+                source: sourceName,
+                category: placeCategory || place.providerCategory || "",
               },
               $setOnInsert: {
                 status: "NEW",
-                createdByName: "Google Places",
+                createdByName: sourceName,
                 createdByType: "system",
                 assignedAgent,
                 autoAssignedAt,
-                activity: [leadActivity("Lead created", `Google Places lead added${placeCategory ? ` under ${placeCategory}` : ""}.`, { actorName: "System", actorType: "system" })],
+                activity: [leadActivity("Lead created", `${sourceName} lead added${placeCategory ? ` under ${placeCategory}` : ""}${options.actor ? ` by ${options.actor.actorName}` : ""}.`, { actorName: options.actor?.actorName || "System", actorType: options.actor ? "admin" : "system" })],
               },
             },
             upsert: true,
@@ -2237,12 +2389,16 @@ async function upsertPlacesAsLeads(places: GooglePlaceLead[], category = "") {
   const googlePlaceIds = newPlaces
     .map((place) => place.googlePlaceId)
     .filter((googlePlaceId): googlePlaceId is string => typeof googlePlaceId === "string" && Boolean(googlePlaceId));
+  const providerPlaceIds = newPlaces
+    .map((place) => place.providerPlaceId || place.googlePlaceId)
+    .filter((providerPlaceId): providerPlaceId is string => typeof providerPlaceId === "string" && Boolean(providerPlaceId));
   const importedPhoneFilters = newPlaces.flatMap((place) => flexiblePhoneRegexes(place.phone).map((phoneRegex) => ({ phone: phoneRegex })));
 
   const leads = newPlaces.length > 0
     ? await Lead.find({
       $or: [
         ...(googlePlaceIds.length > 0 ? [{ googlePlaceId: { $in: googlePlaceIds } }] : []),
+        ...(providerPlaceIds.length > 0 ? [{ placeProvider, providerPlaceId: { $in: providerPlaceIds } }] : []),
         ...importedPhoneFilters,
       ],
     })
@@ -2378,9 +2534,11 @@ export async function listMyLeads(request: Request, response: Response) {
   const limit = Math.min(Math.max(Number(request.query.limit || 50) || 50, 1), 50);
   const page = Math.max(Number(request.query.page || 1) || 1, 1);
   const tab = normalizeEmployeeLeadTab(request.params.tab || request.query.tab);
+  const queueFilter = String(request.query.queue || request.query.leadQueueFilter || "ALL").trim();
   const searchFilter = createLeadSearchFilter(String(request.query.search || ""));
   const searchAll = String(request.query.searchAll || "").toLowerCase() === "true" && Object.keys(searchFilter).length > 0;
   const includeArchived = searchAll || String(request.query.includeArchived || "").toLowerCase() === "true";
+  const autoCallEligible = String(request.query.autoCallEligible || "").toLowerCase() === "true";
   const assignmentFilters = createEmployeeLeadAssignmentFilters(employeeId, employeeNames);
   const canViewAllLeadQueues = await canEmployeeViewAllLeadQueues(employeeId);
   const canViewCompletedQueue = await canEmployeeViewCompletedLeadQueue(employeeId);
@@ -2391,7 +2549,11 @@ export async function listMyLeads(request: Request, response: Response) {
     return;
   }
 
-  const statusFilter = searchAll && includeArchived ? [...leadStatuses] : searchAll ? getEmployeeLeadTabStatuses("all") : getEmployeeLeadTabStatuses(tab);
+  const statusFilter = searchAll && includeArchived
+    ? [...leadStatuses]
+    : searchAll
+      ? getEmployeeLeadTabStatuses("all")
+      : getEmployeeLeadTabStatuses(tab, queueFilter);
   const andFilters: Record<string, unknown>[] = [
     { status: { $in: statusFilter } },
   ];
@@ -2404,15 +2566,15 @@ export async function listMyLeads(request: Request, response: Response) {
     andFilters.push(searchFilter);
   }
 
-  if (tab === "my" && !searchAll) {
-    andFilters.push({ $nor: [createHiddenFromEmployeeQueueTodayFilter()] });
-  }
-
   const stateOptionFilter: Record<string, unknown> = { $and: [...andFilters] };
   const selectedStateFilter = createLeadStateAddressFilter(request.query.state || request.query.stateFilter);
 
   if (selectedStateFilter) {
     andFilters.push(selectedStateFilter);
+  }
+
+  if (autoCallEligible) {
+    andFilters.push({ $nor: [createEmployeeCommentedTodayFilter()] });
   }
 
   const filter: Record<string, unknown> = { $and: andFilters };
@@ -2453,18 +2615,18 @@ export async function listMyLeads(request: Request, response: Response) {
     "updatedAt",
   ].join(" ");
 
+  const shouldClientPageQueue = tab === "my" && !searchAll && Object.keys(searchFilter).length === 0;
   const leadQuery = Lead.find(filter)
     .select(leadFields)
     .slice("comments", -10)
     .slice("activity", 20)
     .populate("assignedAgent", "name employeeCode aliases")
     .populate("assignedTeam", "name")
-    .sort({ updatedAt: -1, createdAt: -1 });
-  const shouldClientPageQueue = tab === "my" && !searchAll;
+    .sort(shouldClientPageQueue ? { createdAt: -1, _id: 1 } : { updatedAt: -1, createdAt: -1 });
   const leads = shouldClientPageQueue
     ? await leadQuery.limit(1000)
     : await leadQuery.skip((page - 1) * limit).limit(limit);
-  const preparedLeads = shouldClientPageQueue ? dedupeLeads(leads).filter((lead) => !isHiddenFromEmployeeQueueToday(lead)) : dedupeLeads(leads);
+  const preparedLeads = dedupeLeads(leads);
   const sortedLeads = searchAll ? preparedLeads : sortLeadsForAgentWorkQueue(preparedLeads);
   const pagedLeads = shouldClientPageQueue ? sortedLeads.slice((page - 1) * limit, page * limit) : sortedLeads;
 
@@ -2533,7 +2695,7 @@ export async function listAdminLeads(request: Request, response: Response) {
     .slice("comments", -10)
     .slice("activity", 30)
     .populate(populateLead)
-    .sort({ updatedAt: -1, createdAt: -1 })
+    .sort(isQueueTab ? { createdAt: -1, _id: 1 } : { updatedAt: -1, createdAt: -1 })
     .limit(queryLimit)
     .skip(isQueueTab ? 0 : (page - 1) * limit);
   const exportLeads = isExportMode ? leads : dedupeLeads(leads);
@@ -3311,7 +3473,11 @@ function normalizeEmployeeLeadTab(value: unknown): EmployeeLeadTab {
   return tabMap[normalizedValue] || "my";
 }
 
-function getEmployeeLeadTabStatuses(tab: EmployeeLeadTab): (typeof leadStatuses)[number][] {
+function getEmployeeLeadTabStatuses(tab: EmployeeLeadTab, queueFilter = "ALL"): (typeof leadStatuses)[number][] {
+  if (tab === "my" && (queueFilter === "NEW" || queueFilter === "Follow up")) {
+    return [queueFilter];
+  }
+
   const statusesByTab: Record<EmployeeLeadTab, (typeof leadStatuses)[number][]> = {
     my: ["NEW", "Follow up"],
     qualified: ["Qualified"],
@@ -3351,6 +3517,7 @@ function createLeadSearchFilter(search: string) {
   const partialPhoneRegex = phoneSearchRegex(trimmedSearch);
   const searchFields: Record<string, unknown>[] = [
     { leadName: searchRegex },
+    { position: searchRegex },
     { businessName: searchRegex },
     { businessAddress: searchRegex },
     { email: searchRegex },
@@ -3361,6 +3528,10 @@ function createLeadSearchFilter(search: string) {
     { status: searchRegex },
     { assignedAgentName: searchRegex },
     { notes: searchRegex },
+    { "comments.body": searchRegex },
+    { "comments.authorName": searchRegex },
+    { followUpNote: searchRegex },
+    { "activity.detail": searchRegex },
     { googlePlaceId: searchRegex },
   ];
 
@@ -3732,14 +3903,14 @@ export async function updateLead(request: Request, response: Response) {
 
   if (leadInput.assignedAgent) {
     if (!Types.ObjectId.isValid(String(leadInput.assignedAgent))) {
-      response.status(400).json({ message: "Select a valid Sales Rep" });
+      response.status(400).json({ message: "Select a valid Sales employee" });
       return;
     }
 
-    const assignedEmployee = await Employee.findById(leadInput.assignedAgent).select("name status role");
+    const assignedEmployee = await Employee.findById(leadInput.assignedAgent).select("name status role team");
 
-    if (!assignedEmployee || assignedEmployee.status === "Archived" || !isSalesRepresentativeRole(assignedEmployee.role)) {
-      response.status(400).json({ message: "Lead can only be assigned to an active Sales Rep" });
+    if (!assignedEmployee || assignedEmployee.status === "Archived" || !isSalesAssignableEmployee(assignedEmployee)) {
+      response.status(400).json({ message: "Lead can only be assigned to a non-archived employee in Sales" });
       return;
     }
 
@@ -3779,6 +3950,59 @@ export async function updateLead(request: Request, response: Response) {
   response.json(lead);
 }
 
+export async function assignLead(request: Request, response: Response) {
+  const leadId = String(request.params.id);
+  const assignedAgent = String(request.body.assignedAgent || "").trim();
+
+  if (!Types.ObjectId.isValid(leadId)) {
+    response.status(400).json({ message: "Invalid lead id" });
+    return;
+  }
+
+  if (!Types.ObjectId.isValid(assignedAgent)) {
+    response.status(400).json({ message: "Select a valid Sales employee" });
+    return;
+  }
+
+  const employee = await Employee.findById(assignedAgent).select("name status role team");
+
+  if (!employee || employee.status === "Archived" || !isSalesAssignableEmployee(employee)) {
+    response.status(400).json({ message: "Lead can only be assigned to a non-archived employee in Sales" });
+    return;
+  }
+
+  const actor = getActivityActor(request);
+  const lead = await Lead.findOneAndUpdate(
+    { _id: leadId, status: { $ne: "Archived" } },
+    {
+      $set: {
+        assignedAgent: new Types.ObjectId(assignedAgent),
+        assignedAgentName: employee.name,
+        autoAssignedAt: null,
+      },
+      $push: activityPush(
+        "Assigned",
+        actor.actorType === "employee"
+          ? `${actor.actorName} passed this lead to ${employee.name}.`
+          : `${actor.actorName} assigned this lead to ${employee.name}.`,
+        actor
+      ),
+    },
+    { returnDocument: "after", runValidators: true }
+  ).populate(populateLead);
+
+  if (!lead) {
+    const existingLead = await Lead.exists({ _id: leadId });
+    response.status(existingLead ? 409 : 404).json({
+      message: existingLead ? "Archived leads cannot be reassigned." : "Lead not found",
+    });
+    return;
+  }
+
+  emitLeadMutation("assigned", lead);
+  response.json(lead);
+}
+
 export async function scheduleLeadFollowUp(request: Request, response: Response) {
   const leadId = String(request.params.id);
   const followUpAt = request.body.followUpAt ? new Date(String(request.body.followUpAt)) : null;
@@ -3808,6 +4032,9 @@ export async function scheduleLeadFollowUp(request: Request, response: Response)
     `CDT: ${formatScheduledCdtTime(followUpAt)}`,
     `PH Time: ${formatScheduledPhTime(followUpAt)}`,
   ].join("\n");
+  const statusAfterScheduling = existingLead.status === "Ongoing Negotiation"
+    ? "Ongoing Negotiation"
+    : "Follow up";
 
   const lead = await Lead.findByIdAndUpdate(
     leadId,
@@ -3816,7 +4043,7 @@ export async function scheduleLeadFollowUp(request: Request, response: Response)
         followUpAt,
         followUpNote: request.body.followUpNote || "",
         followUpPriority: request.body.followUpPriority ?? 100,
-        status: "Follow up",
+        status: statusAfterScheduling,
       },
       $push: activityPush("Follow up scheduled", activityDetail, actor),
     },
@@ -3849,40 +4076,45 @@ export async function addLeadComment(request: Request, response: Response) {
     createdAt: new Date(),
   };
   const actor: LeadActivityActor = { actorName: authorName, actorType: authorType as LeadActivityActor["actorType"] };
-  const currentLead = await Lead.findById(request.params.id).select("status");
-
-  if (!currentLead) {
-    response.status(404).json({ message: "Lead not found" });
-    return;
-  }
-
-  const pushActivity = [leadActivity("Comment added", `${authorName} added a comment.`, actor)];
+  const commentActivity = leadActivity("Comment added", `${authorName} added a comment.`, actor);
+  const statusActivity = leadActivity("Status changed", `${authorName} moved this lead to Follow up after adding a comment.`, actor);
   const setFields: Record<string, unknown> = {
-    notes: body,
     followUpAt: null,
     followUpNote: "",
     followUpPriority: 0,
   };
 
-  if (currentLead.status === "NEW") {
-    setFields.status = "Follow up";
-    pushActivity.unshift(leadActivity("Status changed", `${authorName} moved this lead to Follow up after adding a comment.`, actor));
-  }
-
-  const lead = await Lead.findByIdAndUpdate(
-    request.params.id,
+  let lead = await Lead.findOneAndUpdate(
+    { _id: request.params.id, status: "NEW" },
     {
       $push: {
         comments: comment,
         activity: {
-          $each: pushActivity,
+          $each: [statusActivity, commentActivity],
           $position: 0,
         },
       },
-      $set: setFields,
+      $set: { ...setFields, status: "Follow up" },
     },
     { returnDocument: "after", runValidators: true }
   ).populate(populateLead);
+
+  if (!lead) {
+    lead = await Lead.findByIdAndUpdate(
+      request.params.id,
+      {
+        $push: {
+          comments: comment,
+          activity: {
+            $each: [commentActivity],
+            $position: 0,
+          },
+        },
+        $set: setFields,
+      },
+      { returnDocument: "after", runValidators: true }
+    ).populate(populateLead);
+  }
 
   if (!lead) {
     response.status(404).json({ message: "Lead not found" });
@@ -3905,10 +4137,15 @@ export async function recordLeadCall(request: Request, response: Response) {
   const actor = getActivityActor(request);
   const leadLabel = leadScheduleName(existingLead) || "this lead";
   const phoneText = existingLead.phone ? ` at ${existingLead.phone}` : "";
+  const callFailedToStart = request.body.callOutcome === "failed";
+  const activityLabel = callFailedToStart ? "Call failed to start" : "Call placed";
+  const activityDetail = callFailedToStart
+    ? `${actor.actorName} could not start a Nextiva call to ${leadLabel}${phoneText}.`
+    : `${actor.actorName} called ${leadLabel}${phoneText}.`;
   const lead = await Lead.findByIdAndUpdate(
     leadId,
     {
-      $push: activityPush("Call placed", `${actor.actorName} called ${leadLabel}${phoneText}.`, actor),
+      $push: activityPush(activityLabel, activityDetail, actor),
     },
     { returnDocument: "after", runValidators: true }
   ).populate(populateLead);
@@ -4131,6 +4368,11 @@ export async function bulkArchiveLeads(request: Request, response: Response) {
 }
 
 export async function archiveAllActiveLeads(request: Request, response: Response) {
+  if (request.body.confirmation !== "ARCHIVE_ALL_ACTIVE_LEADS") {
+    response.status(400).json({ message: "Explicit archive-all confirmation is required." });
+    return;
+  }
+
   const actor = getActivityActor(request);
   const result = await Lead.updateMany(
     { status: { $ne: "Archived" } },
@@ -4198,10 +4440,10 @@ export async function bulkAssignLeads(request: Request, response: Response) {
     return;
   }
 
-  const employee = await Employee.findById(assignedAgent).select("name status role");
+  const employee = await Employee.findById(assignedAgent).select("name status role team");
 
-  if (!employee || employee.status === "Archived" || !isSalesRepresentativeRole(employee.role)) {
-    response.status(400).json({ message: "Select an active Sales Rep" });
+  if (!employee || employee.status === "Archived" || !isSalesAssignableEmployee(employee)) {
+    response.status(400).json({ message: "Select a non-archived employee in Sales" });
     return;
   }
 
@@ -4223,6 +4465,11 @@ export async function bulkAssignLeads(request: Request, response: Response) {
 }
 
 export async function restoreAllArchivedLeads(request: Request, response: Response) {
+  if (request.body.confirmation !== "RESTORE_ALL_ARCHIVED_LEADS") {
+    response.status(400).json({ message: "Explicit restore-all confirmation is required." });
+    return;
+  }
+
   const actor = getActivityActor(request);
   const result = await Lead.updateMany(
     { status: "Archived" },
@@ -4236,7 +4483,12 @@ export async function restoreAllArchivedLeads(request: Request, response: Respon
   response.json({ restoredCount: result.modifiedCount });
 }
 
-export async function permanentlyDeleteArchivedLeads(_request: Request, response: Response) {
+export async function permanentlyDeleteArchivedLeads(request: Request, response: Response) {
+  if (request.body.confirmation !== "DELETE_ALL_ARCHIVED_LEADS") {
+    response.status(400).json({ message: "Explicit delete-all confirmation is required." });
+    return;
+  }
+
   const result = await Lead.deleteMany({ status: "Archived" });
   emitLeadChanged({ action: "delete-archived" });
   response.json({ deletedCount: result.deletedCount });
@@ -4266,6 +4518,294 @@ export async function bulkPermanentlyDeleteActiveLeads(request: Request, respons
   const result = await Lead.deleteMany({ _id: { $in: leadIds }, status: { $ne: "Archived" } });
   emitLeadChanged({ action: "bulk-deleted", leadIds });
   response.json({ deletedCount: result.deletedCount });
+}
+
+export async function readTomTomPlacesUsage(request: Request, response: Response) {
+  const actor = await requirePlacesAdmin(request, response);
+  if (!actor) return;
+
+  const location = String(request.query.location || "").trim();
+  const targetLeads = Math.min(Math.max(Number(request.query.targetLeads || 1000), 1), 10000);
+  const usage = await getTomTomUsage();
+
+  response.json({
+    ...usage,
+    manualEstimatedRequests: getTomTomSearchRequestEstimate(targetLeads),
+    autoEstimatedRequests: getTomTomSearchRequestEstimate(targetLeads),
+    geocodingEstimatedRequests: location ? 1 : 0,
+    maxResultsPerRequest: 100,
+    resetTimeZone: "UTC",
+  });
+}
+
+export async function searchAndImportTomTomPlacesAsLeads(request: Request, response: Response) {
+  const actor = await requirePlacesAdmin(request, response);
+  if (!actor) return;
+
+  const textQuery = String(request.body.textQuery || "").trim();
+  const category = String(request.body.category || "").trim();
+  const location = String(request.body.location || "").trim();
+  const radiusMiles = getRadiusMiles(request.body.radiusMiles);
+  const maxResults = Math.min(Math.max(Number(request.body.maxResults || 1000), 1), 10000);
+  const defaultRequestLimit = getTomTomSearchRequestEstimate(maxResults);
+  const requestLimit = Math.min(Math.max(Number(request.body.maxRequests || defaultRequestLimit), 1), TOMTOM_AUTO_SEARCH_REQUEST_LIMIT);
+
+  if (!textQuery) {
+    response.status(400).json({ message: "textQuery is required" });
+    return;
+  }
+
+  if (!isSpecificTomTomSearchQuery(category || textQuery)) {
+    response.status(400).json({ message: "Enter a specific business type. Broad searches cannot be validated accurately." });
+    return;
+  }
+
+  const usageBefore = await getTomTomUsage();
+  const rejectedForGeocodingBudget = location
+    ? await rejectTomTomSearchWithInsufficientBudget({
+      request,
+      response,
+      actor,
+      mode: "manual",
+      query: textQuery,
+      location,
+      radiusMiles,
+      requiredRequests: 1,
+      remainingRequests: usageBefore.products.geocoding.remaining,
+      quotaName: "Geocoding",
+    })
+    : false;
+  if (rejectedForGeocodingBudget) return;
+  const rejectedForBudget = await rejectTomTomSearchWithInsufficientBudget({
+    request,
+    response,
+    actor,
+    mode: "manual",
+    query: textQuery,
+    location,
+    radiusMiles,
+    requiredRequests: requestLimit,
+    remainingRequests: usageBefore.remaining,
+  });
+  if (rejectedForBudget) return;
+
+  try {
+    const result = await searchTomTomPlaceQueries({
+      queries: [category || textQuery],
+      location,
+      radiusMiles,
+      requestBudget: requestLimit,
+      targetCallablePlaces: Math.min(Math.ceil(maxResults * TOMTOM_DUPLICATE_BUFFER_MULTIPLIER), 10000),
+    });
+    const callablePlaces = onlyPlacesWithPhone(dedupePlaces(result.places));
+    const places = callablePlaces.slice(0, maxResults);
+    const skippedNoPhoneCount = result.places.length - callablePlaces.length;
+    const importResult = await upsertPlacesAsLeads(places, category, { provider: "tomtom", actor });
+    const auditStatus = result.limitReached ? "partial" : "completed";
+
+    await recordTomTomSearchAudit({
+      request,
+      actor,
+      mode: "manual",
+      query: textQuery,
+      location,
+      radiusMiles,
+      requestCount: result.requestCount,
+      returnedCount: result.places.length,
+      importedCount: importResult.leads.length,
+      duplicateCount: importResult.duplicateCount,
+      skippedNoPhoneCount,
+      status: auditStatus,
+    });
+
+    response.status(201).json({
+      provider: "tomtom",
+      places: importResult.places,
+      leads: importResult.leads,
+      skippedNoPhoneCount,
+      duplicateCount: importResult.duplicateCount,
+      nextPageToken: "",
+      searchedQueries: result.searchedQueries,
+      searchedPages: result.searchedPages,
+      searchedLocations: result.searchedLocations,
+      requestCount: result.requestCount,
+      rejectedIrrelevantCount: result.rejectedIrrelevantCount,
+      limitReached: result.limitReached,
+      usage: result.usage,
+    });
+  } catch (error) {
+    const usageAfter = await getTomTomUsage().catch(() => usageBefore);
+    await recordTomTomSearchAudit({
+      request,
+      actor,
+      mode: "manual",
+      query: textQuery,
+      location,
+      radiusMiles,
+      requestCount: Math.max(0, usageAfter.used - usageBefore.used),
+      returnedCount: 0,
+      importedCount: 0,
+      duplicateCount: 0,
+      skippedNoPhoneCount: 0,
+      status: "failed",
+      errorMessage: (error as Error).message,
+    }).catch((auditError) => console.error("Unable to record TomTom search audit", auditError));
+    throw error;
+  }
+}
+
+export async function autoSearchTomTomPlacesForProduct(request: Request, response: Response) {
+  const actor = await requirePlacesAdmin(request, response);
+  if (!actor) return;
+
+  const product = String(request.body.product || "").trim();
+  const location = String(request.body.location || "").trim();
+  const radiusMiles = getRadiusMiles(request.body.radiusMiles);
+  const maxResults = Math.min(Math.max(Number(request.body.maxResults || 1000), 1), 10000);
+
+  if (!product) {
+    response.status(400).json({ message: "product is required" });
+    return;
+  }
+
+  if (!isSpecificTomTomSearchQuery(product)) {
+    response.status(400).json({ message: "Enter a specific product or business type so lead relevance can be verified." });
+    return;
+  }
+
+  const targets = getAutoSearchTargets(product);
+  const defaultRequestLimit = getTomTomSearchRequestEstimate(maxResults);
+  const requestLimit = Math.min(Math.max(Number(request.body.maxRequests || defaultRequestLimit), 1), TOMTOM_AUTO_SEARCH_REQUEST_LIMIT);
+  const usageBefore = await getTomTomUsage();
+  const rejectedForGeocodingBudget = location
+    ? await rejectTomTomSearchWithInsufficientBudget({
+      request,
+      response,
+      actor,
+      mode: "auto",
+      query: product,
+      location,
+      radiusMiles,
+      requiredRequests: 1,
+      remainingRequests: usageBefore.products.geocoding.remaining,
+      quotaName: "Geocoding",
+    })
+    : false;
+  if (rejectedForGeocodingBudget) return;
+  const rejectedForBudget = await rejectTomTomSearchWithInsufficientBudget({
+    request,
+    response,
+    actor,
+    mode: "auto",
+    query: product,
+    location,
+    radiusMiles,
+    requiredRequests: requestLimit,
+    remainingRequests: usageBefore.remaining,
+  });
+  if (rejectedForBudget) return;
+
+  try {
+    const result = await searchTomTomPlaceQueries({
+      queries: targets.map((target) => target.query),
+      validationQuery: product,
+      location,
+      radiusMiles,
+      requestBudget: requestLimit,
+      targetCallablePlaces: Math.min(Math.ceil(maxResults * TOMTOM_DUPLICATE_BUFFER_MULTIPLIER), 10000),
+    });
+    const callablePlaces = onlyPlacesWithPhone(dedupePlaces(result.places));
+    const places = callablePlaces.slice(0, maxResults);
+    const skippedNoPhoneCount = result.places.length - callablePlaces.length;
+    const importResult = await upsertPlacesAsLeads(places, product, { provider: "tomtom", actor });
+    const leads = importResult.leads;
+    const scoredAt = new Date();
+
+    if (leads.length > 0) {
+      await Lead.bulkWrite(
+        leads.map((lead) => {
+          const fit = getProductFitScore(
+            {
+              businessName: lead.businessName,
+              category: lead.category,
+              phone: lead.phone,
+              website: lead.website,
+            },
+            product
+          );
+
+          return {
+            updateOne: {
+              filter: { _id: lead._id },
+              update: {
+                $set: {
+                  aiScore: fit.score,
+                  aiScoreReason: fit.reason,
+                  aiScoreSource: "product-fit",
+                  aiScoredAt: scoredAt,
+                },
+              },
+            },
+          };
+        }),
+        { ordered: false }
+      );
+    }
+
+    const refreshedLeads = await Lead.find({ _id: { $in: leads.map((lead) => lead._id) } }).populate(populateLead);
+    const auditStatus = result.limitReached ? "partial" : "completed";
+
+    await recordTomTomSearchAudit({
+      request,
+      actor,
+      mode: "auto",
+      query: product,
+      location,
+      radiusMiles,
+      requestCount: result.requestCount,
+      returnedCount: result.places.length,
+      importedCount: refreshedLeads.length,
+      duplicateCount: importResult.duplicateCount,
+      skippedNoPhoneCount,
+      status: auditStatus,
+    });
+
+    response.status(201).json({
+      provider: "tomtom",
+      product,
+      location,
+      radiusMiles,
+      searchedQueries: result.searchedQueries,
+      searchedLocations: result.searchedLocations,
+      searchedPages: result.searchedPages,
+      places: importResult.places,
+      skippedNoPhoneCount,
+      duplicateCount: importResult.duplicateCount,
+      leads: refreshedLeads.sort((first, second) => (second.aiScore || 0) - (first.aiScore || 0)),
+      requestCount: result.requestCount,
+      rejectedIrrelevantCount: result.rejectedIrrelevantCount,
+      limitReached: result.limitReached,
+      usage: result.usage,
+    });
+  } catch (error) {
+    const usageAfter = await getTomTomUsage().catch(() => usageBefore);
+    await recordTomTomSearchAudit({
+      request,
+      actor,
+      mode: "auto",
+      query: product,
+      location,
+      radiusMiles,
+      requestCount: Math.max(0, usageAfter.used - usageBefore.used),
+      returnedCount: 0,
+      importedCount: 0,
+      duplicateCount: 0,
+      skippedNoPhoneCount: 0,
+      status: "failed",
+      errorMessage: (error as Error).message,
+    }).catch((auditError) => console.error("Unable to record TomTom search audit", auditError));
+    throw error;
+  }
 }
 
 export async function searchPlacesForLeads(request: Request, response: Response) {

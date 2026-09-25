@@ -1,4 +1,4 @@
-import type { FormEvent } from "react";
+import type { FormEvent, KeyboardEvent } from "react";
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router";
@@ -211,6 +211,8 @@ export default function AdminKnowledgeBase() {
     const [deleteTarget, setDeleteTarget] = useState<KnowledgeBaseEntry | null>(null);
     const [suggestionEntryFilter, setSuggestionEntryFilter] = useState<string | null>(null);
     const [searchTerm, setSearchTerm] = useState("");
+    const [isSearchSuggestionsOpen, setIsSearchSuggestionsOpen] = useState(false);
+    const [activeSearchSuggestionIndex, setActiveSearchSuggestionIndex] = useState(-1);
     const [page, setPage] = useState(1);
     const [pageSize, setPageSize] = useState(10);
     const [productForm, setProductForm] = useState<KnowledgeBaseInput>(emptyProduct);
@@ -247,29 +249,37 @@ export default function AdminKnowledgeBase() {
         [entries]
     );
     const activeEntries = useMemo(
-        () => {
-            const query = searchTerm.trim().toLowerCase();
-
-            return normalizedEntries
-                .filter((entry) => entry.entryType === activeTab)
-                .filter((entry) => {
-                    if (!query) return true;
-
-                    return [
-                        entry.title,
-                        entry.description,
-                        entry.question,
-                        entry.answer,
-                        entry.status,
-                        getEntryKindLabel(entry.entryType),
-                    ]
-                        .join(" ")
-                        .toLowerCase()
-                        .includes(query);
-                });
-        },
-        [activeTab, normalizedEntries, searchTerm]
+        () => normalizedEntries.filter((entry) => entry.entryType === activeTab),
+        [activeTab, normalizedEntries]
     );
+    const searchSuggestions = useMemo(() => {
+        const query = searchTerm.trim().toLowerCase();
+        if (!query) return [];
+
+        return normalizedEntries
+            .filter((entry) => entry.entryType === activeTab && entry.title.trim())
+            .filter((entry) => entry.title.toLowerCase().includes(query))
+            .sort((firstEntry, secondEntry) => {
+                const firstTitle = firstEntry.title.toLowerCase();
+                const secondTitle = secondEntry.title.toLowerCase();
+                const firstStartsWithQuery = firstTitle.startsWith(query);
+                const secondStartsWithQuery = secondTitle.startsWith(query);
+
+                if (firstStartsWithQuery !== secondStartsWithQuery) {
+                    return firstStartsWithQuery ? -1 : 1;
+                }
+
+                const firstWordStartsWithQuery = firstTitle.split(/\s+/).some((word) => word.startsWith(query));
+                const secondWordStartsWithQuery = secondTitle.split(/\s+/).some((word) => word.startsWith(query));
+
+                if (firstWordStartsWithQuery !== secondWordStartsWithQuery) {
+                    return firstWordStartsWithQuery ? -1 : 1;
+                }
+
+                return firstEntry.title.localeCompare(secondEntry.title);
+            })
+            .slice(0, 6);
+    }, [activeTab, normalizedEntries, searchTerm]);
     const totalPages = Math.max(1, Math.ceil(activeEntries.length / pageSize));
     const safePage = Math.min(page, totalPages);
     const pageStart = activeEntries.length === 0 ? 0 : (safePage - 1) * pageSize + 1;
@@ -318,7 +328,11 @@ export default function AdminKnowledgeBase() {
 
     useEffect(() => {
         setPage(1);
-    }, [activeTab, pageSize, searchTerm]);
+    }, [activeTab, pageSize]);
+
+    useEffect(() => {
+        setActiveSearchSuggestionIndex(-1);
+    }, [activeTab, searchTerm]);
 
     useEffect(() => {
         const tabFromSearch = getTabFromSearchParam(searchParams.get("tab"));
@@ -481,8 +495,49 @@ export default function AdminKnowledgeBase() {
 
     const switchTab = (tab: KnowledgeBaseEntryType) => {
         setActiveTab(tab);
+        setIsSearchSuggestionsOpen(false);
+        setActiveSearchSuggestionIndex(-1);
         setSearchParams({ tab: getSearchParamForTab(tab) }, { replace: true });
         resetForms();
+    };
+
+    const selectSearchSuggestion = (entry: KnowledgeBaseEntry) => {
+        setSearchTerm(entry.title);
+        setDetailEntry(entry);
+        setIsSearchSuggestionsOpen(false);
+        setActiveSearchSuggestionIndex(-1);
+    };
+
+    const handleSearchKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
+        if (event.key === "Escape") {
+            setIsSearchSuggestionsOpen(false);
+            setActiveSearchSuggestionIndex(-1);
+            return;
+        }
+
+        if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+            if (searchSuggestions.length === 0) return;
+
+            event.preventDefault();
+            setIsSearchSuggestionsOpen(true);
+            setActiveSearchSuggestionIndex((currentIndex) => {
+                if (event.key === "ArrowDown") {
+                    return currentIndex >= searchSuggestions.length - 1 ? 0 : currentIndex + 1;
+                }
+
+                return currentIndex <= 0 ? searchSuggestions.length - 1 : currentIndex - 1;
+            });
+            return;
+        }
+
+        if (event.key === "Enter" && isSearchSuggestionsOpen && activeSearchSuggestionIndex >= 0) {
+            const selectedEntry = searchSuggestions[activeSearchSuggestionIndex];
+
+            if (selectedEntry) {
+                event.preventDefault();
+                selectSearchSuggestion(selectedEntry);
+            }
+        }
     };
 
     const openSuggestions = (entry?: KnowledgeBaseEntry) => {
@@ -515,16 +570,86 @@ export default function AdminKnowledgeBase() {
                         <p className="mt-1 text-sm text-white/45">Products and announcements for agents.</p>
                     </div>
                     <div className="flex flex-1 flex-wrap items-center justify-end gap-2">
-                        <label className="flex h-10 w-[24rem] max-w-full items-center gap-2 rounded-lg border border-white/10 bg-[#090b13]/80 px-3 text-white/45 transition focus-within:border-[#842cff] focus-within:ring-2 focus-within:ring-[#842cff]/20">
-                            <FiSearch className="size-4 shrink-0" aria-hidden="true" />
-                            <input
-                                className="h-full min-w-0 flex-1 bg-transparent text-sm font-semibold text-white outline-none placeholder:text-white/35"
-                                value={searchTerm}
-                                onChange={(event) => setSearchTerm(event.target.value)}
-                                placeholder={`Search ${getTabLabel(activeTab).toLowerCase()}`}
-                                type="search"
-                            />
-                        </label>
+                        <div
+                            className="relative w-[24rem] max-w-full"
+                            onBlur={(event) => {
+                                if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+                                    setIsSearchSuggestionsOpen(false);
+                                    setActiveSearchSuggestionIndex(-1);
+                                }
+                            }}
+                        >
+                            <label className="flex h-10 w-full items-center gap-2 rounded-lg border border-white/10 bg-[#090b13]/80 px-3 text-white/45 transition focus-within:border-[#842cff] focus-within:ring-2 focus-within:ring-[#842cff]/20">
+                                <FiSearch className="size-4 shrink-0" aria-hidden="true" />
+                                <input
+                                    className="h-full min-w-0 flex-1 bg-transparent text-sm font-semibold text-white outline-none placeholder:text-white/35"
+                                    value={searchTerm}
+                                    onChange={(event) => {
+                                        const nextSearchTerm = event.target.value;
+                                        setSearchTerm(nextSearchTerm);
+                                        setIsSearchSuggestionsOpen(Boolean(nextSearchTerm.trim()));
+                                    }}
+                                    onFocus={() => setIsSearchSuggestionsOpen(Boolean(searchTerm.trim()))}
+                                    onKeyDown={handleSearchKeyDown}
+                                    placeholder={`Search ${getTabLabel(activeTab).toLowerCase()}`}
+                                    type="search"
+                                    role="combobox"
+                                    aria-autocomplete="list"
+                                    aria-expanded={isSearchSuggestionsOpen}
+                                    aria-controls="knowledge-base-search-suggestions"
+                                    aria-activedescendant={
+                                        activeSearchSuggestionIndex >= 0
+                                            ? `knowledge-base-search-suggestion-${searchSuggestions[activeSearchSuggestionIndex]?._id}`
+                                            : undefined
+                                    }
+                                />
+                            </label>
+                            {isSearchSuggestionsOpen && (
+                                <div
+                                    id="knowledge-base-search-suggestions"
+                                    className="absolute left-0 right-0 top-[calc(100%+0.5rem)] z-50 max-h-80 overflow-y-auto rounded-lg border border-white/10 bg-[#0d1018] p-1.5 shadow-2xl shadow-black/35"
+                                    role="listbox"
+                                >
+                                    {searchSuggestions.length > 0 ? (
+                                        searchSuggestions.map((entry, index) => (
+                                            <button
+                                                key={entry._id}
+                                                id={`knowledge-base-search-suggestion-${entry._id}`}
+                                                className={[
+                                                    "flex w-full items-start gap-3 rounded-md px-2.5 py-2 text-left transition",
+                                                    activeSearchSuggestionIndex === index
+                                                        ? "bg-[#842cff]/20"
+                                                        : "hover:bg-white/[0.07]",
+                                                ].join(" ")}
+                                                type="button"
+                                                role="option"
+                                                aria-selected={activeSearchSuggestionIndex === index}
+                                                onMouseDown={(event) => event.preventDefault()}
+                                                onClick={() => selectSearchSuggestion(entry)}
+                                            >
+                                                <KnowledgeBaseImage
+                                                    src={entry.photoUrls[0]}
+                                                    alt=""
+                                                    className="size-9 shrink-0 rounded-md border border-white/10 object-cover"
+                                                    fallbackClassName="flex size-9 shrink-0 items-center justify-center rounded-md border border-blue-300/30 bg-blue-500/10 text-blue-200"
+                                                    iconClassName="size-4"
+                                                />
+                                                <span className="min-w-0 flex-1">
+                                                    <span className="block whitespace-normal break-words text-sm font-semibold leading-5 text-white">
+                                                        {entry.title}
+                                                    </span>
+                                                    <span className="mt-0.5 block text-xs text-white/40">{entry.status}</span>
+                                                </span>
+                                            </button>
+                                        ))
+                                    ) : (
+                                        <p className="px-3 py-3 text-sm text-white/45">
+                                            No matching {getTabLabel(activeTab).toLowerCase()}.
+                                        </p>
+                                    )}
+                                </div>
+                            )}
+                        </div>
                         <button
                             className={getPrimaryButtonClass(activeTab)}
                             type="button"
@@ -639,12 +764,12 @@ export default function AdminKnowledgeBase() {
                                                 {activeTab === "Product" ? (
                                                     <tr>
                                                         <th className="px-4 py-3">Title</th>
-                                                        <th className="px-4 py-3 text-right">Actions</th>
+                                                        <th className="w-[4.5rem] px-4 py-3 text-right">Actions</th>
                                                     </tr>
                                                 ) : activeTab === "Article" ? (
                                                     <tr>
                                                         <th className="px-4 py-3">Title</th>
-                                                        <th className="px-4 py-3 text-right">Actions</th>
+                                                        <th className="w-[4.5rem] px-4 py-3 text-right">Actions</th>
                                                     </tr>
                                                 ) : (
                                                     <tr>
@@ -668,15 +793,15 @@ export default function AdminKnowledgeBase() {
                                                             onClick={() => setDetailEntry(entry)}
                                                         >
                                                             <td className="px-4 py-4 align-top">
-                                                                <div className="flex min-w-0 items-center gap-3">
+                                                                <div className="flex min-w-0 items-start gap-3">
                                                                     <KnowledgeBaseImage
                                                                         src={entry.photoUrls[0]}
                                                                         alt={entry.title}
                                                                         className="size-11 shrink-0 rounded-lg border border-white/10 object-cover"
                                                                         fallbackClassName="flex size-11 shrink-0 items-center justify-center rounded-lg border border-blue-300/30 bg-blue-500/10 text-blue-200"
                                                                     />
-                                                                    <span className="min-w-0">
-                                                                        <span className="block truncate font-semibold text-white">{entry.title}</span>
+                                                                    <span className="min-w-0 flex-1">
+                                                                        <span className="block whitespace-normal break-words font-semibold leading-5 text-white">{entry.title}</span>
                                                                         <span className="mt-1 block truncate text-xs text-white/40">{entry.status}</span>
                                                                     </span>
                                                                 </div>
@@ -711,8 +836,8 @@ export default function AdminKnowledgeBase() {
                                                                         className="size-11 shrink-0 rounded-lg border border-white/10 object-cover"
                                                                         fallbackClassName="flex size-11 shrink-0 items-center justify-center rounded-lg border border-blue-300/30 bg-blue-500/10 text-blue-200"
                                                                     />
-                                                                    <span className="min-w-0">
-                                                                        <span className="block truncate font-semibold text-white">{entry.title}</span>
+                                                                    <span className="min-w-0 flex-1">
+                                                                        <span className="block whitespace-normal break-words font-semibold leading-5 text-white">{entry.title}</span>
                                                                         <span className="mt-1 block truncate text-xs text-white/40">{entry.status}</span>
                                                                     </span>
                                                                 </div>

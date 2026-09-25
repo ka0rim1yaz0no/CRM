@@ -88,8 +88,16 @@ export async function getEmployeeSummaries(params?: EmployeeListParams | unknown
     return response.data;
 }
 
-export async function getEmployee(id: string) {
-    const response = await api.get<Employee>(`/employees/${id}`);
+export async function getEmployee(id: string, options: { timeoutMs?: number } = {}) {
+    const response = await api.get<Employee>(`/employees/${id}`, { timeout: options.timeoutMs });
+    return response.data;
+}
+
+export async function getEmployeeSummary(id: string, options: { timeoutMs?: number } = {}) {
+    const response = await api.get<Employee>(`/employees/${id}`, {
+        params: { summary: true },
+        timeout: options.timeoutMs,
+    });
     return response.data;
 }
 

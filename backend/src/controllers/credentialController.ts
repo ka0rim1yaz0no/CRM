@@ -23,46 +23,7 @@ function getCredentialInput(request: Request) {
   };
 }
 
-export async function seedCredentials() {
-  const count = await Credential.countDocuments();
-
-  if (count > 0) {
-    return;
-  }
-
-  await Credential.insertMany([
-    {
-      accountName: "Assistly Admin",
-      username: "admin@assistly.com",
-      password: "Assistly#2026",
-      platform: "Google Workspace",
-      company: "Assistly HQ",
-      team: "All teams",
-      status: "Active",
-    },
-    {
-      accountName: "Billing Team",
-      username: "billing@assistly.com",
-      password: "Billing#8842",
-      platform: "Stripe",
-      company: "Finance",
-      team: "Finance",
-      status: "Review",
-    },
-    {
-      accountName: "Sales Ops",
-      username: "sales.ops",
-      password: "SalesOps#4421",
-      platform: "CRM Admin",
-      company: "Sales Branch",
-      team: "Sales",
-      status: "Active",
-    },
-  ]);
-}
-
 export async function listCredentials(_request: Request, response: Response) {
-  await seedCredentials();
   const credentials = await Credential.find({ status: { $ne: "Archived" } }).sort({ updatedAt: -1 }).lean();
   response.json(
     credentials.map((credential) => ({

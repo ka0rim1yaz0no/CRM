@@ -37,6 +37,7 @@ import {
     groupAttendanceRecordsBySlot,
     isWeekendAttendanceSlotKey,
 } from "../../../lib/attendanceSlots";
+import { buildOffPhoneAttendanceSessions } from "../../../lib/attendanceRecords";
 import { formatCstDate, formatTimeInTimeZone } from "../../../lib/dateTime";
 
 const tabs = ["Job Postings", "Applicants", "Employed", "Attendance", "Archived"] as const;
@@ -722,6 +723,8 @@ export default function AdminHr() {
                         record.firstBreakInOut,
                         record.lunchInOut,
                         record.secondBreakInOut,
+                        record.offPhoneInOut,
+                        record.offPhoneDuration,
                         formatOfficialSchedule(attendanceTableSettings),
                         record.duration,
                         record.overBreak,
@@ -732,7 +735,7 @@ export default function AdminHr() {
             );
             downloadCsv(
                 `hr-attendance-${attendanceSingleDate || attendanceDateFrom || "all"}-${attendanceSingleDate || attendanceDateTo || "all"}.csv`,
-                [["Employee", "Department", "Role", "Date (PH Time)", "Status", "Time In/Out (PH Time)", "1st Break Out/In (PH Time)", "Lunch Out/In (PH Time)", "2nd Break Out/In (PH Time)", "Official Time", "Duration", "Over Break", "Over Lunch", "Undertime", "Overtime"], ...rows]
+                [["Employee", "Department", "Role", "Date (PH Time)", "Status", "Time In/Out (PH Time)", "1st Break Out/In (PH Time)", "Lunch Out/In (PH Time)", "2nd Break Out/In (PH Time)", "Off the Phone Out/In (PH Time)", "Off the Phone Duration", "Official Time", "Duration", "Over Break", "Over Lunch", "Undertime", "Overtime"], ...rows]
             );
         } finally {
             setExportingAttendance(false);
@@ -790,7 +793,7 @@ export default function AdminHr() {
 
                 {activeTab === "Job Postings" ? (
                     <DataShell footer={`Showing ${jobs.length} job posting${jobs.length === 1 ? "" : "s"}`}>
-                        <table className="w-full min-w-[78rem] table-fixed border-separate border-spacing-0 text-left">
+                        <table className="w-full min-w-[90rem] table-fixed border-separate border-spacing-0 text-left">
                             <thead className="sticky top-0 z-10 bg-[#11151f] text-[0.74rem] font-medium text-white/65 shadow-[12px_0_0_#11151f]">
                                 <tr>
                                     <th className="w-[23%] px-4 py-4">Job</th>
@@ -1059,14 +1062,18 @@ export default function AdminHr() {
                                             {formatTimeRange(systemSettings?.officialSecondBreakStartTime, systemSettings?.officialSecondBreakEndTime, "06:15", "06:30")}
                                         </span>
                                     </th>
+                                    <th className="w-[13%] px-2 py-2">
+                                        <span>Off the Phone</span>
+                                        <span className="block text-[0.64rem] font-medium leading-[0.7rem] !text-slate-600">Out/In Â· Duration</span>
+                                    </th>
                                     <th className="w-[8%] px-2 py-2">Duration</th>
                                     <th className="w-[8%] px-2 py-2">Overtime</th>
                                     <th className="w-[6%] px-2 py-2">Actions</th>
                                 </tr>
                             </thead>
                             <tbody className="divide-y divide-slate-300 bg-white">
-                                {attendanceTableLoading && <EmptyRow colSpan={9} text="Loading attendance..." />}
-                                {attendanceTableError && <EmptyRow colSpan={9} text="Unable to load attendance." danger />}
+                                {attendanceTableLoading && <EmptyRow colSpan={10} text="Loading attendance..." />}
+                                {attendanceTableError && <EmptyRow colSpan={10} text="Unable to load attendance." danger />}
                                 {!attendanceTableLoading && !attendanceTableError && pagedAttendanceRows.map((record) => (
                                     <tr key={`${record.employee._id}-${record.dateKey}`} className="text-center text-[0.72rem] !text-black transition hover:bg-slate-50">
                                         <td className="px-2 py-1.5 text-left">
@@ -1111,6 +1118,16 @@ export default function AdminHr() {
                                                 )}
                                             </div>
                                         </td>
+                                        <td className="px-2 py-1.5 !text-black">
+                                            <div className="flex flex-col items-center justify-center gap-0.5">
+                                                <span className="max-w-[12rem] whitespace-normal">{record.offPhoneInOut}</span>
+                                                {record.offPhoneDuration !== "-" && (
+                                                    <span className="rounded-full border border-sky-200 bg-sky-50 px-1.5 py-px text-[0.52rem] font-semibold leading-none !text-sky-700">
+                                                        {record.offPhoneDuration}
+                                                    </span>
+                                                )}
+                                            </div>
+                                        </td>
                                         <td className="px-2 py-1.5 !text-black">{record.duration}</td>
                                         <td className="px-2 py-1.5 !text-black">{record.overtime}</td>
                                         <td className="px-2 py-1.5">
@@ -1132,7 +1149,7 @@ export default function AdminHr() {
                                     </tr>
                                 ))}
                                 {!attendanceTableLoading && !attendanceTableError && !attendanceTableRows.length && (
-                                    <EmptyRow colSpan={9} text={attendanceEmployees.length ? "No attendance records for the selected range." : "No active employees found."} />
+                                    <EmptyRow colSpan={10} text={attendanceEmployees.length ? "No attendance records for the selected range." : "No active employees found."} />
                                 )}
                             </tbody>
                         </table>
@@ -1332,6 +1349,8 @@ type AttendanceHistoryRow = {
     firstBreakInOut: string;
     lunchInOut: string;
     secondBreakInOut: string;
+    offPhoneInOut: string;
+    offPhoneDuration: string;
     duration: string;
     firstOverBreak: string;
     secondOverBreak: string;
@@ -1527,6 +1546,8 @@ function buildAbsentAttendanceRow(dateKey: string): AttendanceHistoryRow {
         firstBreakInOut: "-",
         lunchInOut: "-",
         secondBreakInOut: "-",
+        offPhoneInOut: "-",
+        offPhoneDuration: "-",
         duration: "-",
         firstOverBreak: "-",
         secondOverBreak: "-",
@@ -1637,6 +1658,17 @@ function buildAttendanceHistoryRows(records: AttendanceRecord[], settings?: Syst
             const lunchOut = lunchOutRecord?.timeIn || "";
             const lunchIn = lunchInRecord?.timeIn || "";
             const breakPairs = buildBreakPairs(sortedRecords);
+            const offPhoneSessions = buildOffPhoneAttendanceSessions(sortedRecords);
+            const offPhoneDuration = offPhoneSessions.reduce((total, session) => total + session.durationMs, 0);
+            const offPhoneInOut = offPhoneSessions.length
+                ? offPhoneSessions
+                    .map((session) => {
+                        const startedAt = formatTimeInTimeZone(session.startedAt, timeZone) || "00:00:00";
+                        const endedAt = session.endedAt ? formatTimeInTimeZone(session.endedAt, timeZone) || "00:00:00" : "Open";
+                        return `${startedAt} - ${endedAt}`;
+                    })
+                    .join("; ")
+                : "-";
             const lunchOutTime = lunchOut ? new Date(lunchOut).getTime() : 0;
             const lunchInTime = lunchIn ? new Date(lunchIn).getTime() : lunchOutTime;
             const firstBreak = breakPairs.find((pair) => !lunchOutTime || new Date(pair.breakOut).getTime() < lunchOutTime) || breakPairs[0];
@@ -1677,6 +1709,8 @@ function buildAttendanceHistoryRows(records: AttendanceRecord[], settings?: Syst
                 firstBreakInOut: formatTimePair(firstBreak?.breakOut, firstBreak?.breakIn, timeZone),
                 lunchInOut: formatTimePair(lunchOut, lunchIn, timeZone),
                 secondBreakInOut: formatTimePair(secondBreak?.breakOut, secondBreak?.breakIn, timeZone),
+                offPhoneInOut,
+                offPhoneDuration: formatDuration(offPhoneDuration),
                 duration: formatDuration(workedDuration),
                 firstOverBreak: formatDuration(firstOverBreakDuration),
                 secondOverBreak: formatDuration(secondOverBreakDuration),

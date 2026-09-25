@@ -8,6 +8,7 @@ import { ensureEmployeeIndexes } from "./models/Employee";
 import { createSocketServer } from "./socket";
 
 const port = Number(process.env.PORT || 4000);
+const host = process.env.HOST || "127.0.0.1";
 const mongoUri = process.env.MONGODB_URI || "";
 
 await connectDatabase(mongoUri);
@@ -20,6 +21,6 @@ const httpServer = createServer(app);
 createSocketServer(httpServer);
 startLeadAutoAssignmentScheduler();
 
-httpServer.listen(port, () => {
-  console.log(`API server running on http://localhost:${port}`);
+httpServer.listen(port, host, () => {
+  console.log(`API server running on http://${host}:${port}`);
 });

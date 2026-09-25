@@ -604,7 +604,7 @@ async function syncEmployeePayrollRecords(payPeriod = "", payDate = "") {
     if (existingRecord) {
       if (canRecalculatePayrollRecord(existingRecord.status)) {
         existingRecord.employeeName = employee.name;
-        existingRecord.email = employee.email;
+        existingRecord.email = String(employee.email || "").trim();
         existingRecord.department = employee.team || employee.role || "General";
         existingRecord.payType = resolvedPayType;
         existingRecord.grossPay = grossPay;
@@ -629,7 +629,7 @@ async function syncEmployeePayrollRecords(payPeriod = "", payDate = "") {
     records.push(
       await PayrollRecord.create({
         employeeName: employee.name,
-        email: employee.email,
+        email: String(employee.email || "").trim(),
         employeeId: employee.employeeCode,
         department: employee.team || employee.role || "General",
         payType: resolvedPayType,

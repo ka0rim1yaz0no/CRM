@@ -4,8 +4,18 @@ export type AttendanceRecord = {
     _id: string;
     employee: string;
     timeIn: string;
-    source: "Login" | "Logout" | "Time In" | "Time Out" | "Break Out" | "Break In" | "Lunch Break Out" | "Lunch Break In";
-    attendanceStatus?: "On time" | "Late" | "";
+    source:
+        | "Login"
+        | "Logout"
+        | "Time In"
+        | "Time Out"
+        | "Break Out"
+        | "Break In"
+        | "Lunch Break Out"
+        | "Lunch Break In"
+        | "Off the Phone Out"
+        | "Off the Phone In";
+    attendanceStatus?: "On time" | "Late" | "Undertime" | "";
     isArchived?: boolean;
     createdAt: string;
 };
@@ -16,6 +26,13 @@ export type AttendanceInput = Pick<AttendanceRecord, "source"> & {
 
 export async function getEmployeeAttendance(employeeId: string, params?: { archived?: boolean }) {
     const response = await api.get<AttendanceRecord[]>(`/employees/${employeeId}/attendance`, { params });
+    return response.data;
+}
+
+export async function getEmployeesAttendance(employeeIds: string[]) {
+    const response = await api.get<AttendanceRecord[]>("/attendance", {
+        params: { employeeIds: employeeIds.join(",") },
+    });
     return response.data;
 }
 
@@ -40,7 +57,9 @@ export async function timeInEmployee(employeeId: string) {
 }
 
 export async function timeOutEmployee(employeeId: string) {
-    const response = await api.post<AttendanceRecord>(`/employees/${employeeId}/attendance/time-out`);
+    const response = await api.post<AttendanceRecord>(`/employees/${employeeId}/attendance/time-out`, {
+        intent: "manual-attendance-time-out",
+    });
     return response.data;
 }
 
@@ -65,6 +84,6 @@ export async function lunchBreakInEmployee(employeeId: string) {
 }
 
 export async function reportEmployeeActivity(employeeId: string, state: "active" | "idle", options: { idleStartedAt?: string; reason?: string } = {}) {
-    const response = await api.post<{ availabilityStatus: string }>(`/employees/${employeeId}/activity`, { state, ...options });
+    const response = await api.post<{ availabilityStatus: string; attendanceRecords?: AttendanceRecord[] }>(`/employees/${employeeId}/activity`, { state, ...options });
     return response.data;
 }

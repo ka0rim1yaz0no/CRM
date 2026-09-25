@@ -9,6 +9,7 @@ import {
 } from "../models/BusinessUserAccess";
 import { getBusinessById, getConfiguredBusinesses, getCurrentBusinessId, runWithBusiness } from "../config/tenancy";
 import { reassignLeadsFromAgent } from "./leadController";
+import { emitCallDashboardUpdated } from "../socket";
 
 function toSalary(value: unknown) {
   const salary = Number(value);
@@ -250,7 +251,14 @@ export async function listEmployees(request: Request, response: Response) {
 }
 
 export async function getEmployee(request: Request, response: Response) {
-  const employee = await Employee.findById(request.params.id);
+  const isSummary = String(request.query.summary || "").toLowerCase() === "true";
+  const employeeQuery = Employee.findById(request.params.id);
+
+  if (isSummary) {
+    employeeQuery.select(employeeSummaryFields);
+  }
+
+  const employee = await employeeQuery;
 
   if (!employee) {
     response.status(404).json({ message: "Employee not found" });
@@ -269,6 +277,7 @@ export async function createEmployee(request: Request, response: Response) {
   const payload = employeePayload(request.body);
   const employee = await Employee.create(payload);
   await syncEmployeeBusinessAccess(employee.employeeCode, employee.businessAccessIds, payload);
+  emitCallDashboardUpdated(validBusinessAccessIds(employee.businessAccessIds));
 
   response.status(201).json(withNormalizedAvailability(employee.toObject()));
 }
@@ -284,6 +293,7 @@ export async function updateEmployee(request: Request, response: Response) {
 
   const previousName = toText(existingEmployee.name);
   const previousEmployeeCode = toText(existingEmployee.employeeCode);
+  const previousBusinessAccessIds = validBusinessAccessIds(existingEmployee.businessAccessIds);
   const payload = employeePayload(request.body, { includeProfileImage: shouldUpdateProfileImage });
 
   if (previousName && !sameNormalizedName(previousName, payload.name)) {
@@ -307,6 +317,10 @@ export async function updateEmployee(request: Request, response: Response) {
 
   await syncEmployeeNameReferences(String(employee._id), previousName, employee.name);
   await syncEmployeeBusinessAccess(employee.employeeCode, employee.businessAccessIds, payload, previousEmployeeCode);
+  emitCallDashboardUpdated([
+    ...previousBusinessAccessIds,
+    ...validBusinessAccessIds(employee.businessAccessIds),
+  ]);
 
   response.json(withNormalizedAvailability(employee.toObject()));
 }
@@ -374,6 +388,7 @@ export async function archiveEmployee(request: Request, response: Response) {
   }
 
   await reassignLeadsFromAgent(String(employee._id));
+  emitCallDashboardUpdated(validBusinessAccessIds(employee.businessAccessIds));
 
   response.json(withNormalizedAvailability(employee.toObject()));
 }
@@ -387,6 +402,7 @@ export async function deleteEmployee(request: Request, response: Response) {
   }
 
   await reassignLeadsFromAgent(String(employee._id));
+  emitCallDashboardUpdated(validBusinessAccessIds(employee.businessAccessIds));
 
   response.json(withNormalizedAvailability(employee.toObject()));
 }

@@ -53,6 +53,7 @@ const entireScreenCaptureOptions: EntireScreenDisplayMediaOptions = {
 
 export default function EmployeeLiveShare() {
     const [status, setStatus] = useState("");
+    const [activeRequestId, setActiveRequestId] = useState("");
     const peerRef = useRef<RTCPeerConnection | null>(null);
     const streamRef = useRef<MediaStream | null>(null);
     const requestIdRef = useRef("");
@@ -65,6 +66,7 @@ export default function EmployeeLiveShare() {
         peerRef.current?.close();
         peerRef.current = null;
         requestIdRef.current = "";
+        setActiveRequestId("");
 
         if (notify && requestId) {
             socket.emit("live-share:stop", { requestId, reason });
@@ -91,6 +93,7 @@ export default function EmployeeLiveShare() {
             const peer = new RTCPeerConnection(rtcConfig);
 
             requestIdRef.current = requestId;
+            setActiveRequestId(requestId);
             streamRef.current = stream;
             peerRef.current = peer;
 
@@ -203,7 +206,7 @@ export default function EmployeeLiveShare() {
 
     return (
         <>
-            {status && requestIdRef.current && (
+            {status && activeRequestId && (
                 <div className="fixed bottom-4 right-4 z-[60] flex max-w-sm items-center gap-3 rounded-lg border border-violet-200 bg-white px-4 py-3 text-sm text-slate-700 shadow-xl shadow-slate-950/15">
                     <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-violet-100 text-violet-700">
                         <FiMonitor className="size-4" aria-hidden="true" />

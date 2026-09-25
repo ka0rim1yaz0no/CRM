@@ -232,6 +232,12 @@ export function emitEmployeeAvailabilityUpdated(payload: {
   });
 }
 
+export function emitCallDashboardUpdated(businessIds: string[]) {
+  for (const businessId of new Set(businessIds.filter(Boolean))) {
+    socketServer?.to(businessRoom(businessId)).emit("call-dashboard:updated");
+  }
+}
+
 export function emitLeadChanged(payload: {
   action: string;
   lead?: unknown;

@@ -5109,7 +5109,7 @@
 import { useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 import { Link, useNavigate } from "react-router";
-import { useQueries, useQuery } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import {
     FiActivity,
     FiBarChart2,
@@ -5131,9 +5131,12 @@ import {
     FiX,
 } from "react-icons/fi";
 import AdminLayout from "../adminLayout";
+import CallDashboardPanel from "../../../components/CallDashboardPanel";
 import { getEmployeeSummaries, normalizeEmployeeAvailabilityStatus, type Employee } from "../../../api/employees";
-import { getEmployeeAttendance, type AttendanceRecord } from "../../../api/attendance";
-import { getAgentLeadDashboard, getLead, getLeadCallStats, type AgentLeadActivity, type AgentLeadMonthlyRow, type AgentLeadProgress, type Lead, type LeadCallStat } from "../../../api/leads";
+import { getEmployeeAttendance, getEmployeesAttendance, type AttendanceRecord } from "../../../api/attendance";
+import { getAgentLeadDashboard, getLead, getLeadCallSummary, type AgentLeadActivity, type AgentLeadMonthlyRow, type AgentLeadProgress, type Lead, type LeadCallStat } from "../../../api/leads";
+import { buildOffPhoneAttendanceSessions, type OffPhoneAttendanceSession } from "../../../lib/attendanceRecords";
+import { isAttendanceTimeOutUndertime } from "../../../lib/attendanceSlots";
 import { formatPhDate, formatPhDateTime, formatPhTime } from "../../../lib/dateTime";
 
 const numberFormatter = new Intl.NumberFormat("en-US");
@@ -5752,8 +5755,8 @@ function EmployeeLeadCallsModal({
                         <p className="mt-1 text-sm text-slate-600">
                             Showing {formatNumber(row.leads.length)} lead record
                             {row.leads.length === 1 ? "" : "s"} and{" "}
-                            {formatNumber(row.totalCalls)} total call
-                            {row.totalCalls === 1 ? "" : "s"}.
+                            {formatNumber(row.totalAttempts)} total attempt
+                            {row.totalAttempts === 1 ? "" : "s"}.
                         </p>
                     </div>
 
@@ -5775,20 +5778,22 @@ function EmployeeLeadCallsModal({
                         />
                     ) : (
                         <div className="overflow-x-auto rounded-lg border border-slate-300 bg-white">
-                            <table className="w-full min-w-[52rem] table-fixed border-separate border-spacing-0">
+                            <table className="w-full min-w-[60rem] table-fixed border-separate border-spacing-0">
                                 <colgroup>
-                                    <col className="w-[30%]" />
-                                    <col className="w-[30%]" />
+                                    <col className="w-[24%]" />
+                                    <col className="w-[24%]" />
+                                    <col className="w-[11%]" />
+                                    <col className="w-[14%]" />
                                     <col className="w-[12%]" />
-                                    <col className="w-[14%]" />
-                                    <col className="w-[14%]" />
+                                    <col className="w-[15%]" />
                                 </colgroup>
                                 <thead className="bg-slate-50 text-[0.68rem] uppercase tracking-[0.12em] text-slate-500">
                                     <tr>
                                         <th className="px-3 py-3 text-left font-semibold">Lead</th>
                                         <th className="px-3 py-3 text-left font-semibold">Business</th>
-                                        <th className="px-3 py-3 text-center font-semibold">Calls</th>
+                                        <th className="px-3 py-3 text-center font-semibold">Connected</th>
                                         <th className="px-3 py-3 text-center font-semibold">Not Connected</th>
+                                        <th className="px-3 py-3 text-center font-semibold">Voicemails</th>
                                         <th className="px-3 py-3 text-left font-semibold">Last Call</th>
                                     </tr>
                                 </thead>
@@ -5829,6 +5834,10 @@ function EmployeeLeadCallsModal({
 
                                             <td className="px-3 py-3 text-center font-semibold text-rose-600">
                                                 {formatNumber(lead.callNotConnectedCount)}
+                                            </td>
+
+                                            <td className="px-3 py-3 text-center font-semibold text-blue-600">
+                                                {formatNumber(lead.callVoicemailCount)}
                                             </td>
 
                                             <td className="px-3 py-3 text-sm text-slate-600">
@@ -6044,7 +6053,11 @@ function formatAttendanceDuration(milliseconds: number) {
 }
 
 function getAttendanceStatusText(record: AttendanceRecord) {
-    return String(record.attendanceStatus || "").trim().toLowerCase();
+    return String(record.attendanceStatus || (isAttendanceTimeOutUndertime(record) ? "Undertime" : "")).trim().toLowerCase();
+}
+
+function getAttendanceStatusLabel(record: AttendanceRecord) {
+    return record.attendanceStatus || (isAttendanceTimeOutUndertime(record) ? "Undertime" : "No status");
 }
 
 function getBreakReturnSource(source?: AttendanceRecord["source"]) {
@@ -6073,6 +6086,8 @@ type AttendanceShiftRow = {
     records: AttendanceRecord[];
     overBreakRows: AttendanceOverBreakRow[];
     totalOverBreakMs: number;
+    offPhoneSessions: OffPhoneAttendanceSession[];
+    totalOffPhoneMs: number;
     lateRecords: AttendanceRecord[];
     underTimeRecords: AttendanceRecord[];
     underTimeMs: number;
@@ -6280,6 +6295,10 @@ function buildAttendanceShiftRows(records: AttendanceRecord[], employee?: Employ
                 draft.shiftDateValue === getCurrentShiftDateValue()
             );
             const overBreakRows = buildOverBreakRows(draft.records, draft.shiftEnd, isCurrentOpenShift);
+            const offPhoneSessions = buildOffPhoneAttendanceSessions(
+                draft.records,
+                isCurrentOpenShift ? Date.now() : draft.shiftEnd.getTime()
+            );
             const lateRecords = sortedShiftRecords.filter((record) => getAttendanceStatusText(record).includes("late"));
             const statusUnderTimeRecords = sortedShiftRecords.filter((record) => {
                 const statusText = getAttendanceStatusText(record);
@@ -6303,6 +6322,8 @@ function buildAttendanceShiftRows(records: AttendanceRecord[], employee?: Employ
                 records: sortedShiftRecords,
                 overBreakRows,
                 totalOverBreakMs: overBreakRows.reduce((total, row) => total + row.overMs, 0),
+                offPhoneSessions,
+                totalOffPhoneMs: offPhoneSessions.reduce((total, session) => total + session.durationMs, 0),
                 lateRecords,
                 underTimeRecords,
                 underTimeMs,
@@ -6364,6 +6385,8 @@ function AttendancePanel({
     const totalLateCount = filteredShiftRows.reduce((total, row) => total + row.lateRecords.length, 0);
     const totalUnderTimeCount = filteredShiftRows.reduce((total, row) => total + row.underTimeRecords.length, 0);
     const totalUnderTimeMs = filteredShiftRows.reduce((total, row) => total + row.underTimeMs, 0);
+    const totalOffPhoneMs = filteredShiftRows.reduce((total, row) => total + row.totalOffPhoneMs, 0);
+    const totalOffPhoneSessions = filteredShiftRows.reduce((total, row) => total + row.offPhoneSessions.length, 0);
     const hasAttendanceFilter = Boolean(selectedAttendanceDate || attendanceDateFrom || attendanceDateTo);
     const filterSummary = selectedAttendanceDate
         ? `Selected shift date: ${formatDateOrDash(selectedAttendanceDate)}`
@@ -6409,10 +6432,16 @@ function AttendancePanel({
             detail: "Records marked late inside selected shift rows",
             className: "border-violet-200 bg-violet-50 text-violet-700",
         },
+        {
+            label: "Off the Phone",
+            value: formatAttendanceDuration(totalOffPhoneMs),
+            detail: `${formatNumber(totalOffPhoneSessions)} session${totalOffPhoneSessions === 1 ? "" : "s"} in selected shifts`,
+            className: "border-sky-200 bg-sky-50 text-sky-700",
+        },
     ];
-    const skeletonMetricCards = ["Over break", "Under time", "Late times"];
+    const skeletonMetricCards = ["Over break", "Under time", "Late times", "Off the Phone"];
     const showEmployeeColumn = isAllEmployeesView;
-    const attendanceTableColSpan = showEmployeeColumn ? 8 : 7;
+    const attendanceTableColSpan = showEmployeeColumn ? 9 : 8;
 
     return (
         <section className="rounded-lg border border-slate-200 bg-white p-5 shadow-sm">
@@ -6523,7 +6552,7 @@ function AttendancePanel({
                 </div>
             </div>
 
-            <div className="mt-5 grid gap-3 sm:grid-cols-3">
+            <div className="mt-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
                 {isPlaceholder
                     ? skeletonMetricCards.map((label) => (
                         <article key={label} className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-3">
@@ -6551,7 +6580,7 @@ function AttendancePanel({
                 </div>
 
                 <div className="content-scroll max-h-[34rem] overflow-auto">
-                    <table className="w-full min-w-[76rem] table-fixed border-separate border-spacing-0 text-left text-sm">
+                    <table className="w-full min-w-[84rem] table-fixed border-separate border-spacing-0 text-left text-sm">
                         <colgroup>
                             {showEmployeeColumn && <col className="w-[16%]" />}
                             <col className="w-[12%]" />
@@ -6561,6 +6590,7 @@ function AttendancePanel({
                             <col className="w-[8%]" />
                             <col className="w-[8%]" />
                             <col className="w-[8%]" />
+                            <col className="w-[10%]" />
                         </colgroup>
                         <thead className="sticky top-0 z-10 bg-white text-[0.68rem] uppercase tracking-[0.12em] text-slate-500 shadow-sm">
                             <tr>
@@ -6572,12 +6602,14 @@ function AttendancePanel({
                                 <th className="px-3 py-3 text-center font-semibold">Late</th>
                                 <th className="px-3 py-3 text-center font-semibold">Under</th>
                                 <th className="px-3 py-3 font-semibold">Over Break</th>
+                                <th className="px-3 py-3 font-semibold">Off the Phone</th>
                             </tr>
                         </thead>
                         <tbody className="divide-y divide-slate-200">
                             {isPlaceholder && Array.from({ length: 4 }).map((_, index) => (
                                 <tr key={`attendance-skeleton-${index}`} className="pointer-events-none">
                                     <td className="px-3 py-4"><div className="h-4 w-24 animate-pulse rounded bg-slate-200" /></td>
+                                    <td className="px-3 py-4"><div className="h-4 w-20 animate-pulse rounded bg-slate-200" /></td>
                                     <td className="px-3 py-4"><div className="h-4 w-64 max-w-full animate-pulse rounded bg-slate-200" /><div className="mt-2 h-3 w-40 animate-pulse rounded bg-slate-200" /></td>
                                     <td className="px-3 py-4"><div className="h-4 w-20 animate-pulse rounded bg-slate-200" /></td>
                                     <td className="px-3 py-4"><div className="h-4 w-20 animate-pulse rounded bg-slate-200" /></td>
@@ -6621,6 +6653,16 @@ function AttendancePanel({
                                             <span className="text-xs font-semibold text-slate-400">-</span>
                                         )}
                                     </td>
+                                    <td className="px-3 py-3">
+                                        {row.offPhoneSessions.length > 0 ? (
+                                            <div>
+                                                <p className="font-semibold text-sky-700">{formatAttendanceDuration(row.totalOffPhoneMs)}</p>
+                                                <p className="mt-0.5 text-xs text-slate-500">{formatNumber(row.offPhoneSessions.length)} session{row.offPhoneSessions.length === 1 ? "" : "s"}</p>
+                                            </div>
+                                        ) : (
+                                            <span className="text-xs font-semibold text-slate-400">-</span>
+                                        )}
+                                    </td>
                                 </tr>
                             ))}
                             {!isPlaceholder && filteredShiftRows.length === 0 && (
@@ -6650,6 +6692,9 @@ function AttendanceShiftDetailsModal({ row, onClose }: { row: AttendanceShiftRow
         (first, second) => getAttendanceTimestamp(first) - getAttendanceTimestamp(second)
     );
     const chronologicalOverBreakRows = [...row.overBreakRows].sort(
+        (first, second) => getDateValue(first.startedAt) - getDateValue(second.startedAt)
+    );
+    const chronologicalOffPhoneSessions = [...row.offPhoneSessions].sort(
         (first, second) => getDateValue(first.startedAt) - getDateValue(second.startedAt)
     );
 
@@ -6687,7 +6732,7 @@ function AttendanceShiftDetailsModal({ row, onClose }: { row: AttendanceShiftRow
                 </div>
 
                 <div className="content-scroll overflow-y-auto p-5">
-                    <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
+                    <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-6">
                         <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
                             <p className="text-[0.65rem] font-bold uppercase tracking-[0.12em] text-slate-500">Shift Window</p>
                             <p className="mt-1 text-sm font-semibold text-slate-950">11PM to 8AM</p>
@@ -6707,6 +6752,10 @@ function AttendanceShiftDetailsModal({ row, onClose }: { row: AttendanceShiftRow
                         <div className="rounded-lg border border-rose-200 bg-rose-50 p-3 text-rose-700">
                             <p className="text-[0.65rem] font-bold uppercase tracking-[0.12em] opacity-80">Over Break</p>
                             <p className="mt-1 text-sm font-semibold">{formatAttendanceDuration(row.totalOverBreakMs)}</p>
+                        </div>
+                        <div className="rounded-lg border border-sky-200 bg-sky-50 p-3 text-sky-700">
+                            <p className="text-[0.65rem] font-bold uppercase tracking-[0.12em] opacity-80">Off the Phone</p>
+                            <p className="mt-1 text-sm font-semibold">{formatAttendanceDuration(row.totalOffPhoneMs)}</p>
                         </div>
                     </div>
 
@@ -6747,7 +6796,7 @@ function AttendanceShiftDetailsModal({ row, onClose }: { row: AttendanceShiftRow
                                                 <td className="px-3 py-3 font-semibold text-slate-900">{formatDateOrDash(record.timeIn)}</td>
                                                 <td className="px-3 py-3">{formatPhTime(record.timeIn)}</td>
                                                 <td className="px-3 py-3 font-semibold text-slate-950">{record.source || "Attendance"}</td>
-                                                <td className="px-3 py-3">{record.attendanceStatus || "No status"}</td>
+                                                <td className="px-3 py-3">{getAttendanceStatusLabel(record)}</td>
                                                 <td className="px-3 py-3">
                                                     <div className="flex flex-wrap gap-1.5">
                                                         {isLate && <span className="rounded-full bg-violet-100 px-2 py-1 text-[0.65rem] font-bold uppercase tracking-[0.08em] text-violet-700">Late</span>}
@@ -6776,6 +6825,36 @@ function AttendanceShiftDetailsModal({ row, onClose }: { row: AttendanceShiftRow
                             </p>
                         </div>
                     )}
+
+                    <div className="mt-5 rounded-lg border border-sky-200 bg-sky-50/50 p-4">
+                        <div className="flex flex-wrap items-center justify-between gap-3">
+                            <p className="text-xs font-semibold uppercase tracking-[0.12em] text-sky-700">Off the Phone Sessions</p>
+                            <span className="rounded-full bg-white px-2.5 py-1 text-[0.65rem] font-bold text-sky-700">
+                                {formatAttendanceDuration(row.totalOffPhoneMs)} total
+                            </span>
+                        </div>
+
+                        <div className="mt-3 space-y-2">
+                            {chronologicalOffPhoneSessions.map((session) => (
+                                <article key={session.id} className="rounded-lg border border-sky-200 bg-white px-3 py-3 text-sm text-sky-800">
+                                    <div className="flex flex-wrap items-start justify-between gap-3">
+                                        <div>
+                                            <p className="font-semibold">Off the Phone for {formatAttendanceDuration(session.durationMs)}</p>
+                                            <p className="mt-1 text-xs text-slate-600">
+                                                {formatPhDateTime(session.startedAt)} to {session.endedAt ? formatPhDateTime(session.endedAt) : "Still off the phone"}
+                                            </p>
+                                        </div>
+                                        <span className="rounded-full bg-sky-50 px-2 py-1 text-[0.65rem] font-bold uppercase tracking-[0.08em] text-sky-700">
+                                            {session.isOpen ? "Open" : "Closed"}
+                                        </span>
+                                    </div>
+                                </article>
+                            ))}
+                            {chronologicalOffPhoneSessions.length === 0 && (
+                                <p className="rounded-lg border border-dashed border-sky-200 bg-white p-4 text-sm text-slate-500">No Off the Phone records for this shift.</p>
+                            )}
+                        </div>
+                    </div>
 
                     <div className="mt-5 rounded-lg border border-slate-300 bg-white p-4">
                         <div className="flex flex-wrap items-center justify-between gap-3">
@@ -6878,7 +6957,7 @@ function AttendanceRecordDetailsModal({
                         </div>
                         <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
                             <p className="text-[0.65rem] font-bold uppercase tracking-[0.12em] text-slate-500">Attendance Status</p>
-                            <p className="mt-1 text-sm font-semibold text-slate-950">{record.attendanceStatus || "No status"}</p>
+                            <p className="mt-1 text-sm font-semibold text-slate-950">{getAttendanceStatusLabel(record)}</p>
                         </div>
                     </div>
 
@@ -6959,6 +7038,7 @@ type EmployeeLeadCallRow = {
     businessName: string;
     callCount: number;
     callNotConnectedCount: number;
+    callVoicemailCount: number;
     totalAttempts: number;
     lastCallAt: string | null;
     callLogs: NonNullable<LeadCallStat["callLogs"]>;
@@ -6971,6 +7051,7 @@ type EmployeeCallSummaryRow = {
     employeeTeam: string;
     totalCalls: number;
     totalNotConnectedCalls: number;
+    totalVoicemails: number;
     totalAttempts: number;
     lastCallAt: string | null;
     leads: EmployeeLeadCallRow[];
@@ -7112,13 +7193,19 @@ function buildEmployeeCallRows(leadCallStats: LeadCallStat[]): EmployeeCallSumma
             }
 
             const outcome =
-                log.outcome === "not_connected" ? "not_connected" : "connected";
+                log.outcome === "not_connected"
+                    ? "not_connected"
+                    : log.outcome === "voicemail"
+                      ? "voicemail"
+                      : "connected";
 
             const calledAt =
                 log.calledAt ||
                 (outcome === "not_connected"
                     ? item.lastNotConnectedAt
-                    : item.lastCallAt) ||
+                    : outcome === "voicemail"
+                      ? item.lastVoicemailAt
+                      : item.lastCallAt) ||
                 item.updatedAt ||
                 null;
 
@@ -7130,6 +7217,7 @@ function buildEmployeeCallRows(leadCallStats: LeadCallStat[]): EmployeeCallSumma
                     employeeTeam: log.employeeTeam || "",
                     totalCalls: 0,
                     totalNotConnectedCalls: 0,
+                    totalVoicemails: 0,
                     totalAttempts: 0,
                     lastCallAt: null,
                     leads: [],
@@ -7147,6 +7235,8 @@ function buildEmployeeCallRows(leadCallStats: LeadCallStat[]): EmployeeCallSumma
 
             if (outcome === "not_connected") {
                 employeeRow.totalNotConnectedCalls += 1;
+            } else if (outcome === "voicemail") {
+                employeeRow.totalVoicemails += 1;
             } else {
                 employeeRow.totalCalls += 1;
             }
@@ -7160,6 +7250,7 @@ function buildEmployeeCallRows(leadCallStats: LeadCallStat[]): EmployeeCallSumma
                     businessName,
                     callCount: 0,
                     callNotConnectedCount: 0,
+                    callVoicemailCount: 0,
                     totalAttempts: 0,
                     lastCallAt: null,
                     callLogs: [],
@@ -7178,6 +7269,8 @@ function buildEmployeeCallRows(leadCallStats: LeadCallStat[]): EmployeeCallSumma
 
             if (outcome === "not_connected") {
                 leadRow.callNotConnectedCount += 1;
+            } else if (outcome === "voicemail") {
+                leadRow.callVoicemailCount += 1;
             } else {
                 leadRow.callCount += 1;
             }
@@ -7285,6 +7378,10 @@ function filterLeadCallStatsByDateRange(
                 (log) => log.outcome === "not_connected"
             );
 
+            const voicemailLogs = filteredCallLogs.filter(
+                (log) => log.outcome === "voicemail"
+            );
+
             const latestLog = getLatestCallLog(filteredCallLogs);
 
             return {
@@ -7292,6 +7389,7 @@ function filterLeadCallStatsByDateRange(
                 callLogs: filteredCallLogs,
                 callCount: connectedLogs.length,
                 callNotConnectedCount: notConnectedLogs.length,
+                callVoicemailCount: voicemailLogs.length,
                 lastCallAt: latestLog?.calledAt || null,
             };
         })
@@ -7382,6 +7480,10 @@ function filterLeadCallStatsByDateTimeRange(
                 (log) => log.outcome === "not_connected"
             );
 
+            const voicemailLogs = filteredCallLogs.filter(
+                (log) => log.outcome === "voicemail"
+            );
+
             const latestLog = [...filteredCallLogs].sort((first, second) => {
                 return getCallLogTime(second.calledAt) - getCallLogTime(first.calledAt);
             })[0];
@@ -7391,13 +7493,18 @@ function filterLeadCallStatsByDateTimeRange(
                 callLogs: filteredCallLogs,
                 callCount: connectedLogs.length,
                 callNotConnectedCount: notConnectedLogs.length,
+                callVoicemailCount: voicemailLogs.length,
                 lastCallAt: latestLog?.calledAt || null,
             };
         })
         .filter((item) => item.callLogs.length > 0);
 }
 
+void buildEmployeeCallRows;
+void filterLeadCallStatsByDateTimeRange;
+
 export default function AdminDashboard() {
+    const navigate = useNavigate();
     const [selectedActivity, setSelectedActivity] = useState<AgentLeadActivity | null>(null);
     const [qualifiedLeadRow, setQualifiedLeadRow] = useState<AgentLeadMonthlyRow | null>(null);
     const [selectedMonth, setSelectedMonth] = useState(() => getMonthInputValue(new Date()));
@@ -7474,14 +7581,16 @@ export default function AdminDashboard() {
         refetchInterval: 15_000,
         refetchOnWindowFocus: true,
     });
-    const allAttendanceQueries = useQueries({
-        queries: departmentFilteredAttendanceEmployeeOptions.map((employee) => ({
-            queryKey: ["admin-dashboard-attendance-records", employee._id],
-            queryFn: () => getEmployeeAttendance(employee._id),
-            enabled: !effectiveAttendanceEmployeeId,
-            refetchInterval: 15_000,
-            refetchOnWindowFocus: true,
-        })),
+    const allAttendanceEmployeeIds = useMemo(
+        () => departmentFilteredAttendanceEmployeeOptions.map((employee) => employee._id),
+        [departmentFilteredAttendanceEmployeeOptions]
+    );
+    const allAttendanceQuery = useQuery({
+        queryKey: ["admin-dashboard-attendance-records", "all", allAttendanceEmployeeIds],
+        queryFn: () => getEmployeesAttendance(allAttendanceEmployeeIds),
+        enabled: !effectiveAttendanceEmployeeId && allAttendanceEmployeeIds.length > 0,
+        refetchInterval: 30_000,
+        refetchOnWindowFocus: true,
     });
     const selectedLeadId = selectedActivity?.leadId || "";
     const leadHistoryQuery = useQuery({
@@ -7644,43 +7753,43 @@ export default function AdminDashboard() {
     const [callFilterTimeTo, setCallFilterTimeTo] = useState("08:00");
 
     const leadCallStatsQuery = useQuery({
-        queryKey: ["lead-call-stats", "admin"],
-        queryFn: () => getLeadCallStats(10000),
+        queryKey: ["lead-call-summary", "admin", callFilterDateFrom, callFilterTimeFrom, callFilterDateTo, callFilterTimeTo],
+        queryFn: () => getLeadCallSummary({
+            from: callFilterDateFrom
+                ? new Date(combineDateAndTime(callFilterDateFrom, callFilterTimeFrom || "00:00")).toISOString()
+                : undefined,
+            to: callFilterDateTo
+                ? new Date(combineDateAndTime(callFilterDateTo, callFilterTimeTo || "23:59")).toISOString()
+                : undefined,
+        }),
         refetchInterval: 60_000,
     });
 
-    const leadCallStats = leadCallStatsQuery.data || [];
-    console.log(leadCallStats)
     const selectedAttendanceRecords = attendanceRecordsQuery.data || [];
     const allAttendanceGroups = useMemo(
         () =>
-            departmentFilteredAttendanceEmployeeOptions.map((employee, index) => ({
+            departmentFilteredAttendanceEmployeeOptions.map((employee) => ({
                 employee,
-                attendance: allAttendanceQueries[index]?.data || [],
+                attendance: (allAttendanceQuery.data || []).filter((record) => String(record.employee) === employee._id),
             })),
-        [allAttendanceQueries, departmentFilteredAttendanceEmployeeOptions]
+        [allAttendanceQuery.data, departmentFilteredAttendanceEmployeeOptions]
     );
-    const isAllAttendanceLoading = !effectiveAttendanceEmployeeId && allAttendanceQueries.some((query) => query.isLoading);
-
-    const filteredLeadCallStats = useMemo(() => {
-        return filterLeadCallStatsByDateTimeRange(
-            leadCallStats,
-            callFilterDateFrom,
-            callFilterTimeFrom,
-            callFilterDateTo,
-            callFilterTimeTo
-        );
-    }, [
-        leadCallStats,
-        callFilterDateFrom,
-        callFilterTimeFrom,
-        callFilterDateTo,
-        callFilterTimeTo,
-    ]);
+    const isAllAttendanceLoading = !effectiveAttendanceEmployeeId && allAttendanceQuery.isLoading;
+    const openEmployeeAttendance = (employeeId: string) => {
+        navigate(`/admin/employees/${encodeURIComponent(employeeId)}?tab=attendance`);
+    };
 
     const employeeCallRows = useMemo(() => {
-        return buildEmployeeCallRows(filteredLeadCallStats);
-    }, [filteredLeadCallStats]);
+        return (leadCallStatsQuery.data || []).map((row) => ({
+            ...row,
+            leads: row.leads.map((lead) => ({ ...lead, callLogs: [] })),
+        }));
+    }, [leadCallStatsQuery.data]);
+
+    const totalCallLeadCount = useMemo(
+        () => new Set(employeeCallRows.flatMap((row) => row.leads.map((lead) => lead.leadId))).size,
+        [employeeCallRows]
+    );
 
     const totalLoggedLeadCalls = useMemo(() => {
         return employeeCallRows.reduce((total, item) => total + item.totalCalls, 0);
@@ -7689,6 +7798,13 @@ export default function AdminDashboard() {
     const totalNotConnectedCalls = useMemo(() => {
         return employeeCallRows.reduce(
             (total, item) => total + item.totalNotConnectedCalls,
+            0
+        );
+    }, [employeeCallRows]);
+
+    const totalVoicemails = useMemo(() => {
+        return employeeCallRows.reduce(
+            (total, item) => total + item.totalVoicemails,
             0
         );
     }, [employeeCallRows]);
@@ -7755,6 +7871,8 @@ export default function AdminDashboard() {
                     <KpiCard label="Due Follow-ups" value={formatNumber(summary?.dueFollowUps)} helper={`${formatNumber(summary?.touchedLeadsToday)} leads touched today`} icon={FiClock} accent="orange" />
                     <KpiCard label="Productivity Today" value={formatNumber(summary?.activityToday)} helper={`${formatNumber(summary?.commentsToday)} employee comments logged`} icon={FiTrendingUp} accent="purple" />
                 </div>
+
+                <CallDashboardPanel />
 
                 {isError && (
                     <section className="rounded-lg border border-red-200 bg-red-50 p-4 text-red-700">
@@ -8059,6 +8177,10 @@ export default function AdminDashboard() {
                                 <p className="mt-1 text-xs font-semibold text-rose-600">
                                     {formatNumber(totalNotConnectedCalls)} not connected
                                 </p>
+
+                                <p className="mt-1 text-xs font-semibold text-blue-600">
+                                    {formatNumber(totalVoicemails)} voicemails
+                                </p>
                             </div>
 
                             <div className="flex flex-wrap items-center gap-3">
@@ -8145,8 +8267,8 @@ export default function AdminDashboard() {
                                 </button>
 
                                 <span className="mt-5 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm font-semibold text-emerald-700">
-                                    {formatNumber(filteredLeadCallStats.length)} lead
-                                    {filteredLeadCallStats.length === 1 ? "" : "s"}
+                                    {formatNumber(totalCallLeadCount)} lead
+                                    {totalCallLeadCount === 1 ? "" : "s"}
                                 </span>
 
                                 <Link
@@ -8170,25 +8292,27 @@ export default function AdminDashboard() {
                                 <div className="mt-4">
                                     <EmptyPanel
                                         title="No logged calls yet"
-                                        message="Once an employee clicks Log Call, the lead call data will appear here."
+                                        message="Once an employee logs a call outcome, the lead call data will appear here."
                                     />
                                 </div>
                             ) : (
                                 <div className="mt-4 overflow-x-auto rounded-lg border border-slate-300 bg-white">
-                                    <table className="w-full min-w-[46rem] table-fixed border-separate border-spacing-0">
+                                    <table className="w-full min-w-[54rem] table-fixed border-separate border-spacing-0">
                                         <colgroup>
-                                            <col className="w-[26%]" />
-                                            <col className="w-[13%]" />
-                                            <col className="w-[17%]" />
-                                            <col className="w-[13%]" />
-                                            <col className="w-[17%]" />
+                                            <col className="w-[25%]" />
+                                            <col className="w-[12%]" />
+                                            <col className="w-[15%]" />
+                                            <col className="w-[14%]" />
+                                            <col className="w-[12%]" />
+                                            <col className="w-[22%]" />
                                         </colgroup>
 
                                         <thead className="bg-white text-[0.68rem] uppercase tracking-[0.12em] text-slate-500">
                                             <tr>
                                                 <th className="px-3 py-3 text-left font-semibold">Employee</th>
-                                                <th className="px-3 py-3 text-center font-semibold">Calls</th>
+                                                <th className="px-3 py-3 text-center font-semibold">Connected</th>
                                                 <th className="px-3 py-3 text-center font-semibold">Not Connected</th>
+                                                <th className="px-3 py-3 text-center font-semibold">Voicemails</th>
                                                 <th className="px-3 py-3 text-center font-semibold">Leads</th>
                                                 <th className="px-3 py-3 text-left font-semibold">Last Call</th>
                                             </tr>
@@ -8228,6 +8352,16 @@ export default function AdminDashboard() {
                                                             onClick={() => setSelectedCallEmployeeRow(row)}
                                                         >
                                                             {formatNumber(row.totalNotConnectedCalls)}
+                                                        </button>
+                                                    </td>
+
+                                                    <td className="px-3 py-3 text-center font-semibold text-blue-600">
+                                                        <button
+                                                            type="button"
+                                                            className="inline-flex h-8 items-center justify-center rounded-md border border-blue-200 bg-blue-50 px-3 text-xs font-semibold text-blue-700 transition hover:border-blue-400 hover:bg-blue-100 focus:outline-none focus:ring-2 focus:ring-blue-300"
+                                                            onClick={() => setSelectedCallEmployeeRow(row)}
+                                                        >
+                                                            {formatNumber(row.totalVoicemails)}
                                                         </button>
                                                     </td>
                                                     <td className="px-3 py-3 text-center font-semibold text-slate-950">
@@ -8425,9 +8559,15 @@ export default function AdminDashboard() {
                                                     <p className="mt-1 text-xs text-slate-500">{formatNumber(agent.assignedLeads)} active leads</p>
                                                 </div>
                                             </div>
-                                            <span className={`shrink-0 rounded-md border px-2 py-1 text-xs font-semibold ${availabilityClass(agent.availabilityStatus)}`}>
+                                            <button
+                                                type="button"
+                                                className={`shrink-0 rounded-md border px-2 py-1 text-xs font-semibold transition hover:brightness-95 focus:outline-none focus:ring-2 focus:ring-[#842cff]/30 ${availabilityClass(agent.availabilityStatus)}`}
+                                                onClick={() => openEmployeeAttendance(agent.employeeId)}
+                                                aria-label={`View ${agent.employeeName}'s attendance`}
+                                                title="View employee attendance"
+                                            >
                                                 {normalizeEmployeeAvailabilityStatus(agent.availabilityStatus)}
-                                            </span>
+                                            </button>
                                         </div>
                                     </div>
                                 ))}

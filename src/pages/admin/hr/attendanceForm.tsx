@@ -17,6 +17,7 @@ import {
     groupAttendanceRecordsBySlot,
     isWeekendAttendanceSlotKey,
 } from "../../../lib/attendanceSlots";
+import { buildOffPhoneAttendanceSessions } from "../../../lib/attendanceRecords";
 import { formatTimeInTimeZone } from "../../../lib/dateTime";
 
 const emptyAttendanceShiftForm: AttendanceShiftForm = {
@@ -88,6 +89,8 @@ type AttendanceHistoryRow = {
     firstBreakInOut: string;
     lunchInOut: string;
     secondBreakInOut: string;
+    offPhoneInOut: string;
+    offPhoneDuration: string;
     duration: string;
     overtime: string;
     primaryRecord?: AttendanceRecord;
@@ -318,10 +321,14 @@ export default function AdminAttendanceForm() {
                                             <AttendancePair label="Break 1" value={row.firstBreakInOut} />
                                             <AttendancePair label="Lunch" value={row.lunchInOut} />
                                             <AttendancePair label="Break 2" value={row.secondBreakInOut} />
+                                            <AttendancePair label="Off the Phone" value={row.offPhoneInOut} />
                                         </div>
                                         <div className="mt-3 flex flex-wrap gap-2">
                                             <span className="rounded-md bg-slate-100 px-2.5 py-1 text-xs font-semibold !text-slate-700">Duration {row.duration}</span>
                                             <span className="rounded-md bg-violet-50 px-2.5 py-1 text-xs font-semibold !text-violet-700">OT {row.overtime}</span>
+                                            {row.offPhoneDuration !== "-" && (
+                                                <span className="rounded-md bg-sky-50 px-2.5 py-1 text-xs font-semibold !text-sky-700">Off Phone {row.offPhoneDuration}</span>
+                                            )}
                                         </div>
                                     </article>
                                 ))}
@@ -650,6 +657,17 @@ function buildAttendanceHistoryRows(records: AttendanceRecord[], settings?: Syst
             const lunchOut = lunchOutRecord?.timeIn || "";
             const lunchIn = lunchInRecord?.timeIn || "";
             const breakPairs = buildBreakPairs(sortedRecords);
+            const offPhoneSessions = buildOffPhoneAttendanceSessions(sortedRecords);
+            const offPhoneDuration = offPhoneSessions.reduce((total, session) => total + session.durationMs, 0);
+            const offPhoneInOut = offPhoneSessions.length
+                ? offPhoneSessions
+                    .map((session) => {
+                        const startedAt = formatTimeInTimeZone(session.startedAt, timeZone) || "00:00:00";
+                        const endedAt = session.endedAt ? formatTimeInTimeZone(session.endedAt, timeZone) || "00:00:00" : "Open";
+                        return `${startedAt} - ${endedAt}`;
+                    })
+                    .join("; ")
+                : "-";
             const lunchOutTime = lunchOut ? new Date(lunchOut).getTime() : 0;
             const lunchInTime = lunchIn ? new Date(lunchIn).getTime() : lunchOutTime;
             const firstBreak = breakPairs.find((pair) => !lunchOutTime || new Date(pair.breakOut).getTime() < lunchOutTime) || breakPairs[0];
@@ -675,6 +693,8 @@ function buildAttendanceHistoryRows(records: AttendanceRecord[], settings?: Syst
                 firstBreakInOut: formatTimePair(firstBreak?.breakOut, firstBreak?.breakIn, timeZone),
                 lunchInOut: formatTimePair(lunchOut, lunchIn, timeZone),
                 secondBreakInOut: formatTimePair(secondBreak?.breakOut, secondBreak?.breakIn, timeZone),
+                offPhoneInOut,
+                offPhoneDuration: formatDuration(offPhoneDuration),
                 duration: formatDuration(workedDuration),
                 overtime: formatDuration(overtimeDuration),
                 primaryRecord,

@@ -135,7 +135,9 @@ export default function AdminLayout({ children }: Props) {
             .find((item) => pathname === item.path || pathname.startsWith(`${item.path}/`))?.label || "Admin";
     const notificationCount = notices.length + pendingLeaveRequests.length + unreadMessageCount;
     const businessNamesById = new Map(businesses.map((business) => [business.id, business.name]));
-    const accessibleBusinesses = authUser?.allowedBusinesses?.length
+    const accessibleBusinesses = authUser?.userType === "admin"
+        ? businesses
+        : authUser?.allowedBusinesses?.length
         ? authUser.allowedBusinesses.map((business) => ({
             ...business,
             name: businessNamesById.get(business.id) || business.name,

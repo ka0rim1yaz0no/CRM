@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "Assistly CRM Activity Tracker",
+  "description": "Transparent employee browser activity tracker for Assistly CRM with tab, URL, screenshot, and URL category logging.",
+  "version": "1.0.0",
+  "action": {
+    "default_popup": "src/popup.html",
+    "default_title": "CRM Activity Tracker"
+  },
+  "background": {
+    "service_worker": "src/service_worker.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["src/content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "permissions": [
+    "activeTab",
+    "alarms",
+    "idle",
+    "scripting",
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": ["<all_urls>"]
+}

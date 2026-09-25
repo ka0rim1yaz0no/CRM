@@ -151,7 +151,7 @@ function RoutedApp() {
 
 function App() {
   return (
-    <BrowserRouter unstable_useTransitions={false}>
+    <BrowserRouter>
       <RoutedApp />
     </BrowserRouter>
   )

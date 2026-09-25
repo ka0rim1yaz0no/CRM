@@ -11,10 +11,15 @@ export type AttendanceSlotSettings = {
 export type AttendanceSlotRecord = {
     source: string;
     timeIn: Date | string;
+    attendanceStatus?: string | null;
 };
 
 export function isAttendanceTimeInSource(source?: string) {
     return source === "Login" || source === "Time In";
+}
+
+export function isAttendanceTimeOutSource(source?: string) {
+    return source === "Logout" || source === "Time Out";
 }
 
 export function attendanceSlotTimeZone(settings?: AttendanceSlotSettings | null) {
@@ -33,6 +38,27 @@ export function minutesFromAttendanceTime(value = "00:00") {
     const [hours, minutes] = value.split(":").map((part) => Number(part));
     if (!Number.isFinite(hours) || !Number.isFinite(minutes)) return 0;
     return hours * 60 + minutes;
+}
+
+export function isAttendanceTimeOutUndertime(
+    record?: AttendanceSlotRecord | null,
+    settings?: AttendanceSlotSettings | null
+) {
+    if (!record || !isAttendanceTimeOutSource(record.source)) return false;
+    if (String(record.attendanceStatus || "").trim().toLowerCase() === "undertime") return true;
+
+    const parts = zonedDateParts(record.timeIn, attendanceSlotTimeZone(settings));
+    if (!parts) return false;
+
+    const shiftStartMinutes = minutesFromAttendanceTime(attendanceSlotShiftStart(settings));
+    const shiftEndMinutes = minutesFromAttendanceTime(attendanceSlotShiftEnd(settings));
+    const isOvernightShift = shiftEndMinutes <= shiftStartMinutes;
+
+    if (isOvernightShift) {
+        return parts.minutes >= shiftStartMinutes || parts.minutes < shiftEndMinutes;
+    }
+
+    return parts.minutes < shiftEndMinutes;
 }
 
 function zonedDateParts(value?: Date | string | null, timeZone = ATTENDANCE_TIME_ZONE) {

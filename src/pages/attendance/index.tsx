@@ -461,7 +461,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FiClock, FiCoffee, FiLogIn, FiLogOut, FiPhoneOff, FiPower, FiRefreshCw } from "react-icons/fi";
 import { breakInEmployee, breakOutEmployee, getEmployeeAttendance, lunchBreakInEmployee, lunchBreakOutEmployee, reportEmployeeActivity, timeInEmployee, timeOutEmployee, type AttendanceRecord } from "../../api/attendance";
 import { getAuthUser } from "../../api/authStorage";
-import { getEmployee, normalizeEmployeeAvailabilityStatus, type Employee, type EmployeeAvailabilityStatus } from "../../api/employees";
+import { getEmployeeSummary, normalizeEmployeeAvailabilityStatus, type Employee, type EmployeeAvailabilityStatus } from "../../api/employees";
 import { getSystemSettings } from "../../api/systemSettings";
 import {
     ATTENDANCE_TIME_ZONE,
@@ -470,7 +470,9 @@ import {
     formatAttendanceSlotLabel,
     groupAttendanceRecordsBySlot,
     isAttendanceTimeInSource,
+    isAttendanceTimeOutUndertime,
 } from "../../lib/attendanceSlots";
+import { buildOffPhoneAttendanceSessions, formatAttendanceDuration } from "../../lib/attendanceRecords";
 import { formatDateInTimeZone, formatTimeInTimeZone } from "../../lib/dateTime";
 import MainLayout from "../layout";
 
@@ -579,7 +581,7 @@ export default function AttendancePage() {
     });
     const { data: employeeProfile } = useQuery({
         queryKey: ["employee", employeeId],
-        queryFn: () => getEmployee(employeeId),
+        queryFn: () => getEmployeeSummary(employeeId),
         enabled: Boolean(employeeId),
     });
 
@@ -593,22 +595,32 @@ export default function AttendancePage() {
     const latestSlotKey = latestTimeInRecord ? formatAttendanceSlotKey(latestTimeInRecord.timeIn, attendanceSettings) : "";
     const nowSlotKey = formatAttendanceSlotKey(new Date(), attendanceSettings);
     const latestSlotRecords = latestSlotKey ? [...(recordsBySlot[latestSlotKey] || [])].sort((left, right) => new Date(right.timeIn).getTime() - new Date(left.timeIn).getTime()) : [];
-    const latestSlotHasTimeOut = latestSlotRecords.some((record) => record.source === "Logout" || record.source === "Time Out");
-    const actionSlotKey = latestSlotKey && !latestSlotHasTimeOut ? latestSlotKey : nowSlotKey;
+    const latestSlotTimeIn = latestSlotRecords.find((record) => isAttendanceTimeInSource(record.source));
+    const latestSlotTimeOut = latestSlotRecords.find((record) => record.source === "Logout" || record.source === "Time Out");
+    const latestSlotHasOpenAttendance = Boolean(
+        latestSlotTimeIn && (!latestSlotTimeOut || getRecordTime(latestSlotTimeIn) > getRecordTime(latestSlotTimeOut))
+    );
+    const actionSlotKey = latestSlotKey && latestSlotHasOpenAttendance ? latestSlotKey : nowSlotKey;
     const displaySlotKey = latestSlotKey || nowSlotKey;
     const actionSlotRecords = [...(recordsBySlot[actionSlotKey] || [])].sort((left, right) => new Date(right.timeIn).getTime() - new Date(left.timeIn).getTime());
     const slotRecords = [...(recordsBySlot[displaySlotKey] || [])].sort((left, right) => new Date(right.timeIn).getTime() - new Date(left.timeIn).getTime());
     const slotLabel = formatAttendanceSlotLabel(displaySlotKey);
     const latestRecord = slotRecords[0] || attendance[0];
-    const latestActionSource = actionSlotRecords[0]?.source;
-    const hasTimeIn = actionSlotRecords.some((record) => isAttendanceTimeInSource(record.source));
-    const hasTimeOut = actionSlotRecords.some((record) => record.source === "Logout" || record.source === "Time Out");
-    const hasOpenAttendanceSlot = hasTimeIn && !hasTimeOut;
-    const hasLunchOut = actionSlotRecords.some((record) => record.source === "Lunch Break Out");
-    const hasLunchIn = actionSlotRecords.some((record) => record.source === "Lunch Break In");
-    const breakOutCount = actionSlotRecords.filter((record) => record.source === "Break Out").length;
-    const breakInCount = actionSlotRecords.filter((record) => record.source === "Break In").length;
-    const latestBreakOutRecord = actionSlotRecords.find((record) => record.source === "Break Out");
+    const actionTimeIn = actionSlotRecords.find((record) => isAttendanceTimeInSource(record.source));
+    const actionTimeOut = actionSlotRecords.find((record) => record.source === "Logout" || record.source === "Time Out");
+    const hasOpenAttendanceSlot = Boolean(
+        actionTimeIn && (!actionTimeOut || getRecordTime(actionTimeIn) > getRecordTime(actionTimeOut))
+    );
+    const activeCycleStartedAt = hasOpenAttendanceSlot ? getRecordTime(actionTimeIn) : 0;
+    const activeCycleRecords = activeCycleStartedAt
+        ? actionSlotRecords.filter((record) => getRecordTime(record) >= activeCycleStartedAt)
+        : [];
+    const latestActionSource = activeCycleRecords[0]?.source;
+    const hasLunchOut = activeCycleRecords.some((record) => record.source === "Lunch Break Out");
+    const hasLunchIn = activeCycleRecords.some((record) => record.source === "Lunch Break In");
+    const breakOutCount = activeCycleRecords.filter((record) => record.source === "Break Out").length;
+    const breakInCount = activeCycleRecords.filter((record) => record.source === "Break In").length;
+    const latestBreakOutRecord = activeCycleRecords.find((record) => record.source === "Break Out");
     const latestBreakOutTime = latestBreakOutRecord ? new Date(latestBreakOutRecord.timeIn).getTime() : 0;
     const hasBreakGapElapsed = !latestBreakOutTime || Date.now() - latestBreakOutTime >= 30 * 60 * 1000;
     const latestActionStatus: EmployeeAvailabilityStatus =
@@ -616,9 +628,11 @@ export default function AttendancePage() {
             ? "BREAK"
             : latestActionSource === "Lunch Break Out"
                 ? "LUNCH"
-                : latestActionSource === "Logout" || latestActionSource === "Time Out"
-                    ? "OFFLINE"
-                    : "ONLINE";
+                : latestActionSource === "Off the Phone Out"
+                    ? "OFF THE PHONE"
+                    : latestActionSource === "Logout" || latestActionSource === "Time Out"
+                        ? "OFFLINE"
+                        : "ONLINE";
     const currentStatus: EmployeeAvailabilityStatus = hasOpenAttendanceSlot
         ? employeeAvailabilityStatus === "OFF THE PHONE"
             ? "OFF THE PHONE"
@@ -626,8 +640,8 @@ export default function AttendancePage() {
         : "OFFLINE";
     const isOnBreak = currentStatus === "BREAK" || latestActionSource === "Break Out";
     const isOnLunchBreak = currentStatus === "LUNCH" || latestActionSource === "Lunch Break Out";
-    const activeBreakOutRecord = isOnBreak ? actionSlotRecords.find((record) => record.source === "Break Out") : null;
-    const activeLunchOutRecord = isOnLunchBreak ? actionSlotRecords.find((record) => record.source === "Lunch Break Out") : null;
+    const activeBreakOutRecord = isOnBreak ? activeCycleRecords.find((record) => record.source === "Break Out") : null;
+    const activeLunchOutRecord = isOnLunchBreak ? activeCycleRecords.find((record) => record.source === "Lunch Break Out") : null;
     const activeBreakRecord = activeBreakOutRecord || activeLunchOutRecord;
     const activeBreakLimitMs = getBreakLimitMs(activeBreakRecord?.source);
     const activeBreakLabel = activeBreakOutRecord ? "Break timer · 15 minutes" : activeLunchOutRecord ? "Lunch timer · 1 hour" : "";
@@ -635,8 +649,10 @@ export default function AttendancePage() {
     const activeBreakElapsedMs = activeBreakStartedAt ? nowMs - activeBreakStartedAt : 0;
     const activeBreakRemainingMs = activeBreakLimitMs ? activeBreakLimitMs - activeBreakElapsedMs : 0;
     const isActiveBreakOvertime = activeBreakLimitMs > 0 && activeBreakElapsedMs > activeBreakLimitMs;
+    const offPhoneSessions = buildOffPhoneAttendanceSessions(slotRecords, nowMs);
+    const activeOffPhoneSession = offPhoneSessions.find((session) => session.isOpen) || null;
     const activeOffPhoneStartedAt = currentStatus === "OFF THE PHONE"
-        ? manualOffPhoneStartedAt || getEmployeeStatusTime(currentEmployee) || getRecordTime(latestRecord)
+        ? getRecordTime(activeOffPhoneSession?.startRecord) || manualOffPhoneStartedAt || getEmployeeStatusTime(currentEmployee) || getRecordTime(latestRecord)
         : 0;
     const activeOffPhoneElapsedMs = activeOffPhoneStartedAt ? nowMs - activeOffPhoneStartedAt : 0;
     const slotRecordsChronological = [...slotRecords].sort((left, right) => getRecordTime(left) - getRecordTime(right));
@@ -662,11 +678,11 @@ export default function AttendancePage() {
 
         return matchingOutRecord ? recordTime - getRecordTime(matchingOutRecord) : null;
     };
-    const canTimeIn = !hasTimeIn;
-    const canTimeOut = hasTimeIn && !hasTimeOut && currentStatus !== "BREAK" && currentStatus !== "LUNCH";
-    const canBreakOut = hasTimeIn && !hasTimeOut && currentStatus === "ONLINE" && breakOutCount === breakInCount && breakOutCount < 2 && hasBreakGapElapsed;
+    const canTimeIn = !hasOpenAttendanceSlot;
+    const canTimeOut = hasOpenAttendanceSlot && currentStatus !== "BREAK" && currentStatus !== "LUNCH";
+    const canBreakOut = hasOpenAttendanceSlot && currentStatus === "ONLINE" && breakOutCount === breakInCount && breakOutCount < 2 && hasBreakGapElapsed;
     const canBreakIn = isOnBreak && breakInCount < breakOutCount;
-    const canLunchBreakOut = hasTimeIn && !hasTimeOut && !hasLunchOut && currentStatus === "ONLINE";
+    const canLunchBreakOut = hasOpenAttendanceSlot && !hasLunchOut && currentStatus === "ONLINE";
     const canLunchBreakIn = isOnLunchBreak && !hasLunchIn;
     const canSetOnline = currentStatus === "OFFLINE"
         ? canTimeIn
@@ -674,11 +690,11 @@ export default function AttendancePage() {
             ? canLunchBreakIn
             : currentStatus === "BREAK"
                 ? canBreakIn
-                : currentStatus === "OFF THE PHONE" && hasTimeIn && !hasTimeOut;
+                : currentStatus === "OFF THE PHONE" && hasOpenAttendanceSlot;
     const canSetOffline = currentStatus !== "OFFLINE" && canTimeOut;
     const canSetLunch = canLunchBreakOut;
     const canSetBreak = canBreakOut;
-    const canSetOffPhone = currentStatus === "ONLINE" && hasTimeIn && !hasTimeOut;
+    const canSetOffPhone = currentStatus === "ONLINE" && hasOpenAttendanceSlot;
     const updateEmployeeStatusCache = (availabilityStatus: EmployeeAvailabilityStatus) => {
         queryClient.setQueryData<Employee | undefined>(["employee", employeeId], (current) =>
             current ? { ...current, availabilityStatus } : employee ? { ...employee, availabilityStatus } : current
@@ -703,6 +719,7 @@ export default function AttendancePage() {
         mutationFn: () => timeOutEmployee(employeeId),
         onSuccess: (record) => {
             updateAttendanceCache(record, "OFFLINE");
+            queryClient.invalidateQueries({ queryKey: attendanceQueryKey(employeeId) });
             setShowOfflineConfirm(false);
             setMessage("Status changed to OFFLINE.");
         },
@@ -756,6 +773,13 @@ export default function AttendancePage() {
         onSuccess: (result, status) => {
             const availabilityStatus = normalizeEmployeeAvailabilityStatus(result.availabilityStatus);
             updateEmployeeStatusCache(availabilityStatus);
+            if (result.attendanceRecords?.length) {
+                queryClient.setQueryData<AttendanceRecord[]>(attendanceQueryKey(employeeId), (current = []) => [
+                    ...result.attendanceRecords!,
+                    ...current,
+                ]);
+            }
+            queryClient.invalidateQueries({ queryKey: attendanceQueryKey(employeeId) });
             setManualOffPhoneStartedAt(status === "OFF THE PHONE" ? Date.now() : null);
             setMessage(`Status changed to ${statusLabels[availabilityStatus]}.`);
         },
@@ -772,10 +796,11 @@ export default function AttendancePage() {
         activityStatusMutation.isPending;
 
     const sourceLabel = (source?: AttendanceRecord["source"]) => {
-        if (source === "Login" || source === "Time In" || source === "Break In" || source === "Lunch Break In") return statusLabels.ONLINE;
+        if (source === "Login" || source === "Time In" || source === "Break In" || source === "Lunch Break In" || source === "Off the Phone In") return statusLabels.ONLINE;
         if (source === "Logout" || source === "Time Out") return statusLabels.OFFLINE;
         if (source === "Break Out") return statusLabels.BREAK;
         if (source === "Lunch Break Out") return statusLabels.LUNCH;
+        if (source === "Off the Phone Out") return statusLabels["OFF THE PHONE"];
         return "No attendance yet";
     };
 
@@ -964,6 +989,11 @@ export default function AttendancePage() {
                                 const breakLimitMs = getBreakLimitMs(record.source);
                                 const breakRemainingMs = typeof breakDurationMs === "number" ? breakLimitMs - breakDurationMs : 0;
                                 const isBreakOvertime = breakLimitMs > 0 && typeof breakDurationMs === "number" && breakDurationMs > breakLimitMs;
+                                const offPhoneSession = offPhoneSessions.find((session) =>
+                                    session.endRecord?._id === record._id || (session.isOpen && session.startRecord._id === record._id)
+                                );
+                                const isUnderTime = isAttendanceTimeOutUndertime(record, attendanceSettings);
+                                const displayedAttendanceStatus = record.attendanceStatus || (isUnderTime ? "Undertime" : "");
 
                                 return (
                                     <article key={record._id} className="flex items-center justify-between gap-4 rounded-lg border border-[#9bbde8] bg-white/75 p-4 shadow-sm">
@@ -971,14 +1001,22 @@ export default function AttendancePage() {
                                             <span
                                                 className={[
                                                     "flex size-9 items-center justify-center rounded-lg text-white",
-                                                    record.source === "Login" || record.source === "Time In" || record.source === "Break In" || record.source === "Lunch Break In"
+                                                    record.source === "Off the Phone Out"
+                                                        ? "bg-sky-600"
+                                                        : record.source === "Login" || record.source === "Time In" || record.source === "Break In" || record.source === "Lunch Break In" || record.source === "Off the Phone In"
                                                         ? "bg-[#10ac84]"
                                                         : record.source === "Break Out" || record.source === "Lunch Break Out"
                                                             ? "bg-[#f59e0b]"
                                                             : "bg-[#ee5253]",
                                                 ].join(" ")}
                                             >
-                                                {record.source === "Break Out" || record.source === "Lunch Break Out" ? <FiCoffee /> : record.source === "Logout" || record.source === "Time Out" ? <FiLogOut /> : <FiLogIn />}
+                                                {record.source === "Off the Phone Out"
+                                                    ? <FiPhoneOff />
+                                                    : record.source === "Break Out" || record.source === "Lunch Break Out"
+                                                        ? <FiCoffee />
+                                                        : record.source === "Logout" || record.source === "Time Out"
+                                                            ? <FiLogOut />
+                                                            : <FiLogIn />}
                                             </span>
                                             <div>
                                                 <p className="text-sm font-semibold text-slate-950">{sourceLabel(record.source)}</p>
@@ -1000,9 +1038,15 @@ export default function AttendancePage() {
                                                         : `Duration ${formatBreakTimer(breakDurationMs)}`}
                                                 </span>
                                             )}
-                                            {record.attendanceStatus && (
-                                                <span className={["rounded-full px-3 py-1 text-xs font-semibold", record.attendanceStatus === "Late" ? "bg-red-100 text-red-700" : "bg-emerald-100 text-emerald-700"].join(" ")}>
-                                                    {record.attendanceStatus}
+                                            {offPhoneSession && (
+                                                <span className="rounded-full bg-sky-100 px-3 py-1 font-mono text-xs font-semibold text-sky-700">
+                                                    {offPhoneSession.isOpen ? "Running " : "Duration "}
+                                                    {formatAttendanceDuration(offPhoneSession.durationMs)}
+                                                </span>
+                                            )}
+                                            {displayedAttendanceStatus && (
+                                                <span className={["rounded-full px-3 py-1 text-xs font-semibold", displayedAttendanceStatus === "Late" ? "bg-red-100 text-red-700" : displayedAttendanceStatus === "Undertime" ? "bg-amber-100 text-amber-700" : "bg-emerald-100 text-emerald-700"].join(" ")}>
+                                                    {displayedAttendanceStatus}
                                                 </span>
                                             )}
                                             <span className="rounded-full bg-[#f4efff] px-3 py-1 text-xs font-semibold text-slate-700">{slotLabel || formatDateInTimeZone(record.timeIn, attendanceTimeZone)}</span>

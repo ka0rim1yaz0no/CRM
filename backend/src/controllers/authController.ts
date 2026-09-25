@@ -3,6 +3,7 @@ import { Employee, normalizeEmployeeAvailabilityStatus } from "../models/Employe
 import { getBusinessAccessForEmployeeCode, normalizeBusinessAccessIds } from "../models/BusinessUserAccess";
 import { getBusinessById, getCurrentBusinessId, getPublicBusinesses, type PublicBusinessConfig, runWithBusiness } from "../config/tenancy";
 import { syncEmployeeAvailabilityAcrossBusinesses } from "../services/employeeAvailabilityService";
+import { findConfiguredAdmin } from "../config/adminUsers";
 
 function responseBusiness(request: Request, publicBusinesses: PublicBusinessConfig[]) {
   if (!request.business) {
@@ -35,25 +36,22 @@ export async function loginWithEmployeeCode(request: Request, response: Response
     return;
   }
 
-  if (employeeCode === "00000003") {
+  const configuredAdmin = findConfiguredAdmin(employeeCode);
+
+  if (configuredAdmin) {
     const publicBusinesses = await getPublicBusinesses();
 
     response.json({
-      user: { id: "admin", name: "Administrator One", role: "Admin", employeeCode },
+      user: { id: "admin", name: configuredAdmin.name, role: "Admin", employeeCode },
       userType: "admin",
       business: responseBusiness(request, publicBusinesses),
       allowedBusinesses: publicBusinesses,
     });
     return;
-  } else if (employeeCode === "00000001") {
-    const publicBusinesses = await getPublicBusinesses();
+  }
 
-    response.json({
-      user: { id: "admin", name: "Administrator Two", role: "Admin", employeeCode },
-      userType: "admin",
-      business: responseBusiness(request, publicBusinesses),
-      allowedBusinesses: publicBusinesses,
-    });
+  if (["00000003", "00000001"].includes(employeeCode)) {
+    response.status(401).json({ message: "Invalid employee code" });
     return;
   }
 
@@ -99,7 +97,9 @@ export async function switchEmployeeBusiness(request: Request, response: Respons
   }
 
   const currentEmployee = await runWithBusiness(currentBusiness.id, () =>
-    Employee.findOne({ employeeCode, status: { $ne: "Archived" } }).select("employeeCode businessAccessIds availabilityStatus")
+    Employee.findOne({ employeeCode, status: { $ne: "Archived" } }).select(
+      "employeeCode businessAccessIds availabilityStatus availabilityStatusReason"
+    )
   );
 
   if (!currentEmployee) {
@@ -128,7 +128,11 @@ export async function switchEmployeeBusiness(request: Request, response: Respons
   }
 
   const currentAvailabilityStatus = normalizeEmployeeAvailabilityStatus(currentEmployee.availabilityStatus);
-  await syncEmployeeAvailabilityAcrossBusinesses(currentEmployee.employeeCode, currentAvailabilityStatus);
+  await syncEmployeeAvailabilityAcrossBusinesses(
+    currentEmployee.employeeCode,
+    currentAvailabilityStatus,
+    currentEmployee.availabilityStatusReason
+  );
   targetEmployee.availabilityStatus = currentAvailabilityStatus;
 
   response.json({

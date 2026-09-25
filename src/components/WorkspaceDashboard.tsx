@@ -18,13 +18,14 @@ import {
     FiTarget,
     FiX,
 } from "react-icons/fi";
-import { getEmployee, normalizeEmployeeAvailabilityStatus, type Employee } from "../api/employees";
+import { getEmployeeSummary, normalizeEmployeeAvailabilityStatus, type Employee } from "../api/employees";
 import { getEmployeeAttendance, type AttendanceRecord } from "../api/attendance";
 import { getEmployeeNotices } from "../api/notices";
-import { getAgentLeadDashboard, getEmployeeLeadLogs, getMyLeadCallStats, getMyLeadCounts, getMyLeads, type AgentLeadMonthlyRow, type AgentLeadProgress, type EmployeeLeadLog, type LeadCallStat, type LeadCountResult, type LeadStatus } from "../api/leads";
+import { getAgentLeadDashboard, getEmployeeLeadLogs, getMyLeadCallSummary, getMyLeadCounts, getMyLeads, type AgentLeadMonthlyRow, type AgentLeadProgress, type EmployeeLeadLog, type LeadCallStat, type LeadCountResult, type LeadStatus } from "../api/leads";
 import { getTasks, type CrmTask, type TaskStatus } from "../api/tasks";
 import { getKnowledgeBaseEntries, type KnowledgeBaseEntry } from "../api/knowledgeBase";
 import { formatPhDate, formatPhDateTime, formatPhTime } from "../lib/dateTime";
+import { isAttendanceTimeOutUndertime } from "../lib/attendanceSlots";
 import { getPlainTextFromRichText } from "../lib/richText";
 import { getAuthUser } from "../api/authStorage";
 
@@ -835,7 +836,11 @@ function formatAttendanceDuration(milliseconds: number) {
 }
 
 function getAttendanceStatusText(record: AttendanceRecord) {
-    return String(record.attendanceStatus || "").trim().toLowerCase();
+    return String(record.attendanceStatus || (isAttendanceTimeOutUndertime(record) ? "Undertime" : "")).trim().toLowerCase();
+}
+
+function getAttendanceStatusLabel(record: AttendanceRecord) {
+    return record.attendanceStatus || (isAttendanceTimeOutUndertime(record) ? "Undertime" : "No status");
 }
 
 function getBreakReturnSource(source?: AttendanceRecord["source"]) {
@@ -1445,7 +1450,7 @@ function AttendanceShiftDetailsModal({ row, onClose }: { row: AttendanceShiftRow
                                                 <td className="px-3 py-3 font-semibold text-slate-900">{formatDateOrDash(record.timeIn)}</td>
                                                 <td className="px-3 py-3">{formatPhTime(record.timeIn)}</td>
                                                 <td className="px-3 py-3 font-semibold text-slate-950">{record.source || "Attendance"}</td>
-                                                <td className="px-3 py-3">{record.attendanceStatus || "No status"}</td>
+                                                <td className="px-3 py-3">{getAttendanceStatusLabel(record)}</td>
                                                 <td className="px-3 py-3">
                                                     <div className="flex flex-wrap gap-1.5">
                                                         {isLate && <span className="rounded-full bg-violet-100 px-2 py-1 text-[0.65rem] font-bold uppercase tracking-[0.08em] text-violet-700">Late</span>}
@@ -1564,7 +1569,7 @@ function AttendanceRecordDetailsModal({
                         </div>
                         <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
                             <p className="text-[0.65rem] font-bold uppercase tracking-[0.12em] text-slate-500">Attendance Status</p>
-                            <p className="mt-1 text-sm font-semibold text-slate-950">{record.attendanceStatus || "No status"}</p>
+                            <p className="mt-1 text-sm font-semibold text-slate-950">{getAttendanceStatusLabel(record)}</p>
                         </div>
                     </div>
 
@@ -1775,8 +1780,8 @@ function EmployeeLeadCallsModal({
                         <p className="mt-1 text-sm text-slate-600">
                             Showing {formatNumber(row.leads.length)} lead record
                             {row.leads.length === 1 ? "" : "s"} and{" "}
-                            {formatNumber(row.totalCalls)} total call
-                            {row.totalCalls === 1 ? "" : "s"}.
+                            {formatNumber(row.totalAttempts)} total attempt
+                            {row.totalAttempts === 1 ? "" : "s"}.
                         </p>
                     </div>
 
@@ -1798,20 +1803,22 @@ function EmployeeLeadCallsModal({
                         />
                     ) : (
                         <div className="overflow-x-auto rounded-lg border border-slate-300 bg-white">
-                            <table className="w-full min-w-[52rem] table-fixed border-separate border-spacing-0">
+                            <table className="w-full min-w-[60rem] table-fixed border-separate border-spacing-0">
                                 <colgroup>
-                                    <col className="w-[30%]" />
-                                    <col className="w-[30%]" />
+                                    <col className="w-[24%]" />
+                                    <col className="w-[24%]" />
+                                    <col className="w-[11%]" />
+                                    <col className="w-[14%]" />
                                     <col className="w-[12%]" />
-                                    <col className="w-[14%]" />
-                                    <col className="w-[14%]" />
+                                    <col className="w-[15%]" />
                                 </colgroup>
                                 <thead className="bg-slate-50 text-[0.68rem] uppercase tracking-[0.12em] text-slate-500">
                                     <tr>
                                         <th className="px-3 py-3 text-left font-semibold">Lead</th>
                                         <th className="px-3 py-3 text-left font-semibold">Business</th>
-                                        <th className="px-3 py-3 text-center font-semibold">Calls</th>
+                                        <th className="px-3 py-3 text-center font-semibold">Connected</th>
                                         <th className="px-3 py-3 text-center font-semibold">Not Connected</th>
+                                        <th className="px-3 py-3 text-center font-semibold">Voicemails</th>
                                         <th className="px-3 py-3 text-left font-semibold">Last Call</th>
                                     </tr>
                                 </thead>
@@ -1854,6 +1861,10 @@ function EmployeeLeadCallsModal({
                                                 {formatNumber(lead.callNotConnectedCount)}
                                             </td>
 
+                                            <td className="px-3 py-3 text-center font-semibold text-blue-600">
+                                                {formatNumber(lead.callVoicemailCount)}
+                                            </td>
+
                                             <td className="px-3 py-3 text-sm text-slate-600">
                                                 {lead.lastCallAt ? formatPhDateTime(lead.lastCallAt) : "No date"}
                                             </td>
@@ -1885,6 +1896,7 @@ type EmployeeLeadCallRow = {
     businessName: string;
     callCount: number;
     callNotConnectedCount: number;
+    callVoicemailCount: number;
     totalAttempts: number;
     lastCallAt: string | null;
     callLogs: NonNullable<LeadCallStat["callLogs"]>;
@@ -1897,6 +1909,7 @@ type EmployeeCallSummaryRow = {
     employeeTeam: string;
     totalCalls: number;
     totalNotConnectedCalls: number;
+    totalVoicemails: number;
     totalAttempts: number;
     lastCallAt: string | null;
     leads: EmployeeLeadCallRow[];
@@ -1939,13 +1952,19 @@ function buildEmployeeCallRows(leadCallStats: LeadCallStat[]): EmployeeCallSumma
             }
 
             const outcome =
-                log.outcome === "not_connected" ? "not_connected" : "connected";
+                log.outcome === "not_connected"
+                    ? "not_connected"
+                    : log.outcome === "voicemail"
+                      ? "voicemail"
+                      : "connected";
 
             const calledAt =
                 log.calledAt ||
                 (outcome === "not_connected"
                     ? item.lastNotConnectedAt
-                    : item.lastCallAt) ||
+                    : outcome === "voicemail"
+                      ? item.lastVoicemailAt
+                      : item.lastCallAt) ||
                 item.updatedAt ||
                 null;
 
@@ -1957,6 +1976,7 @@ function buildEmployeeCallRows(leadCallStats: LeadCallStat[]): EmployeeCallSumma
                     employeeTeam: log.employeeTeam || "",
                     totalCalls: 0,
                     totalNotConnectedCalls: 0,
+                    totalVoicemails: 0,
                     totalAttempts: 0,
                     lastCallAt: null,
                     leads: [],
@@ -1974,6 +1994,8 @@ function buildEmployeeCallRows(leadCallStats: LeadCallStat[]): EmployeeCallSumma
 
             if (outcome === "not_connected") {
                 employeeRow.totalNotConnectedCalls += 1;
+            } else if (outcome === "voicemail") {
+                employeeRow.totalVoicemails += 1;
             } else {
                 employeeRow.totalCalls += 1;
             }
@@ -1987,6 +2009,7 @@ function buildEmployeeCallRows(leadCallStats: LeadCallStat[]): EmployeeCallSumma
                     businessName,
                     callCount: 0,
                     callNotConnectedCount: 0,
+                    callVoicemailCount: 0,
                     totalAttempts: 0,
                     lastCallAt: null,
                     callLogs: [],
@@ -2005,6 +2028,8 @@ function buildEmployeeCallRows(leadCallStats: LeadCallStat[]): EmployeeCallSumma
 
             if (outcome === "not_connected") {
                 leadRow.callNotConnectedCount += 1;
+            } else if (outcome === "voicemail") {
+                leadRow.callVoicemailCount += 1;
             } else {
                 leadRow.callCount += 1;
             }
@@ -2170,6 +2195,10 @@ function filterLeadCallStatsByDateTimeRange(
                 (log) => log.outcome === "not_connected"
             );
 
+            const voicemailLogs = filteredCallLogs.filter(
+                (log) => log.outcome === "voicemail"
+            );
+
             const latestLog = [...filteredCallLogs].sort((first, second) => {
                 return getCallLogTime(second.calledAt) - getCallLogTime(first.calledAt);
             })[0];
@@ -2179,18 +2208,22 @@ function filterLeadCallStatsByDateTimeRange(
                 callLogs: filteredCallLogs,
                 callCount: connectedLogs.length,
                 callNotConnectedCount: notConnectedLogs.length,
+                callVoicemailCount: voicemailLogs.length,
                 lastCallAt: latestLog?.calledAt || null,
             };
         })
         .filter((item) => item.callLogs.length > 0);
 }
 
+void buildEmployeeCallRows;
+void filterLeadCallStatsByDateTimeRange;
+
 export default function WorkspaceDashboard({ userName, employee }: WorkspaceDashboardProps) {
     const employeeId = employee?._id || "";
 
     const employeeQuery = useQuery({
         queryKey: ["employee-dashboard-profile", employeeId],
-        queryFn: () => getEmployee(employeeId),
+        queryFn: () => getEmployeeSummary(employeeId),
         enabled: Boolean(employeeId),
     });
 
@@ -2284,16 +2317,6 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
         },
     ];
 
-    if (!employeeId) {
-        return (
-            <section className="rounded-lg border border-amber-200 bg-amber-50 p-5 text-amber-800">
-                <h1 className="text-lg font-semibold">Employee dashboard unavailable</h1>
-                <p className="mt-2 text-sm">Log in with an employee code to view assigned leads, tasks, attendance, and notices.</p>
-            </section>
-        );
-    }
-
-
     // call logger
 
     function getDateStart(value: string) {
@@ -2382,6 +2405,10 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
                     (log) => log.outcome === "not_connected"
                 );
 
+                const voicemailLogs = filteredCallLogs.filter(
+                    (log) => log.outcome === "voicemail"
+                );
+
                 const latestLog = getLatestCallLog(filteredCallLogs);
 
                 return {
@@ -2389,6 +2416,7 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
                     callLogs: filteredCallLogs,
                     callCount: connectedLogs.length,
                     callNotConnectedCount: notConnectedLogs.length,
+                    callVoicemailCount: voicemailLogs.length,
                     lastCallAt: latestLog?.calledAt || null,
                 };
             })
@@ -2416,33 +2444,31 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
 
 
     const leadCallStatsQuery = useQuery({
-        queryKey: ["lead-call-stats", "me", authEmployeeId],
-        queryFn: () => getMyLeadCallStats(10000, authEmployeeId),
+        queryKey: ["lead-call-summary", "me", authEmployeeId, callFilterDateFrom, callFilterTimeFrom, callFilterDateTo, callFilterTimeTo],
+        queryFn: () => getMyLeadCallSummary({
+            employeeId: authEmployeeId,
+            from: callFilterDateFrom
+                ? new Date(combineDateAndTime(callFilterDateFrom, callFilterTimeFrom || "00:00")).toISOString()
+                : undefined,
+            to: callFilterDateTo
+                ? new Date(combineDateAndTime(callFilterDateTo, callFilterTimeTo || "23:59")).toISOString()
+                : undefined,
+        }),
         enabled: Boolean(authEmployeeId),
         refetchInterval: 60_000,
     });
 
-    const leadCallStats = leadCallStatsQuery.data || [];
-
-    const filteredLeadCallStats = useMemo(() => {
-        return filterLeadCallStatsByDateTimeRange(
-            leadCallStats,
-            callFilterDateFrom,
-            callFilterTimeFrom,
-            callFilterDateTo,
-            callFilterTimeTo
-        );
-    }, [
-        leadCallStats,
-        callFilterDateFrom,
-        callFilterTimeFrom,
-        callFilterDateTo,
-        callFilterTimeTo,
-    ]);
-
     const employeeCallRows = useMemo(() => {
-        return buildEmployeeCallRows(filteredLeadCallStats);
-    }, [filteredLeadCallStats]);
+        return (leadCallStatsQuery.data || []).map((row) => ({
+            ...row,
+            leads: row.leads.map((lead) => ({ ...lead, callLogs: [] })),
+        }));
+    }, [leadCallStatsQuery.data]);
+
+    const totalCallLeadCount = useMemo(
+        () => new Set(employeeCallRows.flatMap((row) => row.leads.map((lead) => lead.leadId))).size,
+        [employeeCallRows]
+    );
 
     const totalLoggedLeadCalls = useMemo(() => {
         return employeeCallRows.reduce((total, item) => total + item.totalCalls, 0);
@@ -2455,9 +2481,16 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
         );
     }, [employeeCallRows]);
 
+    const totalVoicemails = useMemo(() => {
+        return employeeCallRows.reduce(
+            (total, item) => total + item.totalVoicemails,
+            0
+        );
+    }, [employeeCallRows]);
+
     const totalCallAttempts = useMemo(() => {
-        return totalLoggedLeadCalls + totalNotConnectedCalls;
-    }, [totalLoggedLeadCalls, totalNotConnectedCalls]);
+        return totalLoggedLeadCalls + totalNotConnectedCalls + totalVoicemails;
+    }, [totalLoggedLeadCalls, totalNotConnectedCalls, totalVoicemails]);
 
     const clearCallFilters = () => {
         setCallFilterDateFrom("");
@@ -2489,6 +2522,15 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
         setCallFilterDateTo(formatDateInputValue(today));
         setCallFilterTimeTo(formatTimeInputValue(today));
     };
+
+    if (!employeeId) {
+        return (
+            <section className="rounded-lg border border-amber-200 bg-amber-50 p-5 text-amber-800">
+                <h1 className="text-lg font-semibold">Employee dashboard unavailable</h1>
+                <p className="mt-2 text-sm">Log in with an employee code to view assigned leads, tasks, attendance, and notices.</p>
+            </section>
+        );
+    }
 
 
     return (
@@ -2541,6 +2583,10 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
 
                             <p className="mt-1 text-xs font-semibold text-rose-600">
                                 {formatNumber(totalNotConnectedCalls)} not connected
+                            </p>
+
+                            <p className="mt-1 text-xs font-semibold text-blue-600">
+                                {formatNumber(totalVoicemails)} voicemails
                             </p>
 
                             <p className="mt-1 text-xs font-semibold text-slate-500">
@@ -2625,8 +2671,8 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
                             </button>
 
                             <span className="mt-5 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm font-semibold text-emerald-700">
-                                {formatNumber(filteredLeadCallStats.length)} lead
-                                {filteredLeadCallStats.length === 1 ? "" : "s"}
+                                {formatNumber(totalCallLeadCount)} lead
+                                {totalCallLeadCount === 1 ? "" : "s"}
                             </span>
 
                             <Link
@@ -2662,13 +2708,14 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
                         </div>
                     ) : (
                         <div className="overflow-x-auto rounded-lg border border-slate-300 bg-white">
-                            <table className="w-full min-w-[46rem] table-fixed border-separate border-spacing-0">
+                            <table className="w-full min-w-[54rem] table-fixed border-separate border-spacing-0">
                                 <colgroup>
-                                    <col className="w-[26%]" />
-                                    <col className="w-[13%]" />
-                                    <col className="w-[17%]" />
-                                    <col className="w-[13%]" />
-                                    <col className="w-[17%]" />
+                                    <col className="w-[25%]" />
+                                    <col className="w-[12%]" />
+                                    <col className="w-[15%]" />
+                                    <col className="w-[14%]" />
+                                    <col className="w-[12%]" />
+                                    <col className="w-[22%]" />
                                 </colgroup>
 
                                 <thead className="bg-white text-[0.68rem] uppercase tracking-[0.12em] text-slate-500">
@@ -2677,10 +2724,13 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
                                             Employee
                                         </th>
                                         <th className="px-3 py-3 text-center font-semibold">
-                                            Calls
+                                            Connected
                                         </th>
                                         <th className="px-3 py-3 text-center font-semibold">
                                             Not Connected
+                                        </th>
+                                        <th className="px-3 py-3 text-center font-semibold">
+                                            Voicemails
                                         </th>
                                         <th className="px-3 py-3 text-center font-semibold">
                                             Leads
@@ -2728,6 +2778,16 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
                                                     onClick={() => setSelectedCallEmployeeRow(row)}
                                                 >
                                                     {formatNumber(row.totalNotConnectedCalls)}
+                                                </button>
+                                            </td>
+
+                                            <td className="px-3 py-3 text-center font-semibold text-blue-600">
+                                                <button
+                                                    type="button"
+                                                    className="inline-flex h-8 items-center justify-center rounded-md border border-blue-200 bg-blue-50 px-3 text-xs font-semibold text-blue-700 transition hover:border-blue-400 hover:bg-blue-100 focus:outline-none focus:ring-2 focus:ring-blue-300"
+                                                    onClick={() => setSelectedCallEmployeeRow(row)}
+                                                >
+                                                    {formatNumber(row.totalVoicemails)}
                                                 </button>
                                             </td>
 

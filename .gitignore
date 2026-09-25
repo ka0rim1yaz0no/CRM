@@ -9,8 +9,17 @@ lerna-debug.log*
 
 node_modules
 dist
+callbridge/dist
+callbridge/.package
 dist-ssr
-backend/
+backend/.env
+backend/.env.*
+!backend/.env.example
+backend/uploads
+uploads
+*.zip
+*.rar
+*.7z
 *.local
 
 # Editor directories and files

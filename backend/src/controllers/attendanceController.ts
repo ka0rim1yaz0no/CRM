@@ -1,14 +1,25 @@
 import type { Request, Response } from "express";
-import type { Types } from "mongoose";
-import { Attendance, type AttendanceSource } from "../models/Attendance";
+import { Types } from "mongoose";
+import { Attendance, type AttendanceSource, type AttendanceStatus } from "../models/Attendance";
 import { syncEmployeeAvailabilityAcrossBusinesses } from "../services/employeeAvailabilityService";
 import { Employee, normalizeEmployeeAvailabilityStatus } from "../models/Employee";
 import { recordEmployeeTransaction } from "./employeeTransactionController";
-import { emitEmployeeAvailabilityUpdated } from "../socket";
+import { emitCallDashboardUpdated, emitEmployeeAvailabilityUpdated } from "../socket";
 import { getSystemSettings } from "./systemSettingsController";
 
 const activityTrackedStatuses = new Set(["ONLINE", "OFF THE PHONE"]);
-const attendanceSources: AttendanceSource[] = ["Login", "Logout", "Time In", "Time Out", "Break Out", "Break In", "Lunch Break Out", "Lunch Break In"];
+const attendanceSources: AttendanceSource[] = [
+  "Login",
+  "Logout",
+  "Time In",
+  "Time Out",
+  "Break Out",
+  "Break In",
+  "Lunch Break Out",
+  "Lunch Break In",
+  "Off the Phone Out",
+  "Off the Phone In",
+];
 const timeInSources: AttendanceSource[] = ["Login", "Time In"];
 const timeOutSources: AttendanceSource[] = ["Logout", "Time Out"];
 const breakOutGapMs = 30 * 60 * 1000;
@@ -70,6 +81,27 @@ async function getTimeInStatus(timeIn: Date) {
   const [startHour, startMinute] = officialShiftStartTime.split(":").map((part) => Number(part));
   const allowedStart = zonedDateTimeToUtc(shiftStartDay.year, shiftStartDay.month, shiftStartDay.day, startHour, startMinute + (settings.lateGraceMinutes || 0), timeZone);
   return timeIn.getTime() > allowedStart.getTime() ? "Late" : "On time";
+}
+
+async function getTimeOutStatus(timeOut: Date): Promise<AttendanceStatus> {
+  const settings = await getSystemSettings();
+  const timeZone = settings.attendanceTimeZone || "Asia/Manila";
+  const actual = zonedParts(timeOut, timeZone);
+  const startMinutes = minutesFromTime(settings.officialShiftStartTime || "23:00");
+  const endMinutes = minutesFromTime(settings.officialShiftEndTime || "08:00");
+  const actualMinutes = actual.hour * 60 + actual.minute;
+  const isOvernightShift = endMinutes <= startMinutes;
+  const isUnderTime = isOvernightShift
+    ? actualMinutes >= startMinutes || actualMinutes < endMinutes
+    : actualMinutes < endMinutes;
+
+  return isUnderTime ? "Undertime" : "";
+}
+
+async function getAttendanceStatus(source: AttendanceSource, occurredAt: Date): Promise<AttendanceStatus> {
+  if (timeInSources.includes(source)) return getTimeInStatus(occurredAt);
+  if (timeOutSources.includes(source)) return getTimeOutStatus(occurredAt);
+  return "";
 }
 
 async function getTodayAttendanceRange() {
@@ -145,10 +177,12 @@ export async function recordEmployeeTimeIn(employeeId: Types.ObjectId | string) 
 }
 
 export async function recordEmployeeTimeOut(employeeId: Types.ObjectId | string) {
+  const now = new Date();
   return Attendance.create({
     employee: employeeId,
-    timeIn: new Date(),
+    timeIn: now,
     source: "Time Out",
+    attendanceStatus: await getTimeOutStatus(now),
   });
 }
 
@@ -181,6 +215,22 @@ export async function recordEmployeeLunchBreakIn(employeeId: Types.ObjectId | st
     employee: employeeId,
     timeIn: new Date(),
     source: "Lunch Break In",
+  });
+}
+
+export async function recordEmployeeOffPhoneOut(employeeId: Types.ObjectId | string, occurredAt = new Date()) {
+  return Attendance.create({
+    employee: employeeId,
+    timeIn: occurredAt,
+    source: "Off the Phone Out",
+  });
+}
+
+export async function recordEmployeeOffPhoneIn(employeeId: Types.ObjectId | string, occurredAt = new Date()) {
+  return Attendance.create({
+    employee: employeeId,
+    timeIn: occurredAt,
+    source: "Off the Phone In",
   });
 }
 
@@ -481,9 +531,17 @@ export async function lunchBreakInEmployee(request: Request, response: Response)
 
 export async function timeOutEmployee(request: Request, response: Response) {
   const employeeId = String(request.params.employeeId || request.body.employeeId || "").trim();
+  const intent = String(request.body.intent || "").trim();
+  const actorEmployeeCode = String(request.header("x-crm-user-code") || "").trim();
+  const actorUserType = String(request.header("x-crm-user-type") || "").trim().toLowerCase();
 
   if (!employeeId) {
     response.status(400).json({ message: "employeeId is required" });
+    return;
+  }
+
+  if (intent !== "manual-attendance-time-out") {
+    response.status(400).json({ message: "Offline status requires manual confirmation." });
     return;
   }
 
@@ -491,6 +549,11 @@ export async function timeOutEmployee(request: Request, response: Response) {
 
   if (!employee) {
     response.status(404).json({ message: "Employee not found" });
+    return;
+  }
+
+  if (actorUserType !== "employee" || !actorEmployeeCode || actorEmployeeCode !== employee.employeeCode) {
+    response.status(403).json({ message: "You can only set your own attendance status offline." });
     return;
   }
 
@@ -509,7 +572,7 @@ export async function timeOutEmployee(request: Request, response: Response) {
 
   const updatedEmployee = await Employee.findOneAndUpdate(
     { _id: employee._id },
-    { availabilityStatus: "OFFLINE" },
+    { availabilityStatus: "OFFLINE", availabilityStatusReason: "manual-time-out" },
     { returnDocument: "after", runValidators: true }
   );
 
@@ -518,7 +581,18 @@ export async function timeOutEmployee(request: Request, response: Response) {
     return;
   }
 
-  const businessEmployees = await syncEmployeeAvailabilityAcrossBusinesses(employee.employeeCode, updatedEmployee.availabilityStatus);
+  const businessEmployees = await syncEmployeeAvailabilityAcrossBusinesses(
+    employee.employeeCode,
+    updatedEmployee.availabilityStatus,
+    updatedEmployee.availabilityStatusReason
+  );
+
+  const offPhoneOutCount = countAttendanceSource(activeSlot.records, "Off the Phone Out");
+  const offPhoneInCount = countAttendanceSource(activeSlot.records, "Off the Phone In");
+
+  if (offPhoneInCount < offPhoneOutCount) {
+    await recordEmployeeOffPhoneIn(employee._id);
+  }
 
   const attendance = await recordEmployeeTimeOut(employee._id);
   emitEmployeeAvailabilityUpdated({
@@ -547,6 +621,29 @@ export async function listEmployeeAttendance(request: Request, response: Respons
   response.json(attendance);
 }
 
+export async function listEmployeesAttendance(request: Request, response: Response) {
+  const employeeIds = Array.from(
+    new Set(
+      String(request.query.employeeIds || "")
+        .split(",")
+        .map((value) => value.trim())
+        .filter((value) => Types.ObjectId.isValid(value))
+    )
+  ).slice(0, 200);
+
+  if (!employeeIds.length) {
+    response.json([]);
+    return;
+  }
+
+  const attendance = await Attendance.find({
+    employee: { $in: employeeIds },
+    isArchived: { $ne: true },
+  }).sort({ timeIn: -1 }).lean();
+
+  response.json(attendance);
+}
+
 export async function createEmployeeAttendance(request: Request, response: Response) {
   const employeeId = String(request.params.employeeId || request.body.employeeId || "").trim();
   const source = attendanceSources.includes(request.body.source) ? request.body.source : "Time In";
@@ -567,7 +664,7 @@ export async function createEmployeeAttendance(request: Request, response: Respo
     employee: employee._id,
     timeIn,
     source,
-    attendanceStatus: source === "Time In" || source === "Login" ? await getTimeInStatus(timeIn) : "",
+    attendanceStatus: await getAttendanceStatus(source, timeIn),
   });
 
   await recordEmployeeTransaction({
@@ -576,6 +673,8 @@ export async function createEmployeeAttendance(request: Request, response: Respo
     title: "Attendance added",
     description: `${employee.name} had an attendance record added by admin.`,
   });
+
+  if (request.business?.id) emitCallDashboardUpdated([request.business.id]);
 
   response.status(201).json(attendance);
 }
@@ -595,7 +694,7 @@ export async function updateEmployeeAttendance(request: Request, response: Respo
     {
       timeIn,
       source,
-      attendanceStatus: source === "Time In" || source === "Login" ? await getTimeInStatus(timeIn) : "",
+      attendanceStatus: await getAttendanceStatus(source, timeIn),
     },
     { returnDocument: "after", runValidators: true }
   );
@@ -605,6 +704,7 @@ export async function updateEmployeeAttendance(request: Request, response: Respo
     return;
   }
 
+  if (request.business?.id) emitCallDashboardUpdated([request.business.id]);
   response.json(attendance);
 }
 
@@ -620,6 +720,7 @@ export async function archiveEmployeeAttendance(request: Request, response: Resp
     return;
   }
 
+  if (request.business?.id) emitCallDashboardUpdated([request.business.id]);
   response.json(attendance);
 }
 
@@ -650,6 +751,20 @@ export async function recordEmployeeActivity(request: Request, response: Respons
     return;
   }
 
+  if (state === "idle" && activityReason !== "manual-off-the-phone") {
+    response.json({ availabilityStatus: currentStatus });
+    return;
+  }
+
+  const manualOffPhoneLocked =
+    currentStatus === "OFF THE PHONE" &&
+    employee.availabilityStatusReason === "manual-off-the-phone";
+
+  if (manualOffPhoneLocked && state === "active" && activityReason !== "manual-online") {
+    response.json({ availabilityStatus: currentStatus });
+    return;
+  }
+
   const nextStatus = state === "idle" ? "OFF THE PHONE" : "ONLINE";
 
   if (currentStatus === nextStatus) {
@@ -657,9 +772,19 @@ export async function recordEmployeeActivity(request: Request, response: Respons
     return;
   }
 
+  const offPhoneOccurredAt = activityReason === "manual-off-the-phone"
+    ? new Date()
+    : idleStartedAt || new Date(Date.now() - 10 * 60 * 1000);
+  const activeSlot = await getActiveAttendanceSlot(employee._id);
+
   employee.availabilityStatus = nextStatus;
+  employee.availabilityStatusReason = activityReason;
   await employee.save();
-  const businessEmployees = await syncEmployeeAvailabilityAcrossBusinesses(employee.employeeCode, employee.availabilityStatus);
+  const businessEmployees = await syncEmployeeAvailabilityAcrossBusinesses(
+    employee.employeeCode,
+    employee.availabilityStatus,
+    employee.availabilityStatusReason
+  );
   emitEmployeeAvailabilityUpdated({
     employeeId: String(employee._id),
     availabilityStatus: employee.availabilityStatus,
@@ -677,9 +802,21 @@ export async function recordEmployeeActivity(request: Request, response: Respons
     : activityReason === "tab-return"
     ? `${employee.name} returned to the CRM tab.`
     : `${employee.name} became active again.`;
-  const offPhoneOccurredAt = activityReason === "manual-off-the-phone"
-    ? new Date()
-    : idleStartedAt || new Date(Date.now() - 10 * 60 * 1000);
+  const attendanceRecords = [];
+
+  if (activeSlot.timeIn && !activeSlot.timeOut) {
+    const offPhoneOutCount = countAttendanceSource(activeSlot.records, "Off the Phone Out");
+    const offPhoneInCount = countAttendanceSource(activeSlot.records, "Off the Phone In");
+
+    if (nextStatus === "OFF THE PHONE" && offPhoneOutCount <= offPhoneInCount) {
+      const startedAt = new Date(Math.max(offPhoneOccurredAt.getTime(), activeSlot.timeIn.timeIn.getTime()));
+      attendanceRecords.push(await recordEmployeeOffPhoneOut(employee._id, startedAt));
+    }
+
+    if (nextStatus === "ONLINE" && offPhoneInCount < offPhoneOutCount) {
+      attendanceRecords.push(await recordEmployeeOffPhoneIn(employee._id));
+    }
+  }
 
   await recordEmployeeTransaction({
     employee: employee._id,
@@ -694,5 +831,7 @@ export async function recordEmployeeActivity(request: Request, response: Respons
     },
   });
 
-  response.json({ availabilityStatus: employee.availabilityStatus });
+  emitCallDashboardUpdated(businessEmployees.map((item) => item.businessId));
+
+  response.json({ availabilityStatus: employee.availabilityStatus, attendanceRecords });
 }

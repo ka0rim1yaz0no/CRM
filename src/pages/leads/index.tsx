@@ -1,17 +1,18 @@
 import type { FormEvent, UIEvent } from "react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { FiArchive, FiCalendar, FiCheckCircle, FiClock, FiEdit2, FiMail, FiMessageCircle, FiPhone, FiPlus, FiSave, FiSearch, FiStar, FiUserPlus, FiX } from "react-icons/fi";
+import { FiArchive, FiCalendar, FiCheckCircle, FiClock, FiEdit2, FiMail, FiMessageCircle, FiPhone, FiPlus, FiSave, FiSearch, FiStar, FiUserPlus, FiVoicemail, FiX } from "react-icons/fi";
 import { FaWhatsapp } from "react-icons/fa";
-import { useSearchParams } from "react-router";
+import { useLocation, useSearchParams } from "react-router";
 import MainLayout from "../layout";
 import { getAuthUser } from "../../api/authStorage";
 import { getEmployees, type Employee } from "../../api/employees";
-import { addLeadComment, archiveLead, createLead, getLeadCallStat, getMyLeadCounts, getMyLeads, logConnectedLeadCall, logLeadNotConnected, recordLeadCall, scheduleLeadFollowUp, toggleLeadFavorite, updateLead, updateLeadStatus, type EmployeeLeadTab, type Lead, type LeadInput, type LeadStatus, type MyLeadsPage } from "../../api/leads";
+import { addLeadComment, archiveLead, assignLead, createLead, getLead, getLeadCallStat, getMyLeadCounts, getMyLeads, logConnectedLeadCall, logLeadNotConnected, logLeadVoicemail, recordLeadCall, scheduleLeadFollowUp, toggleLeadFavorite, updateLead, updateLeadStatus, type EmployeeLeadTab, type Lead, type LeadInput, type LeadStatus, type MyLeadsPage } from "../../api/leads";
 import { getSystemSettings } from "../../api/systemSettings";
 import { useToast } from "../../components/ToastProvider";
 import { useFeatureFlags } from "../../hooks/useFeatureFlags";
 import { formatCstDate, formatCstDateTime, formatCstDateTimeInput, getCurrentCstDateTimeInput, parseCstDateTimeInput, formatPhDateTime } from "../../lib/dateTime";
+import { clearAutoCallPendingComment, getAutoCallPendingComment, getEmployeeCommentMarker, startAutoCallPendingComment } from "../../lib/employeeAutoCall";
 import { socket } from "../../lib/socket";
 
 const tabs: Array<LeadStatus | "ALL"> = [
@@ -34,7 +35,8 @@ const employeeStatusOptions: LeadStatus[] = [
     "Dead",
 ];
 
-type CallLoggerConfirmAction = "connected" | "not_connected";
+type CallLoggerConfirmAction = "connected" | "not_connected" | "voicemail";
+type LeadActionName = "archive" | "assignment" | "details" | "schedule" | "status";
 
 type LeadChangedPayload = {
     action: string;
@@ -212,7 +214,14 @@ function toLeadInput(lead: Lead, overrides: Partial<LeadInput> = {}): LeadInput 
 }
 
 function mergeLeadPages(current: Lead[], next: Lead[]) {
-    const leadsById = new Map([...current, ...next].map((lead) => [lead._id, lead]));
+    const leadsById = new Map<string, Lead>();
+
+    [...current, ...next].forEach((lead) => {
+        if (!leadsById.has(lead._id)) {
+            leadsById.set(lead._id, lead);
+        }
+    });
+
     return Array.from(leadsById.values());
 }
 
@@ -372,10 +381,20 @@ function sortEmployeeLeadsForWorkQueue(leads: Lead[], now = Date.now()) {
         if (firstWorkedAt !== null || secondWorkedAt !== null) {
             if (firstWorkedAt === null) return -1;
             if (secondWorkedAt === null) return 1;
-            return firstWorkedAt - secondWorkedAt;
+            const workedAtDelta = firstWorkedAt - secondWorkedAt;
+
+            if (workedAtDelta !== 0) {
+                return workedAtDelta;
+            }
         }
 
-        return 0;
+        const createdAtDelta = (parseLeadTime(second.createdAt) || 0) - (parseLeadTime(first.createdAt) || 0);
+
+        if (createdAtDelta !== 0) {
+            return createdAtDelta;
+        }
+
+        return first._id.localeCompare(second._id);
     });
 }
 
@@ -425,9 +444,15 @@ export default function Leads() {
     const queryClient = useQueryClient();
     const { showToast } = useToast();
     const { isEnabled } = useFeatureFlags();
+    const location = useLocation();
     const [searchParams, setSearchParams] = useSearchParams();
     const authUser = getAuthUser();
     const employeeId = authUser?.userType === "employee" ? authUser.user._id : "";
+    const employeeCode = authUser?.userType === "employee"
+        ? String(authUser.user.employeeCode || authUser.user._id).trim()
+        : "";
+    const requestedLeadId = searchParams.get("lead") || "";
+    const routedAutoCallLead = (location.state as { autoCallLead?: Lead } | null)?.autoCallLead;
     const employeeName = authUser?.userType === "employee" ? authUser.user.name : "Employee";
     const canViewAllLeads = authUser?.userType === "employee" && canViewAllLeadQueues(authUser.user);
     const canViewCompletedLeads = authUser?.userType === "employee" && canViewCompletedLeadQueue(authUser.user);
@@ -453,6 +478,9 @@ export default function Leads() {
     const [isDetailEditing, setIsDetailEditing] = useState(false);
     const [detailDraft, setDetailDraft] = useState<LeadDetailDraft>(emptyLeadDetailDraft);
     const [commentDraft, setCommentDraft] = useState("");
+    const pendingCommentSaveRef = useRef<{ leadId: string; body: string; promise: Promise<Lead> } | null>(null);
+    const leadActionPendingRef = useRef<LeadActionName | null>(null);
+    const [activeLeadAction, setActiveLeadAction] = useState<LeadActionName | null>(null);
     const [passAgentId, setPassAgentId] = useState("");
     const [passConfirm, setPassConfirm] = useState<{ lead: Lead; agent: Employee } | null>(null);
     const [followUpDateTime, setFollowUpDateTime] = useState("");
@@ -495,7 +523,7 @@ export default function Leads() {
                 tab: requestedEmployeeLeadTab,
                 page: 1,
                 limit: LEAD_PAGE_SIZE,
-                search: isGlobalLeadSearchActive ? effectiveLeadSearch : undefined,
+                search: effectiveLeadSearch || undefined,
                 searchAll: isGlobalLeadSearchActive || undefined,
                 includeArchived: isGlobalLeadSearchActive || undefined,
                 state: leadStateFilter !== "ALL" ? leadStateFilter : undefined,
@@ -504,6 +532,11 @@ export default function Leads() {
     });
     const leads = leadPageData?.leads || [];
     const leadStateOptions = leadPageData?.stateOptions || [];
+    const { data: requestedLead } = useQuery({
+        queryKey: ["lead", requestedLeadId],
+        queryFn: () => getLead(requestedLeadId),
+        enabled: Boolean(employeeId && requestedLeadId),
+    });
     const { data: leadCounts = {} } = useQuery({
         queryKey: ["lead-counts", employeeId, employeeLeadNames.join("|"), leadStateFilter],
         queryFn: () => getMyLeadCounts({ employeeId, employeeNames: employeeLeadNames, state: leadStateFilter !== "ALL" ? leadStateFilter : undefined }),
@@ -568,17 +601,25 @@ export default function Leads() {
                         lead.category,
                         lead.status,
                         lead.notes,
+                        ...(lead.comments || []).flatMap((comment) => [comment.body, comment.authorName]),
+                        ...(lead.activity || []).map((item) => item.detail),
                     ]
                         .join(" ")
                         .toLowerCase()
                         .includes(searchText)
                 );
-        const availableLeads = activeTab === "NEW" && !isGlobalLeadSearchActive ? searchFilteredLeads.filter((lead) => !isHiddenFromEmployeeQueueToday(lead)) : searchFilteredLeads;
-        return isGlobalLeadSearchActive ? availableLeads : sortEmployeeLeadsForWorkQueue(availableLeads, queueClock);
+        return isGlobalLeadSearchActive ? searchFilteredLeads : sortEmployeeLeadsForWorkQueue(searchFilteredLeads, queueClock);
     }, [activeCategoryTab, activeTab, canUseLeadCategories, effectiveLeadSearch, employeeId, isGlobalLeadSearchActive, leads, queueClock, showFavoritesOnly, workedLeadHolds]);
     const contactedTodayCount = leadCounts.ContactedToday ?? leads.filter((lead) => isNewWorkQueueLead(lead) && isHiddenFromEmployeeQueueToday(lead)).length;
 
+    const routeSelectedLead = requestedLeadId
+        ? leads.find((lead) => lead._id === requestedLeadId) ||
+          workedLeadHolds.find((lead) => lead._id === requestedLeadId) ||
+          (requestedLead?._id === requestedLeadId ? requestedLead : null) ||
+          (routedAutoCallLead?._id === requestedLeadId ? routedAutoCallLead : null)
+        : null;
     const selectedLead =
+        routeSelectedLead ||
         leads.find((lead) => lead._id === selectedLeadId) ||
         workedLeadHolds.find((lead) => lead._id === selectedLeadId) ||
         filteredLeads[0] ||
@@ -626,7 +667,7 @@ export default function Leads() {
                 tab: requestedEmployeeLeadTab,
                 page: nextPage,
                 limit: LEAD_PAGE_SIZE,
-                search: isGlobalLeadSearchActive ? effectiveLeadSearch : undefined,
+                search: effectiveLeadSearch || undefined,
                 searchAll: isGlobalLeadSearchActive || undefined,
                 includeArchived: isGlobalLeadSearchActive || undefined,
                 state: leadStateFilter !== "ALL" ? leadStateFilter : undefined,
@@ -675,6 +716,12 @@ export default function Leads() {
     };
 
     const selectLead = (leadId: string) => {
+        if (requestedLeadId && leadId !== requestedLeadId) {
+            const nextSearchParams = new URLSearchParams(searchParams);
+            nextSearchParams.delete("lead");
+            setSearchParams(nextSearchParams, { replace: true });
+        }
+
         setSelectedLeadId(leadId);
 
         if (!showLeadMiniTabs) {
@@ -732,8 +779,9 @@ export default function Leads() {
 
                     const hasLead = current.leads.some((lead) => lead._id === changedLead._id);
                     const isAssignedHere = changedLead.assignedAgent?._id === employeeId;
+                    const shouldAddToCurrentPage = isAssignedHere && payload.action !== "call-logged";
 
-                    if (!hasLead && !isAssignedHere) {
+                    if (!hasLead && !shouldAddToCurrentPage) {
                         return current;
                     }
 
@@ -802,11 +850,55 @@ export default function Leads() {
     const addCommentMutation = useMutation({
         mutationFn: ({ id, body }: { id: string; body: string }) =>
             addLeadComment(id, { body, authorName: employeeName, authorType: "employee" }),
-        onSuccess: (updatedLead) => {
+        onMutate: (variables) => {
+            const pendingAutoCall = getAutoCallPendingComment(employeeCode);
+            clearAutoCallPendingComment(employeeCode, variables.id);
+            const previousLeadPage = queryClient.getQueryData<typeof leadPageData>(leadQueryKey);
+            const optimisticComment = {
+                _id: `pending-${Date.now()}`,
+                authorName: employeeName,
+                authorType: "employee" as const,
+                body: variables.body,
+                createdAt: new Date().toISOString(),
+            };
+
+            updateCachedLeadPage((current) => current.map((lead) =>
+                lead._id === variables.id
+                    ? { ...lead, comments: [...(lead.comments || []), optimisticComment] }
+                    : lead
+            ));
+            setCommentDraft((current) => (current.trim() === variables.body ? "" : current));
+
+            return {
+                previousLeadPage,
+                pendingAutoCall: pendingAutoCall?.leadId === variables.id ? pendingAutoCall : null,
+            };
+        },
+        onSuccess: (updatedLead, variables) => {
             updateCachedLeadPage((current) => current.map((lead) => (lead._id === updatedLead._id ? updatedLead : lead)));
             holdWorkedLead(updatedLead);
-            setCommentDraft("");
-            invalidateEmployeeLeads();
+            clearAutoCallPendingComment(employeeCode, updatedLead._id);
+            setCommentDraft((current) => (current.trim() === variables.body ? "" : current));
+            void queryClient.invalidateQueries({ queryKey: ["lead-counts", employeeId] });
+            showToast({ tone: "success", message: "Note added to the lead." });
+        },
+        onError: (error, variables, context) => {
+            if (context?.previousLeadPage) {
+                queryClient.setQueryData(leadQueryKey, context.previousLeadPage);
+            }
+            if (context?.pendingAutoCall && !getAutoCallPendingComment(employeeCode)) {
+                startAutoCallPendingComment(
+                    employeeCode,
+                    context.pendingAutoCall.leadId,
+                    context.pendingAutoCall.baselineCommentMarker
+                );
+            }
+            setCommentDraft((current) => current || variables.body);
+            const message =
+                (error as { response?: { data?: { message?: string } } })?.response?.data?.message ||
+                (error instanceof Error ? error.message : "") ||
+                "Could not add the note. Please try again.";
+            showToast({ tone: "error", message });
         },
     });
 
@@ -819,22 +911,27 @@ export default function Leads() {
     });
 
     const updateDetailsMutation = useMutation({
-        mutationFn: ({ lead, draft }: { lead: Lead; draft: LeadDetailDraft }) =>
-            updateLead(
-                lead._id,
-                toLeadInput(lead, {
+        mutationFn: async ({ lead, draft }: { lead: Lead; draft: LeadDetailDraft }) => {
+            const currentLead = await getLead(lead._id);
+            return updateLead(
+                currentLead._id,
+                toLeadInput(currentLead, {
                     ...draft,
                     businessName: draft.businessName.trim(),
-                    category: canUseLeadCategories ? draft.category : lead.category,
+                    category: canUseLeadCategories ? draft.category : currentLead.category,
                     activityActorName: employeeName,
                     activityActorType: "employee",
                 })
-            ),
+            );
+        },
         onSuccess: (updatedLead) => {
             updateCachedLeadPage((current) => current.map((lead) => (lead._id === updatedLead._id ? updatedLead : lead)));
             setDetailDraft(createLeadDetailDraft(updatedLead));
             setIsDetailEditing(false);
             invalidateEmployeeLeads();
+        },
+        onError: () => {
+            showToast({ tone: "error", message: "Could not save lead details." });
         },
     });
 
@@ -848,6 +945,9 @@ export default function Leads() {
                 setFollowUpDateTime("");
             }
             invalidateEmployeeLeads();
+        },
+        onError: () => {
+            showToast({ tone: "error", message: "Could not update lead status." });
         },
     });
 
@@ -905,14 +1005,14 @@ export default function Leads() {
 
     const passLeadMutation = useMutation({
         mutationFn: ({ lead, agent }: { lead: Lead; agent: Employee }) =>
-            updateLead(
+            assignLead(
                 lead._id,
-                toLeadInput(lead, {
+                {
                     assignedAgent: agent._id,
                     assignedAgentName: agent.name,
                     activityActorName: employeeName,
                     activityActorType: "employee",
-                })
+                }
             ),
         onSuccess: (updatedLead) => {
             updateCachedLeadPage((current) => mergeLeadPages([updatedLead], current));
@@ -920,8 +1020,69 @@ export default function Leads() {
             setPassAgentId("");
             setPassConfirm(null);
             invalidateEmployeeLeads();
+            showToast({ tone: "success", message: `Lead reassigned to ${updatedLead.assignedAgent?.name || updatedLead.assignedAgentName}.` });
+        },
+        onError: () => {
+            showToast({ tone: "error", message: "Could not reassign the lead." });
         },
     });
+
+    const startCommentSave = (leadId: string, body: string) => {
+        const currentPendingSave = pendingCommentSaveRef.current;
+
+        if (currentPendingSave?.leadId === leadId) {
+            return currentPendingSave.promise;
+        }
+
+        const promise = addCommentMutation.mutateAsync({ id: leadId, body });
+        pendingCommentSaveRef.current = { leadId, body, promise };
+        void promise.then(
+            () => {
+                if (pendingCommentSaveRef.current?.promise === promise) pendingCommentSaveRef.current = null;
+            },
+            () => {
+                if (pendingCommentSaveRef.current?.promise === promise) pendingCommentSaveRef.current = null;
+            }
+        );
+        return promise;
+    };
+
+    const runLeadActionAfterComment = async (
+        leadId: string,
+        actionName: LeadActionName,
+        action: () => Promise<unknown>
+    ) => {
+        if (leadActionPendingRef.current) {
+            return;
+        }
+
+        leadActionPendingRef.current = actionName;
+        setActiveLeadAction(actionName);
+
+        try {
+            const pendingCommentSave = pendingCommentSaveRef.current;
+            let savedCommentBody = "";
+
+            if (pendingCommentSave) {
+                await pendingCommentSave.promise;
+                if (pendingCommentSave.leadId === leadId) {
+                    savedCommentBody = pendingCommentSave.body.trim();
+                }
+            }
+
+            const unsavedComment = selectedLead?._id === leadId ? commentDraft.trim() : "";
+            if (unsavedComment && unsavedComment !== savedCommentBody) {
+                await startCommentSave(leadId, unsavedComment);
+            }
+
+            await action();
+        } catch {
+            // Each mutation reports its own error and a failed note prevents the queued action.
+        } finally {
+            leadActionPendingRef.current = null;
+            setActiveLeadAction(null);
+        }
+    };
 
     useEffect(() => {
         setDetailDraft(createLeadDetailDraft(selectedLead));
@@ -929,9 +1090,15 @@ export default function Leads() {
         setCommentDraft("");
         setPassAgentId("");
         setPassConfirm(null);
-        setFollowUpDateTime(formatCstDateTimeInput(selectedLead?.followUpAt) || getCurrentCstDateTimeInput());
+    }, [selectedLead?._id]);
+
+    useEffect(() => {
         setStatusDraft(selectedLead?.status || "NEW");
-    }, [selectedLead?._id, selectedLead?.status, selectedLead?.followUpAt]);
+    }, [selectedLead?._id, selectedLead?.status]);
+
+    useEffect(() => {
+        setFollowUpDateTime(formatCstDateTimeInput(selectedLead?.followUpAt) || getCurrentCstDateTimeInput());
+    }, [selectedLead?._id, selectedLead?.followUpAt]);
 
     useEffect(() => {
         const timeoutId = window.setTimeout(() => {
@@ -960,9 +1127,18 @@ export default function Leads() {
         }
 
         if (routeLeadId) {
+            if (!shouldSearchAll && !canViewAllLeads) {
+                setLeadSearch("");
+                setDebouncedLeadSearch("");
+                setIsGlobalLeadSearch(false);
+                setActiveTab("NEW");
+                setShowFavoritesOnly(false);
+                setActiveCategoryTab("ALL");
+            }
+
             setSelectedLeadId(routeLeadId);
         }
-    }, [searchParams]);
+    }, [canViewAllLeads, searchParams]);
 
     useEffect(() => {
         const intervalId = window.setInterval(() => {
@@ -994,7 +1170,7 @@ export default function Leads() {
     useEffect(() => {
         setLeadPage(1);
         setHasMoreLeads(true);
-        setSelectedLeadId(null);
+        setSelectedLeadId(requestedLeadId || null);
         setActiveCategoryTab("ALL");
     }, [activeTab, effectiveLeadSearch, employeeId, showFavoritesOnly]);
 
@@ -1006,7 +1182,7 @@ export default function Leads() {
     }, [activeTab, isGlobalLeadSearchActive, isLoading, leadCounts, leadPage, leadPageData?.total, leads.length]);
 
     const saveComment = () => {
-        if (addCommentMutation.isPending) {
+        if (addCommentMutation.isPending || pendingCommentSaveRef.current) {
             return;
         }
 
@@ -1020,8 +1196,16 @@ export default function Leads() {
             return;
         }
 
-        setCommentDraft("");
-        addCommentMutation.mutate({ id: selectedLead._id, body });
+        void startCommentSave(selectedLead._id, body).catch(() => undefined);
+    };
+
+    const handleArchiveLead = () => {
+        if (!selectedLead || archiveLeadMutation.isPending) {
+            return;
+        }
+
+        const leadId = selectedLead._id;
+        void runLeadActionAfterComment(leadId, "archive", () => archiveLeadMutation.mutateAsync(leadId));
     };
 
     const requestPassLead = () => {
@@ -1059,11 +1243,12 @@ export default function Leads() {
             return;
         }
 
-        scheduleFollowUpMutation.mutate({
-            id: selectedLead._id,
+        const leadId = selectedLead._id;
+        void runLeadActionAfterComment(leadId, "schedule", () => scheduleFollowUpMutation.mutateAsync({
+            id: leadId,
             followUpAt: scheduledDate.toISOString(),
             followUpNote: "",
-        });
+        }));
     };
 
     const handleSaveStatus = () => {
@@ -1071,7 +1256,11 @@ export default function Leads() {
             return;
         }
 
-        updateStatusMutation.mutate({ id: selectedLead._id, status: statusDraft });
+        const leadId = selectedLead._id;
+        const nextStatus = statusDraft;
+        void runLeadActionAfterComment(leadId, "status", () =>
+            updateStatusMutation.mutateAsync({ id: leadId, status: nextStatus })
+        );
     };
 
     const openLeadModal = () => {
@@ -1144,7 +1333,22 @@ export default function Leads() {
             return;
         }
 
-        updateDetailsMutation.mutate({ lead: selectedLead, draft: detailDraft });
+        const lead = selectedLead;
+        const draft = { ...detailDraft };
+        void runLeadActionAfterComment(lead._id, "details", () =>
+            updateDetailsMutation.mutateAsync({ lead, draft })
+        );
+    };
+
+    const confirmPassLead = () => {
+        if (!passConfirm || passLeadMutation.isPending) {
+            return;
+        }
+
+        const assignment = passConfirm;
+        void runLeadActionAfterComment(assignment.lead._id, "assignment", () =>
+            passLeadMutation.mutateAsync(assignment)
+        );
     };
 
     const toggleFavorite = (lead: Lead) => {
@@ -1225,10 +1429,17 @@ export default function Leads() {
         });
     }, [selectedLeadCallLogs]);
 
+    const selectedLeadVoicemailLogs = useMemo(() => {
+        return selectedLeadCallLogs.filter((log) => {
+            return log.outcome === "voicemail";
+        });
+    }, [selectedLeadCallLogs]);
+
     const selectedLeadCallCount = selectedLeadConnectedLogs.length;
     const selectedLeadCallNotConnectedCount = selectedLeadNotConnectedLogs.length;
+    const selectedLeadVoicemailCount = selectedLeadVoicemailLogs.length;
     const selectedLeadTotalCallAttempts =
-        selectedLeadCallCount + selectedLeadCallNotConnectedCount;
+        selectedLeadCallCount + selectedLeadCallNotConnectedCount + selectedLeadVoicemailCount;
 
     // const hasLoggedAnyCallActionToday = useMemo(() => {
     //     return selectedLeadCallLogs.some((log) => isSameLocalDay(log.calledAt));
@@ -1314,7 +1525,7 @@ export default function Leads() {
             await handleCallStatSuccess(
                 callStat,
                 variables.leadId,
-                "Call logged."
+                "Connected logged."
             );
         },
 
@@ -1341,15 +1552,41 @@ export default function Leads() {
         onError: handleCallStatError,
     });
 
+    const logVoicemailMutation = useMutation({
+        mutationFn: ({
+            leadId,
+            employeeId,
+        }: {
+            leadId: string;
+            employeeId: string;
+        }) => logLeadVoicemail(leadId, employeeId),
+
+        onSuccess: async (callStat, variables) => {
+            await handleCallStatSuccess(
+                callStat,
+                variables.leadId,
+                "Voicemail logged."
+            );
+        },
+
+        onError: handleCallStatError,
+    });
+
     const isLoggingConnectedCall = logConnectedCallMutation.isPending;
     const isLoggingNotConnected = logNotConnectedMutation.isPending;
-    const isLoggingAnyCall = isLoggingConnectedCall || isLoggingNotConnected;
+    const isLoggingVoicemail = logVoicemailMutation.isPending;
+    const isLoggingAnyCall =
+        isLoggingConnectedCall || isLoggingNotConnected || isLoggingVoicemail;
 
     const selectedLeadDisplayName =
         selectedLead?.leadName || selectedLead?.businessName || "this lead";
 
     const requestedCallLoggerLabel =
-        callLoggerConfirmAction === "not_connected" ? "Not connected" : "Log Call";
+        callLoggerConfirmAction === "not_connected"
+            ? "Not connected"
+            : callLoggerConfirmAction === "voicemail"
+              ? "Voicemail"
+              : "Connected";
 
     const openLogConnectedCallConfirm = () => {
         if (isLoggingAnyCall) {
@@ -1383,6 +1620,22 @@ export default function Leads() {
         setCallLoggerConfirmAction("not_connected");
     };
 
+    const openLogVoicemailConfirm = () => {
+        if (isLoggingAnyCall) {
+            return;
+        }
+
+        if (!selectedLead) {
+            showToast({
+                tone: "error",
+                message: "No lead selected.",
+            });
+            return;
+        }
+
+        setCallLoggerConfirmAction("voicemail");
+    };
+
     const closeCallLoggerConfirm = () => {
         if (isLoggingAnyCall) {
             return;
@@ -1396,10 +1649,16 @@ export default function Leads() {
             return;
         }
 
-        if (callLoggerConfirmAction === "connected") {
-            handleLogConnectedCall();
-        } else {
-            handleLogNotConnected();
+        switch (callLoggerConfirmAction) {
+            case "connected":
+                handleLogConnectedCall();
+                break;
+            case "not_connected":
+                handleLogNotConnected();
+                break;
+            case "voicemail":
+                handleLogVoicemail();
+                break;
         }
 
         setCallLoggerConfirmAction(null);
@@ -1458,6 +1717,35 @@ export default function Leads() {
         }
 
         logNotConnectedMutation.mutate({
+            leadId: selectedLead._id,
+            employeeId: currentEmployeeId,
+        });
+    };
+
+    const handleLogVoicemail = () => {
+        if (isLoggingAnyCall) {
+            return;
+        }
+
+        if (!selectedLead) {
+            showToast({
+                tone: "error",
+                message: "No lead selected.",
+            });
+            return;
+        }
+
+        const currentEmployeeId = getCurrentEmployeeIdForCall();
+
+        if (!currentEmployeeId) {
+            showToast({
+                tone: "error",
+                message: "Logged-in employee not found. Please log out and log back in.",
+            });
+            return;
+        }
+
+        logVoicemailMutation.mutate({
             leadId: selectedLead._id,
             employeeId: currentEmployeeId,
         });
@@ -1608,6 +1896,7 @@ export default function Leads() {
                                 const isFavorite = isLeadFavorite(lead, employeeId);
                                 const isCallPriority = isCallPriorityLead(lead);
                                 const isScheduledToday = isScheduledForToday(lead);
+                                const wasCommentedToday = hasManualCommentToday(lead);
 
                                 return (
                                     <div
@@ -1633,28 +1922,31 @@ export default function Leads() {
                                             <FiStar className="size-4" fill={isFavorite ? "currentColor" : "none"} aria-hidden="true" />
                                         </button>
                                         <button
-                                            className="flex min-w-0 flex-1 items-center justify-between gap-4 text-left"
+                                            className="flex min-w-0 flex-1 items-center justify-between gap-3 text-left"
                                             type="button"
                                             onClick={() => selectLead(lead._id)}
                                         >
-                                            <span className="min-w-0">
+                                            <span className="min-w-0 flex-1">
                                                 <span className="block truncate text-sm font-semibold text-white">
                                                     {lead.leadName || lead.businessName}
                                                 </span>
                                                 <span className="mt-1 block truncate text-xs text-white/45">{lead.businessName}</span>
                                             </span>
-                                            <span className="shrink-0 text-right">
-                                                <span className="block text-xs font-semibold text-white/45">
+                                            <span className="w-[42%] min-w-0 max-w-[7.5rem] shrink-0 text-right">
+                                                <span className="block truncate text-xs font-semibold text-white/45" title={canUseLeadCategories ? lead.category || lead.source : lead.source}>
                                                     {canUseLeadCategories ? lead.category || lead.source : lead.source}
                                                 </span>
-                                                <span className="mt-1 flex items-center justify-end gap-1.5 text-xs font-semibold text-[#5f27cd]">
-                                                    {isCallPriority && (
-                                                        <FiCheckCircle className="size-3.5 text-sky-400" aria-hidden="true" />
-                                                    )}
-                                                    {isScheduledToday && (
-                                                        <FiClock className="size-3.5 text-red-400" aria-hidden="true" />
-                                                    )}
-                                                    <span>{lead.status}</span>
+                                                <span className="mt-1 grid grid-cols-[0.875rem_minmax(0,1fr)] items-center gap-1.5 text-left text-xs font-semibold text-[#5f27cd]">
+                                                    <span className="flex size-3.5 items-center justify-center" aria-hidden="true">
+                                                        {isCallPriority ? (
+                                                            <FiCheckCircle className="size-3.5 text-sky-400" />
+                                                        ) : isScheduledToday ? (
+                                                            <FiClock className="size-3.5 text-red-400" />
+                                                        ) : wasCommentedToday ? (
+                                                            <FiCheckCircle className="size-3.5 text-sky-400" />
+                                                        ) : null}
+                                                    </span>
+                                                    <span className="truncate">{lead.status}</span>
                                                 </span>
                                             </span>
                                         </button>
@@ -1682,11 +1974,11 @@ export default function Leads() {
                                 <button
                                     className="flex h-9 items-center gap-2 rounded-lg border border-white/10 bg-white/[0.06] px-3 text-xs font-semibold text-white/70 transition hover:border-red-400/30 hover:bg-red-400/10 hover:text-red-100 disabled:cursor-not-allowed disabled:opacity-60"
                                     type="button"
-                                    onClick={() => archiveLeadMutation.mutate(selectedLead._id)}
-                                    disabled={archiveLeadMutation.isPending}
+                                    onClick={handleArchiveLead}
+                                    disabled={archiveLeadMutation.isPending || Boolean(activeLeadAction)}
                                 >
                                     <FiArchive className="size-4" aria-hidden="true" />
-                                    {archiveLeadMutation.isPending ? "Archiving..." : "Archive"}
+                                    {activeLeadAction === "archive" ? "Saving & archiving..." : "Archive"}
                                 </button>
                             )}
                         </div>
@@ -1768,7 +2060,7 @@ export default function Leads() {
                                                         <button
                                                             className="flex h-9 items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.06] px-3 text-xs font-semibold text-white/65 transition hover:bg-white/10 hover:text-white"
                                                             type="button"
-                                                            disabled={updateDetailsMutation.isPending}
+                                                            disabled={updateDetailsMutation.isPending || Boolean(activeLeadAction)}
                                                             onClick={cancelDetailEdit}
                                                         >
                                                             <FiX className="size-3.5" aria-hidden="true" />
@@ -1777,11 +2069,11 @@ export default function Leads() {
                                                         <button
                                                             className="flex h-9 items-center gap-1.5 rounded-lg border border-[#842cff]/35 bg-[#842cff]/15 px-3 text-xs font-semibold text-[#d7c5ff] transition hover:bg-[#842cff]/25 disabled:cursor-not-allowed disabled:opacity-60"
                                                             type="button"
-                                                            disabled={updateDetailsMutation.isPending || !detailDraft.businessName.trim()}
+                                                            disabled={updateDetailsMutation.isPending || Boolean(activeLeadAction) || !detailDraft.businessName.trim()}
                                                             onClick={saveLeadDetails}
                                                         >
                                                             <FiSave className="size-3.5" aria-hidden="true" />
-                                                            {updateDetailsMutation.isPending ? "Saving..." : "Save"}
+                                                            {activeLeadAction === "details" ? "Saving..." : "Save"}
                                                         </button>
                                                     </>
                                                 ) : (
@@ -1819,6 +2111,13 @@ export default function Leads() {
                                                     href={`tel:${selectedLead.phone}`}
                                                     onClick={() => {
                                                         if (selectedLead.phone) {
+                                                            if (selectedLead.status === "Follow up") {
+                                                                startAutoCallPendingComment(
+                                                                    employeeCode,
+                                                                    selectedLead._id,
+                                                                    getEmployeeCommentMarker(selectedLead.comments)
+                                                                );
+                                                            }
                                                             recordCallMutation.mutate(selectedLead._id);
                                                         }
                                                     }}
@@ -1902,7 +2201,7 @@ export default function Leads() {
 
                                     {/* Employee Leads page call logger card */}
                                     <div className="rounded-lg border border-white/10 bg-white/[0.04] p-4">
-                                        <div className="flex flex-wrap items-start justify-between gap-3">
+                                        <div className="flex flex-col gap-3">
                                             <div>
                                                 <p className="text-xs font-medium uppercase tracking-[0.14em] text-white/35">
                                                     Calls
@@ -1914,6 +2213,10 @@ export default function Leads() {
 
                                                 <p className="mt-1 text-xs text-white/45">
                                                     Not connected: {selectedLeadCallNotConnectedCount}
+                                                </p>
+
+                                                <p className="mt-1 text-xs text-white/45">
+                                                    Voicemails: {selectedLeadVoicemailCount}
                                                 </p>
 
                                                 <p className="mt-1 text-xs text-white/35">
@@ -1930,9 +2233,9 @@ export default function Leads() {
                                                 )}
                                             </div>
 
-                                            <div className="flex items-center gap-4">
+                                            <div className="grid w-full grid-cols-3 gap-2">
                                                 <button
-                                                    className="admin-log-call-button flex h-11 min-w-0 items-center justify-center rounded-lg border border-[#f13453] bg-[#f13453] px-3 text-sm font-semibold text-white transition hover:border-[#db203f] hover:bg-[#db203f] disabled:cursor-not-allowed disabled:opacity-80"
+                                                    className="admin-log-call-button flex h-10 min-w-0 items-center justify-center rounded-lg border border-[#f13453] bg-[#f13453] px-2 text-xs font-semibold text-white transition hover:border-[#db203f] hover:bg-[#db203f] disabled:cursor-not-allowed disabled:opacity-80"
                                                     type="button"
                                                     onClick={openLogNotConnectedConfirm}
                                                     disabled={!selectedLead || isLoggingAnyCall}
@@ -1941,12 +2244,22 @@ export default function Leads() {
                                                 </button>
 
                                                 <button
-                                                    className="admin-log-call-button flex h-11 min-w-0 items-center justify-center rounded-lg border border-[#10ac84] bg-[#10ac84] px-3 text-sm font-semibold text-white transition hover:border-[#0b8f6e] hover:bg-[#0b8f6e] disabled:cursor-not-allowed disabled:opacity-80"
+                                                    className="admin-log-call-button flex h-10 min-w-0 items-center justify-center gap-1.5 rounded-lg border border-[#2563eb] bg-[#2563eb] px-2 text-xs font-semibold text-white transition hover:border-[#1d4ed8] hover:bg-[#1d4ed8] disabled:cursor-not-allowed disabled:opacity-80"
+                                                    type="button"
+                                                    onClick={openLogVoicemailConfirm}
+                                                    disabled={!selectedLead || isLoggingAnyCall}
+                                                >
+                                                    <FiVoicemail className="size-4" aria-hidden="true" />
+                                                    {isLoggingVoicemail ? "Logging" : "Voicemail"}
+                                                </button>
+
+                                                <button
+                                                    className="admin-log-call-button flex h-10 min-w-0 items-center justify-center rounded-lg border border-[#10ac84] bg-[#10ac84] px-2 text-xs font-semibold text-white transition hover:border-[#0b8f6e] hover:bg-[#0b8f6e] disabled:cursor-not-allowed disabled:opacity-80"
                                                     type="button"
                                                     onClick={openLogConnectedCallConfirm}
                                                     disabled={!selectedLead || isLoggingAnyCall}
                                                 >
-                                                    {isLoggingConnectedCall ? "Logging" : "Log Call"}
+                                                    {isLoggingConnectedCall ? "Logging" : "Connected"}
                                                 </button>
                                             </div>
                                         </div>
@@ -1984,16 +2297,16 @@ export default function Leads() {
                                                 value={isStatusDraftQualified ? "" : followUpDateTime}
                                                 min={getCurrentCstDateTimeInput()}
                                                 onChange={(event) => setFollowUpDateTime(event.target.value)}
-                                                disabled={isStatusDraftQualified}
+                                                disabled={isStatusDraftQualified || Boolean(activeLeadAction)}
                                             />
                                             <button
                                                 className="flex h-10 items-center justify-center gap-2 rounded-lg border border-[#ff9f43] bg-[#ff9f43] px-4 text-sm font-semibold text-white shadow-sm shadow-[#ff9f43]/20 transition hover:border-[#f08a2b] hover:bg-[#f08a2b] disabled:cursor-not-allowed disabled:opacity-60"
                                                 type="button"
-                                                disabled={!followUpDateTime || scheduleFollowUpMutation.isPending || isStatusDraftQualified}
+                                                disabled={!followUpDateTime || scheduleFollowUpMutation.isPending || isStatusDraftQualified || Boolean(activeLeadAction)}
                                                 onClick={handleScheduleFollowUp}
                                             >
                                                 <FiCalendar className="size-4" aria-hidden="true" />
-                                                {scheduleFollowUpMutation.isPending ? "Scheduling" : "Schedule"}
+                                                {activeLeadAction === "schedule" ? "Saving & scheduling" : "Schedule"}
                                             </button>
                                         </div>
                                         <p className="mt-2 text-xs text-white/35">
@@ -2017,7 +2330,7 @@ export default function Leads() {
                                                 className="h-11 min-w-0 rounded-lg border border-white/10 bg-[#0d1018] px-3 text-sm font-semibold text-white outline-none transition focus:border-[#842cff] focus:ring-2 focus:ring-[#842cff]/20"
                                                 value={statusDraft}
                                                 onChange={(event) => setStatusDraft(event.target.value as LeadStatus)}
-                                                disabled={updateStatusMutation.isPending}
+                                                disabled={updateStatusMutation.isPending || Boolean(activeLeadAction)}
                                             >
                                                 {Array.from(new Set([...visibleEmployeeStatusOptions, selectedLead.status])).map((status) => (
                                                     <option key={status} value={status}>
@@ -2028,11 +2341,11 @@ export default function Leads() {
                                             <button
                                                 className="flex h-11 items-center justify-center gap-2 rounded-lg border border-[#10ac84] bg-[#10ac84] px-4 text-sm font-semibold text-white shadow-sm shadow-[#10ac84]/20 transition hover:border-[#0b8f6e] hover:bg-[#0b8f6e] disabled:cursor-not-allowed disabled:opacity-60"
                                                 type="button"
-                                                disabled={updateStatusMutation.isPending || !hasStatusUpdate}
+                                                disabled={updateStatusMutation.isPending || Boolean(activeLeadAction) || !hasStatusUpdate}
                                                 onClick={handleSaveStatus}
                                             >
                                                 <FiSave className="size-4" aria-hidden="true" />
-                                                {updateStatusMutation.isPending ? "Saving" : isStatusDraftQualified && shouldClearQualifiedFollowUp ? "Reset" : "Save"}
+                                                {activeLeadAction === "status" ? "Saving" : isStatusDraftQualified && shouldClearQualifiedFollowUp ? "Reset" : "Save"}
                                             </button>
                                         </div>
                                         {updateStatusMutation.isPending && (
@@ -2050,6 +2363,7 @@ export default function Leads() {
                                                 className="h-10 min-w-0 rounded-lg border border-white/10 bg-[#0d1018] px-3 text-sm font-semibold text-white outline-none transition focus:border-[#842cff] focus:ring-2 focus:ring-[#842cff]/20"
                                                 value={passAgentId}
                                                 onChange={(event) => setPassAgentId(event.target.value)}
+                                                disabled={Boolean(activeLeadAction)}
                                             >
                                                 <option value="">Select agent</option>
                                                 {passableAgents.map((employee) => (
@@ -2061,7 +2375,7 @@ export default function Leads() {
                                             <button
                                                 className="flex h-10 items-center justify-center gap-2 rounded-lg border border-[#2e86de] bg-[#2e86de] px-4 text-sm font-semibold text-white shadow-sm shadow-[#2e86de]/20 transition hover:border-[#1f6fbf] hover:bg-[#1f6fbf] disabled:cursor-not-allowed disabled:opacity-60"
                                                 type="button"
-                                                disabled={!passAgentId || passLeadMutation.isPending}
+                                                disabled={!passAgentId || passLeadMutation.isPending || Boolean(activeLeadAction)}
                                                 onClick={requestPassLead}
                                             >
                                                 <FiUserPlus className="size-4" aria-hidden="true" />
@@ -2106,17 +2420,18 @@ export default function Leads() {
                                                         saveComment();
                                                     }
                                                 }}
-                                                placeholder="Add a comment for this lead..."
+                                                placeholder="Add a note for this lead..."
+                                                disabled={addCommentMutation.isPending || Boolean(activeLeadAction)}
                                             />
                                             <div className="mt-3 flex justify-end">
                                                 <button
                                                     className="flex h-10 items-center gap-2 rounded-lg border border-[#10ac84] bg-[#10ac84] px-4 text-sm font-semibold text-white shadow-sm shadow-[#10ac84]/20 transition hover:border-[#0b8f6e] hover:bg-[#0b8f6e] disabled:cursor-not-allowed disabled:opacity-60"
                                                     type="button"
-                                                    disabled={addCommentMutation.isPending || !commentDraft.trim()}
+                                                    disabled={addCommentMutation.isPending || Boolean(activeLeadAction) || !commentDraft.trim()}
                                                     onClick={saveComment}
                                                 >
                                                     <FiSave className="size-4" aria-hidden="true" />
-                                                    {addCommentMutation.isPending ? "Saving..." : "Add Comment"}
+                                                    {addCommentMutation.isPending ? "Saving..." : "Add Note"}
                                                 </button>
                                             </div>
                                         </div>
@@ -2255,7 +2570,7 @@ export default function Leads() {
                 <div
                     className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4 backdrop-blur-sm"
                     onPointerDown={(event) => {
-                        if (event.target === event.currentTarget) {
+                        if (event.target === event.currentTarget && !activeLeadAction) {
                             setPassConfirm(null);
                         }
                     }}
@@ -2277,7 +2592,7 @@ export default function Leads() {
                             <button
                                 className="h-9 rounded-lg border border-white/10 bg-white/[0.06] px-3 text-sm font-semibold text-white/65 transition hover:bg-white/10 hover:text-white"
                                 type="button"
-                                disabled={passLeadMutation.isPending}
+                                disabled={passLeadMutation.isPending || Boolean(activeLeadAction)}
                                 onClick={() => setPassConfirm(null)}
                             >
                                 Cancel
@@ -2285,10 +2600,10 @@ export default function Leads() {
                             <button
                                 className="h-9 rounded-lg bg-[linear-gradient(135deg,#842cff,#4a0ebd)] px-3 text-sm font-semibold text-white transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60"
                                 type="button"
-                                disabled={passLeadMutation.isPending}
-                                onClick={() => passLeadMutation.mutate(passConfirm)}
+                                disabled={passLeadMutation.isPending || Boolean(activeLeadAction)}
+                                onClick={confirmPassLead}
                             >
-                                {passLeadMutation.isPending ? "Re assigning..." : "Confirm Re Assign"}
+                                {activeLeadAction === "assignment" ? "Saving & re assigning..." : "Confirm Re Assign"}
                             </button>
                         </div>
                     </section>
@@ -2345,7 +2660,9 @@ export default function Leads() {
                                 className={
                                     callLoggerConfirmAction === "not_connected"
                                         ? "font-semibold text-[#e11d48]"
-                                        : "font-semibold text-[#0f8f70]"
+                                        : callLoggerConfirmAction === "voicemail"
+                                          ? "font-semibold text-[#2563eb]"
+                                          : "font-semibold text-[#0f8f70]"
                                 }
                             >
                                 {requestedCallLoggerLabel}
@@ -2369,7 +2686,9 @@ export default function Leads() {
                                     "flex h-10 items-center justify-center rounded-lg px-4 text-sm font-semibold text-white transition disabled:cursor-not-allowed disabled:opacity-70",
                                     callLoggerConfirmAction === "not_connected"
                                         ? "border border-[#f13453] bg-[#f13453] hover:border-[#db203f] hover:bg-[#db203f]"
-                                        : "border border-[#10ac84] bg-[#10ac84] hover:border-[#0b8f6e] hover:bg-[#0b8f6e]",
+                                        : callLoggerConfirmAction === "voicemail"
+                                          ? "border border-[#2563eb] bg-[#2563eb] hover:border-[#1d4ed8] hover:bg-[#1d4ed8]"
+                                          : "border border-[#10ac84] bg-[#10ac84] hover:border-[#0b8f6e] hover:bg-[#0b8f6e]",
                                 ].join(" ")}
                                 onClick={confirmCallLoggerAction}
                                 disabled={isLoggingAnyCall}

@@ -1,4 +1,5 @@
 import { api } from "../lib/api";
+import { normalizePhoneForCall } from "../lib/phoneNumber";
 import type { Employee } from "./employees";
 import type { Team } from "./teams";
 
@@ -32,6 +33,8 @@ export type Lead = {
     assignedTeam: Team | null;
     favoriteByEmployees?: string[];
     googlePlaceId: string;
+    placeProvider?: "" | "google" | "tomtom";
+    providerPlaceId?: string;
     notes: string;
     comments?: Array<{
         _id?: string;
@@ -87,8 +90,14 @@ export type LeadInput = {
     activityActorType?: "admin" | "employee" | "system";
 };
 
-export type GooglePlaceLead = {
+export type BusinessPlaceLead = {
     googlePlaceId: string;
+    provider?: "google" | "tomtom";
+    providerPlaceId?: string;
+    providerCategory?: string;
+    matchedQuery?: string;
+    relevanceScore?: number;
+    relevanceReason?: string;
     businessName: string;
     businessAddress: string;
     phone: string;
@@ -97,21 +106,80 @@ export type GooglePlaceLead = {
     longitude?: number;
 };
 
-export type GooglePlacesSearchResult = {
-    places: GooglePlaceLead[];
-    nextPageToken: string;
-};
-
-export type GooglePlacesImportAllResult = GooglePlacesSearchResult & {
+export type PlacesImportResult = {
+    places: BusinessPlaceLead[];
     leads: Lead[];
     skippedNoPhoneCount?: number;
     duplicateCount?: number;
+    rejectedIrrelevantCount?: number;
     searchedLocations?: string[];
     searchedQueries?: string[];
     searchedPages?: number;
 };
 
-export type GooglePlacesAutoSearchResult = GooglePlacesImportAllResult & {
+export type TomTomUsage = {
+    provider: "tomtom";
+    dayKey: string;
+    periodKey: string;
+    resetAt: string;
+    usagePeriod: "month";
+    used: number;
+    limit: number;
+    remaining: number;
+    configured: boolean;
+    evaluationMode: boolean;
+    products: {
+        discover: {
+            product: "places-discover";
+            periodKey: string;
+            used: number;
+            limit: number;
+            remaining: number;
+        };
+        search: {
+            product: "search";
+            periodKey: string;
+            used: number;
+            limit: number;
+            remaining: number;
+        };
+        suggest: {
+            product: "places-suggest";
+            periodKey: string;
+            used: number;
+            limit: number;
+            remaining: number;
+        };
+        details: {
+            product: "places-details";
+            periodKey: string;
+            used: number;
+            limit: number;
+            remaining: number;
+        };
+        geocoding: {
+            product: "geocoding";
+            periodKey: string;
+            used: number;
+            limit: number;
+            remaining: number;
+        };
+    };
+    manualEstimatedRequests: number;
+    autoEstimatedRequests: number;
+    geocodingEstimatedRequests: number;
+    maxResultsPerRequest: number;
+    resetTimeZone: string;
+};
+
+export type TomTomPlacesImportResult = PlacesImportResult & {
+    provider: "tomtom";
+    requestCount: number;
+    limitReached: boolean;
+    usage: Omit<TomTomUsage, "manualEstimatedRequests" | "autoEstimatedRequests" | "maxResultsPerRequest" | "resetTimeZone">;
+};
+
+export type TomTomPlacesAutoSearchResult = TomTomPlacesImportResult & {
     product: string;
     location: string;
     radiusMiles?: number;
@@ -393,8 +461,8 @@ export async function getAgentLeadDashboard(params: { month?: string; dateFrom?:
     return response.data;
 }
 
-export async function getLead(id: string) {
-    const response = await api.get<Lead>(`/leads/${id}`);
+export async function getLead(id: string, options: { timeoutMs?: number } = {}) {
+    const response = await api.get<Lead>(`/leads/${id}`, { timeout: options.timeoutMs });
     return response.data;
 }
 
@@ -404,11 +472,13 @@ export async function getMyLeads(params: {
     page?: number;
     limit?: number;
     tab?: EmployeeLeadTab;
+    queue?: "ALL" | "NEW" | "Follow up";
     search?: string;
     searchAll?: boolean;
     includeArchived?: boolean;
     state?: string;
-}) {
+    autoCallEligible?: boolean;
+}, options: { timeoutMs?: number } = {}) {
     const endpoint = params.tab && params.tab !== "my" ? `/my-leads/${params.tab}` : "/my-leads";
     const response = await api.get<MyLeadsPage>(endpoint, {
         params: {
@@ -416,8 +486,58 @@ export async function getMyLeads(params: {
             tab: undefined,
             employeeNames: params.employeeNames?.join(","),
         },
+        timeout: options.timeoutMs,
     });
     return response.data;
+}
+
+export async function getNextAutoCallLead(params: {
+    employeeId: string;
+    employeeNames: string[];
+    excludedLeadIds?: string[];
+}, options: { timeoutMs?: number } = {}) {
+    const excludedLeadIds = new Set(params.excludedLeadIds || []);
+    let page = 1;
+
+    const getPhilippineDate = (value: string | Date) => new Intl.DateTimeFormat("en-CA", {
+        timeZone: "Asia/Manila",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+    }).format(new Date(value));
+    const currentPhilippineDate = getPhilippineDate(new Date());
+    const wasCommentedByEmployeeToday = (lead: Lead) => (lead.comments || []).some(
+        (comment) => comment.authorType === "employee" && getPhilippineDate(comment.createdAt) === currentPhilippineDate
+    );
+
+    while (true) {
+        const leadPage = await getMyLeads({
+            employeeId: params.employeeId,
+            employeeNames: params.employeeNames,
+            tab: "my",
+            queue: "ALL",
+            page,
+            limit: 50,
+        }, options);
+        const callableLead = leadPage.leads
+            .filter((item) => !excludedLeadIds.has(item._id))
+            .filter((item) => !wasCommentedByEmployeeToday(item))
+            .map((lead) => ({ lead, normalizedPhone: normalizePhoneForCall(lead.phone) }))
+            .find((item) => Boolean(item.normalizedPhone));
+
+        if (callableLead?.normalizedPhone) {
+            return {
+                ...callableLead,
+                queue: callableLead.lead.status === "Follow up" ? "Follow up" as const : "NEW" as const,
+            };
+        }
+
+        if (!leadPage.hasMore || leadPage.nextPage === null) {
+            return null;
+        }
+
+        page = leadPage.nextPage;
+    }
 }
 
 export async function getMyLeadCounts(params: { employeeId?: string; employeeNames?: string[]; state?: string } = {}) {
@@ -450,6 +570,14 @@ export async function updateLead(id: string, lead: LeadInput) {
     return response.data;
 }
 
+export async function assignLead(
+    id: string,
+    assignment: { assignedAgent: string; assignedAgentName?: string } & LeadActivityActorInput
+) {
+    const response = await api.patch<Lead>(`/leads/${id}/assign`, assignment);
+    return response.data;
+}
+
 export async function archiveLead(id: string, actor: LeadActivityActorInput = {}) {
     const response = await api.patch<Lead>(`/leads/${id}/archive`, actor);
     return response.data;
@@ -476,6 +604,7 @@ export async function bulkArchiveLeads(leadIds: string[]) {
 
 export async function archiveAllActiveLeads() {
     const response = await api.patch<LeadBulkArchiveResult>("/leads/bulk/archive-all", {
+        confirmation: "ARCHIVE_ALL_ACTIVE_LEADS",
         activityActorName: "Admin",
         activityActorType: "admin",
     });
@@ -512,6 +641,7 @@ export async function bulkPermanentlyDeleteActiveLeads(leadIds: string[]) {
 
 export async function restoreAllArchivedLeads() {
     const response = await api.patch<LeadBulkRestoreResult>("/leads/archived/restore", {
+        confirmation: "RESTORE_ALL_ARCHIVED_LEADS",
         activityActorName: "Admin",
         activityActorType: "admin",
     });
@@ -519,7 +649,9 @@ export async function restoreAllArchivedLeads() {
 }
 
 export async function permanentlyDeleteAllArchivedLeads() {
-    const response = await api.delete<LeadPermanentDeleteResult>("/leads/archived/permanent");
+    const response = await api.delete<LeadPermanentDeleteResult>("/leads/archived/permanent", {
+        data: { confirmation: "DELETE_ALL_ARCHIVED_LEADS" },
+    });
     return response.data;
 }
 
@@ -554,8 +686,12 @@ type LeadActivityActorInput = {
     activityActorType?: "admin" | "employee" | "system";
 };
 
-export async function recordLeadCall(id: string, actor: LeadActivityActorInput = {}) {
-    const response = await api.post<Lead>(`/leads/${id}/calls`, actor);
+export async function recordLeadCall(
+    id: string,
+    actor: LeadActivityActorInput & { callOutcome?: "confirmed" | "failed" } = {},
+    options: { timeoutMs?: number } = {}
+) {
+    const response = await api.post<Lead>(`/leads/${id}/calls`, actor, { timeout: options.timeoutMs });
     return response.data;
 }
 
@@ -579,52 +715,56 @@ export async function scoreLeadsByHighestPotential(leadIds: string[] = []) {
     return response.data;
 }
 
-export async function searchGooglePlaces({ textQuery, pageToken = "" }: { textQuery: string; pageToken?: string }) {
-    const response = await api.post<GooglePlacesSearchResult>("/leads/google-places/search", { textQuery, pageToken });
+export async function getTomTomUsage({ product = "", location = "", targetLeads = 1000 }: { product?: string; location?: string; targetLeads?: number } = {}) {
+    const response = await api.get<TomTomUsage>("/leads/tomtom/usage", { params: { product, location, targetLeads } });
     return response.data;
 }
 
-export async function importGooglePlaces(places: GooglePlaceLead[], category = "") {
-    const response = await api.post<Lead[]>("/leads/google-places/import", { places, category });
-    return response.data;
-}
-
-export async function searchAndImportGooglePlaces({
+export async function searchAndImportTomTomPlaces({
     textQuery,
     category = "",
     location = "",
     radiusMiles = 0,
-    maxPages = 20,
+    maxResults = 1000,
+    maxRequests,
 }: {
     textQuery: string;
     category?: string;
     location?: string;
     radiusMiles?: number;
-    maxPages?: number;
+    maxResults?: number;
+    maxRequests?: number;
 }) {
-    const response = await api.post<GooglePlacesImportAllResult>("/leads/google-places/search-import", { textQuery, category, location, radiusMiles, maxPages });
+    const response = await api.post<TomTomPlacesImportResult>("/leads/tomtom/search-import", {
+        textQuery,
+        category,
+        location,
+        radiusMiles,
+        maxResults,
+        maxRequests,
+    });
     return response.data;
 }
 
-export async function autoSearchGooglePlacesLeads({
+export async function autoSearchTomTomPlacesLeads({
     product,
     location = "",
     radiusMiles = 0,
-    maxResults = 10000,
-    maxPages = 20,
+    maxResults = 1000,
+    maxRequests,
 }: {
     product: string;
     location?: string;
     radiusMiles?: number;
     maxResults?: number;
-    maxPages?: number;
+    maxRequests?: number;
 }) {
-    const response = await api.post<GooglePlacesAutoSearchResult>("/leads/google-places/auto-search", {
+    const response = await api.post<TomTomPlacesAutoSearchResult>("/leads/tomtom/auto-search", {
         product,
         location,
         radiusMiles,
         maxResults,
-        maxPages,
+        maxRequests,
     });
     return response.data;
 }
@@ -687,7 +827,7 @@ export async function autoSearchGooglePlacesLeads({
 // }
 
 
-export type LeadCallOutcome = "connected" | "not_connected";
+export type LeadCallOutcome = "connected" | "not_connected" | "voicemail";
 
 export type LeadCallLogItem = {
     _id?: string;
@@ -715,11 +855,43 @@ export type LeadCallStat = {
     businessName: string;
     callCount: number;
     callNotConnectedCount?: number;
+    callVoicemailCount?: number;
     lastCallAt?: string | null;
     lastNotConnectedAt?: string | null;
+    lastVoicemailAt?: string | null;
     callLogs: LeadCallLogItem[];
     createdAt?: string;
     updatedAt?: string;
+};
+
+export type LeadCallSummaryLead = {
+    leadId: string;
+    leadName: string;
+    businessName: string;
+    callCount: number;
+    callNotConnectedCount: number;
+    callVoicemailCount: number;
+    totalAttempts: number;
+    lastCallAt: string | null;
+};
+
+export type EmployeeLeadCallSummary = {
+    employeeId: string;
+    employeeName: string;
+    employeeRole: string;
+    employeeTeam: string;
+    totalCalls: number;
+    totalNotConnectedCalls: number;
+    totalVoicemails: number;
+    totalAttempts: number;
+    lastCallAt: string | null;
+    leads: LeadCallSummaryLead[];
+};
+
+export type LeadCallSummaryParams = {
+    from?: string;
+    to?: string;
+    employeeId?: string;
 };
 
 export async function getLeadCallStat(leadId: string) {
@@ -749,6 +921,16 @@ export async function getMyLeadCallStats(limit = 10000, employeeId = "") {
     return response.data;
 }
 
+export async function getLeadCallSummary(params: LeadCallSummaryParams = {}) {
+    const response = await api.get<EmployeeLeadCallSummary[]>("/log/call-summary", { params });
+    return response.data;
+}
+
+export async function getMyLeadCallSummary(params: LeadCallSummaryParams = {}) {
+    const response = await api.get<EmployeeLeadCallSummary[]>("/log/call-summary/me", { params });
+    return response.data;
+}
+
 export async function logConnectedLeadCall(leadId: string, employeeId: string) {
     const response = await api.patch<LeadCallStat>(`/log/${leadId}/log-call`, {
         employeeId,
@@ -760,6 +942,15 @@ export async function logConnectedLeadCall(leadId: string, employeeId: string) {
 
 export async function logLeadNotConnected(leadId: string, employeeId: string) {
     const response = await api.patch<LeadCallStat>(`/log/${leadId}/not-connected`, {
+        employeeId,
+        clickedAt: new Date().toISOString(),
+    });
+
+    return response.data;
+}
+
+export async function logLeadVoicemail(leadId: string, employeeId: string) {
+    const response = await api.patch<LeadCallStat>(`/log/${leadId}/voicemail`, {
         employeeId,
         clickedAt: new Date().toISOString(),
     });

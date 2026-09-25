@@ -30,6 +30,9 @@ import { employeeTransactionRouter } from "./routes/employeeTransactionRoutes";
 import { browserActivityRouter } from "./routes/browserActivityRoutes";
 import { errorHandler } from "./middleware/errorHandler";
 import { callRouter } from "./routes/callLoggerRoutes";
+import { callBridgeRouter } from "./routes/callBridgeRoutes";
+import { callDashboardRouter } from "./routes/callDashboardRoutes";
+import { tomTomQuotaRouter } from "./routes/tomTomQuotaRoutes";
 import { businessContextMiddleware, createBusiness, getPublicBusinesses, updateBusinessDisplayName } from "./config/tenancy";
 
 const appDirectory = path.dirname(fileURLToPath(import.meta.url));
@@ -112,6 +115,10 @@ export function createApp() {
         "X-Business-Id",
         "X-Tenant-Id",
         "X-Integration-Key",
+        "X-CRM-User-Code",
+        "X-CRM-User-Name",
+        "X-CRM-User-Type",
+        "X-TomTom-Quota-Secret",
       ],
     })
   );
@@ -168,6 +175,8 @@ export function createApp() {
     response.json(business);
   });
 
+  app.use("/api/tomtom-quota", tomTomQuotaRouter);
+
   app.use("/api", businessContextMiddleware);
 
   app.use("/api/auth", authRouter);
@@ -192,6 +201,8 @@ export function createApp() {
   app.use("/api/reports", reportRouter);
   app.use("/api/messages", messageRouter);
   app.use("/api/browser-activity", browserActivityRouter);
+  app.use("/api/call-bridge", callBridgeRouter);
+  app.use("/api/call-dashboard", callDashboardRouter);
   app.use("/api", noticeRouter);
   app.use("/api", leaveRequestRouter);
   app.use("/api", attendanceRouter);

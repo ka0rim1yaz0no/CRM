@@ -1669,6 +1669,35 @@ textarea.bg-\[\#0d1018\] {
   border-color: rgba(132, 44, 255, 0.34) !important;
 }
 
+.login-screen .login-wordmark {
+  position: relative;
+  aspect-ratio: 510 / 489;
+}
+
+.login-screen .login-wordmark-layer {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.login-screen .login-wordmark-symbol {
+  clip-path: inset(0 0 41.7% 0);
+}
+
+.login-screen .login-wordmark-name {
+  clip-path: inset(58.3% 0 30.4% 0);
+  transform: translateX(5.4%);
+  -webkit-mask-image: radial-gradient(circle at 80.4% 63.7%, transparent 0 4.8%, #000 5.2%);
+  mask-image: radial-gradient(circle at 80.4% 63.7%, transparent 0 4.8%, #000 5.2%);
+}
+
+.login-screen .login-wordmark-tagline {
+  clip-path: inset(69% 0 23.5% 0);
+  transform: translateX(1.8%);
+}
+
 .login-screen .login-code-input,
 .login-screen .login-code-input:focus {
   background-color: transparent !important;

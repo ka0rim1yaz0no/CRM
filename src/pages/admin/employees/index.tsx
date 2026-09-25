@@ -47,7 +47,9 @@ import {
     formatAttendanceSlotLabel,
     groupAttendanceRecordsBySlot,
     isWeekendAttendanceSlotKey,
+    isAttendanceTimeOutUndertime,
 } from "../../../lib/attendanceSlots";
+import { buildOffPhoneAttendanceSessions, formatAttendanceDuration } from "../../../lib/attendanceRecords";
 import { socket } from "../../../lib/socket";
 import { DataTablePagination } from "../../../components/admin/DataTable";
 import { useToast } from "../../../components/ToastProvider";
@@ -59,6 +61,7 @@ const contactRelationship: ContactRelationships[] = ["Father", "Mother", "Siblin
 const employeeStatusFilters = ["Active", "Archived", "All"] as const;
 const noticeSeverities: NoticeSeverity[] = ["Info", "Warning", "Critical"];
 const todayInputValue = getCurrentCstDateInput;
+const employeeCodeCollator = new Intl.Collator("en", { numeric: true, sensitivity: "base" });
 type EmployeeRecordTab = "details" | "hr" | "leads" | "notices" | "leave" | "attendance" | "transactions";
 type AttendanceCalendarDay = {
     dateKey: string;
@@ -67,7 +70,9 @@ type AttendanceCalendarDay = {
     records: AttendanceRecord[];
     hasTimeIn: boolean;
     hasTimeOut: boolean;
-    status: "late-present" | "ontime-present" | "overtime" | "absent" | "future";
+    isLate: boolean;
+    isUnderTime: boolean;
+    status: "late-present" | "ontime-present" | "undertime" | "overtime" | "absent" | "future";
 };
 
 function splitPhoneExtension(phone = "") {
@@ -80,6 +85,18 @@ function splitPhoneExtension(phone = "") {
 
 function digitsOnly(value = "") {
     return value.replace(/\D/g, "");
+}
+
+function compareEmployeesByCode(first: Employee, second: Employee) {
+    const firstCode = String(first.employeeCode || "").trim();
+    const secondCode = String(second.employeeCode || "").trim();
+
+    if (!firstCode && !secondCode) return first.name.localeCompare(second.name);
+    if (!firstCode) return 1;
+    if (!secondCode) return -1;
+
+    const codeComparison = employeeCodeCollator.compare(firstCode, secondCode);
+    return codeComparison || first.name.localeCompare(second.name);
 }
 
 function availabilityBadgeClass(value?: string) {
@@ -201,12 +218,15 @@ function attendanceSourceLabel(source?: AttendanceRecord["source"]) {
     if (source === "Break In") return "Back Online";
     if (source === "Lunch Break Out") return "Lunch";
     if (source === "Lunch Break In") return "Back Online";
+    if (source === "Off the Phone Out") return "Off the Phone";
+    if (source === "Off the Phone In") return "Back on Phone";
     return source || "Attendance";
 }
 
 function attendanceStatusTone(status: AttendanceCalendarDay["status"]) {
     if (status === "late-present") return "border-rose-300 bg-rose-50 text-rose-700";
     if (status === "ontime-present") return "border-emerald-300 bg-emerald-50 text-emerald-700";
+    if (status === "undertime") return "border-amber-300 bg-amber-50 text-amber-700";
     if (status === "overtime") return "border-violet-300 bg-violet-50 text-violet-700";
     return "border-slate-300 bg-white text-slate-600";
 }
@@ -214,9 +234,16 @@ function attendanceStatusTone(status: AttendanceCalendarDay["status"]) {
 function attendancePresenceLabel(status: AttendanceCalendarDay["status"]) {
     if (status === "late-present") return "Late-Present";
     if (status === "ontime-present") return "Ontime-Present";
+    if (status === "undertime") return "Undertime";
     if (status === "overtime") return "Overtime";
     if (status === "future") return "";
     return "Absent";
+}
+
+function attendanceDayStatuses(day: AttendanceCalendarDay) {
+    if (day.status === "future") return [];
+    if (day.isLate && day.isUnderTime) return ["late-present", "undertime"] as const;
+    return [day.status];
 }
 
 function leaveRequestStatusClass(status: LeaveRequest["status"]) {
@@ -636,11 +663,16 @@ export default function AdminEmployees() {
 
     const activeEmployees = useMemo(() => employees.filter((employee) => employee.status !== "Archived"), [employees]);
     const archivedEmployees = useMemo(() => employees.filter((employee) => employee.status === "Archived"), [employees]);
-    const filteredEmployees = useMemo(() => employees.filter((employee) => {
-        if (employeeStatusFilter === "Archived") return employee.status === "Archived";
-        if (employeeStatusFilter === "Active") return employee.status !== "Archived";
-        return employee.status !== "Archived";
-    }), [employeeStatusFilter, employees]);
+    const filteredEmployees = useMemo(
+        () => employees
+            .filter((employee) => {
+                if (employeeStatusFilter === "Archived") return employee.status === "Archived";
+                if (employeeStatusFilter === "Active") return employee.status !== "Archived";
+                return employee.status !== "Archived";
+            })
+            .sort(compareEmployeesByCode),
+        [employeeStatusFilter, employees]
+    );
     const money = (value = 0) => formatCurrency(value, systemSettings?.currencyCode || "USD");
     const activeDepartmentCount = useMemo(() => new Set(activeEmployees.map((employee) => employee.team).filter(Boolean)).size, [activeEmployees]);
     const totalPages = Math.max(1, Math.ceil(filteredEmployees.length / pageSize));
@@ -674,13 +706,17 @@ export default function AdminEmployees() {
         queryFn: () => getEmployeeAttendance(viewingEmployee?._id || ""),
         enabled: Boolean(viewingEmployee?._id && employeeRecordTab === "attendance"),
     });
+    const employeeAttendanceSettings = useMemo(
+        () => ({ ...systemSettings, attendanceTimeZone: ATTENDANCE_TIME_ZONE }),
+        [systemSettings],
+    );
     const attendanceMonthStart = useMemo(() => {
-        const baseRecord = employeeAttendance[0];
-        const baseDate = baseRecord ? new Date(baseRecord.timeIn) : new Date();
-        return new Date(Date.UTC(baseDate.getUTCFullYear(), baseDate.getUTCMonth() + attendanceMonthOffset, 1));
-    }, [attendanceMonthOffset, employeeAttendance]);
+        const currentSlotKey = formatAttendanceSlotKey(new Date(), employeeAttendanceSettings);
+        const [year, month] = currentSlotKey.split("-").map(Number);
+        return new Date(Date.UTC(year, month - 1 + attendanceMonthOffset, 1));
+    }, [attendanceMonthOffset, employeeAttendanceSettings]);
     const attendanceCalendarDays = useMemo<AttendanceCalendarDay[]>(() => {
-        const settings = { attendanceTimeZone: ATTENDANCE_TIME_ZONE };
+        const settings = employeeAttendanceSettings;
         const grouped = groupAttendanceRecordsBySlot(employeeAttendance, settings);
         const monthDays = makeMonthDays(attendanceMonthStart);
         const todayDateKey = formatAttendanceSlotKey(new Date(), settings);
@@ -689,13 +725,18 @@ export default function AdminEmployees() {
             const dateKey = dateKeyFromUtcDate(date);
             const records = [...(grouped[dateKey] || [])].sort((first, second) => new Date(first.timeIn).getTime() - new Date(second.timeIn).getTime());
             const timeInRecord = records.find((record) => record.source === "Login" || record.source === "Time In");
+            const timeOutRecord = [...records].reverse().find((record) => record.source === "Logout" || record.source === "Time Out");
             const isWeekendSlot = isWeekendAttendanceSlotKey(dateKey);
             const hasTimeIn = Boolean(timeInRecord);
-            const hasTimeOut = records.some((record) => record.source === "Logout" || record.source === "Time Out");
+            const hasTimeOut = Boolean(timeOutRecord);
+            const isLate = timeInRecord?.attendanceStatus === "Late";
+            const isUnderTime = Boolean(timeInRecord && timeOutRecord && isAttendanceTimeOutUndertime(timeOutRecord, settings));
             const status: AttendanceCalendarDay["status"] = timeInRecord
-                ? isWeekendSlot
+                ? isUnderTime
+                    ? "undertime"
+                    : isWeekendSlot
                     ? "overtime"
-                    : timeInRecord.attendanceStatus === "Late"
+                    : isLate
                         ? "late-present"
                         : "ontime-present"
                 : dateKey > todayDateKey
@@ -709,17 +750,23 @@ export default function AdminEmployees() {
                 records,
                 hasTimeIn,
                 hasTimeOut,
+                isLate,
+                isUnderTime,
                 status,
             };
         });
-    }, [attendanceMonthStart, employeeAttendance]);
+    }, [attendanceMonthStart, employeeAttendance, employeeAttendanceSettings]);
     const selectedAttendanceDay = useMemo(
         () =>
             attendanceCalendarDays.find((day) => day.dateKey === selectedAttendanceDateKey) ||
+            attendanceCalendarDays.find((day) => day.dateKey === formatAttendanceSlotKey(new Date(), employeeAttendanceSettings)) ||
             attendanceCalendarDays.find((day) => day.records.length > 0) ||
-            attendanceCalendarDays.find((day) => day.dateKey === formatAttendanceSlotKey(new Date(), { attendanceTimeZone: ATTENDANCE_TIME_ZONE })) ||
             attendanceCalendarDays[0],
-        [attendanceCalendarDays, selectedAttendanceDateKey],
+        [attendanceCalendarDays, employeeAttendanceSettings, selectedAttendanceDateKey],
+    );
+    const selectedAttendanceOffPhoneSessions = useMemo(
+        () => buildOffPhoneAttendanceSessions(selectedAttendanceDay?.records || []),
+        [selectedAttendanceDay],
     );
     const { data: employeeTransactions = [] } = useQuery({
         queryKey: ["employee-transactions", viewingEmployee?._id, transactionDate],
@@ -1200,8 +1247,9 @@ export default function AdminEmployees() {
         if (!routedEmployee) return;
 
         if (isEmployeeDetailPage) {
+            const requestedTab = new URLSearchParams(location.search).get("tab");
             setViewingEmployee(routedEmployee);
-            setEmployeeRecordTab("details");
+            setEmployeeRecordTab(requestedTab === "attendance" ? "attendance" : "details");
             setSelectedAttendanceDateKey("");
             setAttendanceMonthOffset(0);
             setTransactionDate(todayInputValue());
@@ -1232,7 +1280,7 @@ export default function AdminEmployees() {
             setModalMode("edit");
             setOpenDropdown(null);
         }
-    }, [isEmployeeDetailPage, isEmployeeEditPage, routedEmployee]);
+    }, [isEmployeeDetailPage, isEmployeeEditPage, location.search, routedEmployee]);
 
     useEffect(() => {
         if (!isEmployeeRoutePage || isEmployeeDetailPage) {
@@ -2748,6 +2796,7 @@ export default function AdminEmployees() {
                                                     <div className="flex flex-wrap gap-2 text-xs font-semibold">
                                                         <span className="rounded-full border border-rose-300 bg-rose-50 px-2 py-1 text-rose-700">Late-Present</span>
                                                         <span className="rounded-full border border-emerald-300 bg-emerald-50 px-2 py-1 text-emerald-700">Ontime-Present</span>
+                                                        <span className="rounded-full border border-amber-300 bg-amber-50 px-2 py-1 text-amber-700">Undertime</span>
                                                         <span className="rounded-full border border-violet-300 bg-violet-50 px-2 py-1 text-violet-700">Overtime</span>
                                                         <span className="rounded-full border border-slate-300 bg-white px-2 py-1 text-slate-600">Absent</span>
                                                     </div>
@@ -2777,11 +2826,13 @@ export default function AdminEmployees() {
                                                             <div className="flex items-center justify-between">
                                                                 <span className={["text-xs font-bold", isInMonth ? "text-slate-900" : "text-slate-400"].join(" ")}>{day.dayNumber}</span>
                                                             </div>
-                                                            {day.status !== "future" && (
-                                                                <span className={`mt-3 block rounded-md border px-1.5 py-1 text-center text-[0.62rem] font-bold ${attendanceStatusTone(day.status)}`}>
-                                                                    {attendancePresenceLabel(day.status)}
-                                                                </span>
-                                                            )}
+                                                            <div className="mt-2 flex flex-col gap-1">
+                                                                {attendanceDayStatuses(day).map((status) => (
+                                                                    <span key={status} className={`block w-full rounded-md border px-1.5 py-1 text-center text-[0.62rem] font-bold ${attendanceStatusTone(status)}`}>
+                                                                        {day.isLate && day.isUnderTime && status === "late-present" ? "Late" : attendancePresenceLabel(status)}
+                                                                    </span>
+                                                                ))}
+                                                            </div>
                                                         </button>
                                                     );
                                                 })}
@@ -2794,11 +2845,13 @@ export default function AdminEmployees() {
                                                     <p className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">Selected Slot</p>
                                                     <p className="mt-1 text-base font-semibold text-black">{selectedAttendanceDay?.label || "No slot"}</p>
                                                 </div>
-                                                {selectedAttendanceDay?.status !== "future" && (
-                                                    <span className={`rounded-full border px-2.5 py-1 text-xs font-bold ${attendanceStatusTone(selectedAttendanceDay?.status || "absent")}`}>
-                                                        {attendancePresenceLabel(selectedAttendanceDay?.status || "absent")}
-                                                    </span>
-                                                )}
+                                                <div className="flex flex-wrap justify-end gap-2">
+                                                    {selectedAttendanceDay && attendanceDayStatuses(selectedAttendanceDay).map((status) => (
+                                                        <span key={status} className={`rounded-full border px-2.5 py-1 text-xs font-bold ${attendanceStatusTone(status)}`}>
+                                                            {attendancePresenceLabel(status)}
+                                                        </span>
+                                                    ))}
+                                                </div>
                                             </div>
 
                                             <div className="mt-4 space-y-3">
@@ -2809,25 +2862,40 @@ export default function AdminEmployees() {
                                                         <p className="mt-1 text-sm text-slate-600">Attendance records will appear here.</p>
                                                     </div>
                                                 )}
-                                                {selectedAttendanceDay?.records.map((attendance) => (
-                                                    <article key={attendance._id} className="flex items-start gap-3 rounded-lg border border-slate-300 bg-white p-3">
-                                                        <div className="flex size-9 shrink-0 items-center justify-center rounded-lg border border-[#842cff]/25 bg-[#842cff]/10 text-[#5f27cd]">
-                                                            <FiClock className="size-4" aria-hidden="true" />
-                                                        </div>
-                                                        <div className="min-w-0 flex-1">
-                                                            <div className="flex flex-wrap items-center gap-2">
-                                                                <p className="text-sm font-semibold text-black">{attendanceSourceLabel(attendance.source)}</p>
-                                                                {attendance.attendanceStatus && (
-                                                                    <span className={["rounded-md px-2 py-1 text-xs font-semibold", attendance.attendanceStatus === "Late" ? "bg-red-100 text-red-700" : "bg-emerald-100 text-emerald-700"].join(" ")}>
-                                                                        {attendance.attendanceStatus}
-                                                                    </span>
-                                                                )}
+                                                {selectedAttendanceDay?.records.map((attendance) => {
+                                                    const offPhoneSession = selectedAttendanceOffPhoneSessions.find((session) =>
+                                                        session.endRecord?._id === attendance._id ||
+                                                        (session.isOpen && session.startRecord._id === attendance._id)
+                                                    );
+                                                    const isUnderTime = isAttendanceTimeOutUndertime(attendance, employeeAttendanceSettings);
+                                                    const displayedAttendanceStatus = attendance.attendanceStatus || (isUnderTime ? "Undertime" : "");
+
+                                                    return (
+                                                        <article key={attendance._id} className="flex items-start gap-3 rounded-lg border border-slate-300 bg-white p-3">
+                                                            <div className="flex size-9 shrink-0 items-center justify-center rounded-lg border border-[#842cff]/25 bg-[#842cff]/10 text-[#5f27cd]">
+                                                                <FiClock className="size-4" aria-hidden="true" />
                                                             </div>
-                                                            <p className="mt-1 text-sm text-slate-600">{formatPhDateTime(attendance.timeIn)}</p>
-                                                            <p className="mt-1 text-xs font-semibold text-slate-500">{attendance.source}</p>
-                                                        </div>
-                                                    </article>
-                                                ))}
+                                                            <div className="min-w-0 flex-1">
+                                                                <div className="flex flex-wrap items-center gap-2">
+                                                                    <p className="text-sm font-semibold text-black">{attendanceSourceLabel(attendance.source)}</p>
+                                                                    {displayedAttendanceStatus && (
+                                                                        <span className={["rounded-md px-2 py-1 text-xs font-semibold", displayedAttendanceStatus === "Late" ? "bg-red-100 text-red-700" : displayedAttendanceStatus === "Undertime" ? "bg-amber-100 text-amber-700" : "bg-emerald-100 text-emerald-700"].join(" ")}>
+                                                                            {displayedAttendanceStatus}
+                                                                        </span>
+                                                                    )}
+                                                                    {offPhoneSession && (
+                                                                        <span className="rounded-md bg-sky-100 px-2 py-1 text-xs font-semibold text-sky-700">
+                                                                            {offPhoneSession.isOpen ? "Running " : "Duration "}
+                                                                            {formatAttendanceDuration(offPhoneSession.durationMs)}
+                                                                        </span>
+                                                                    )}
+                                                                </div>
+                                                                <p className="mt-1 text-sm text-slate-600">{formatPhDateTime(attendance.timeIn)}</p>
+                                                                <p className="mt-1 text-xs font-semibold text-slate-500">{attendance.source}</p>
+                                                            </div>
+                                                        </article>
+                                                    );
+                                                })}
                                             </div>
                                         </aside>
                                     </div>

@@ -257,6 +257,8 @@ export type LeadDocument = {
   assignedTeam: Types.ObjectId | null;
   favoriteByEmployees: Types.ObjectId[];
   googlePlaceId: string;
+  placeProvider: "" | "google" | "tomtom";
+  providerPlaceId: string;
   notes: string;
 
   callCount: number;
@@ -474,6 +476,19 @@ const leadSchema = new Schema<LeadDocument>(
     },
 
     googlePlaceId: {
+      type: String,
+      trim: true,
+      default: "",
+    },
+
+    placeProvider: {
+      type: String,
+      enum: ["", "google", "tomtom"],
+      default: "",
+      index: true,
+    },
+
+    providerPlaceId: {
       type: String,
       trim: true,
       default: "",

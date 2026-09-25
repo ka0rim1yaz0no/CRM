@@ -42,7 +42,7 @@ export type PayrollListItemDocument = {
 const payrollRecordSchema = new Schema<PayrollRecordDocument>(
   {
     employeeName: { type: String, required: true, trim: true },
-    email: { type: String, required: true, trim: true },
+    email: { type: String, trim: true, default: "" },
     employeeId: { type: String, required: true, trim: true },
     department: { type: String, required: true, trim: true },
     payType: { type: String, enum: ["Monthly", "Semi-monthly", "Weekly", "Hourly", "Contract"], required: true, trim: true, default: "Semi-monthly" },

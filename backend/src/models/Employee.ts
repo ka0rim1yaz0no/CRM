@@ -44,6 +44,7 @@ export type EmployeeDocument = {
   salary: number;
   status: EmployeeStatus;
   availabilityStatus: EmployeeAvailabilityStatus;
+  availabilityStatusReason: string;
   businessAccessIds: string[];
 };
 
@@ -84,6 +85,7 @@ const employeeSchema = new Schema<EmployeeDocument>(
       default: "OFFLINE",
       set: normalizeEmployeeAvailabilityStatus,
     },
+    availabilityStatusReason: { type: String, trim: true, default: "" },
   },
   { timestamps: true }
 );

@@ -5,6 +5,7 @@ import { loginWithEmployeeCode } from "../api/auth";
 import { getBusinesses } from "../api/businesses";
 import { setAuthUser } from "../api/authStorage";
 import { getActiveBusinessId, setActiveBusinessId, type BusinessOption } from "../api/businessStorage";
+import { activateCallBridgeForEmployee, beginCallBridgeBrowserSession } from "../api/callBridge";
 import { refreshSocketBusinessContext } from "../lib/socket";
 
 const BadgeIcon = () => (
@@ -83,6 +84,12 @@ function Login() {
       refreshSocketBusinessContext();
       const authUser = await loginWithEmployeeCode(employeeCode, selectedBusinessId);
       setAuthUser(authUser);
+
+      if (authUser.userType === "employee" && authUser.user.employeeCode) {
+        beginCallBridgeBrowserSession(authUser.user.employeeCode);
+        void activateCallBridgeForEmployee(authUser.user.employeeCode, { timeoutMs: 3_000 }).catch(() => undefined);
+      }
+
       queryClient.clear();
       navigate(authUser.userType === "admin" ? "/admin/dashboard" : "/dashboard", { replace: true });
     } catch (loginError) {
@@ -102,11 +109,15 @@ function Login() {
         <div className="relative grid w-full max-w-[57.5rem] items-center gap-8 lg:grid-cols-[1fr_26.25rem]">
           <aside className="flex justify-center lg:justify-start relative left-[-6.5rem]">
             <div className="flex w-full max-w-[38rem] items-center justify-center lg:justify-start">
-              <img
-                className="w-full max-w-[28rem] object-contain drop-shadow-[0_0_1.5rem_rgba(126,47,255,0.22)] sm:max-w-[30rem]"
-                src="/images/logo2.png"
-                alt="Assistly"
-              />
+              <div
+                className="login-wordmark w-full max-w-[28rem] drop-shadow-[0_0_1.5rem_rgba(126,47,255,0.22)] sm:max-w-[30rem]"
+                role="img"
+                aria-label="Assistly"
+              >
+                <img className="login-wordmark-layer login-wordmark-symbol" src="/images/logo2.png" alt="" aria-hidden="true" />
+                <img className="login-wordmark-layer login-wordmark-name" src="/images/logo2.png" alt="" aria-hidden="true" />
+                <img className="login-wordmark-layer login-wordmark-tagline" src="/images/logo2.png" alt="" aria-hidden="true" />
+              </div>
             </div>
           </aside>
 

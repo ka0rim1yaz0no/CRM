@@ -1,9 +1,10 @@
 import { Router } from "express";
 import {
+  assignLead,
   archiveLead,
   archiveAllActiveLeads,
   addLeadComment,
-  autoSearchPlacesForProduct,
+  autoSearchTomTomPlacesForProduct,
   autoAssignLead,
   bulkAssignLeads,
   bulkArchiveLeads,
@@ -13,8 +14,8 @@ import {
   countLeads,
   createLead,
   importLeads,
-  importPlacesAsLeads,
   readAgentLeadDashboard,
+  readTomTomPlacesUsage,
   readLead,
   listEmployeeLeadLogs,
   listMyLeads,
@@ -27,14 +28,13 @@ import {
   restoreLead,
   scoreLeadsByHighestPotential,
   scheduleLeadFollowUp,
-  searchAndImportPlacesAsLeads,
-  searchPlacesForLeads,
+  searchAndImportTomTomPlacesAsLeads,
   updateLead,
   updateLeadComment,
   updateLeadStatus,
   toggleLeadFavorite,
 } from "../controllers/leadController";
-import { getLeadCallStat, getLeadCallStats, getMyLeadCallStats, logConnectedCall, logNotConnectedCall } from "../controllers/leadCallStatController";
+import { getLeadCallStat, getLeadCallStats, getMyLeadCallStats, logConnectedCall, logNotConnectedCall, logVoicemailCall } from "../controllers/leadCallStatController";
 
 export const leadRouter = Router();
 
@@ -59,6 +59,7 @@ leadRouter.delete("/bulk/active/permanent", bulkPermanentlyDeleteActiveLeads);
 leadRouter.patch("/archived/restore", restoreAllArchivedLeads);
 leadRouter.delete("/archived/permanent", permanentlyDeleteArchivedLeads);
 leadRouter.put("/:id", updateLead);
+leadRouter.patch("/:id/assign", assignLead);
 leadRouter.patch("/:id/archive", archiveLead);
 leadRouter.patch("/:id/restore", restoreLead);
 leadRouter.delete("/:id/permanent", permanentlyDeleteLead);
@@ -69,13 +70,13 @@ leadRouter.patch("/:id/status", updateLeadStatus);
 leadRouter.patch("/:id/favorite", toggleLeadFavorite);
 leadRouter.patch("/:id/follow-up", scheduleLeadFollowUp);
 leadRouter.patch("/:id/auto-assign", autoAssignLead);
-leadRouter.post("/google-places/search", searchPlacesForLeads);
-leadRouter.post("/google-places/search-import", searchAndImportPlacesAsLeads);
-leadRouter.post("/google-places/auto-search", autoSearchPlacesForProduct);
-leadRouter.post("/google-places/import", importPlacesAsLeads);
+leadRouter.get("/tomtom/usage", readTomTomPlacesUsage);
+leadRouter.post("/tomtom/search-import", searchAndImportTomTomPlacesAsLeads);
+leadRouter.post("/tomtom/auto-search", autoSearchTomTomPlacesForProduct);
 
 
 leadRouter.get("/:id/call-stat", getLeadCallStat);
 
 leadRouter.patch("/:id/log-call", logConnectedCall);
 leadRouter.patch("/:id/not-connected", logNotConnectedCall);
+leadRouter.patch("/:id/voicemail", logVoicemailCall);

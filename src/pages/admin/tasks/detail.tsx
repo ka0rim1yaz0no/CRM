@@ -79,7 +79,7 @@ export default function AdminTaskDetail() {
         addCommentMutation.mutate(body);
     };
 
-    const useSuggestedComment = (comment: string) => {
+    const applySuggestedComment = (comment: string) => {
         setCommentDraft(comment);
     };
 
@@ -197,7 +197,7 @@ export default function AdminTaskDetail() {
                                             key={comment}
                                             className="rounded-lg border border-slate-300 bg-slate-50 px-3 py-2 text-left text-sm font-semibold leading-5 text-slate-700 transition hover:border-[#842cff]/50 hover:bg-[#842cff]/10 hover:text-slate-950"
                                             type="button"
-                                            onClick={() => useSuggestedComment(comment)}
+                                            onClick={() => applySuggestedComment(comment)}
                                         >
                                             {comment}
                                         </button>
