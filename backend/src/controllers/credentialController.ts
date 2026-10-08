@@ -1,5 +1,15 @@
 import type { Request, Response } from "express";
+import { getBusinessById, getDefaultBusiness, runWithBusiness } from "../config/tenancy";
 import { Credential, type CredentialStatus } from "../models/Credential";
+
+function sharedCredentialBusinessId() {
+  const configuredId = String(process.env.SHARED_CREDENTIAL_BUSINESS_ID || "business-a").trim();
+  return getBusinessById(configuredId)?.id || getDefaultBusiness().id;
+}
+
+function withSharedCredentials<T>(callback: () => Promise<T>) {
+  return runWithBusiness(sharedCredentialBusinessId(), callback);
+}
 
 function toText(value: unknown, fallback = "") {
   const text = String(value || "").trim();
@@ -24,7 +34,9 @@ function getCredentialInput(request: Request) {
 }
 
 export async function listCredentials(_request: Request, response: Response) {
-  const credentials = await Credential.find({ status: { $ne: "Archived" } }).sort({ updatedAt: -1 }).lean();
+  const credentials = await withSharedCredentials(() =>
+    Credential.find({ status: { $ne: "Archived" } }).sort({ updatedAt: -1 }).lean()
+  );
   response.json(
     credentials.map((credential) => ({
       ...credential,
@@ -47,15 +59,17 @@ export async function createCredential(request: Request, response: Response) {
     return;
   }
 
-  const credential = await Credential.create(input);
+  const credential = await withSharedCredentials(() => Credential.create(input));
   response.status(201).json(credential);
 }
 
 export async function updateCredential(request: Request, response: Response) {
-  const credential = await Credential.findByIdAndUpdate(request.params.id, getCredentialInput(request), {
-    returnDocument: "after",
-    runValidators: true,
-  });
+  const credential = await withSharedCredentials(() =>
+    Credential.findByIdAndUpdate(request.params.id, getCredentialInput(request), {
+      returnDocument: "after",
+      runValidators: true,
+    })
+  );
 
   if (!credential) {
     response.status(404).json({ message: "Credential not found" });
@@ -66,10 +80,12 @@ export async function updateCredential(request: Request, response: Response) {
 }
 
 export async function archiveCredential(request: Request, response: Response) {
-  const credential = await Credential.findByIdAndUpdate(
-    request.params.id,
-    { status: "Archived" },
-    { returnDocument: "after", runValidators: true }
+  const credential = await withSharedCredentials(() =>
+    Credential.findByIdAndUpdate(
+      request.params.id,
+      { status: "Archived" },
+      { returnDocument: "after", runValidators: true }
+    )
   );
 
   if (!credential) {
