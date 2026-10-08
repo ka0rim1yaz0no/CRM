@@ -3,6 +3,7 @@ import { Employee, normalizeEmployeeAvailabilityStatus } from "../models/Employe
 import { getBusinessAccessForEmployeeCode, normalizeBusinessAccessIds } from "../models/BusinessUserAccess";
 import { getBusinessById, getCurrentBusinessId, getPublicBusinesses, type PublicBusinessConfig, runWithBusiness } from "../config/tenancy";
 import { syncEmployeeAvailabilityAcrossBusinesses } from "../services/employeeAvailabilityService";
+import { syncActiveAttendanceForBusinessSwitch } from "../services/employeeAttendanceSyncService";
 import { findConfiguredAdmin } from "../config/adminUsers";
 
 function responseBusiness(request: Request, publicBusinesses: PublicBusinessConfig[]) {
@@ -78,6 +79,24 @@ export async function loginWithEmployeeCode(request: Request, response: Response
   });
 }
 
+export async function listEmployeeBusinesses(request: Request, response: Response) {
+  const employeeCode = String(request.query.employeeCode || "").trim();
+
+  if (!employeeCode) {
+    response.status(400).json({ message: "Employee code is required" });
+    return;
+  }
+
+  const allowedBusinesses = await allowedBusinessesForEmployee(
+    employeeCode,
+    [],
+    request.business?.id || getCurrentBusinessId()
+  );
+
+  response.set("Cache-Control", "no-store");
+  response.json(allowedBusinesses);
+}
+
 export async function switchEmployeeBusiness(request: Request, response: Response) {
   const employeeCode = String(request.body.employeeCode || "").trim();
   const currentBusinessId = String(request.body.currentBusinessId || getCurrentBusinessId()).trim();
@@ -133,6 +152,15 @@ export async function switchEmployeeBusiness(request: Request, response: Respons
     currentAvailabilityStatus,
     currentEmployee.availabilityStatusReason
   );
+  try {
+    await syncActiveAttendanceForBusinessSwitch(
+      currentEmployee.employeeCode,
+      currentBusiness.id,
+      targetBusiness.id
+    );
+  } catch (error) {
+    console.error(`Unable to carry attendance while switching ${currentEmployee.employeeCode} from ${currentBusiness.id} to ${targetBusiness.id}:`, error);
+  }
   targetEmployee.availabilityStatus = currentAvailabilityStatus;
 
   response.json({

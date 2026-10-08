@@ -51,7 +51,8 @@ export type EmployeeInput = Omit<Employee, "_id">;
 
 export type EmployeeProfileInput = Pick<
     Employee,
-    "personalPhone" | "personalEmail" | "personalAddress" | "emergencyContact" | "personalNotes" | "contactRelationship" | "emergencyContactNumber"
+    "personalPhone" | "personalEmail" | "personalAddress" | "emergencyContact" | "personalNotes" | "contactRelationship" | "emergencyContactNumber" |
+    "bankName" | "bankAccountName" | "bankAccountNumber"
 >;
 
 export type EmployeeProfileUpdateResponse = {
@@ -61,7 +62,7 @@ export type EmployeeProfileUpdateResponse = {
 
 export type EmployeeBankInput = Pick<
     Employee,
-    "bankName" | "bankAccountName" | "bankAccountNumber" | "bankRoutingNumber"
+    "bankName" | "bankAccountName" | "bankAccountNumber"
 >;
 
 type EmployeeListParams = {

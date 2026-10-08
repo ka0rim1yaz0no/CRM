@@ -35,7 +35,7 @@ import {
     type LeaveRequest,
 } from "../../../api/leaveRequests";
 import { getRoles } from "../../../api/roles";
-import { getEmployeeAttendance, type AttendanceRecord } from "../../../api/attendance";
+import { getEmployeeAttendance, updateEmployeeAttendance, type AttendanceRecord } from "../../../api/attendance";
 import { getEmployeeTransactions } from "../../../api/employeeTransactions";
 import { getSystemSettings } from "../../../api/systemSettings";
 import { getLeads, updateLead, type Lead, type LeadInput } from "../../../api/leads";
@@ -85,6 +85,24 @@ function splitPhoneExtension(phone = "") {
 
 function digitsOnly(value = "") {
     return value.replace(/\D/g, "");
+}
+
+function attendanceDateTimeInput(value: string) {
+    const parts = new Intl.DateTimeFormat("en-US", {
+        timeZone: ATTENDANCE_TIME_ZONE,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        hourCycle: "h23",
+    }).formatToParts(new Date(value));
+    const fields = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+    return `${fields.year}-${fields.month}-${fields.day}T${fields.hour}:${fields.minute}`;
+}
+
+function attendanceInputToIso(value: string) {
+    return new Date(`${value}:00+08:00`).toISOString();
 }
 
 function compareEmployeesByCode(first: Employee, second: Employee) {
@@ -517,12 +535,15 @@ export default function AdminEmployees() {
         queryKey: ["employee", employeeId],
         queryFn: () => getEmployee(employeeId || ""),
         enabled: Boolean(employeeId),
+        staleTime: 30_000,
     });
     const [modalMode, setModalMode] = useState<"add" | "edit">("add");
     const [editingEmployeeId, setEditingEmployeeId] = useState<string | null>(null);
     const [viewingEmployee, setViewingEmployee] = useState<Employee | null>(null);
     const [employeeRecordTab, setEmployeeRecordTab] = useState<EmployeeRecordTab>("details");
     const [selectedAttendanceDateKey, setSelectedAttendanceDateKey] = useState("");
+    const [attendanceEditRecord, setAttendanceEditRecord] = useState<AttendanceRecord | null>(null);
+    const [attendanceEditTime, setAttendanceEditTime] = useState("");
     const [attendanceMonthOffset, setAttendanceMonthOffset] = useState(0);
     const [transactionDate, setTransactionDate] = useState(todayInputValue);
     const [noticeForm, setNoticeForm] = useState<NoticeInput>({
@@ -534,6 +555,7 @@ export default function AdminEmployees() {
     const [editingNoticeId, setEditingNoticeId] = useState<string | null>(null);
     const [leaveReviewNotes, setLeaveReviewNotes] = useState<Record<string, string>>({});
     const [employeeLeadSearch, setEmployeeLeadSearch] = useState("");
+    const [employeeSwitcherSearch, setEmployeeSwitcherSearch] = useState("");
     const [selectedEmployeeLeadIds, setSelectedEmployeeLeadIds] = useState<string[]>([]);
     const [archiveTarget, setArchiveTarget] = useState<{ employee: Employee; id: string } | null>(null);
     const [openDropdown, setOpenDropdown] = useState<"role" | "department" | "status" | "contactRelationship" | null>(null);
@@ -572,10 +594,11 @@ export default function AdminEmployees() {
         availabilityStatus: "OFFLINE",
         businessAccessIds: getActiveBusinessId() ? [getActiveBusinessId()] : [],
     });
-    const { data: viewingEmployeeDetails, isFetching: isFetchingViewingEmployee } = useQuery({
+    const { data: viewingEmployeeDetails } = useQuery({
         queryKey: ["employee", viewingEmployee?._id],
         queryFn: () => getEmployee(viewingEmployee?._id || ""),
         enabled: Boolean(viewingEmployee?._id),
+        staleTime: 30_000,
     });
 
     const getDropdownStyle = (button: HTMLButtonElement | null) => {
@@ -673,6 +696,17 @@ export default function AdminEmployees() {
             .sort(compareEmployeesByCode),
         [employeeStatusFilter, employees]
     );
+    const employeeSwitcherOptions = useMemo(() => {
+        const searchText = employeeSwitcherSearch.trim().toLowerCase();
+
+        return [...employees]
+            .filter((employee) => employee.status !== "Archived")
+            .filter((employee) => !searchText || [employee.name, employee.employeeCode, employee.role, employee.team]
+                .join(" ")
+                .toLowerCase()
+                .includes(searchText))
+            .sort(compareEmployeesByCode);
+    }, [employeeSwitcherSearch, employees]);
     const money = (value = 0) => formatCurrency(value, systemSettings?.currencyCode || "USD");
     const activeDepartmentCount = useMemo(() => new Set(activeEmployees.map((employee) => employee.team).filter(Boolean)).size, [activeEmployees]);
     const totalPages = Math.max(1, Math.ceil(filteredEmployees.length / pageSize));
@@ -703,7 +737,7 @@ export default function AdminEmployees() {
     });
     const { data: employeeAttendance = [] } = useQuery({
         queryKey: ["employee-attendance", viewingEmployee?._id],
-        queryFn: () => getEmployeeAttendance(viewingEmployee?._id || ""),
+        queryFn: () => getEmployeeAttendance(viewingEmployee?._id || "", { all: true }),
         enabled: Boolean(viewingEmployee?._id && employeeRecordTab === "attendance"),
     });
     const employeeAttendanceSettings = useMemo(
@@ -815,6 +849,34 @@ export default function AdminEmployees() {
             invalidateEmployees();
             queryClient.setQueryData(["employee", employee._id], employee);
             setViewingEmployee((current) => (current?._id === employee._id ? employee : current));
+        },
+    });
+
+    const updateAttendanceMutation = useMutation({
+        mutationFn: ({ record, timeIn }: { record: AttendanceRecord; timeIn: string }) =>
+            updateEmployeeAttendance(viewingEmployee?._id || "", record._id, { source: record.source, timeIn }),
+        onSuccess: (updatedRecord) => {
+            queryClient.setQueryData<AttendanceRecord[]>(["employee-attendance", viewingEmployee?._id], (records = []) =>
+                records.map((record) => record._id === updatedRecord._id ? updatedRecord : record)
+            );
+            [
+                ["employee-attendance"],
+                ["employees-attendance"],
+                ["employee-transactions"],
+                ["payroll-records"],
+                ["payroll-stats"],
+                ["payroll-dtr"],
+                ["payroll-payslip-dtr"],
+                ["dashboard"],
+                ["call-dashboard"],
+                ["tracker"],
+            ].forEach((queryKey) => queryClient.invalidateQueries({ queryKey }));
+            setAttendanceEditRecord(null);
+            setAttendanceEditTime("");
+            showToast({ tone: "success", message: "Attendance time updated across the system." });
+        },
+        onError: () => {
+            showToast({ tone: "error", message: "Could not update the attendance time." });
         },
     });
 
@@ -1240,7 +1302,19 @@ export default function AdminEmployees() {
     };
 
     const openEmployeeView = (employee: Employee) => {
-        navigate(roleWorkspacePath(`/admin/employees/${employee._id}`));
+        if (employee._id === viewingEmployee?._id) return;
+        const cachedEmployee = queryClient.getQueryData<Employee>(["employee", employee._id]);
+        setViewingEmployee(cachedEmployee || employee);
+        const tabQuery = employeeRecordTab === "details" ? "" : `?tab=${employeeRecordTab}`;
+        navigate(roleWorkspacePath(`/admin/employees/${employee._id}${tabQuery}`), { preventScrollReset: true });
+    };
+
+    const preloadEmployeeView = (employeeIdToPreload: string) => {
+        void queryClient.prefetchQuery({
+            queryKey: ["employee", employeeIdToPreload],
+            queryFn: () => getEmployee(employeeIdToPreload),
+            staleTime: 30_000,
+        });
     };
 
     useEffect(() => {
@@ -1248,8 +1322,19 @@ export default function AdminEmployees() {
 
         if (isEmployeeDetailPage) {
             const requestedTab = new URLSearchParams(location.search).get("tab");
+            const requestedRecordTab: EmployeeRecordTab = requestedTab && [
+                "details",
+                "hr",
+                "leads",
+                "notices",
+                "leave",
+                "attendance",
+                "transactions",
+            ].includes(requestedTab)
+                ? requestedTab as EmployeeRecordTab
+                : "details";
             setViewingEmployee(routedEmployee);
-            setEmployeeRecordTab(requestedTab === "attendance" ? "attendance" : "details");
+            setEmployeeRecordTab(requestedRecordTab);
             setSelectedAttendanceDateKey("");
             setAttendanceMonthOffset(0);
             setTransactionDate(todayInputValue());
@@ -1365,13 +1450,13 @@ export default function AdminEmployees() {
 
     return (
         <AdminLayout>
-            {isEmployeeRoutePage && (isLoadingRoutedEmployee || (isEmployeeEditPage && !shouldRenderEmployeeForm && !isRoutedEmployeeError) || (isEmployeeDetailPage && !viewingEmployee && !isRoutedEmployeeError)) && (
+            {isEmployeeRoutePage && ((isLoadingRoutedEmployee && !viewingEmployee) || (isEmployeeEditPage && !shouldRenderEmployeeForm && !isRoutedEmployeeError) || (isEmployeeDetailPage && !viewingEmployee && !isRoutedEmployeeError)) && (
                 <section className="flex min-h-[calc(100vh-8.5rem)] items-center justify-center rounded-lg border border-slate-300 bg-white p-6 text-sm font-semibold text-slate-500">
                     Loading employee...
                 </section>
             )}
 
-            {isEmployeeRoutePage && isRoutedEmployeeError && (
+            {isEmployeeRoutePage && isRoutedEmployeeError && !viewingEmployee && (
                 <section className="flex min-h-[calc(100vh-8.5rem)] items-center justify-center rounded-lg border border-slate-300 bg-white p-6 text-sm font-semibold text-red-600">
                     Unable to load employee.
                 </section>
@@ -1951,6 +2036,27 @@ export default function AdminEmployees() {
                                     placeholder="Private HR notes"
                                 />
                             </label>
+
+                            <div className="sm:col-span-2 border-t border-white/10 pt-4">
+                                <p className="text-xs font-medium uppercase tracking-[0.14em] text-white/35">Bank Details <span className="normal-case tracking-normal text-white/25">(optional)</span></p>
+                            </div>
+                            {[
+                                ["Bank Name", "bankName", "Bank or financial institution"],
+                                ["Account Name", "bankAccountName", "Name on the account"],
+                                ["Account Number", "bankAccountNumber", "Account number"],
+                            ].map(([label, field, placeholder]) => (
+                                <label key={field}>
+                                    <span className="text-xs font-medium uppercase tracking-[0.14em] text-white/35">{label}</span>
+                                    <input
+                                        className="mt-2 h-11 w-full rounded-lg border border-white/10 bg-black/20 px-3 text-sm font-semibold text-white outline-none transition placeholder:text-white/30 focus:border-[#842cff] focus:ring-2 focus:ring-[#842cff]/20"
+                                        value={String(newEmployee[field as keyof EmployeeInput] || "")}
+                                        onChange={(event) => updateEmployeeForm(field as keyof EmployeeInput, event.target.value)}
+                                        inputMode={field.includes("Number") ? "numeric" : undefined}
+                                        autoComplete="off"
+                                        placeholder={placeholder}
+                                    />
+                                </label>
+                            ))}
                         </div>
 
                         <div className="flex justify-end gap-3 border-t border-white/10 px-5 py-3.5">
@@ -2026,10 +2132,10 @@ export default function AdminEmployees() {
 
             {isEmployeeDetailPage && viewingEmployee && (
                 <div
-                    className=""
+                    className="grid min-h-[calc(100vh-8.5rem)] gap-4 xl:grid-cols-[19rem_minmax(0,1fr)]"
                 >
                     <section
-                        className="flex min-h-[calc(100vh-8.5rem)] w-full flex-col overflow-hidden rounded-lg border border-slate-300 bg-slate-50 text-slate-950 shadow-lg shadow-slate-950/10"
+                        className="order-2 flex min-h-[calc(100vh-8.5rem)] min-w-0 flex-col overflow-hidden rounded-lg border border-slate-300 bg-slate-50 text-slate-950 shadow-lg shadow-slate-950/10"
                     >
                         <div className="border-b border-slate-300 bg-white/55 px-5 py-5">
                             <div className="flex items-start justify-between gap-4">
@@ -2138,12 +2244,6 @@ export default function AdminEmployees() {
                                     </button>
                                 ))}
                             </div>
-                            {isFetchingViewingEmployee && (
-                                <div className="mb-4 rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-semibold text-slate-700">
-                                    Loading employee details...
-                                </div>
-                            )}
-
                             {employeeRecordTab === "details" && (
                                 <section className="overflow-hidden rounded-lg border border-slate-300 bg-white shadow-sm shadow-slate-200/70">
                                     <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-300 bg-[#f5efff] px-4 py-3">
@@ -2214,6 +2314,9 @@ export default function AdminEmployees() {
                                             ],
                                             ["Personal Address", viewingEmployee.personalAddress || "Not provided"],
                                             ["Personal Notes", viewingEmployee.personalNotes || "Not provided"],
+                                            ["Bank Name", viewingEmployee.bankName || "Not provided"],
+                                            ["Bank Account Name", viewingEmployee.bankAccountName || "Not provided"],
+                                            ["Bank Account Number", viewingEmployee.bankAccountNumber || "Not provided"],
                                         ].map(([label, value]) => (
                                             <div
                                                 key={label}
@@ -2893,6 +2996,18 @@ export default function AdminEmployees() {
                                                                 <p className="mt-1 text-sm text-slate-600">{formatPhDateTime(attendance.timeIn)}</p>
                                                                 <p className="mt-1 text-xs font-semibold text-slate-500">{attendance.source}</p>
                                                             </div>
+                                                            <button
+                                                                className="flex size-8 shrink-0 items-center justify-center rounded-lg border border-slate-300 bg-white text-slate-600 transition hover:border-[#842cff]/40 hover:bg-violet-50 hover:text-[#5f27cd]"
+                                                                type="button"
+                                                                onClick={() => {
+                                                                    setAttendanceEditRecord(attendance);
+                                                                    setAttendanceEditTime(attendanceDateTimeInput(attendance.timeIn));
+                                                                }}
+                                                                aria-label={`Edit ${attendanceSourceLabel(attendance.source)} time`}
+                                                                title="Edit time"
+                                                            >
+                                                                <FiEdit2 className="size-3.5" aria-hidden="true" />
+                                                            </button>
                                                         </article>
                                                     );
                                                 })}
@@ -2964,6 +3079,135 @@ export default function AdminEmployees() {
                             )}
                         </div>
                     </section>
+
+                    <aside className="order-1 flex min-h-[24rem] flex-col overflow-hidden rounded-lg border border-slate-300 bg-white text-slate-950 shadow-sm xl:max-h-[calc(100vh-8.5rem)]">
+                        <div className="shrink-0 border-b border-slate-300 px-4 py-4">
+                            <p className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">Employees</p>
+                            <p className="mt-1 text-sm font-semibold text-slate-950">Choose another employee</p>
+                            <label className="mt-3 flex h-10 items-center gap-2 rounded-lg border border-slate-300 bg-slate-50 px-3 focus-within:border-[#842cff]/60 focus-within:bg-white">
+                                <FiSearch className="size-4 shrink-0 text-slate-500" aria-hidden="true" />
+                                <input
+                                    className="min-w-0 flex-1 bg-transparent text-sm text-slate-950 outline-none placeholder:text-slate-400"
+                                    value={employeeSwitcherSearch}
+                                    onChange={(event) => setEmployeeSwitcherSearch(event.target.value)}
+                                    placeholder="Search employees"
+                                    aria-label="Search employees"
+                                />
+                                {employeeSwitcherSearch && (
+                                    <button
+                                        className="flex size-7 shrink-0 items-center justify-center rounded-md text-slate-500 transition hover:bg-slate-200 hover:text-slate-950"
+                                        type="button"
+                                        onClick={() => setEmployeeSwitcherSearch("")}
+                                        aria-label="Clear employee search"
+                                    >
+                                        <FiX className="size-3.5" aria-hidden="true" />
+                                    </button>
+                                )}
+                            </label>
+                        </div>
+
+                        <div className="content-scroll min-h-0 flex-1 overflow-y-auto p-2">
+                            {employeeSwitcherOptions.length === 0 && (
+                                <p className="px-3 py-8 text-center text-sm text-slate-500">No employees found.</p>
+                            )}
+                            {employeeSwitcherOptions.map((employee) => {
+                                const isSelected = employee._id === viewingEmployee._id;
+
+                                return (
+                                    <button
+                                        key={employee._id}
+                                        className={[
+                                            "mb-1 flex w-full items-center gap-3 rounded-lg border px-3 py-3 text-left transition last:mb-0",
+                                            isSelected
+                                                ? "border-[#842cff]/35 bg-[#842cff]/10"
+                                                : "border-transparent hover:border-slate-300 hover:bg-slate-50",
+                                        ].join(" ")}
+                                        type="button"
+                                        onClick={() => openEmployeeView(employee)}
+                                        onPointerEnter={() => preloadEmployeeView(employee._id)}
+                                        onFocus={() => preloadEmployeeView(employee._id)}
+                                        aria-current={isSelected ? "page" : undefined}
+                                    >
+                                        <span className="flex size-10 shrink-0 items-center justify-center overflow-hidden rounded-lg border border-slate-300 bg-white text-sm font-semibold text-slate-700">
+                                            {employee.profileImage ? (
+                                                <img className="size-full object-cover" src={employee.profileImage} alt="" />
+                                            ) : (
+                                                employeeInitials(employee.name)
+                                            )}
+                                        </span>
+                                        <span className="min-w-0 flex-1">
+                                            <span className="block truncate text-sm font-semibold text-slate-950">{employee.name}</span>
+                                            <span className="mt-1 block truncate text-xs text-slate-500">{employee.role} · {employee.employeeCode}</span>
+                                        </span>
+                                        <span className={["size-2 shrink-0 rounded-full", availabilityDotClass(employee.availabilityStatus)].join(" ")} aria-hidden="true" />
+                                        <FiChevronRight className={["size-4 shrink-0", isSelected ? "text-[#5f27cd]" : "text-slate-400"].join(" ")} aria-hidden="true" />
+                                    </button>
+                                );
+                            })}
+                        </div>
+                    </aside>
+                </div>
+            )}
+
+            {attendanceEditRecord && (
+                <div
+                    className="modal-backdrop-enter fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4 backdrop-blur-sm"
+                    onMouseDown={(event) => {
+                        if (event.target === event.currentTarget && !updateAttendanceMutation.isPending) {
+                            setAttendanceEditRecord(null);
+                            setAttendanceEditTime("");
+                        }
+                    }}
+                >
+                    <form
+                        className="modal-panel-enter w-full max-w-[28rem] overflow-hidden rounded-lg border border-white/10 bg-[#0d1018] shadow-2xl shadow-black/40"
+                        onSubmit={(event) => {
+                            event.preventDefault();
+                            const parsedTime = new Date(`${attendanceEditTime}:00+08:00`);
+                            if (!attendanceEditTime || Number.isNaN(parsedTime.getTime())) {
+                                showToast({ tone: "error", message: "Choose a valid attendance date and time." });
+                                return;
+                            }
+                            updateAttendanceMutation.mutate({ record: attendanceEditRecord, timeIn: attendanceInputToIso(attendanceEditTime) });
+                        }}
+                    >
+                        <div className="flex items-center justify-between border-b border-white/10 px-5 py-4">
+                            <div>
+                                <p className="text-xs font-semibold uppercase tracking-[0.14em] text-white/35">Edit Attendance Log</p>
+                                <h3 className="mt-1 text-lg font-semibold text-white">{attendanceSourceLabel(attendanceEditRecord.source)}</h3>
+                            </div>
+                            <button
+                                className="flex size-8 items-center justify-center rounded-lg border border-white/10 bg-white/[0.05] text-white/60 transition hover:bg-white/10 hover:text-white"
+                                type="button"
+                                disabled={updateAttendanceMutation.isPending}
+                                onClick={() => {
+                                    setAttendanceEditRecord(null);
+                                    setAttendanceEditTime("");
+                                }}
+                                aria-label="Close attendance editor"
+                            >
+                                <FiX className="size-4" aria-hidden="true" />
+                            </button>
+                        </div>
+                        <div className="p-5">
+                            <label>
+                                <span className="text-xs font-semibold uppercase tracking-[0.14em] text-white/40">Date and time · PH Time</span>
+                                <input
+                                    className="mt-2 h-11 w-full rounded-lg border border-white/10 bg-black/20 px-3 text-sm font-semibold text-white outline-none transition focus:border-[#842cff] focus:ring-2 focus:ring-[#842cff]/20"
+                                    type="datetime-local"
+                                    required
+                                    autoFocus
+                                    value={attendanceEditTime}
+                                    onChange={(event) => setAttendanceEditTime(event.target.value)}
+                                />
+                            </label>
+                            <p className="mt-3 text-xs leading-5 text-white/40">Updating this log recalculates its attendance status and refreshes attendance, payroll, payslips, tracker, and dashboard data.</p>
+                        </div>
+                        <div className="flex justify-end gap-2 border-t border-white/10 px-5 py-3">
+                            <button className="h-10 rounded-lg border border-white/10 bg-white/[0.05] px-4 text-sm font-semibold text-white/65" type="button" disabled={updateAttendanceMutation.isPending} onClick={() => { setAttendanceEditRecord(null); setAttendanceEditTime(""); }}>Cancel</button>
+                            <button className="h-10 rounded-lg bg-[#842cff] px-4 text-sm font-semibold text-white disabled:opacity-60" type="submit" disabled={updateAttendanceMutation.isPending}>{updateAttendanceMutation.isPending ? "Saving..." : "Save Time"}</button>
+                        </div>
+                    </form>
                 </div>
             )}
 

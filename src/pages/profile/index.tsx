@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSearchParams } from "react-router";
-import { FiBell, FiBriefcase, FiCalendar, FiCheck, FiCheckCircle, FiChevronDown, FiChevronLeft, FiChevronRight, FiEdit2, FiMail, FiMapPin, FiPhone, FiSave, FiShield, FiTrendingUp, FiX } from "react-icons/fi";
+import { FiBell, FiBriefcase, FiCalendar, FiCheck, FiCheckCircle, FiChevronDown, FiChevronLeft, FiChevronRight, FiClock, FiEdit2, FiMail, FiMapPin, FiPhone, FiRefreshCw, FiSave, FiShield, FiTrendingUp, FiX } from "react-icons/fi";
 import { getAuthUser, setAuthUser as setStoredAuthUser } from "../../api/authStorage";
 import { getEmployee, updateEmployeeProfile, type ContactRelationships, type EmployeeProfileInput } from "../../api/employees";
+import { getEmployeeRecentActivity } from "../../api/employeeTransactions";
 import {
     createEmployeeLeaveRequest,
     getEmployeeLeaveRequests,
@@ -17,20 +18,6 @@ import { acknowledgeEmployeeNotice, getEmployeeNotices, markEmployeeNoticeRead, 
 import { formatPhDate, formatPhDateTime } from "../../lib/dateTime";
 import MainLayout from "../layout";
 
-const profileStats = [
-    ["Active Leads", "18", "+12%"],
-    ["Closed Deals", "42", "+8%"],
-    ["Response Time", "8m", "-18%"],
-];
-
-const skills = ["Lead qualification", "Pipeline follow-up", "Client calls", "CRM updates", "Workflow demo"];
-
-const activities = [
-    ["Qualified Northstar Labs", "2 hours ago"],
-    ["Sent follow-up to Daniel Kim", "5 hours ago"],
-    ["Tagged Jordan Lee for next process", "Yesterday"],
-];
-
 const emptyProfileForm: EmployeeProfileInput = {
     personalPhone: "",
     personalEmail: "",
@@ -39,6 +26,9 @@ const emptyProfileForm: EmployeeProfileInput = {
     contactRelationship: "Father",
     emergencyContactNumber: "",
     personalNotes: "",
+    bankName: "",
+    bankAccountName: "",
+    bankAccountNumber: "",
 };
 
 function profileFormFromEmployee(employee?: Partial<EmployeeProfileInput> | null): EmployeeProfileInput {
@@ -50,6 +40,9 @@ function profileFormFromEmployee(employee?: Partial<EmployeeProfileInput> | null
         contactRelationship: employee?.contactRelationship || "Father",
         emergencyContactNumber: employee?.emergencyContactNumber || "",
         personalNotes: employee?.personalNotes || "",
+        bankName: employee?.bankName || "",
+        bankAccountName: employee?.bankAccountName || "",
+        bankAccountNumber: employee?.bankAccountNumber || "",
     };
 }
 
@@ -285,12 +278,28 @@ export default function Profile() {
         enabled: Boolean(employeeId),
     });
     const currentEmployee = employeeProfile || employee;
+    const recentActivityQuery = useInfiniteQuery({
+        queryKey: ["employee-recent-activity", employeeId],
+        queryFn: ({ pageParam }) => getEmployeeRecentActivity(employeeId, pageParam, 10),
+        initialPageParam: 0,
+        getNextPageParam: (lastPage) => lastPage.nextOffset ?? undefined,
+        enabled: Boolean(employeeId && activeProfileTab === "overview"),
+        staleTime: 60_000,
+    });
+    const recentActivities = recentActivityQuery.data?.pages.flatMap((page) => page.items) || [];
+    const profileMetrics = recentActivityQuery.data?.pages[0]?.metrics;
+    const profileStats = [
+        ["Active Leads", profileMetrics?.activeLeads ?? "-", "Currently assigned"],
+        ["Closed Deals", profileMetrics?.closedDeals ?? "-", "Completed leads"],
+        ["Call Attempts", profileMetrics?.callAttempts ?? "-", "Recorded calls"],
+    ];
     const name = currentEmployee?.name || authUser?.user.name || "Admin";
-    const role = currentEmployee?.role || "Sales Agent";
-    const team = currentEmployee?.team || localStorage.getItem("activeDepartment") || "Sales";
-    const email = currentEmployee?.email || "admin@assistly.com";
-    const phone = currentEmployee?.phone || "+1 (415) 555-0101";
-    const employeeCode = currentEmployee?.employeeCode || "00000003";
+    const role = currentEmployee?.role || "Not provided";
+    const team = currentEmployee?.team || "Not provided";
+    const email = currentEmployee?.email || "Not provided";
+    const phone = currentEmployee?.phone || "Not provided";
+    const employeeCode = currentEmployee?.employeeCode || "Not assigned";
+    const employmentStatus = currentEmployee?.status || "Not provided";
     const profileImageValue = currentEmployee?.profileImage || "";
     const initials = name
         .split(" ")
@@ -573,7 +582,7 @@ export default function Profile() {
     return (
         <MainLayout>
             <section className="min-h-[calc(100vh-8.5rem)] space-y-5">
-                <div className="overflow-hidden rounded-lg border border-white/10 bg-[#090b13]/80">
+                <div className="theme-surface-bg overflow-hidden rounded-lg border border-white/10">
                     <div className="h-36 border-b border-white/10 bg-[radial-gradient(circle_at_18%_10%,rgba(132,44,255,0.36),transparent_28%),linear-gradient(135deg,rgba(255,255,255,0.08),transparent_45%)]" />
                     <div className="px-5 pb-5">
                         <div className="-mt-14 flex flex-wrap items-end justify-between gap-4">
@@ -592,7 +601,7 @@ export default function Profile() {
                                     <p className="text-xs font-medium uppercase tracking-[0.16em] text-white/35">Agent Profile</p>
                                     <h2 className="mt-1 truncate text-2xl font-semibold text-white">{name}</h2>
                                     <div className="mt-2 flex flex-wrap gap-2">
-                                        {[role, team, "Active", `${unreadNoticeCount} unread notice${unreadNoticeCount === 1 ? "" : "s"}`].map((label) => (
+                                        {[role, team, employmentStatus, `${unreadNoticeCount} unread notice${unreadNoticeCount === 1 ? "" : "s"}`].map((label) => (
                                             <span key={label} className="rounded-md border border-white/10 bg-white/[0.06] px-3 py-1 text-xs font-semibold text-white/65">
                                                 {label}
                                             </span>
@@ -605,7 +614,7 @@ export default function Profile() {
                     </div>
                 </div>
 
-                <div className="flex flex-wrap gap-2 rounded-lg border border-white/10 bg-[#090b13]/80 p-2">
+                <div className="theme-surface-bg flex flex-wrap gap-2 rounded-lg border border-white/10 p-2">
                     {[
                         ["overview", "Overview"],
                         ["leave", `Leave${pendingLeaveCount > 0 ? ` (${pendingLeaveCount})` : ""}`],
@@ -630,13 +639,13 @@ export default function Profile() {
                 {activeProfileTab === "overview" ? (
                     <div className="grid gap-5 xl:grid-cols-[22rem_1fr]">
                         <aside className="space-y-5">
-                            <section className="rounded-lg border border-white/10 bg-[#090b13]/80 p-5">
+                            <section className="theme-surface-bg rounded-lg border border-white/10 p-5">
                                 <p className="text-xs font-medium uppercase tracking-[0.16em] text-white/35">Contact</p>
                                 <div className="mt-4 space-y-3">
                                     {[
                                         [FiMail, "Email", email],
                                         [FiPhone, "Phone", phone],
-                                        [FiMapPin, "Location", "Asia/Taipei"],
+                                        [FiMapPin, "Address", currentEmployee?.personalAddress || "Not provided"],
                                     ].map(([Icon, label, value]) => {
                                         const ContactIcon = Icon as typeof FiMail;
                                         return (
@@ -652,18 +661,7 @@ export default function Profile() {
                                 </div>
                             </section>
 
-                            <section className="rounded-lg border border-white/10 bg-[#090b13]/80 p-5">
-                                <p className="text-xs font-medium uppercase tracking-[0.16em] text-white/35">Skills</p>
-                                <div className="mt-4 flex flex-wrap gap-2">
-                                    {skills.map((skill) => (
-                                        <span key={skill} className="rounded-md border border-[#842cff]/25 bg-[#842cff]/10 px-3 py-1.5 text-xs font-semibold text-[#b994ff]">
-                                            {skill}
-                                        </span>
-                                    ))}
-                                </div>
-                            </section>
-
-                            <section className="rounded-lg border border-white/10 bg-[#090b13]/80 p-5">
+                            <section className="theme-surface-bg rounded-lg border border-white/10 p-5">
                                 <div className="flex items-center justify-between gap-3">
                                     <p className="text-xs font-medium uppercase tracking-[0.16em] text-white/35">Profile Summary</p>
                                     <FiShield className="size-4 text-[#b994ff]" aria-hidden="true" />
@@ -673,7 +671,7 @@ export default function Profile() {
                                         ["Employee Code", employeeCode],
                                         ["Department", team],
                                         ["Position", role],
-                                        ["Status", "Active"],
+                                        ["Status", employmentStatus],
                                     ].map(([label, value]) => (
                                         <div key={label} className="flex items-center justify-between gap-4 rounded-lg border border-white/10 bg-white/[0.04] px-3 py-2">
                                             <span className="text-xs font-medium uppercase tracking-[0.12em] text-white/35">{label}</span>
@@ -686,18 +684,18 @@ export default function Profile() {
 
                         <div className="space-y-5">
                             <div className="grid gap-3 md:grid-cols-3">
-                                {profileStats.map(([label, value, trend]) => (
-                                    <article key={label} className="rounded-lg border border-white/10 bg-[#090b13]/80 p-4">
+                                {profileStats.map(([label, value, detail]) => (
+                                    <article key={label} className="theme-surface-bg rounded-lg border border-white/10 p-4">
                                         <p className="text-xs font-medium uppercase tracking-[0.14em] text-white/35">{label}</p>
                                         <div className="mt-3 flex items-end justify-between gap-3">
                                             <p className="text-2xl font-semibold text-white">{value}</p>
-                                            <span className="text-xs font-semibold text-emerald-300">{trend}</span>
+                                            <span className="text-right text-xs font-semibold text-white/35">{detail}</span>
                                         </div>
                                     </article>
                                 ))}
                             </div>
 
-                            <section className="rounded-lg border border-white/10 bg-[#090b13]/80 p-5">
+                            <section className="theme-surface-bg rounded-lg border border-white/10 p-5">
                                 <div className="flex flex-wrap items-center justify-between gap-3">
                                     <div>
                                         <p className="text-xs font-medium uppercase tracking-[0.16em] text-white/35">Personal Details</p>
@@ -797,11 +795,26 @@ export default function Profile() {
                                         <span className="text-xs font-medium uppercase tracking-[0.12em] text-white/35">Personal Notes</span>
                                         <textarea className={textareaClass} disabled={isProfileFormDisabled} value={profileForm.personalNotes || ""} onChange={(event) => updateProfileForm("personalNotes", event.target.value)} />
                                     </label>
+                                    <div className="border-t border-white/10 pt-4 md:col-span-2">
+                                        <p className="text-xs font-medium uppercase tracking-[0.12em] text-white/35">Bank Details</p>
+                                    </div>
+                                    <label className="space-y-2">
+                                        <span className="text-xs font-medium uppercase tracking-[0.12em] text-white/35">Bank Name</span>
+                                        <input className={inputClass} disabled={isProfileFormDisabled} value={profileForm.bankName || ""} onChange={(event) => updateProfileForm("bankName", event.target.value)} autoComplete="organization" />
+                                    </label>
+                                    <label className="space-y-2">
+                                        <span className="text-xs font-medium uppercase tracking-[0.12em] text-white/35">Account Name</span>
+                                        <input className={inputClass} disabled={isProfileFormDisabled} value={profileForm.bankAccountName || ""} onChange={(event) => updateProfileForm("bankAccountName", event.target.value)} autoComplete="name" />
+                                    </label>
+                                    <label className="space-y-2">
+                                        <span className="text-xs font-medium uppercase tracking-[0.12em] text-white/35">Account Number</span>
+                                        <input className={inputClass} disabled={isProfileFormDisabled} value={profileForm.bankAccountNumber || ""} onChange={(event) => updateProfileForm("bankAccountNumber", event.target.value)} inputMode="numeric" autoComplete="off" />
+                                    </label>
                                 </div>
                                 {isProfileEditing && activeDropdown && (
                                     <div
                                         ref={dropdownMenuRef}
-                                        className="fixed z-[60] overflow-hidden rounded-lg border border-white/10 bg-[#11141d] shadow-2xl shadow-black/40"
+                                        className="theme-panel-bg fixed z-[60] overflow-hidden rounded-lg border border-white/10 shadow-2xl shadow-black/40"
                                         style={getDropdownStyle(activeDropdown.buttonRef.current)}
                                         onMouseDown={(event) => event.stopPropagation()}
                                     >
@@ -824,7 +837,7 @@ export default function Profile() {
                                 )}
                             </section>
 
-                            <section className="rounded-lg border border-white/10 bg-[#090b13]/80 p-5">
+                            <section className="theme-surface-bg rounded-lg border border-white/10 p-5">
                                 <div className="flex items-center gap-2">
                                     <FiBriefcase className="size-4 text-[#b994ff]" aria-hidden="true" />
                                     <p className="text-xs font-medium uppercase tracking-[0.16em] text-white/35">Work Information</p>
@@ -834,9 +847,9 @@ export default function Profile() {
                                         ["Employee Code", employeeCode],
                                         ["Department", team],
                                         ["Position", role],
-                                        ["Status", "Active"],
-                                        ["Manager", "Admin"],
-                                        ["Work Mode", "Remote"],
+                                        ["Status", employmentStatus],
+                                        ["Company", currentEmployee?.company || "Not provided"],
+                                        ["Date Hired", currentEmployee?.dateHired ? formatPhDate(currentEmployee.dateHired) : "Not provided"],
                                     ].map(([label, value]) => (
                                         <div key={label} className="flex items-center justify-between gap-4 border-b border-white/10 pb-3 last:border-b-0 md:even:border-b-0">
                                             <span className="text-sm text-white/45">{label}</span>
@@ -846,31 +859,59 @@ export default function Profile() {
                                 </div>
                             </section>
 
-                            <section className="rounded-lg border border-white/10 bg-[#090b13]/80 p-5">
+                            <section className="theme-surface-bg rounded-lg border border-white/10 p-5">
                                 <div className="flex items-center justify-between gap-3">
                                     <div className="flex items-center gap-2">
                                         <FiTrendingUp className="size-4 text-[#b994ff]" aria-hidden="true" />
                                         <p className="text-xs font-medium uppercase tracking-[0.16em] text-white/35">Recent Activity</p>
                                     </div>
-                                    <span className="rounded-md bg-white/[0.06] px-2 py-1 text-xs font-semibold text-white/45">Latest updates</span>
+                                    <button
+                                        className="flex size-8 items-center justify-center rounded-lg border border-white/10 bg-white/[0.04] text-white/50 transition hover:bg-white/[0.08] hover:text-white disabled:cursor-not-allowed disabled:opacity-50"
+                                        type="button"
+                                        disabled={recentActivityQuery.isFetching}
+                                        onClick={() => recentActivityQuery.refetch()}
+                                        aria-label="Refresh recent activity"
+                                        title="Refresh"
+                                    >
+                                        <FiRefreshCw className={["size-3.5", recentActivityQuery.isFetching ? "animate-spin" : ""].join(" ")} aria-hidden="true" />
+                                    </button>
                                 </div>
                                 <div className="mt-4 space-y-3">
-                                    {activities.map(([activity, time]) => (
-                                        <article key={activity} className="flex items-center gap-3 rounded-lg border border-white/10 bg-white/[0.04] p-3">
-                                            <div className="flex size-9 shrink-0 items-center justify-center rounded-lg border border-emerald-400/20 bg-emerald-400/10 text-emerald-300">
-                                                <FiCheckCircle className="size-4" aria-hidden="true" />
+                                    {recentActivityQuery.isPending && Array.from({ length: 3 }, (_, index) => (
+                                        <div key={index} className="h-[4.4rem] animate-pulse rounded-lg border border-white/10 bg-white/[0.04]" />
+                                    ))}
+                                    {!recentActivityQuery.isPending && recentActivities.length === 0 && (
+                                        <div className="rounded-lg border border-dashed border-white/10 px-4 py-7 text-center">
+                                            <p className="text-sm font-semibold text-white/65">No recent activity</p>
+                                            <p className="mt-1 text-xs text-white/35">Attendance, notices, and leave updates will appear here.</p>
+                                        </div>
+                                    )}
+                                    {recentActivities.map((activity) => (
+                                        <article key={activity._id} className="flex min-h-[4.4rem] items-center gap-3 rounded-lg border border-white/10 bg-white/[0.04] p-3">
+                                            <div className="flex size-9 shrink-0 items-center justify-center rounded-lg border border-[#842cff]/25 bg-[#842cff]/10 text-[#c9a7ff]">
+                                                <FiClock className="size-4" aria-hidden="true" />
                                             </div>
                                             <div className="min-w-0 flex-1">
-                                                <p className="truncate text-sm font-semibold text-white">{activity}</p>
-                                                <p className="mt-1 text-xs text-white/40">{name}</p>
+                                                <p className="truncate text-sm font-semibold text-white">{activity.title}</p>
+                                                <p className="mt-1 line-clamp-1 text-xs text-white/40">{activity.description}</p>
                                             </div>
-                                            <span className="text-xs text-white/35">{time}</span>
+                                            <span className="shrink-0 text-right text-xs text-white/35">{formatPhDateTime(activity.occurredAt)}</span>
                                         </article>
                                     ))}
+                                    {recentActivityQuery.hasNextPage && (
+                                        <button
+                                            className="h-9 w-full rounded-lg border border-white/10 bg-white/[0.04] text-xs font-semibold text-white/60 transition hover:bg-white/[0.08] hover:text-white disabled:cursor-wait disabled:opacity-50"
+                                            type="button"
+                                            disabled={recentActivityQuery.isFetchingNextPage}
+                                            onClick={() => recentActivityQuery.fetchNextPage()}
+                                        >
+                                            {recentActivityQuery.isFetchingNextPage ? "Loading..." : "Load more"}
+                                        </button>
+                                    )}
                                 </div>
                             </section>
 
-                            <section className="rounded-lg border border-white/10 bg-[#090b13]/80 p-5">
+                            <section className="theme-surface-bg rounded-lg border border-white/10 p-5">
                                 <div className="flex items-center gap-2">
                                     <FiShield className="size-4 text-[#b994ff]" aria-hidden="true" />
                                     <p className="text-xs font-medium uppercase tracking-[0.16em] text-white/35">Account Security</p>
@@ -887,7 +928,7 @@ export default function Profile() {
                     </div>
                 ) : activeProfileTab === "leave" ? (
                     <div className="grid gap-5 xl:grid-cols-[0.92fr_1.08fr]">
-                        <section className="rounded-lg border border-white/10 bg-[#090b13]/80 p-5">
+                        <section className="theme-surface-bg rounded-lg border border-white/10 p-5">
                             <div className="flex items-center gap-2">
                                 <FiCalendar className="size-4 text-[#b994ff]" aria-hidden="true" />
                                 <div>
@@ -1028,7 +1069,7 @@ export default function Profile() {
                             </div>
                         </section>
 
-                        <section className="rounded-lg border border-white/10 bg-[#090b13]/80 p-5">
+                        <section className="theme-surface-bg rounded-lg border border-white/10 p-5">
                             <div className="flex flex-wrap items-center justify-between gap-3">
                                 <div>
                                     <p className="text-xs font-medium uppercase tracking-[0.16em] text-white/35">Leave Requests</p>
@@ -1147,7 +1188,7 @@ export default function Profile() {
                         </section>
                     </div>
                 ) : (
-                    <section className="rounded-lg border border-white/10 bg-[#090b13]/80 p-5">
+                    <section className="theme-surface-bg rounded-lg border border-white/10 p-5">
                         <div className="flex flex-wrap items-center justify-between gap-3">
                             <div className="flex items-center gap-2">
                                 <FiBell className="size-4 text-[#b994ff]" aria-hidden="true" />

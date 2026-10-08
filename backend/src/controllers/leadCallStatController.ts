@@ -1,6 +1,8 @@
 import { Lead } from "../models/Lead";
 import { Employee } from "../models/Employee";
 import { LeadCallStat } from "../models/leadCallStat";
+import { getCallBridgeAttemptModel } from "../models/CallBridge";
+import { getCallProvider } from "../config/callProvider";
 import { Types } from "mongoose";
 
 type LeadCallOutcome = "connected" | "not_connected" | "voicemail";
@@ -35,6 +37,52 @@ function getEmployeeTeamValue(team: unknown) {
     }
 
     return String(team);
+}
+
+async function holdLeadAfterCallOutcome(
+    leadId: Types.ObjectId,
+    employee: { _id: Types.ObjectId; name?: string; employeeCode?: string; role?: string; team?: unknown },
+    calledAt: Date
+) {
+    const employeeName = employee.name || employee.employeeCode || "Employee";
+    const employeeRole = employee.role || "";
+    const employeeTeam = getEmployeeTeamValue(employee.team);
+    const existingRow = await Lead.updateOne(
+        { _id: leadId, "callsByEmployee.employee": employee._id },
+        {
+            $set: {
+                lastCallAt: calledAt,
+                "callsByEmployee.$.lastCallAt": calledAt,
+                "callsByEmployee.$.employeeName": employeeName,
+                "callsByEmployee.$.employeeRole": employeeRole,
+                "callsByEmployee.$.employeeTeam": employeeTeam,
+            },
+        }
+    );
+
+    if (existingRow.matchedCount > 0) {
+        return;
+    }
+
+    await Lead.updateOne(
+        {
+            _id: leadId,
+            callsByEmployee: { $not: { $elemMatch: { employee: employee._id } } },
+        },
+        {
+            $set: { lastCallAt: calledAt },
+            $push: {
+                callsByEmployee: {
+                    employee: employee._id,
+                    employeeName,
+                    employeeRole,
+                    employeeTeam,
+                    count: 0,
+                    lastCallAt: calledAt,
+                },
+            },
+        }
+    );
 }
 
 function getLogOutcome(log: any): LeadCallOutcome {
@@ -164,14 +212,32 @@ async function createLeadCallLogUpdate(req: any, res: any, outcome: LeadCallOutc
         const employeeName = employee.name || employee.employeeCode || "Employee";
         const employeeRole = employee.role || "";
         const employeeTeam = getEmployeeTeamValue(employee.team);
+        const attempt = getCallProvider() === "ringcentral"
+            ? await getCallBridgeAttemptModel().findOne({
+                employeeCode: employee.employeeCode,
+                businessId: req.business?.id || "",
+                leadId,
+                providerSessionId: { $exists: true, $ne: "" },
+                reservedAt: { $gte: new Date(now.getTime() - 6 * 60 * 60_000) },
+              }).sort({ reservedAt: -1 })
+            : null;
+        const callLogId = new Types.ObjectId();
 
         const callLog = {
+            _id: callLogId,
             employee: employee._id,
             employeeName,
             employeeRole,
             employeeTeam,
             outcome,
             calledAt: now,
+            ...(attempt ? {
+                provider: "ringcentral",
+                providerSessionId: attempt.providerSessionId,
+                providerResult: attempt.providerResult || "RingCentral session confirmed",
+                verificationSource: "manual" as const,
+                durationSeconds: attempt.durationSeconds || 0,
+            } : {}),
         };
 
         const update: any = {
@@ -219,6 +285,19 @@ async function createLeadCallLogUpdate(req: any, res: any, outcome: LeadCallOutc
                 setDefaultsOnInsert: true,
             }
         ).lean();
+
+        await holdLeadAfterCallOutcome(lead._id, employee, now);
+
+        if (attempt) {
+            attempt.phase = "classified";
+            attempt.outcome = outcome;
+            attempt.outcomeReason = "Outcome selected manually in the CRM";
+            attempt.classificationConfidence = "high";
+            attempt.classificationSource = "manual";
+            attempt.classifiedAt = now;
+            attempt.callStatLogId = String(callLogId);
+            await attempt.save();
+        }
 
         return res.json(normalizeCallStatForResponse(callStat));
     } catch (error) {
@@ -342,68 +421,83 @@ async function sendLeadCallSummary(req: any, res: any, employeeOnly: boolean) {
             };
         }
 
-        const rows = await LeadCallStat.aggregate([
-            { $unwind: "$callLogs" },
-            ...(Object.keys(logMatch).length ? [{ $match: logMatch }] : []),
-            {
-                $group: {
-                    _id: { employee: "$callLogs.employee", lead: "$lead" },
-                    employeeName: { $last: "$callLogs.employeeName" },
-                    employeeRole: { $last: "$callLogs.employeeRole" },
-                    employeeTeam: { $last: "$callLogs.employeeTeam" },
-                    leadName: { $last: "$leadName" },
-                    businessName: { $last: "$businessName" },
-                    callCount: {
-                        $sum: {
-                            $cond: [
-                                { $eq: [{ $ifNull: ["$callLogs.outcome", "connected"] }, "connected"] },
-                                1,
-                                0,
-                            ],
+        const employeeFilter: Record<string, unknown> = {
+            status: { $ne: "Archived" },
+        };
+
+        if (employeeId) {
+            employeeFilter._id = new Types.ObjectId(String(employeeId));
+        } else {
+            employeeFilter.role = /sales/i;
+        }
+
+        const [rows, employees] = await Promise.all([
+            LeadCallStat.aggregate([
+                { $unwind: "$callLogs" },
+                ...(Object.keys(logMatch).length ? [{ $match: logMatch }] : []),
+                {
+                    $group: {
+                        _id: { employee: "$callLogs.employee", lead: "$lead" },
+                        employeeName: { $last: "$callLogs.employeeName" },
+                        employeeRole: { $last: "$callLogs.employeeRole" },
+                        employeeTeam: { $last: "$callLogs.employeeTeam" },
+                        leadName: { $last: "$leadName" },
+                        businessName: { $last: "$businessName" },
+                        callCount: {
+                            $sum: {
+                                $cond: [
+                                    { $eq: [{ $ifNull: ["$callLogs.outcome", "connected"] }, "connected"] },
+                                    1,
+                                    0,
+                                ],
+                            },
                         },
-                    },
-                    callNotConnectedCount: {
-                        $sum: { $cond: [{ $eq: ["$callLogs.outcome", "not_connected"] }, 1, 0] },
-                    },
-                    callVoicemailCount: {
-                        $sum: { $cond: [{ $eq: ["$callLogs.outcome", "voicemail"] }, 1, 0] },
-                    },
-                    totalAttempts: { $sum: 1 },
-                    lastCallAt: { $max: "$callLogs.calledAt" },
-                },
-            },
-            { $sort: { lastCallAt: -1 as const } },
-            {
-                $group: {
-                    _id: "$_id.employee",
-                    employeeName: { $first: "$employeeName" },
-                    employeeRole: { $first: "$employeeRole" },
-                    employeeTeam: { $first: "$employeeTeam" },
-                    totalCalls: { $sum: "$callCount" },
-                    totalNotConnectedCalls: { $sum: "$callNotConnectedCount" },
-                    totalVoicemails: { $sum: "$callVoicemailCount" },
-                    totalAttempts: { $sum: "$totalAttempts" },
-                    lastCallAt: { $max: "$lastCallAt" },
-                    leads: {
-                        $push: {
-                            leadId: { $toString: "$_id.lead" },
-                            leadName: "$leadName",
-                            businessName: "$businessName",
-                            callCount: "$callCount",
-                            callNotConnectedCount: "$callNotConnectedCount",
-                            callVoicemailCount: "$callVoicemailCount",
-                            totalAttempts: "$totalAttempts",
-                            lastCallAt: "$lastCallAt",
+                        callNotConnectedCount: {
+                            $sum: { $cond: [{ $eq: ["$callLogs.outcome", "not_connected"] }, 1, 0] },
                         },
+                        callVoicemailCount: {
+                            $sum: { $cond: [{ $eq: ["$callLogs.outcome", "voicemail"] }, 1, 0] },
+                        },
+                        totalAttempts: { $sum: 1 },
+                        lastCallAt: { $max: "$callLogs.calledAt" },
                     },
                 },
-            },
-            { $sort: { lastCallAt: -1 as const } },
+                { $sort: { lastCallAt: -1 as const } },
+                {
+                    $group: {
+                        _id: "$_id.employee",
+                        employeeName: { $first: "$employeeName" },
+                        employeeRole: { $first: "$employeeRole" },
+                        employeeTeam: { $first: "$employeeTeam" },
+                        totalCalls: { $sum: "$callCount" },
+                        totalNotConnectedCalls: { $sum: "$callNotConnectedCount" },
+                        totalVoicemails: { $sum: "$callVoicemailCount" },
+                        totalAttempts: { $sum: "$totalAttempts" },
+                        lastCallAt: { $max: "$lastCallAt" },
+                        leads: {
+                            $push: {
+                                leadId: { $toString: "$_id.lead" },
+                                leadName: "$leadName",
+                                businessName: "$businessName",
+                                callCount: "$callCount",
+                                callNotConnectedCount: "$callNotConnectedCount",
+                                callVoicemailCount: "$callVoicemailCount",
+                                totalAttempts: "$totalAttempts",
+                                lastCallAt: "$lastCallAt",
+                            },
+                        },
+                    },
+                },
+                { $sort: { lastCallAt: -1 as const } },
+            ]),
+            Employee.find(employeeFilter).select("name role team").lean(),
         ]);
 
-        return res.json(rows.map((row: any) => ({
+        const summaryRows = rows.map((row: any) => ({
             employeeId: String(row._id || ""),
             employeeName: row.employeeName || "Employee",
+            crmBusinessId: String(req.business?.id || ""),
+            crmBusinessName: String(req.business?.name || "Current business"),
             employeeRole: row.employeeRole || "",
             employeeTeam: row.employeeTeam || "",
             totalCalls: Number(row.totalCalls || 0),
@@ -412,7 +506,42 @@ async function sendLeadCallSummary(req: any, res: any, employeeOnly: boolean) {
             totalAttempts: Number(row.totalAttempts || 0),
             lastCallAt: row.lastCallAt || null,
             leads: row.leads || [],
-        })));
+        }));
+        const summaryRowsByEmployeeId = new Map<string, any>(
+            summaryRows.map((row: any) => [row.employeeId, row])
+        );
+        const rowsByEmployeeId = new Map<string, any>();
+
+        for (const employee of employees) {
+            const currentEmployeeId = String(employee._id);
+            const existing = summaryRowsByEmployeeId.get(currentEmployeeId);
+
+            rowsByEmployeeId.set(currentEmployeeId, {
+                employeeId: currentEmployeeId,
+                employeeName: employee.name || existing?.employeeName || "Employee",
+                crmBusinessId: String(req.business?.id || ""),
+                crmBusinessName: String(req.business?.name || "Current business"),
+                employeeRole: employee.role || existing?.employeeRole || "",
+                employeeTeam: getEmployeeTeamValue(employee.team) || existing?.employeeTeam || "",
+                totalCalls: existing?.totalCalls || 0,
+                totalNotConnectedCalls: existing?.totalNotConnectedCalls || 0,
+                totalVoicemails: existing?.totalVoicemails || 0,
+                totalAttempts: existing?.totalAttempts || 0,
+                lastCallAt: existing?.lastCallAt || null,
+                leads: existing?.leads || [],
+            });
+        }
+
+        return res.json(Array.from(rowsByEmployeeId.values()).sort((first, second) => {
+            const firstCallAt = first.lastCallAt ? new Date(first.lastCallAt).getTime() : 0;
+            const secondCallAt = second.lastCallAt ? new Date(second.lastCallAt).getTime() : 0;
+
+            if (firstCallAt !== secondCallAt) {
+                return secondCallAt - firstCallAt;
+            }
+
+            return first.employeeName.localeCompare(second.employeeName);
+        }));
     } catch (error) {
         console.error("Get lead call summary error:", error);
         return res.status(500).json({ message: "Could not load lead call summary." });

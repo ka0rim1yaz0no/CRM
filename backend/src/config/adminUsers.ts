@@ -13,6 +13,10 @@ export function getConfiguredAdmins(): ConfiguredAdmin[] {
       employeeCode: String(process.env.CRM_ADMIN_TWO_CODE || "").trim(),
       name: "Administrator Two",
     },
+    {
+      employeeCode: String(process.env.CRM_ADMIN_THREE_CODE || "").trim(),
+      name: "Administrator Three",
+    },
   ].filter((admin) => Boolean(admin.employeeCode));
 }
 

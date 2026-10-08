@@ -1,5 +1,5 @@
 $ErrorActionPreference = "Stop"
-$BridgeVersion = "0.3.0"
+$BridgeVersion = "0.4.0"
 $InstallDirectory = Join-Path $env:LOCALAPPDATA "Assistly\CallBridge"
 $SourceScript = Join-Path $PSScriptRoot "AssistlyCallBridge.ps1"
 $InstalledScript = Join-Path $InstallDirectory "AssistlyCallBridge.ps1"

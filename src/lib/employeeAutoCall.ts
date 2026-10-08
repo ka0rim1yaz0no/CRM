@@ -4,6 +4,7 @@ export const AUTO_CALL_API_TIMEOUT_MS = 10 * 1000;
 export const AUTO_CALL_CONFIRM_TIMEOUT_MS = 30 * 1000;
 export const AUTO_CALL_CONFIRM_POLL_MS = 2 * 1000;
 export const AUTO_CALL_FAILURE_COOLDOWN_MS = 30 * 60 * 1000;
+export const AUTO_CALL_COMMENT_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 export const AUTO_CALL_START_HOUR_PH = 23;
 export const AUTO_CALL_END_HOUR_PH = 8;
 
@@ -17,9 +18,20 @@ export type AutoCallPendingComment = {
 
 type EmployeeCommentMarkerInput = {
     _id?: string;
+    authorName?: string;
     authorType?: string;
     body?: string;
     createdAt?: string;
+};
+
+type AutoCallEligibilityLead = {
+    status?: string;
+    followUpAt?: string | Date | null;
+    comments?: EmployeeCommentMarkerInput[];
+    callsByEmployee?: Array<{
+        employeeName?: string;
+        lastCallAt?: string | Date | null;
+    }>;
 };
 
 function getPendingCommentStorageKey(employeeCode: string) {
@@ -68,6 +80,55 @@ export function getEmployeeCommentMarker(comments: EmployeeCommentMarkerInput[] 
     return [latestEmployeeComment._id, latestEmployeeComment.createdAt, latestEmployeeComment.body]
         .map((value) => String(value || "").trim())
         .join("|");
+}
+
+export function isLeadEligibleForAutoCall(
+    lead: AutoCallEligibilityLead,
+    now = new Date(),
+    employeeNames: string[] = []
+) {
+    if (lead.status !== "NEW" && lead.status !== "Follow up") {
+        return false;
+    }
+
+    const followUpTime = new Date(lead.followUpAt || "").getTime();
+
+    if (Number.isFinite(followUpTime) && followUpTime > now.getTime()) {
+        return false;
+    }
+
+    const normalizedEmployeeNames = new Set(
+        employeeNames.map((name) => String(name || "").trim().toLowerCase()).filter(Boolean)
+    );
+    const matchingComments = (lead.comments || []).filter((comment) =>
+        comment.authorType === "employee" && (
+            normalizedEmployeeNames.size === 0 ||
+            normalizedEmployeeNames.has(String(comment.authorName || "").trim().toLowerCase())
+        )
+    );
+    const commentTimes = matchingComments
+        .map((comment) => new Date(comment.createdAt || "").getTime())
+        .filter(Number.isFinite);
+
+    if (commentTimes.length === 0) {
+        return matchingComments.length === 0;
+    }
+
+    if (matchingComments.some((comment) => !Number.isFinite(new Date(comment.createdAt || "").getTime()))) {
+        return false;
+    }
+
+    const latestCommentTime = Math.max(...commentTimes);
+    if (
+        lead.status === "Follow up" &&
+        Number.isFinite(followUpTime) &&
+        followUpTime <= now.getTime() &&
+        latestCommentTime < followUpTime
+    ) {
+        return true;
+    }
+
+    return latestCommentTime <= now.getTime() - AUTO_CALL_COMMENT_COOLDOWN_MS;
 }
 
 export function startAutoCallPendingComment(employeeCode: string, leadId: string, baselineCommentMarker = "") {

@@ -1,8 +1,10 @@
 import type { Request, Response } from "express";
 import { Notice } from "../models/Notice";
 import { recordEmployeeTransaction } from "./employeeTransactionController";
+import { syncSharedEmployeeRecords } from "../services/employeeRecordSyncService";
 
-export async function listRecentNotices(_request: Request, response: Response) {
+export async function listRecentNotices(request: Request, response: Response) {
+  if (request.business?.id) await syncSharedEmployeeRecords(request.business.id);
   const notices = await Notice.find()
     .populate({ path: "employee", select: "name employeeCode team role" })
     .sort({ createdAt: -1 })
@@ -11,6 +13,7 @@ export async function listRecentNotices(_request: Request, response: Response) {
 }
 
 export async function listEmployeeNotices(request: Request, response: Response) {
+  if (request.business?.id) await syncSharedEmployeeRecords(request.business.id);
   const employeeId = String(request.params.employeeId);
   const notices = await Notice.find({ employee: employeeId }).sort({ createdAt: -1 });
   response.json(notices);

@@ -14,19 +14,21 @@ function duration(milliseconds: number) {
 
 function statusClasses(status: CallDashboardRow["status"]) {
     if (status === "ON CALL") return "border-emerald-200 bg-emerald-50 text-emerald-800";
+    if (status === "ONLINE") return "border-green-200 bg-green-50 text-green-800";
     if (status === "CALL WAITING") return "border-sky-200 bg-sky-50 text-sky-800";
     if (status === "OFF THE PHONE") return "border-amber-200 bg-amber-50 text-amber-800";
+    if (status === "BREAK" || status === "LUNCH") return "border-orange-200 bg-orange-50 text-orange-800";
     return "border-slate-200 bg-slate-100 text-slate-600";
 }
 
 function visibleStatus(row: CallDashboardRow, now: number, shiftStart: number, shiftEnd: number) {
     if (now < shiftStart || now >= shiftEnd) {
-        return { status: row.status === "OFF THE PHONE" ? "OFF THE PHONE" as const : "OFFLINE" as const, startedAt: 0, detail: "Outside call shift" };
+        return { status: row.status, startedAt: 0, detail: "Outside call shift" };
     }
     const deadline = row.transitionUntil ? new Date(row.transitionUntil).getTime() : 0;
     if (deadline && now >= deadline) {
         return {
-            status: "OFFLINE" as const,
+            status: row.status === "CALL WAITING" ? "ONLINE" as const : row.status,
             startedAt: deadline,
             detail: row.status === "CALL WAITING" ? "Ready to dial" : "Dial not confirmed",
         };
@@ -38,7 +40,7 @@ function visibleStatus(row: CallDashboardRow, now: number, shiftStart: number, s
     };
 }
 
-export default function CallDashboardPanel() {
+export default function CallDashboardPanel({ businessName }: { businessName?: string }) {
     const queryClient = useQueryClient();
     const [clock, setClock] = useState(Date.now);
     const { data, isLoading, isError } = useQuery({
@@ -80,8 +82,9 @@ export default function CallDashboardPanel() {
     const rows = data?.employees.map((row) => ({ row, visible: visibleStatus(row, serverNow, shiftStart, shiftEnd) })) || [];
     const counts = {
         onCall: rows.filter(({ visible }) => visible.status === "ON CALL").length,
+        online: rows.filter(({ visible }) => visible.status === "ONLINE").length,
         waiting: rows.filter(({ visible }) => visible.status === "CALL WAITING").length,
-        offPhone: rows.filter(({ visible }) => visible.status === "OFF THE PHONE").length,
+        away: rows.filter(({ visible }) => ["OFF THE PHONE", "BREAK", "LUNCH"].includes(visible.status)).length,
         offline: rows.filter(({ visible }) => visible.status === "OFFLINE").length,
     };
     const displayRows = rows.map(({ row, visible }) => {
@@ -107,13 +110,14 @@ export default function CallDashboardPanel() {
                         <h3 id="call-dashboard-title" className="text-base font-semibold">Call Dashboard</h3>
                     </div>
                     <p className="mt-0.5 text-xs text-slate-500">
-                        {data ? `${formatPhDate(data.shift.start)} · ${formatPhTime(data.shift.start)} to ${formatPhTime(data.shift.end)} PH shift` : "Loading shift"}
+                        {data ? `${businessName || data.business.name} · ${formatPhDate(data.shift.start)} · ${formatPhTime(data.shift.start)} to ${formatPhTime(data.shift.end)} PH shift` : "Loading shift"}
                     </p>
                 </div>
                 {data && <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs font-medium text-slate-600">
                     <span><span className="mr-1 inline-block size-2 rounded-full bg-emerald-500" />{counts.onCall} on call</span>
+                    <span><span className="mr-1 inline-block size-2 rounded-full bg-green-500" />{counts.online} online</span>
                     <span><span className="mr-1 inline-block size-2 rounded-full bg-sky-500" />{counts.waiting} waiting</span>
-                    <span><span className="mr-1 inline-block size-2 rounded-full bg-amber-500" />{counts.offPhone} off phone</span>
+                    <span><span className="mr-1 inline-block size-2 rounded-full bg-amber-500" />{counts.away} away</span>
                     <span><span className="mr-1 inline-block size-2 rounded-full bg-slate-400" />{counts.offline} offline</span>
                 </div>}
             </div>
@@ -139,7 +143,7 @@ export default function CallDashboardPanel() {
                                         <span className="flex size-8 shrink-0 items-center justify-center rounded-md bg-[#842cff] text-xs font-semibold text-white">{row.name.trim().charAt(0).toUpperCase() || "?"}</span>
                                         <div className="min-w-0">
                                             <p className="truncate text-sm font-semibold" title={row.name}>{row.name}</p>
-                                            <p className="truncate text-xs text-slate-500" title={[row.role, row.team].filter(Boolean).join(" · ")}>{[row.role, row.team].filter(Boolean).join(" · ")}</p>
+                                            <p className="truncate text-xs text-slate-500" title={[row.role, row.team, businessName || row.businessName].filter(Boolean).join(" · ")}>{[row.role, row.team, businessName || row.businessName].filter(Boolean).join(" · ")}</p>
                                         </div>
                                     </div>
                                 </td>
@@ -167,7 +171,7 @@ export default function CallDashboardPanel() {
                                 </span>
                                 <div className="min-w-0">
                                     <p className="break-words text-sm font-semibold">{row.name}</p>
-                                    <p className="break-words text-xs text-slate-500">{[row.role, row.team].filter(Boolean).join(" · ")}</p>
+                                    <p className="break-words text-xs text-slate-500">{[row.role, row.team, businessName || row.businessName].filter(Boolean).join(" · ")}</p>
                                 </div>
                             </div>
                             <span className={`inline-flex shrink-0 whitespace-nowrap rounded-md border px-2 py-1 text-xs font-semibold ${statusClasses(visible.status)}`}>

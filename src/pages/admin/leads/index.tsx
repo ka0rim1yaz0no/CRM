@@ -69,7 +69,8 @@ import {
 } from "../../../api/leads";
 import { useClickOutside } from "../../../hooks/useClickOutside";
 import { useToast } from "../../../components/ToastProvider";
-import { formatCstDate, formatCstDateTime, formatCstDateTimeInput, formatPhDateTime, getCurrentCstDateTimeInput, parseCstDateTimeInput } from "../../../lib/dateTime";
+import { formatCstDate, formatLeadScheduleDate, formatLeadScheduleDateTime, formatLeadScheduleDateTimeInput, formatPhDateTime, getCurrentLeadScheduleDateTimeInput, parseLeadScheduleDateTimeInput } from "../../../lib/dateTime";
+import { getPhoneCallUrl } from "../../../lib/phoneNumber";
 import { getSystemSettings } from "../../../api/systemSettings";
 
 type AdminLeadTab = LeadStatus | "Unassigned" | "ALL";
@@ -649,7 +650,7 @@ function getLeadActivity(lead: Lead): LeadActivityItem[] {
     if (lead.status !== "Qualified" && lead.followUpAt) {
         activities.push({
             label: "Follow-up scheduled",
-            detail: `${formatCstDateTime(lead.followUpAt)} (${getRelativeTime(lead.followUpAt)}).`,
+            detail: `${formatLeadScheduleDateTime(lead.followUpAt)} (${getRelativeTime(lead.followUpAt)}).`,
             status: "Priority",
         });
     }
@@ -748,7 +749,7 @@ function updateLeadPageData(current: AdminLeadsPage | undefined, updater: (leads
 }
 
 function isScheduledForToday(lead: Lead) {
-    return Boolean(lead.status !== "Qualified" && lead.followUpAt && formatCstDate(lead.followUpAt) === formatCstDate(new Date()));
+    return Boolean(lead.status !== "Qualified" && lead.followUpAt && formatLeadScheduleDate(lead.followUpAt) === formatLeadScheduleDate(new Date()));
 }
 
 function hasManualCommentToday(lead: Lead) {
@@ -956,9 +957,13 @@ export default function AdminLeads() {
     const [leadStateFilter, setLeadStateFilter] = useState("ALL");
     const [dateFromFilter, setDateFromFilter] = useState("");
     const [dateToFilter, setDateToFilter] = useState("");
-    const [leadPage, setLeadPage] = useState(1);
+    const [, setLeadPage] = useState(1);
     const [hasMoreLeads, setHasMoreLeads] = useState(true);
     const [isFetchingMoreLeads, setIsFetchingMoreLeads] = useState(false);
+    const leadListRef = useRef<HTMLDivElement>(null);
+    const leadPageRef = useRef(1);
+    const leadFetchInFlightRef = useRef(false);
+    const leadQueryIdentityRef = useRef("");
     const [isExportingLeads, setIsExportingLeads] = useState(false);
     const shouldUseDateRangeFilter = activeTab === "Qualified";
     const effectiveDateFromFilter = shouldUseDateRangeFilter ? dateFromFilter : "";
@@ -1055,6 +1060,7 @@ export default function AdminLeads() {
             selectedAgentName,
         ]
     );
+    const leadQueryIdentity = JSON.stringify(leadQueryKey);
 
     const { data: leadPageData, isLoading, isError } = useQuery({
         queryKey: leadQueryKey,
@@ -1194,6 +1200,8 @@ export default function AdminLeads() {
     }, isBulkMenuOpen);
 
     const invalidateLeads = async () => {
+        leadPageRef.current = 1;
+        leadFetchInFlightRef.current = false;
         setLeadPage(1);
         setHasMoreLeads(true);
         await queryClient.invalidateQueries({ queryKey: ["admin-leads"] });
@@ -1213,12 +1221,11 @@ export default function AdminLeads() {
     }, [leadSearch]);
 
     useEffect(() => {
-        const routeSearch = searchParams.get("leadSearch") || "";
         const routeScope = searchParams.get("scope") || searchParams.get("tab") || "";
         const routeTab = getRouteLeadTab(routeScope);
         const routeLeadIdParam = searchParams.get("lead") || "";
 
-        if (!routeSearch && !routeTab && !routeLeadIdParam) {
+        if (!routeTab && !routeLeadIdParam) {
             return;
         }
 
@@ -1231,11 +1238,6 @@ export default function AdminLeads() {
             setAllStatusFilter("ALL");
         }
 
-        if (routeSearch) {
-            setLeadSearch(routeSearch);
-            setDebouncedLeadSearch(routeSearch);
-        }
-
         if (routeLeadIdParam) {
             setSelectedLeadId(routeLeadIdParam);
             setLeadHistoryIds((current) => (current.includes(routeLeadIdParam) ? current : [routeLeadIdParam, ...current].slice(0, 8)));
@@ -1243,9 +1245,16 @@ export default function AdminLeads() {
     }, [searchParams]);
 
     useEffect(() => {
+        leadQueryIdentityRef.current = leadQueryIdentity;
+        leadPageRef.current = 1;
+        leadFetchInFlightRef.current = false;
         setLeadPage(1);
         setHasMoreLeads(true);
-    }, [activeTab, allStatusFilter, assignedAgentFilter, debouncedLeadSearch, effectiveDateFromFilter, effectiveDateToFilter, leadQueueFilter, leadStateFilter]);
+        setIsFetchingMoreLeads(false);
+        if (leadListRef.current) {
+            leadListRef.current.scrollTop = 0;
+        }
+    }, [leadQueryIdentity]);
 
     useEffect(() => {
         if (leadStateFilter === "ALL" || leadStateOptions.length === 0) {
@@ -1321,10 +1330,26 @@ export default function AdminLeads() {
     });
     const bulkAssignLeadsMutation = useMutation({
         mutationFn: bulkAssignLeads,
-        onSuccess: () => {
+        onSuccess: (result, variables) => {
             setSelectedBulkLeadIds([]);
             setIsBulkAssignMenuOpen(false);
-            invalidateLeads();
+            void invalidateLeads();
+
+            const leadLabel = result.assignedCount === 1 ? "lead" : "leads";
+            if (result.assignedCount === 0) {
+                showToast({ tone: "info", message: "No lead assignments changed. Refresh the list and try again." });
+                return;
+            }
+
+            showToast({
+                tone: "success",
+                message: variables.assignedAgent === "UNASSIGNED"
+                    ? `Unassigned ${result.assignedCount.toLocaleString()} ${leadLabel}.`
+                    : `Assigned ${result.assignedCount.toLocaleString()} ${leadLabel} to ${variables.assignedAgentName}. Assigned leads leave Unassigned but remain in NEW until their status changes.`,
+            });
+        },
+        onError: (error) => {
+            showToast({ tone: "error", message: getRequestErrorMessage(error, "Could not assign the selected leads.") });
         },
     });
     const bulkPermanentDeleteMutation = useMutation({
@@ -1403,7 +1428,7 @@ export default function AdminLeads() {
                     currentLeads.map((currentLead) => (currentLead._id === lead._id ? lead : currentLead))
                 )
             );
-            setFollowUpDateTime(formatCstDateTimeInput(lead.followUpAt) || getCurrentCstDateTimeInput());
+            setFollowUpDateTime(formatLeadScheduleDateTimeInput(lead.followUpAt) || getCurrentLeadScheduleDateTimeInput());
         },
         onError: (error) => {
             showToast({ tone: "error", message: getRequestErrorMessage(error, "Could not schedule the follow-up.") });
@@ -1479,6 +1504,7 @@ export default function AdminLeads() {
                 )
             );
             setIsAssignEditing(false);
+            void invalidateLeads();
             showToast({ tone: "success", message: `Lead assigned to ${lead.assignedAgent?.name || lead.assignedAgentName}.` });
         },
         onError: (error) => {
@@ -1496,7 +1522,7 @@ export default function AdminLeads() {
                 )
             );
             setStatusDraft(lead.status);
-            setFollowUpDateTime(formatCstDateTimeInput(lead.followUpAt) || getCurrentCstDateTimeInput());
+            setFollowUpDateTime(formatLeadScheduleDateTimeInput(lead.followUpAt) || getCurrentLeadScheduleDateTimeInput());
             void invalidateLeads();
         },
         onError: (error) => {
@@ -1626,7 +1652,7 @@ export default function AdminLeads() {
 
         if (assignedAgentFilter !== "ALL") {
             if (assignedAgentFilter === "UNASSIGNED") {
-                params.assignedAgentNames = [""];
+                params.unassigned = true;
             } else if (assignedAgentFilter.startsWith("manual:")) {
                 params.assignedAgentNames = [
                     assignedAgentFilter.replace(/^manual:/, ""),
@@ -1733,7 +1759,6 @@ export default function AdminLeads() {
 
         return filter === "NEW" ? "New" : "Follow up";
     };
-    const hasDateRangeFilter = Boolean(effectiveDateFromFilter || effectiveDateToFilter);
     const activeTabTotalCount =
         leadPageData?.total ??
         (activeTab === "NEW"
@@ -1746,10 +1771,6 @@ export default function AdminLeads() {
                     : leadCounts[leadQueueFilter] || leads.length
                 : leadCounts[activeTab] || leadCounts.ALL || leads.length);
     const getTabCount = (tab: AdminLeadTab) => {
-        if (tab === "ALL" && (debouncedLeadSearch || assignedAgentFilter !== "ALL" || leadStateFilter !== "ALL" || hasDateRangeFilter || activeCategoryTab !== "ALL")) {
-            return activeTab === "ALL" ? filteredLeads.length : leads.filter((lead) => lead.status !== "Archived").length;
-        }
-
         if (tab === activeTab) {
             return activeCategoryTab === "ALL" ? activeTabTotalCount : filteredLeads.length;
         }
@@ -1804,10 +1825,12 @@ export default function AdminLeads() {
     }, [activeTab, activeCategoryTab, assignedAgentFilter, leadSearch]);
 
     useEffect(() => {
-        if (!isLoading) {
-            setHasMoreLeads(leads.length >= LEAD_PAGE_SIZE && leads.length < activeTabTotalCount);
+        if (!isLoading && leadPageData) {
+            leadPageRef.current = Math.max(leadPageData.page || 1, 1);
+            setLeadPage(leadPageRef.current);
+            setHasMoreLeads(leadPageData.hasMore);
         }
-    }, [activeTabTotalCount, isLoading, leads.length]);
+    }, [isLoading, leadPageData]);
 
     const toggleBulkLead = (leadId: string) => {
         setSelectedBulkLeadIds((current) => (current.includes(leadId) ? current.filter((id) => id !== leadId) : [...current, leadId]));
@@ -1952,11 +1975,13 @@ export default function AdminLeads() {
     };
 
     const fetchMoreLeads = async () => {
-        if (isFetchingMoreLeads || isLoading || !hasMoreLeads) {
+        if (leadFetchInFlightRef.current || isLoading || !hasMoreLeads) {
             return;
         }
 
-        const nextPage = leadPage + 1;
+        const requestIdentity = leadQueryIdentityRef.current;
+        const nextPage = leadPageRef.current + 1;
+        leadFetchInFlightRef.current = true;
         setIsFetchingMoreLeads(true);
 
         try {
@@ -1965,6 +1990,10 @@ export default function AdminLeads() {
                 page: nextPage,
                 limit: LEAD_PAGE_SIZE,
             });
+
+            if (requestIdentity !== leadQueryIdentityRef.current) {
+                return;
+            }
 
             queryClient.setQueryData<AdminLeadsPage>(leadQueryKey, (current) => {
                 if (!current) {
@@ -1976,10 +2005,16 @@ export default function AdminLeads() {
                     leads: mergeLeadPages(current.leads, nextLeadPage.leads),
                 };
             });
+            leadPageRef.current = nextPage;
             setLeadPage(nextPage);
             setHasMoreLeads(nextLeadPage.hasMore);
+        } catch (error) {
+            showToast({ tone: "error", message: getRequestErrorMessage(error, "Could not load more leads. Please try again.") });
         } finally {
-            setIsFetchingMoreLeads(false);
+            if (requestIdentity === leadQueryIdentityRef.current) {
+                leadFetchInFlightRef.current = false;
+                setIsFetchingMoreLeads(false);
+            }
         }
     };
 
@@ -2236,7 +2271,7 @@ export default function AdminLeads() {
     }, [selectedLead?._id, selectedLead?.status]);
 
     useEffect(() => {
-        setFollowUpDateTime(formatCstDateTimeInput(selectedLead?.followUpAt) || getCurrentCstDateTimeInput());
+        setFollowUpDateTime(formatLeadScheduleDateTimeInput(selectedLead?.followUpAt) || getCurrentLeadScheduleDateTimeInput());
     }, [selectedLead?._id, selectedLead?.followUpAt]);
 
     const handleAiSort = () => {
@@ -2264,7 +2299,7 @@ export default function AdminLeads() {
             return;
         }
 
-        const scheduledDate = parseCstDateTimeInput(followUpDateTime);
+        const scheduledDate = parseLeadScheduleDateTimeInput(followUpDateTime);
 
         if (!scheduledDate) {
             showToast({ tone: "error", message: "Use a valid follow-up date and time." });
@@ -2639,7 +2674,7 @@ export default function AdminLeads() {
                                                                     </button>
                                                                     <div className="my-1 h-px bg-slate-200" />
                                                                     {salesAssignableEmployees.length === 0 && (
-                                                                        <p className="px-3 py-2 text-xs font-semibold !text-slate-500">No Sales employees available</p>
+                                                                        <p className="px-3 py-2 text-xs font-semibold !text-slate-500">No active Sales employees in this business</p>
                                                                     )}
                                                                     {salesAssignableEmployees.map((employee) => (
                                                                         <button
@@ -2849,7 +2884,7 @@ export default function AdminLeads() {
                             })}
                         </div>
 
-                        <div className="content-scroll min-h-0 flex-1 divide-y divide-white/10 overflow-y-auto" onScroll={handleLeadListScroll}>
+                        <div ref={leadListRef} className="content-scroll min-h-0 flex-1 divide-y divide-white/10 overflow-y-auto overscroll-contain [scrollbar-gutter:stable]" onScroll={handleLeadListScroll}>
                             {isLoading && <p className="px-5 py-6 text-sm text-white/45">Loading leads...</p>}
                             {isError && <p className="px-5 py-6 text-sm text-red-200">Unable to load leads.</p>}
                             {!isLoading && !isError && filteredLeads.length === 0 && (
@@ -2926,6 +2961,17 @@ export default function AdminLeads() {
                                 <p className="px-5 py-4 text-center text-xs font-semibold text-white/35">
                                     Loading leads... {leads.length.toLocaleString()} / {activeTabTotalCount.toLocaleString()}
                                 </p>
+                            )}
+                            {!isLoading && !isError && !isFetchingMoreLeads && filteredLeads.length > 0 && hasMoreLeads && (
+                                <div className="flex justify-center px-5 py-4">
+                                    <button
+                                        className="h-9 rounded-lg border border-white/15 bg-white/[0.04] px-4 text-xs font-semibold text-white/70 transition hover:bg-white/[0.08] hover:text-white"
+                                        type="button"
+                                        onClick={() => void fetchMoreLeads()}
+                                    >
+                                        Load more leads
+                                    </button>
+                                </div>
                             )}
                             {!isLoading && !isError && filteredLeads.length > 0 && !hasMoreLeads && (
                                 <p className="px-5 py-4 text-center text-xs font-semibold text-white/25">End of list</p>
@@ -3051,8 +3097,9 @@ export default function AdminLeads() {
                                             <div className="flex items-center gap-2 sm:absolute sm:right-5 sm:top-5 sm:order-2 sm:justify-end">
                                                 <a
                                                     className="flex size-9 items-center justify-center rounded-lg border border-[#10ac84] bg-[#10ac84] text-white transition hover:border-[#0b8f6e] hover:bg-[#0b8f6e]"
-                                                    href={`tel:${selectedLead.phone}`}
+                                                    href={getPhoneCallUrl(selectedLead.phone)}
                                                     aria-label="Call lead"
+                                                    title="Call lead"
                                                 >
                                                     <FiPhone className="size-4" aria-hidden="true" />
                                                 </a>
@@ -3285,7 +3332,7 @@ export default function AdminLeads() {
 
                                                 <div className="rounded-lg border border-white/10 bg-black/10 p-3">
                                                     <p className="text-xs font-medium uppercase tracking-[0.14em] text-white/35">
-                                                        Follow Up
+                                                        Follow Up (Eastern Time)
                                                     </p>
                                                     <div className="mt-2 grid gap-2 sm:grid-cols-[minmax(0,1fr)_7rem]">
                                                         <input
@@ -3293,7 +3340,7 @@ export default function AdminLeads() {
                                                             className="h-11 min-w-0 rounded-lg border border-white/10 bg-black/20 px-3 text-sm font-semibold text-white outline-none transition focus:border-[#842cff] focus:ring-2 focus:ring-[#842cff]/20"
                                                             type="datetime-local"
                                                             value={isQualifiedStatusDraft ? "" : followUpDateTime}
-                                                            min={getCurrentCstDateTimeInput()}
+                                                            min={getCurrentLeadScheduleDateTimeInput()}
                                                             onChange={(event) => setFollowUpDateTime(event.target.value)}
                                                             disabled={isQualifiedStatusDraft || Boolean(activeLeadAction)}
                                                         />
@@ -3312,7 +3359,7 @@ export default function AdminLeads() {
                                                                 ? "Save to clear the existing follow-up schedule."
                                                                 : "Qualified leads have no follow-up schedule."
                                                             : selectedLead.followUpAt
-                                                                ? `Next: ${formatCstDateTime(selectedLead.followUpAt)}`
+                                                                ? `Next: ${formatLeadScheduleDateTime(selectedLead.followUpAt)}`
                                                                 : "No follow-up scheduled"}
                                                     </p>
                                                 </div>
@@ -3382,7 +3429,7 @@ export default function AdminLeads() {
                                             ["Filter", selectedLead.category || "All"],
                                             ["AI Score", selectedLead.aiScore ? `${selectedLead.aiScore}/100` : "Not scored"],
                                             ["AI Reason", selectedLead.aiScoreReason || "No score yet"],
-                                            ["Follow Up", selectedLead.status !== "Qualified" && selectedLead.followUpAt ? formatCstDateTime(selectedLead.followUpAt) : "None"],
+                                            ["Follow Up", selectedLead.status !== "Qualified" && selectedLead.followUpAt ? formatLeadScheduleDateTime(selectedLead.followUpAt) : "None"],
                                             ["Status", selectedLead.status],
                                             ["Current Agent", getCurrentLeadAgent(selectedLead)],
                                             ["Previous Agent", getPreviousLeadAgent(selectedLead)],

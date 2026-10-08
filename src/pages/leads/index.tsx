@@ -9,10 +9,12 @@ import { getAuthUser } from "../../api/authStorage";
 import { getEmployees, type Employee } from "../../api/employees";
 import { addLeadComment, archiveLead, assignLead, createLead, getLead, getLeadCallStat, getMyLeadCounts, getMyLeads, logConnectedLeadCall, logLeadNotConnected, logLeadVoicemail, recordLeadCall, scheduleLeadFollowUp, toggleLeadFavorite, updateLead, updateLeadStatus, type EmployeeLeadTab, type Lead, type LeadInput, type LeadStatus, type MyLeadsPage } from "../../api/leads";
 import { getSystemSettings } from "../../api/systemSettings";
+import { getLatestCallBridgeAttempt } from "../../api/callBridge";
 import { useToast } from "../../components/ToastProvider";
 import { useFeatureFlags } from "../../hooks/useFeatureFlags";
-import { formatCstDate, formatCstDateTime, formatCstDateTimeInput, getCurrentCstDateTimeInput, parseCstDateTimeInput, formatPhDateTime } from "../../lib/dateTime";
+import { formatCstDate, formatLeadScheduleDate, formatLeadScheduleDateTime, formatLeadScheduleDateTimeInput, getCurrentLeadScheduleDateTimeInput, parseLeadScheduleDateTimeInput, formatPhDateTime } from "../../lib/dateTime";
 import { clearAutoCallPendingComment, getAutoCallPendingComment, getEmployeeCommentMarker, startAutoCallPendingComment } from "../../lib/employeeAutoCall";
+import { getPhoneCallUrl } from "../../lib/phoneNumber";
 import { socket } from "../../lib/socket";
 
 const tabs: Array<LeadStatus | "ALL"> = [
@@ -287,7 +289,7 @@ function getLeadDeprioritizedTime(lead: Lead) {
 }
 
 function isScheduledForToday(lead: Lead) {
-    return Boolean(lead.status !== "Qualified" && lead.followUpAt && formatCstDate(lead.followUpAt) === formatCstDate(new Date()));
+    return Boolean(lead.status !== "Qualified" && lead.followUpAt && formatLeadScheduleDate(lead.followUpAt) === formatLeadScheduleDate(new Date()));
 }
 
 function isScheduledDueNow(lead: Lead, now = Date.now()) {
@@ -480,6 +482,9 @@ export default function Leads() {
     const [commentDraft, setCommentDraft] = useState("");
     const pendingCommentSaveRef = useRef<{ leadId: string; body: string; promise: Promise<Lead> } | null>(null);
     const leadActionPendingRef = useRef<LeadActionName | null>(null);
+    const leadListRef = useRef<HTMLDivElement>(null);
+    const leadPageRef = useRef(1);
+    const leadFetchInFlightRef = useRef(false);
     const [activeLeadAction, setActiveLeadAction] = useState<LeadActionName | null>(null);
     const [passAgentId, setPassAgentId] = useState("");
     const [passConfirm, setPassConfirm] = useState<{ lead: Lead; agent: Employee } | null>(null);
@@ -653,11 +658,12 @@ export default function Leads() {
     };
 
     const fetchMoreLeads = async () => {
-        if (!employeeId || isFetchingMoreLeads || !hasMoreLeads) {
+        if (!employeeId || leadFetchInFlightRef.current || !hasMoreLeads) {
             return;
         }
 
-        const nextPage = leadPage + 1;
+        const nextPage = leadPageRef.current + 1;
+        leadFetchInFlightRef.current = true;
         setIsFetchingMoreLeads(true);
 
         try {
@@ -677,16 +683,22 @@ export default function Leads() {
                 ...nextLeadPage,
                 leads: mergeLeadPages(current?.leads || [], nextLeadPage.leads),
             }));
+            leadPageRef.current = nextPage;
             setLeadPage(nextPage);
             setHasMoreLeads(nextLeadPage.hasMore);
+        } catch {
+            showToast({ tone: "error", message: "Could not load more leads. Please try again." });
         } finally {
+            leadFetchInFlightRef.current = false;
             setIsFetchingMoreLeads(false);
         }
     };
 
     useEffect(() => {
+        leadPageRef.current = 1;
+        leadFetchInFlightRef.current = false;
         setLeadPage(1);
-        setHasMoreLeads(true);
+        setHasMoreLeads(leadPageData?.hasMore ?? true);
     }, [employeeId, employeeLeadNames.join("|"), effectiveLeadSearch, isGlobalLeadSearchActive, leadStateFilter, requestedEmployeeLeadTab]);
 
     useEffect(() => {
@@ -708,9 +720,9 @@ export default function Leads() {
 
     const handleLeadListScroll = (event: UIEvent<HTMLDivElement>) => {
         const list = event.currentTarget;
-        const scrollableDistance = list.scrollHeight - list.clientHeight;
+        const remainingDistance = list.scrollHeight - list.clientHeight - list.scrollTop;
 
-        if (scrollableDistance <= 0 || list.scrollTop / scrollableDistance >= 0.5) {
+        if (remainingDistance <= 320) {
             void fetchMoreLeads();
         }
     };
@@ -751,8 +763,6 @@ export default function Leads() {
     const invalidateEmployeeLeads = () => {
         void queryClient.invalidateQueries({ queryKey: ["leads", employeeId] });
         void queryClient.invalidateQueries({ queryKey: ["lead-counts", employeeId] });
-        void queryClient.refetchQueries({ queryKey: leadQueryKey });
-        void queryClient.refetchQueries({ queryKey: ["lead-counts", employeeId, employeeLeadNames.join("|"), leadStateFilter] });
     };
 
     const updateCachedLeadPage = (updateLeads: (current: Lead[]) => Lead[]) => {
@@ -772,13 +782,35 @@ export default function Leads() {
             const changedLead = payload.lead;
             const changedLeadId = changedLead?._id;
             const changedLeadIds = new Set([...(payload.leadIds || []), ...(changedLeadId ? [changedLeadId] : [])]);
+            const cachedLeadExists = changedLeadId
+                ? queryClient.getQueriesData<MyLeadsPage>({ queryKey: ["leads", employeeId] }).some(([, current]) =>
+                    Boolean(current?.leads.some((lead) => lead._id === changedLeadId))
+                )
+                : false;
+            const normalizedEmployeeNames = new Set(employeeLeadNames.map((name) => name.trim().toLowerCase()).filter(Boolean));
+            const isAssignedHere = Boolean(changedLead && (
+                changedLead.assignedAgent?._id === employeeId ||
+                normalizedEmployeeNames.has(String(changedLead.assignedAgentName || "").trim().toLowerCase())
+            ));
+
+            if (payload.action === "call-outcome-classified" && changedLeadId) {
+                void queryClient.invalidateQueries({ queryKey: ["lead-call-stat", changedLeadId] });
+                void queryClient.invalidateQueries({ queryKey: ["lead-call-stats"], exact: false });
+                void queryClient.invalidateQueries({ queryKey: ["agent-lead-dashboard"], exact: false });
+            }
+
+            // Lead events are broadcast across the business. Ignore another
+            // employee's single-lead update instead of multiplying it into a
+            // full queue and count refresh in every open browser.
+            if (changedLead && !cachedLeadExists && !isAssignedHere) {
+                return;
+            }
 
             if (changedLead) {
                 queryClient.setQueriesData<MyLeadsPage>({ queryKey: ["leads", employeeId] }, (current) => {
                     if (!current) return current;
 
                     const hasLead = current.leads.some((lead) => lead._id === changedLead._id);
-                    const isAssignedHere = changedLead.assignedAgent?._id === employeeId;
                     const shouldAddToCurrentPage = isAssignedHere && payload.action !== "call-logged";
 
                     if (!hasLead && !shouldAddToCurrentPage) {
@@ -812,14 +844,23 @@ export default function Leads() {
             setQueueClock(Date.now());
             void queryClient.invalidateQueries({ queryKey: ["leads", employeeId] });
             void queryClient.invalidateQueries({ queryKey: ["lead-counts", employeeId] });
-            void queryClient.refetchQueries({ queryKey: leadQueryKey });
-            void queryClient.refetchQueries({ queryKey: ["lead-counts", employeeId, employeeLeadNames.join("|"), leadStateFilter] });
+        };
+
+        const handleLeadCallStatUpdated = (payload: { leadId?: string }) => {
+            const leadId = String(payload.leadId || "");
+            if (!leadId) return;
+
+            void queryClient.invalidateQueries({ queryKey: ["lead-call-stat", leadId] });
+            void queryClient.invalidateQueries({ queryKey: ["lead-call-stats"], exact: false });
+            void queryClient.invalidateQueries({ queryKey: ["agent-lead-dashboard"], exact: false });
         };
 
         socket.on("lead:changed", handleLeadChanged);
+        socket.on("lead-call-stat:updated", handleLeadCallStatUpdated);
 
         return () => {
             socket.off("lead:changed", handleLeadChanged);
+            socket.off("lead-call-stat:updated", handleLeadCallStatUpdated);
         };
     }, [employeeId, employeeLeadNames, leadQueryKey, leadStateFilter, queryClient]);
 
@@ -954,10 +995,30 @@ export default function Leads() {
     const toggleFavoriteMutation = useMutation({
         mutationFn: ({ lead, favorite }: { lead: Lead; favorite: boolean }) =>
             toggleLeadFavorite(lead._id, { employeeId, favorite }),
+        onMutate: ({ lead, favorite }) => {
+            const previousLeadPage = queryClient.getQueryData<typeof leadPageData>(leadQueryKey);
+            const previousRequestedLead = queryClient.getQueryData<Lead>(["lead", lead._id]);
+            const nextFavoriteEmployeeIds = favorite
+                ? Array.from(new Set([...(lead.favoriteByEmployees || []).map(String), employeeId]))
+                : (lead.favoriteByEmployees || []).map(String).filter((favoriteEmployeeId) => favoriteEmployeeId !== employeeId);
+            const optimisticLead = { ...lead, favoriteByEmployees: nextFavoriteEmployeeIds };
+
+            updateCachedLeadPage((current) => current.map((item) => (item._id === lead._id ? optimisticLead : item)));
+            queryClient.setQueryData<Lead>(["lead", lead._id], (current) => current ? { ...current, favoriteByEmployees: nextFavoriteEmployeeIds } : current);
+            setWorkedLeadHolds((current) => current.map((item) => (item._id === lead._id ? optimisticLead : item)));
+
+            return { previousLeadPage, previousRequestedLead };
+        },
         onSuccess: (updatedLead) => {
             updateCachedLeadPage((current) => current.map((lead) => (lead._id === updatedLead._id ? updatedLead : lead)));
+            queryClient.setQueryData<Lead>(["lead", updatedLead._id], updatedLead);
+            setWorkedLeadHolds((current) => current.map((lead) => (lead._id === updatedLead._id ? updatedLead : lead)));
         },
-        onError: () => {
+        onError: (_error, variables, context) => {
+            if (context?.previousLeadPage) {
+                queryClient.setQueryData(leadQueryKey, context.previousLeadPage);
+            }
+            queryClient.setQueryData(["lead", variables.lead._id], context?.previousRequestedLead);
             showToast({ tone: "error", message: "Could not update favorite." });
         },
     });
@@ -1097,7 +1158,7 @@ export default function Leads() {
     }, [selectedLead?._id, selectedLead?.status]);
 
     useEffect(() => {
-        setFollowUpDateTime(formatCstDateTimeInput(selectedLead?.followUpAt) || getCurrentCstDateTimeInput());
+        setFollowUpDateTime(formatLeadScheduleDateTimeInput(selectedLead?.followUpAt) || getCurrentLeadScheduleDateTimeInput());
     }, [selectedLead?._id, selectedLead?.followUpAt]);
 
     useEffect(() => {
@@ -1168,18 +1229,28 @@ export default function Leads() {
     }, [canAddLeads]);
 
     useEffect(() => {
+        leadPageRef.current = 1;
+        leadFetchInFlightRef.current = false;
         setLeadPage(1);
-        setHasMoreLeads(true);
+        setHasMoreLeads(leadPageData?.hasMore ?? true);
         setSelectedLeadId(requestedLeadId || null);
         setActiveCategoryTab("ALL");
-    }, [activeTab, effectiveLeadSearch, employeeId, showFavoritesOnly]);
+    }, [activeTab, effectiveLeadSearch, employeeId]);
 
     useEffect(() => {
         if (!isLoading && leadPage === 1) {
-            const expectedTotal = isGlobalLeadSearchActive ? leadPageData?.total || leads.length : getTabCount(activeTab) || leadCounts.ALL || leads.length;
-            setHasMoreLeads(leads.length === LEAD_PAGE_SIZE && leads.length < expectedTotal);
+            setHasMoreLeads(Boolean(leadPageData?.hasMore));
         }
-    }, [activeTab, isGlobalLeadSearchActive, isLoading, leadCounts, leadPage, leadPageData?.total, leads.length]);
+    }, [isLoading, leadPage, leadPageData?.hasMore]);
+
+    useEffect(() => {
+        const list = leadListRef.current;
+
+        if (!list || isLoading || isFetchingMoreLeads || !hasMoreLeads) return;
+        if (list.scrollHeight <= list.clientHeight + 1) {
+            void fetchMoreLeads();
+        }
+    }, [filteredLeads.length, hasMoreLeads, isFetchingMoreLeads, isLoading]);
 
     const saveComment = () => {
         if (addCommentMutation.isPending || pendingCommentSaveRef.current) {
@@ -1237,7 +1308,7 @@ export default function Leads() {
             return;
         }
 
-        const scheduledDate = parseCstDateTimeInput(followUpDateTime);
+        const scheduledDate = parseLeadScheduleDateTimeInput(followUpDateTime);
         if (!scheduledDate) {
             showToast({ tone: "error", message: "Use a valid follow-up date and time." });
             return;
@@ -1399,6 +1470,29 @@ export default function Leads() {
     });
 
     const selectedLeadCallStat = selectedLeadCallStatQuery.data || null;
+    const selectedLeadShadowAttemptQuery = useQuery({
+        queryKey: ["call-bridge-attempt", employeeCode, activeSelectedLeadId],
+        queryFn: () => getLatestCallBridgeAttempt(employeeCode, activeSelectedLeadId),
+        enabled: import.meta.env.DEV && Boolean(employeeCode && activeSelectedLeadId),
+        refetchInterval: 3_000,
+    });
+    const selectedLeadShadowAttempt = selectedLeadShadowAttemptQuery.data?.attempt || null;
+    const selectedLeadShadowLabel = useMemo(() => {
+        if (!selectedLeadShadowAttempt) return "";
+        if (selectedLeadShadowAttempt.phase === "failed") return "Call not confirmed";
+        if (selectedLeadShadowAttempt.outcome === "voicemail") return "Voicemail";
+        if (selectedLeadShadowAttempt.outcome === "not_connected") {
+            return selectedLeadShadowAttempt.classificationConfidence === "high"
+                ? "Not connected"
+                : "Likely not connected";
+        }
+        if (selectedLeadShadowAttempt.outcome === "connected") return "Connected";
+        if (selectedLeadShadowAttempt.outcome === "unclassified") return "Processing automatically";
+        if (selectedLeadShadowAttempt.phase === "classifying") return "Processing automatically";
+        if (selectedLeadShadowAttempt.phase === "answered") return "Answered - processing";
+        if (selectedLeadShadowAttempt.phase === "ringing") return "Ringing";
+        return "Waiting for RingCentral";
+    }, [selectedLeadShadowAttempt]);
 
     const selectedLeadCallLogs = useMemo(() => {
         const logs = selectedLeadCallStat?.callLogs || [];
@@ -1473,6 +1567,7 @@ export default function Leads() {
                 : callStat.lead?._id;
 
         const leadIdToUpdate = statLeadId || fallbackLeadId;
+        clearAutoCallPendingComment(employeeCode, leadIdToUpdate);
 
         queryClient.setQueryData(["lead-call-stat", leadIdToUpdate], callStat);
 
@@ -1886,7 +1981,7 @@ export default function Leads() {
                             </div>
                         )}
 
-                        <div className="content-scroll min-h-0 flex-1 divide-y divide-white/10 overflow-y-auto" onScroll={handleLeadListScroll}>
+                        <div ref={leadListRef} className="content-scroll min-h-0 flex-1 divide-y divide-white/10 overflow-y-auto overscroll-contain [scrollbar-gutter:stable]" onScroll={handleLeadListScroll}>
                             {isLoading && <p className="px-5 py-6 text-sm text-white/45">{canViewAllLeads ? "Loading leads..." : "Loading assigned leads..."}</p>}
                             {isError && <p className="px-5 py-6 text-sm text-red-200">{canViewAllLeads ? "Unable to load leads." : "Unable to load assigned leads."}</p>}
                             {!isLoading && !isError && filteredLeads.length === 0 && (
@@ -1957,6 +2052,15 @@ export default function Leads() {
                                 <p className="px-5 py-4 text-center text-xs font-semibold text-white/40">
                                     Loading leads... {leads.length.toLocaleString()} / {(leadPageData?.total || leads.length).toLocaleString()}
                                 </p>
+                            )}
+                            {!isLoading && !isFetchingMoreLeads && hasMoreLeads && leads.length > 0 && (
+                                <button
+                                    className="flex w-full items-center justify-center px-5 py-4 text-xs font-semibold text-white/55 transition hover:bg-white/[0.04] hover:text-white"
+                                    type="button"
+                                    onClick={() => void fetchMoreLeads()}
+                                >
+                                    Load more leads
+                                </button>
                             )}
                             {!isLoading && !hasMoreLeads && leads.length > 0 && (
                                 <p className="px-5 py-4 text-center text-xs text-white/30">End of loaded leads</p>
@@ -2108,7 +2212,7 @@ export default function Leads() {
                                                 )}
                                                 <a
                                                     className="flex size-9 items-center justify-center rounded-lg border border-white/10 bg-white/[0.06] text-white/70 transition hover:bg-white/10 hover:text-white"
-                                                    href={`tel:${selectedLead.phone}`}
+                                                    href={getPhoneCallUrl(selectedLead.phone)}
                                                     onClick={() => {
                                                         if (selectedLead.phone) {
                                                             if (selectedLead.status === "Follow up") {
@@ -2122,6 +2226,7 @@ export default function Leads() {
                                                         }
                                                     }}
                                                     aria-label="Call lead"
+                                                    title="Call lead"
                                                 >
                                                     <FiPhone className="size-4" aria-hidden="true" />
                                                 </a>
@@ -2231,8 +2336,20 @@ export default function Leads() {
                                                             : "No date"}
                                                     </p>
                                                 )}
+
+                                                {selectedLeadShadowAttempt && selectedLeadShadowAttemptQuery.data?.shadowMode && (
+                                                    <div className="mt-3 rounded-md border border-cyan-300/20 bg-cyan-300/[0.07] px-3 py-2.5">
+                                                        <p className="text-[0.68rem] font-semibold uppercase tracking-[0.12em] text-cyan-200/70">
+                                                            Automatic detection - local test
+                                                        </p>
+                                                        <p className="mt-1 text-sm font-semibold text-cyan-100">
+                                                            {selectedLeadShadowLabel}
+                                                        </p>
+                                                    </div>
+                                                )}
                                             </div>
 
+                                            {!selectedLeadShadowAttemptQuery.data?.shadowMode && (
                                             <div className="grid w-full grid-cols-3 gap-2">
                                                 <button
                                                     className="admin-log-call-button flex h-10 min-w-0 items-center justify-center rounded-lg border border-[#f13453] bg-[#f13453] px-2 text-xs font-semibold text-white transition hover:border-[#db203f] hover:bg-[#db203f] disabled:cursor-not-allowed disabled:opacity-80"
@@ -2262,6 +2379,7 @@ export default function Leads() {
                                                     {isLoggingConnectedCall ? "Logging" : "Connected"}
                                                 </button>
                                             </div>
+                                            )}
                                         </div>
                                     </div>
 
@@ -2272,7 +2390,7 @@ export default function Leads() {
                                             ["Created By", selectedLead.createdByName || "System"],
                                             ...(canUseLeadCategories ? [["Filter", selectedLead.category || "All"]] : []),
                                             ["AI Score", selectedLead.aiScore ? `${selectedLead.aiScore}/100` : "Not scored"],
-                                            ["Follow Up", selectedLead.status !== "Qualified" && selectedLead.followUpAt ? formatCstDateTime(selectedLead.followUpAt) : "None"],
+                                            ["Follow Up", selectedLead.status !== "Qualified" && selectedLead.followUpAt ? formatLeadScheduleDateTime(selectedLead.followUpAt) : "None"],
                                             ["Status", selectedLead.status],
                                             ["Current Agent", getCurrentLeadAgent(selectedLead)],
                                             ["Previous Agent", getPreviousLeadAgent(selectedLead)],
@@ -2288,14 +2406,14 @@ export default function Leads() {
                                     <div className="rounded-lg border border-white/10 bg-white/[0.04] p-4">
                                         <div className="flex items-center gap-2">
                                             <FiCalendar className="size-4 text-[#b78cff]" aria-hidden="true" />
-                                            <p className="text-xs font-medium uppercase tracking-[0.14em] text-white/35">Schedule Follow Up</p>
+                                            <p className="text-xs font-medium uppercase tracking-[0.14em] text-white/35">Schedule Follow Up (Eastern Time)</p>
                                         </div>
                                         <div className="mt-3 grid gap-3 sm:grid-cols-[minmax(0,14rem)_auto]">
                                             <input
                                                 className="h-10 min-w-0 rounded-lg border border-white/10 bg-black/20 px-3 text-sm font-semibold text-white outline-none transition focus:border-[#842cff] focus:ring-2 focus:ring-[#842cff]/20"
                                                 type="datetime-local"
                                                 value={isStatusDraftQualified ? "" : followUpDateTime}
-                                                min={getCurrentCstDateTimeInput()}
+                                                min={getCurrentLeadScheduleDateTimeInput()}
                                                 onChange={(event) => setFollowUpDateTime(event.target.value)}
                                                 disabled={isStatusDraftQualified || Boolean(activeLeadAction)}
                                             />
@@ -2315,7 +2433,7 @@ export default function Leads() {
                                                     ? "Save Qualified to clear the existing follow-up schedule."
                                                     : "Qualified leads have no follow-up schedule."
                                                 : selectedLead.followUpAt
-                                                    ? `Current follow-up: ${formatCstDateTime(selectedLead.followUpAt)}`
+                                                    ? `Current follow-up: ${formatLeadScheduleDateTime(selectedLead.followUpAt)}`
                                                     : "No follow-up scheduled."}
                                         </p>
                                     </div>

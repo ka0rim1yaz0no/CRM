@@ -1,17 +1,21 @@
-import type { ElementType, ReactNode } from "react";
-import { useRef, useState } from "react";
+import type { ElementType, FormEvent, ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link, NavLink, useLocation } from "react-router";
+import { Link, NavLink, useLocation, useNavigate } from "react-router";
 import { getBusinesses } from "../../../api/businesses";
 import { getActiveBusinessId, setActiveBusinessId } from "../../../api/businessStorage";
 import { clearAuthUser, getAuthUser, setAuthUser } from "../../../api/authStorage";
 import type { FeatureKey } from "../../../api/features";
 import { getLeaveRequests } from "../../../api/leaveRequests";
 import { getRecentNotices } from "../../../api/notices";
+import { getEmployeeSummaries } from "../../../api/employees";
+import { getEvaluations } from "../../../api/evaluations";
+import { getAdminLeads } from "../../../api/leads";
 import { useFeatureFlags } from "../../../hooks/useFeatureFlags";
 import { useClickOutside } from "../../../hooks/useClickOutside";
 import { useMessageNotifications } from "../../../hooks/useMessageNotifications";
 import { formatPhDate, formatPhDateTime } from "../../../lib/dateTime";
+import { getEmployeeEvaluationReminders } from "../../../lib/employeeEvaluation";
 import { refreshSocketBusinessContext } from "../../../lib/socket";
 import {
     FiBarChart2,
@@ -19,6 +23,7 @@ import {
     FiBookOpen,
     FiChevronDown,
     FiCheckSquare,
+    FiClipboard,
     FiImage,
     FiFileText,
     FiLogOut,
@@ -31,6 +36,7 @@ import {
     FiTarget,
     FiUserPlus,
     FiUsers,
+    FiX,
 } from "react-icons/fi";
 import { FaRegMoneyBillAlt } from "react-icons/fa";
 import { MdPassword } from "react-icons/md";
@@ -52,6 +58,19 @@ type AdminNavSection = {
     title: string;
     items: AdminNavItem[];
 };
+
+function notificationDismissalStorageKey(userCode = "admin") {
+    return `admin-notifications-dismissed:${userCode || "admin"}`;
+}
+
+function readDismissedNotifications(storageKey: string) {
+    try {
+        const value = JSON.parse(window.localStorage.getItem(storageKey) || "[]");
+        return new Set<string>(Array.isArray(value) ? value.map(String) : []);
+    } catch {
+        return new Set<string>();
+    }
+}
 
 const adminNavSections: AdminNavSection[] = [
     {
@@ -75,6 +94,7 @@ const adminNavSections: AdminNavSection[] = [
         title: "Workspace",
         items: [
             { label: "HR", path: "/admin/hr", icon: FiFileText, feature: "hr" },
+            { label: "Evaluations", path: "/admin/evaluations", icon: FiClipboard, feature: "hr" },
             { label: "Knowledge Base", path: "/admin/knowledge-base", icon: FiBookOpen, feature: "knowledge-base" },
             { label: "Media", path: "/admin/media", icon: FiImage, feature: "media" },
             { label: "Messages", path: "/admin/messages", icon: FiMessageCircle, feature: "messages" },
@@ -94,15 +114,20 @@ export default function AdminLayout({ children }: Props) {
     const [isScrolling, setIsScrolling] = useState(false);
     const [isNotificationsOpen, setIsNotificationsOpen] = useState(false);
     const [isBusinessOpen, setIsBusinessOpen] = useState(false);
+    const [adminSearch, setAdminSearch] = useState("");
+    const [debouncedAdminSearch, setDebouncedAdminSearch] = useState("");
+    const [isAdminSearchOpen, setIsAdminSearchOpen] = useState(false);
     const { pathname } = useLocation();
+    const navigate = useNavigate();
     const scrollTimer = useRef<number | undefined>(undefined);
     const notificationsRef = useRef<HTMLDivElement>(null);
     const businessRef = useRef<HTMLDivElement>(null);
+    const adminSearchRef = useRef<HTMLFormElement>(null);
     const queryClient = useQueryClient();
     const authUser = getAuthUser();
     const isPocOperations = isPocOperationsUser(authUser);
     const { isEnabled } = useFeatureFlags();
-    const { messageNotifications, unreadMessageCount, markMessageRead, markAllMessagesRead } = useMessageNotifications();
+    const { unreadMessageCount } = useMessageNotifications();
     const { data: businesses = [] } = useQuery({
         queryKey: ["businesses"],
         queryFn: getBusinesses,
@@ -111,7 +136,7 @@ export default function AdminLayout({ children }: Props) {
     const { data: notices = [] } = useQuery({
         queryKey: ["recent-notices"],
         queryFn: getRecentNotices,
-        enabled: isNotificationsOpen,
+        enabled: authUser?.userType === "admin",
         staleTime: 60_000,
     });
     const { data: pendingLeaveRequests = [] } = useQuery({
@@ -120,6 +145,43 @@ export default function AdminLayout({ children }: Props) {
         refetchInterval: 30_000,
         staleTime: 10_000,
     });
+    const { data: evaluationEmployees = [] } = useQuery({
+        queryKey: ["employees", "summary", "evaluation-reminders"],
+        queryFn: getEmployeeSummaries,
+        enabled: authUser?.userType === "admin",
+        refetchInterval: 15 * 60_000,
+        staleTime: 5 * 60_000,
+    });
+    const { data: completedEvaluations = [] } = useQuery({
+        queryKey: ["evaluations", "notification-status"],
+        queryFn: getEvaluations,
+        staleTime: 60_000,
+    });
+    const completedEvaluationKeys = new Set(
+        completedEvaluations
+            .filter((evaluation) => evaluation.status === "Completed")
+            .map((evaluation) => `${evaluation.employeeCode}-${evaluation.milestoneMonth}-${evaluation.dueDate.slice(0, 10)}`)
+    );
+    const evaluationReminders = getEmployeeEvaluationReminders(evaluationEmployees).filter((reminder) =>
+        !completedEvaluationKeys.has(`${reminder.employeeCode}-${reminder.milestoneMonth}-${reminder.dueDate.toISOString().slice(0, 10)}`)
+    );
+    const normalizedAdminSearch = debouncedAdminSearch.trim();
+    const { data: adminLeadSearchData, isFetching: isAdminLeadSearchFetching } = useQuery({
+        queryKey: ["admin-header-lead-search", normalizedAdminSearch],
+        queryFn: () => getAdminLeads({ search: normalizedAdminSearch, tab: "all", page: 1, limit: 8 }),
+        enabled: normalizedAdminSearch.length >= 2,
+        staleTime: 15_000,
+    });
+    const matchingEmployees = useMemo(() => {
+        if (normalizedAdminSearch.length < 2) return [];
+        const search = normalizedAdminSearch.toLowerCase();
+        return evaluationEmployees.filter((employee) =>
+            [employee.name, employee.employeeCode, employee.email, employee.role, employee.team]
+                .filter(Boolean)
+                .some((value) => String(value).toLowerCase().includes(search))
+        ).slice(0, 5);
+    }, [evaluationEmployees, normalizedAdminSearch]);
+    const matchingLeads = adminLeadSearchData?.leads || [];
     const visibleNavSections = adminNavSections
         .map((section) => ({
             ...section,
@@ -133,7 +195,6 @@ export default function AdminLayout({ children }: Props) {
         [...visibleNavItems]
             .sort((first, second) => second.path.length - first.path.length)
             .find((item) => pathname === item.path || pathname.startsWith(`${item.path}/`))?.label || "Admin";
-    const notificationCount = notices.length + pendingLeaveRequests.length + unreadMessageCount;
     const businessNamesById = new Map(businesses.map((business) => [business.id, business.name]));
     const accessibleBusinesses = authUser?.userType === "admin"
         ? businesses
@@ -154,6 +215,24 @@ export default function AdminLayout({ children }: Props) {
     const accountName = authUser?.user.name || "User";
     const accountPosition = authUser?.user.role || (authUser?.userType === "employee" ? authUser.user.team : "Admin") || "Team member";
     const accountInitial = accountName.charAt(0).toUpperCase() || "U";
+    const dismissalStorageKey = notificationDismissalStorageKey(authUser?.user.employeeCode);
+    const [dismissedNotifications, setDismissedNotifications] = useState<Set<string>>(() =>
+        readDismissedNotifications(dismissalStorageKey)
+    );
+    const dismissNotification = (notificationId: string) => {
+        setDismissedNotifications((current) => {
+            const next = new Set(current).add(notificationId);
+            window.localStorage.setItem(dismissalStorageKey, JSON.stringify(Array.from(next)));
+            return next;
+        });
+    };
+    const visibleUnreadMessageCount = unreadMessageCount;
+    const visiblePendingLeaveRequests = pendingLeaveRequests.filter((item) => !dismissedNotifications.has(`leave:${item._id}`));
+    const visibleEvaluationReminders = evaluationReminders.filter((item) => !dismissedNotifications.has(`evaluation:${item.id}`));
+    const visibleNotices = notices.filter((item) => !dismissedNotifications.has(`notice:${item._id}`));
+    const visibleNotificationCount = visiblePendingLeaveRequests.length
+        + visibleEvaluationReminders.length
+        + visibleNotices.length;
 
     const handleScroll = () => {
         setIsScrolling(true);
@@ -162,6 +241,44 @@ export default function AdminLayout({ children }: Props) {
     };
     useClickOutside(notificationsRef, () => setIsNotificationsOpen(false), isNotificationsOpen);
     useClickOutside(businessRef, () => setIsBusinessOpen(false), isBusinessOpen);
+    useClickOutside(adminSearchRef, () => setIsAdminSearchOpen(false), isAdminSearchOpen);
+
+    useEffect(() => {
+        const timeoutId = window.setTimeout(() => setDebouncedAdminSearch(adminSearch.trim()), 250);
+        return () => window.clearTimeout(timeoutId);
+    }, [adminSearch]);
+
+    const submitAdminSearch = (event: FormEvent<HTMLFormElement>) => {
+        event.preventDefault();
+        const search = adminSearch.trim();
+        if (!search) return;
+
+        const normalizedSearch = search.toLowerCase();
+        const exactEmployee = matchingEmployees.find((employee) =>
+            [employee.name, employee.employeeCode, employee.email]
+                .filter(Boolean)
+                .some((value) => String(value).toLowerCase() === normalizedSearch)
+        );
+        const exactLead = matchingLeads.find((lead) =>
+            [lead.businessName, lead.leadName, lead.email, lead.phone]
+                .filter(Boolean)
+                .some((value) => String(value).toLowerCase() === normalizedSearch)
+        );
+        const employee = exactEmployee || (!exactLead ? matchingEmployees[0] : undefined);
+        const lead = exactLead || (!employee ? matchingLeads[0] : undefined);
+
+        setIsAdminSearchOpen(false);
+        setAdminSearch("");
+        setDebouncedAdminSearch("");
+
+        if (employee) {
+            navigate(roleWorkspacePath(`/admin/employees/${employee._id}`, authUser));
+            return;
+        }
+        if (lead) {
+            navigate(roleWorkspacePath(`/admin/leads?scope=ALL&lead=${encodeURIComponent(lead._id)}`, authUser));
+        }
+    };
 
     const handleBusinessSwitch = (businessId: string) => {
         const nextBusiness = accessibleBusinesses.find((business) => business.id === businessId);
@@ -180,6 +297,20 @@ export default function AdminLayout({ children }: Props) {
         queryClient.clear();
         refreshSocketBusinessContext();
         setIsBusinessOpen(false);
+
+        // Employee document ids belong to one business database. Keeping a
+        // detail/edit id in the URL after a tenant switch requests a document
+        // that cannot exist in the newly selected database.
+        if (/^\/(?:admin|poc)\/employees\/[^/]+(?:\/edit)?\/?$/.test(pathname)) {
+            window.location.assign(roleWorkspacePath("/admin/employees", authUser));
+            return;
+        }
+
+        if (/^\/admin\/hr\/attendance\/[^/]+\/[^/]+\/edit\/?$/.test(pathname)) {
+            window.location.assign("/admin/hr?tab=attendance");
+            return;
+        }
+
         window.location.reload();
     };
 
@@ -225,6 +356,11 @@ export default function AdminLayout({ children }: Props) {
                                                         <Icon className="size-5" aria-hidden="true" />
                                                     </span>
                                                     <span className="min-w-0 truncate">{label}</span>
+                                                    {label === "Messages" && visibleUnreadMessageCount > 0 && (
+                                                        <span className="ml-auto inline-flex min-w-5 items-center justify-center rounded-full bg-[#842cff] px-1.5 py-0.5 text-[0.65rem] font-bold leading-none text-white">
+                                                            {visibleUnreadMessageCount > 99 ? "99+" : visibleUnreadMessageCount}
+                                                        </span>
+                                                    )}
                                                 </NavLink>
                                             </li>
                                         ))}
@@ -255,6 +391,11 @@ export default function AdminLayout({ children }: Props) {
                                     >
                                         <Icon className="size-5 shrink-0" aria-hidden="true" />
                                         <span className="min-w-0 truncate">{label}</span>
+                                        {label === "Messages" && visibleUnreadMessageCount > 0 && (
+                                            <span className="ml-auto inline-flex min-w-5 items-center justify-center rounded-full bg-[#842cff] px-1.5 py-0.5 text-[0.65rem] font-bold leading-none text-white">
+                                                {visibleUnreadMessageCount > 99 ? "99+" : visibleUnreadMessageCount}
+                                            </span>
+                                        )}
                                     </NavLink>
                                 </li>
                             ))}
@@ -303,14 +444,61 @@ export default function AdminLayout({ children }: Props) {
                         </div>
 
                         <div className="flex min-w-0 flex-1 items-center justify-end gap-2 2xl:gap-3">
-                            <label className="hidden h-10 w-full max-w-[18rem] items-center gap-3 rounded-lg border border-white/10 bg-white/[0.06] px-3 text-white/50 transition focus-within:border-[#842cff] focus-within:bg-white/[0.08] focus-within:ring-2 focus-within:ring-[#842cff]/20 lg:flex 2xl:h-11 2xl:max-w-[22rem]">
-                                <FiSearch className="size-5 shrink-0" aria-hidden="true" />
-                                <input
-                                    className="h-full min-w-0 flex-1 bg-transparent text-sm text-white outline-none placeholder:text-white/35"
-                                    type="search"
-                                    placeholder="Search agents or leads"
-                                />
-                            </label>
+                            <form ref={adminSearchRef} className="relative hidden w-full max-w-[18rem] lg:block 2xl:max-w-[22rem]" onSubmit={submitAdminSearch}>
+                                <label className="flex h-10 items-center gap-3 rounded-lg border border-white/10 bg-white/[0.06] px-3 text-white/50 transition focus-within:border-[#842cff] focus-within:bg-white/[0.08] focus-within:ring-2 focus-within:ring-[#842cff]/20 2xl:h-11">
+                                    <FiSearch className="size-5 shrink-0" aria-hidden="true" />
+                                    <input
+                                        className="h-full min-w-0 flex-1 bg-transparent text-sm text-white outline-none placeholder:text-white/35"
+                                        type="search"
+                                        value={adminSearch}
+                                        onChange={(event) => { setAdminSearch(event.target.value); setIsAdminSearchOpen(true); }}
+                                        onFocus={() => setIsAdminSearchOpen(true)}
+                                        placeholder="Search agents or leads"
+                                        aria-label="Search agents or leads"
+                                    />
+                                    {adminSearch && (
+                                        <button className="flex size-7 shrink-0 items-center justify-center rounded-md text-white/40 transition hover:bg-white/10 hover:text-white" type="button" onClick={() => { setAdminSearch(""); setDebouncedAdminSearch(""); }} aria-label="Clear search">
+                                            <FiX className="size-4" aria-hidden="true" />
+                                        </button>
+                                    )}
+                                </label>
+
+                                {isAdminSearchOpen && normalizedAdminSearch.length >= 2 && (
+                                    <div className="theme-panel-bg absolute right-0 top-[calc(100%+0.5rem)] z-50 w-[24rem] overflow-hidden rounded-lg border border-white/10 shadow-2xl shadow-black/45">
+                                        <div className="content-scroll max-h-[28rem] overflow-y-auto p-2">
+                                            {isAdminLeadSearchFetching && matchingLeads.length === 0 && (
+                                                <p className="px-3 py-4 text-sm text-white/45">Searching leads...</p>
+                                            )}
+                                            {matchingEmployees.length > 0 && (
+                                                <div className="mb-2">
+                                                    <p className="px-3 py-2 text-[0.68rem] font-semibold uppercase tracking-[0.14em] text-white/35">Employees</p>
+                                                    {matchingEmployees.map((employee) => (
+                                                        <button key={employee._id} className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left transition hover:bg-white/[0.07]" type="button" onClick={() => { setIsAdminSearchOpen(false); setAdminSearch(""); setDebouncedAdminSearch(""); navigate(roleWorkspacePath(`/admin/employees/${employee._id}`, authUser)); }}>
+                                                            <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-[#842cff]/20 text-xs font-bold text-[#d8c8ff]">{employee.name.split(/\s+/).map((part) => part[0]).join("").slice(0, 2).toUpperCase()}</span>
+                                                            <span className="min-w-0 flex-1"><span className="block truncate text-sm font-semibold text-white">{employee.name}</span><span className="mt-0.5 block truncate text-xs text-white/45">{employee.role} · {employee.employeeCode}</span></span>
+                                                        </button>
+                                                    ))}
+                                                </div>
+                                            )}
+                                            {matchingLeads.length > 0 && (
+                                                <div>
+                                                    <p className="px-3 py-2 text-[0.68rem] font-semibold uppercase tracking-[0.14em] text-white/35">Leads</p>
+                                                    {matchingLeads.map((lead) => (
+                                                        <button key={lead._id} className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left transition hover:bg-white/[0.07]" type="button" onClick={() => { setIsAdminSearchOpen(false); setAdminSearch(""); setDebouncedAdminSearch(""); navigate(roleWorkspacePath(`/admin/leads?scope=ALL&lead=${encodeURIComponent(lead._id)}`, authUser)); }}>
+                                                            <FiTarget className="size-4 shrink-0 text-[#b994ff]" aria-hidden="true" />
+                                                            <span className="min-w-0 flex-1"><span className="block truncate text-sm font-semibold text-white">{lead.businessName || lead.leadName || "Unnamed lead"}</span><span className="mt-0.5 block truncate text-xs text-white/45">{lead.leadName || "No contact name"} · {lead.phone || lead.email || lead.status}</span></span>
+                                                        </button>
+                                                    ))}
+                                                </div>
+                                            )}
+                                            {!isAdminLeadSearchFetching && matchingEmployees.length === 0 && matchingLeads.length === 0 && (
+                                                <p className="px-3 py-5 text-center text-sm text-white/45">No employees or leads found.</p>
+                                            )}
+                                        </div>
+                                        <button className="flex h-10 w-full items-center justify-center border-t border-white/10 text-xs font-semibold text-[#d8c8ff] transition hover:bg-white/[0.06]" type="submit">Open top result</button>
+                                    </div>
+                                )}
+                            </form>
 
                             <div ref={notificationsRef} className="relative">
                                 <button
@@ -324,65 +512,34 @@ export default function AdminLayout({ children }: Props) {
                                     onClick={() => setIsNotificationsOpen((isOpen) => !isOpen)}
                                 >
                                     <FiBell className="size-5" aria-hidden="true" />
-                                    {notificationCount > 0 && <span className="absolute right-2.5 top-2.5 size-2 rounded-full bg-[#842cff]" />}
+                                    {visibleNotificationCount > 0 && <span className="absolute right-2.5 top-2.5 size-2 rounded-full bg-[#842cff]" />}
                                 </button>
                                 {isNotificationsOpen && (
-                                    <div className="absolute right-0 top-[calc(100%+0.5rem)] z-40 w-80 overflow-hidden rounded-lg border border-white/10 bg-[#11141d] shadow-2xl shadow-black/45">
+                                    <div className="theme-panel-bg absolute right-0 top-[calc(100%+0.5rem)] z-40 w-80 overflow-hidden rounded-lg border border-white/10 shadow-2xl shadow-black/45">
                                         <div className="flex items-center justify-between gap-3 border-b border-white/10 px-4 py-3">
                                             <div>
                                                 <p className="text-xs font-medium uppercase tracking-[0.14em] text-white/35">Notifications</p>
-                                                <p className="mt-1 text-sm font-semibold text-white">{notificationCount} latest records</p>
+                                                <p className="mt-1 text-sm font-semibold text-white">{visibleNotificationCount} notifications</p>
                                             </div>
-                                            {unreadMessageCount > 0 && (
-                                                <button
-                                                    className="h-8 rounded-lg border border-white/10 bg-white/[0.05] px-3 text-xs font-semibold text-white/65 transition hover:bg-white/10 hover:text-white"
-                                                    type="button"
-                                                    onClick={markAllMessagesRead}
-                                                >
-                                                    Read messages
-                                                </button>
-                                            )}
                                         </div>
                                         <div className="content-scroll max-h-96 overflow-y-auto p-2">
-                                            {messageNotifications.length === 0 && pendingLeaveRequests.length === 0 && notices.length === 0 && (
+                                            {visibleNotificationCount === 0 && (
                                                 <p className="rounded-lg border border-white/10 bg-white/[0.035] p-4 text-sm text-white/45">No notifications yet.</p>
                                             )}
-                                            {messageNotifications.map((notification) => (
-                                                <Link
-                                                    key={notification.id}
-                                                    className={[
-                                                        "mb-2 block rounded-lg border p-3 text-left transition",
-                                                        notification.isRead
-                                                            ? "border-white/10 bg-white/[0.025] text-white/55 hover:bg-white/[0.055]"
-                                                            : "border-[#842cff]/45 bg-[#842cff]/15 text-white hover:bg-[#842cff]/20",
-                                                    ].join(" ")}
-                                                    to={notification.href}
-                                                    onClick={() => {
-                                                        markMessageRead(notification.id);
-                                                        setIsNotificationsOpen(false);
-                                                    }}
-                                                >
-                                                    <div className="flex items-start justify-between gap-3">
-                                                        <p className="line-clamp-1 text-sm font-semibold">Message from {notification.senderName}</p>
-                                                        {!notification.isRead && <span className="mt-1 size-2 shrink-0 rounded-full bg-[#842cff]" />}
-                                                    </div>
-                                                    <p className="mt-1 line-clamp-1 text-xs font-semibold text-white/60">{notification.title}</p>
-                                                    <p className="mt-1 line-clamp-2 text-xs leading-5 text-white/55">{notification.body}</p>
-                                                    <p className="mt-2 text-[0.68rem] font-semibold uppercase tracking-[0.12em] text-white/35">
-                                                        Message · {formatPhDateTime(notification.createdAt)}
-                                                    </p>
-                                                </Link>
-                                            ))}
-                                            {pendingLeaveRequests.map((leaveRequest) => {
+                                            {visiblePendingLeaveRequests.map((leaveRequest) => {
                                                 const employee = typeof leaveRequest.employee === "string" ? null : leaveRequest.employee;
+                                                const employeeId = typeof leaveRequest.employee === "string" ? leaveRequest.employee : leaveRequest.employee?._id;
                                                 const employeeName = employee?.name || "Employee";
 
                                                 return (
+                                                    <div key={leaveRequest._id} className="relative mb-2">
                                                     <Link
-                                                        key={leaveRequest._id}
-                                                        className="mb-2 block rounded-lg border border-amber-300/35 bg-amber-300/10 p-3 text-left transition hover:bg-amber-300/15"
-                                                        to={roleWorkspacePath("/admin/employees", authUser)}
-                                                        onClick={() => setIsNotificationsOpen(false)}
+                                                        className="block rounded-lg border border-amber-300/35 bg-amber-300/10 p-3 pr-11 text-left transition hover:bg-amber-300/15"
+                                                        to={employeeId ? roleWorkspacePath(`/admin/employees/${employeeId}?tab=leave`, authUser) : roleWorkspacePath("/admin/hr", authUser)}
+                                                        onClick={() => {
+                                                            dismissNotification(`leave:${leaveRequest._id}`);
+                                                            setIsNotificationsOpen(false);
+                                                        }}
                                                     >
                                                         <div className="flex items-start justify-between gap-3">
                                                             <p className="line-clamp-1 text-sm font-semibold text-white">Leave request from {employeeName}</p>
@@ -398,17 +555,67 @@ export default function AdminLayout({ children }: Props) {
                                                             Leave · {formatPhDateTime(leaveRequest.createdAt)}
                                                         </p>
                                                     </Link>
+                                                    <button
+                                                        className="absolute right-2 top-2 flex size-7 items-center justify-center rounded-md text-white/45 transition hover:bg-white/10 hover:text-white"
+                                                        type="button"
+                                                        aria-label="Dismiss notification"
+                                                        onClick={() => dismissNotification(`leave:${leaveRequest._id}`)}
+                                                    >
+                                                        <FiX className="size-4" aria-hidden="true" />
+                                                    </button>
+                                                    </div>
                                                 );
                                             })}
-                                            {notices.map((notice) => {
+                                            {visibleEvaluationReminders.map((reminder) => (
+                                                <div key={reminder.id} className="relative mb-2">
+                                                <Link
+                                                    className="block rounded-lg border border-cyan-300/35 bg-cyan-300/10 p-3 pr-11 text-left transition hover:bg-cyan-300/15"
+                                                    to={roleWorkspacePath("/admin/evaluations", authUser)}
+                                                    onClick={() => {
+                                                        dismissNotification(`evaluation:${reminder.id}`);
+                                                        setIsNotificationsOpen(false);
+                                                    }}
+                                                >
+                                                    <div className="flex items-start justify-between gap-3">
+                                                        <p className="line-clamp-2 text-sm font-semibold text-white">
+                                                            {reminder.employeeName} needs a {reminder.milestoneMonth}-month evaluation
+                                                        </p>
+                                                        <span className="shrink-0 rounded-md bg-cyan-100 px-2 py-1 text-[0.65rem] font-bold uppercase tracking-[0.1em] text-cyan-800">
+                                                            Evaluation
+                                                        </span>
+                                                    </div>
+                                                    <p className="mt-1 text-xs leading-5 text-white/60">
+                                                        {reminder.daysUntilDue === 0
+                                                            ? "Evaluation is due today."
+                                                            : `Evaluation is due in ${reminder.daysUntilDue} day${reminder.daysUntilDue === 1 ? "" : "s"}.`}
+                                                    </p>
+                                                    <p className="mt-2 text-[0.68rem] font-semibold uppercase tracking-[0.12em] text-white/35">
+                                                        Code {reminder.employeeCode || "-"} · Due {formatPhDate(reminder.dueDate)}
+                                                    </p>
+                                                </Link>
+                                                <button
+                                                    className="absolute right-2 top-2 flex size-7 items-center justify-center rounded-md text-white/45 transition hover:bg-white/10 hover:text-white"
+                                                    type="button"
+                                                    aria-label="Dismiss notification"
+                                                    onClick={() => dismissNotification(`evaluation:${reminder.id}`)}
+                                                >
+                                                    <FiX className="size-4" aria-hidden="true" />
+                                                </button>
+                                                </div>
+                                            ))}
+                                            {visibleNotices.map((notice) => {
+                                                const employeeId = typeof notice.employee === "string" ? notice.employee : notice.employee._id;
                                                 const employeeName = typeof notice.employee === "string" ? "Employee" : notice.employee.name;
 
                                                 return (
+                                                    <div key={notice._id} className="relative mb-2">
                                                     <Link
-                                                        key={notice._id}
-                                                        className="block rounded-lg border border-white/10 bg-white/[0.025] p-3 text-left transition hover:bg-white/[0.055]"
-                                                        to={roleWorkspacePath("/admin/employees", authUser)}
-                                                        onClick={() => setIsNotificationsOpen(false)}
+                                                        className="block rounded-lg border border-white/10 bg-white/[0.025] p-3 pr-11 text-left transition hover:bg-white/[0.055]"
+                                                        to={roleWorkspacePath(`/admin/employees/${employeeId}?tab=notices`, authUser)}
+                                                        onClick={() => {
+                                                            dismissNotification(`notice:${notice._id}`);
+                                                            setIsNotificationsOpen(false);
+                                                        }}
                                                     >
                                                         <div className="flex items-start justify-between gap-3">
                                                             <p className="line-clamp-1 text-sm font-semibold text-white">{notice.title}</p>
@@ -430,26 +637,21 @@ export default function AdminLayout({ children }: Props) {
                                                             {employeeName} · {formatPhDateTime(notice.createdAt)}
                                                         </p>
                                                     </Link>
+                                                    <button
+                                                        className="absolute right-2 top-2 flex size-7 items-center justify-center rounded-md text-white/45 transition hover:bg-white/10 hover:text-white"
+                                                        type="button"
+                                                        aria-label="Dismiss notification"
+                                                        onClick={() => dismissNotification(`notice:${notice._id}`)}
+                                                    >
+                                                        <FiX className="size-4" aria-hidden="true" />
+                                                    </button>
+                                                    </div>
                                                 );
                                             })}
                                         </div>
                                     </div>
                                 )}
                             </div>
-
-                            <Link
-                                className="relative flex size-10 shrink-0 items-center justify-center rounded-lg border border-white/10 bg-white/[0.06] text-white/70 transition hover:bg-white/10 hover:text-white focus:outline-none focus:ring-2 focus:ring-[#842cff]/60 2xl:size-11"
-                                to="/admin/messages"
-                                aria-label="Messages"
-                                onClick={markAllMessagesRead}
-                            >
-                                <FiMessageCircle className="size-5" aria-hidden="true" />
-                                {unreadMessageCount > 0 && (
-                                    <span className="absolute right-1 top-1 min-w-5 rounded-full bg-[#842cff] px-1.5 py-0.5 text-[0.65rem] font-bold leading-none text-white">
-                                        {unreadMessageCount > 9 ? "9+" : unreadMessageCount}
-                                    </span>
-                                )}
-                            </Link>
 
                             <div ref={businessRef} className="relative">
                                 <button
@@ -476,7 +678,7 @@ export default function AdminLayout({ children }: Props) {
                                 </button>
 
                                 {isBusinessOpen && (
-                                    <div className="absolute right-0 top-[calc(100%+0.5rem)] z-40 w-64 overflow-hidden rounded-lg border border-white/10 bg-[#11141d] p-1 shadow-2xl shadow-black/45">
+                                    <div className="theme-panel-bg absolute right-0 top-[calc(100%+0.5rem)] z-40 w-64 overflow-hidden rounded-lg border border-white/10 p-1 shadow-2xl shadow-black/45">
                                         <div className="border-b border-white/10 px-3 py-2">
                                             <p className="text-xs font-medium uppercase tracking-[0.14em] text-white/35">Switch Business</p>
                                             <div className="mt-2 flex min-w-0 items-center gap-2.5">

@@ -241,8 +241,6 @@ function DashboardEmptyPanel({ title, message }: { title: string; message: strin
 }
 
 function AgentProgressRow({ agent }: { agent: AgentLeadProgress }) {
-    const currentTotal = agent.newLeads + agent.followUps + agent.qualified + agent.dead;
-
     return (
         <tr className="text-sm text-slate-700 transition hover:bg-slate-50">
             <td className="min-w-[13rem] px-3 py-3">
@@ -256,7 +254,7 @@ function AgentProgressRow({ agent }: { agent: AgentLeadProgress }) {
                     </div>
                 </div>
             </td>
-            <td className="px-3 py-3 text-center font-semibold text-slate-950">{formatNumber(currentTotal)}</td>
+            <td className="px-3 py-3 text-center font-semibold text-slate-950">{formatNumber(agent.assignedLeads)}</td>
             <td className="px-3 py-3 text-center">{formatNumber(agent.newLeads)}</td>
             <td className="px-3 py-3 text-center">{formatNumber(agent.followUps)}</td>
             <td className="px-3 py-3 text-center">{formatNumber(agent.qualified)}</td>
@@ -2263,7 +2261,7 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
 
     const attendanceQuery = useQuery({
         queryKey: ["employee-dashboard-attendance", employeeId],
-        queryFn: () => getEmployeeAttendance(employeeId),
+        queryFn: () => getEmployeeAttendance(employeeId, { limit: 120 }),
         enabled: Boolean(employeeId),
     });
 

@@ -9,13 +9,12 @@ import {
     reserveCallBridgeCall,
 } from "../api/callBridge";
 import { getEmployeeSummary, normalizeEmployeeAvailabilityStatus } from "../api/employees";
-import { getLead, getNextAutoCallLead, recordLeadCall, type Lead } from "../api/leads";
+import { getLead, getNextAutoCallLead, recordLeadCall } from "../api/leads";
 import {
     AUTO_CALL_API_TIMEOUT_MS,
     AUTO_CALL_CHECK_INTERVAL_MS,
     AUTO_CALL_CONFIRM_POLL_MS,
     AUTO_CALL_CONFIRM_TIMEOUT_MS,
-    AUTO_CALL_FAILURE_COOLDOWN_MS,
     AUTO_CALL_MIN_INTERVAL_MS,
     clearAutoCallPendingComment,
     getAutoCallPendingComment,
@@ -23,40 +22,21 @@ import {
     isSalesRole,
     isWithinAutoCallWindow,
     millisecondsUntilAutoCallWindowStart,
-    millisecondsUntilNextPhilippineDay,
     startAutoCallPendingComment,
+    isLeadEligibleForAutoCall,
 } from "../lib/employeeAutoCall";
-import { normalizePhoneForCall } from "../lib/phoneNumber";
+import { getRingCentralCallUrl, normalizePhoneForCall } from "../lib/phoneNumber";
 
 const AUTO_CALL_STORAGE_PREFIX = "crm:employee-auto-call";
-const AUTO_CALL_FAILURE_STORAGE_PREFIX = "crm:employee-auto-call-failures";
 
 function wait(milliseconds: number) {
     return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
 }
 
-function readFailureCooldowns(storageKey: string, now: number) {
-    try {
-        const storedValue = JSON.parse(window.localStorage.getItem(storageKey) || "{}") as Record<string, unknown>;
-        return Object.fromEntries(
-            Object.entries(storedValue)
-                .map(([leadId, expiresAt]) => [leadId, Number(expiresAt)] as const)
-                .filter(([, expiresAt]) => Number.isFinite(expiresAt) && expiresAt > now)
-        );
-    } catch {
-        return {};
-    }
-}
-
-function saveFailureCooldowns(storageKey: string, cooldowns: Record<string, number>) {
-    try {
-        window.localStorage.setItem(storageKey, JSON.stringify(cooldowns));
-    } catch {
-        // A blocked storage write should not prevent a confirmed call from being handled.
-    }
-}
-
-async function waitForConfirmedCall(employeeCode: string, previousCallEndedAt: string | null) {
+async function waitForConfirmedCall(
+    employeeCode: string,
+    previousCallEndedAt: string | null
+) {
     const confirmationDeadline = Date.now() + AUTO_CALL_CONFIRM_TIMEOUT_MS;
     const previousCallEndedTime = previousCallEndedAt ? new Date(previousCallEndedAt).getTime() : 0;
 
@@ -78,9 +58,18 @@ async function waitForConfirmedCall(employeeCode: string, previousCallEndedAt: s
     return false;
 }
 
-function launchPhoneCall(phone: string) {
+function launchPhoneCall(phone: string, provider: "nextiva" | "ringcentral") {
+    const target = phone.trim();
+    if (provider === "ringcentral") {
+        const callUrl = getRingCentralCallUrl(target);
+        if (callUrl) {
+            window.location.assign(callUrl);
+        }
+        return;
+    }
+
     const link = document.createElement("a");
-    link.href = `tel:${phone.trim()}`;
+    link.href = `tel:${target}`;
     link.hidden = true;
     link.setAttribute("aria-hidden", "true");
     document.body.appendChild(link);
@@ -88,21 +77,22 @@ function launchPhoneCall(phone: string) {
     link.remove();
 }
 
-function isLeadAssignedToEmployee(lead: Lead, employeeId: string, employeeNames: string[]) {
-    const assignedEmployeeId = String(lead.assignedAgent?._id || "").trim();
-    const assignedAgentName = String(lead.assignedAgentName || "").trim().toLowerCase();
-    const normalizedEmployeeNames = employeeNames.map((name) => String(name).trim().toLowerCase()).filter(Boolean);
-
-    return assignedEmployeeId === employeeId || normalizedEmployeeNames.includes(assignedAgentName);
-}
-
-function isMissingLeadError(error: unknown) {
-    return (error as { response?: { status?: number } })?.response?.status === 404;
-}
-
 function getTerminalLeadReservationErrorCode(error: unknown) {
     const code = (error as { response?: { data?: { code?: string } } })?.response?.data?.code;
-    return code === "LEAD_ALREADY_COMMENTED" || code === "LEAD_NOT_FOUND" ? code : null;
+    return code === "LEAD_ALREADY_COMMENTED" || code === "LEAD_NOT_ASSIGNED" || code === "LEAD_NOT_FOUND" || code === "LEAD_NOT_CALLABLE" ? code : null;
+}
+
+function isLeadAssignedToEmployee(
+    lead: Awaited<ReturnType<typeof getLead>>,
+    employeeId: string,
+    employeeNames: string[]
+) {
+    const assignedAgentId = typeof lead.assignedAgent === "object" && lead.assignedAgent
+        ? String(lead.assignedAgent._id || "")
+        : String(lead.assignedAgent || "");
+    const normalizedEmployeeNames = new Set(employeeNames.map((value) => value.trim().toLowerCase()).filter(Boolean));
+
+    return assignedAgentId === employeeId || normalizedEmployeeNames.has(String(lead.assignedAgentName || "").trim().toLowerCase());
 }
 
 export default function EmployeeAutoCaller() {
@@ -169,7 +159,6 @@ export default function EmployeeAutoCaller() {
         const employeeId = initialAuthUser.user._id;
         const employeeCode = String(initialAuthUser.user.employeeCode || employeeId).trim();
         const lastCallStorageKey = `${AUTO_CALL_STORAGE_PREFIX}:${employeeCode}`;
-        const failureStorageKey = `${AUTO_CALL_FAILURE_STORAGE_PREFIX}:${employeeCode}`;
         let isDisposed = false;
         let intervalId: number | undefined;
         let startTimeoutId: number | undefined;
@@ -189,7 +178,10 @@ export default function EmployeeAutoCaller() {
 
             isChecking.current = true;
             let reservedEmployeeCode = "";
+            let reservedLeadId = "";
+            let reservationToken = "";
             let callWasLaunched = false;
+            let providerCallConfirmed = false;
 
             try {
                 const employee = await getEmployeeSummary(employeeId, { timeoutMs: AUTO_CALL_API_TIMEOUT_MS });
@@ -227,53 +219,50 @@ export default function EmployeeAutoCaller() {
                 const employeeNames = Array.from(
                     new Set([employee.name, employee.employeeCode, ...(employee.aliases || [])].filter(Boolean))
                 );
-                const failureCooldowns = readFailureCooldowns(failureStorageKey, now);
-                saveFailureCooldowns(failureStorageKey, failureCooldowns);
                 let pendingComment = getAutoCallPendingComment(employee.employeeCode);
-                let nextAutoCallLead: Awaited<ReturnType<typeof getNextAutoCallLead>> = null;
+
+                let queueAutoCallLead: Awaited<ReturnType<typeof getNextAutoCallLead>> = null;
 
                 if (pendingComment) {
                     const pendingLeadId = pendingComment.leadId;
+                    const baselineCommentMarker = pendingComment.baselineCommentMarker;
 
                     try {
                         const pendingLead = await getLead(pendingLeadId, { timeoutMs: AUTO_CALL_API_TIMEOUT_MS });
-                        const normalizedPhone = normalizePhoneForCall(pendingLead.phone);
-                        const commentWasAdded =
-                            getEmployeeCommentMarker(pendingLead.comments) !== pendingComment.baselineCommentMarker;
-                        const remainsCallable =
-                            (pendingLead.status === "NEW" || pendingLead.status === "Follow up") &&
-                            isLeadAssignedToEmployee(pendingLead, employeeId, employeeNames) &&
-                            Boolean(normalizedPhone);
+                        const pendingPhone = normalizePhoneForCall(pendingLead.phone);
+                        const commentUnchanged = getEmployeeCommentMarker(pendingLead.comments) === baselineCommentMarker;
+                        const stillAssigned = isLeadAssignedToEmployee(pendingLead, employeeId, employeeNames);
 
-                        if (commentWasAdded || !remainsCallable) {
-                            clearAutoCallPendingComment(employee.employeeCode, pendingLead._id);
-                            pendingComment = null;
-                        } else if (normalizedPhone) {
-                            nextAutoCallLead = {
+                        if (
+                            commentUnchanged &&
+                            stillAssigned &&
+                            pendingPhone &&
+                            isLeadEligibleForAutoCall(pendingLead, new Date(), employeeNames)
+                        ) {
+                            queueAutoCallLead = {
                                 lead: pendingLead,
-                                normalizedPhone,
+                                normalizedPhone: pendingPhone,
                                 queue: pendingLead.status === "Follow up" ? "Follow up" : "NEW",
                             };
+                        } else {
+                            clearAutoCallPendingComment(employee.employeeCode, pendingLeadId);
+                            pendingComment = null;
                         }
-                    } catch (error) {
-                        if (!isMissingLeadError(error)) {
-                            throw error;
-                        }
-
+                    } catch {
                         clearAutoCallPendingComment(employee.employeeCode, pendingLeadId);
                         pendingComment = null;
                     }
                 }
 
-                if (!nextAutoCallLead) {
-                    nextAutoCallLead = await getNextAutoCallLead({
+                if (!queueAutoCallLead) {
+                    queueAutoCallLead = await getNextAutoCallLead({
                         employeeId,
                         employeeNames,
-                        excludedLeadIds: Object.keys(failureCooldowns),
                     }, { timeoutMs: AUTO_CALL_API_TIMEOUT_MS });
                 }
-                const firstCallableLead = nextAutoCallLead?.lead;
-                const normalizedPhone = nextAutoCallLead?.normalizedPhone;
+
+                const firstCallableLead = queueAutoCallLead?.lead;
+                const normalizedPhone = queueAutoCallLead?.normalizedPhone;
 
                 if (!firstCallableLead || !normalizedPhone || isDisposed) {
                     return;
@@ -291,14 +280,6 @@ export default function EmployeeAutoCaller() {
 
                     if (terminalErrorCode) {
                         clearAutoCallPendingComment(employee.employeeCode, firstCallableLead._id);
-                        const failedAt = Date.now();
-                        const cooldownDuration = terminalErrorCode === "LEAD_ALREADY_COMMENTED"
-                            ? millisecondsUntilNextPhilippineDay(new Date(failedAt))
-                            : AUTO_CALL_FAILURE_COOLDOWN_MS;
-                        saveFailureCooldowns(failureStorageKey, {
-                            ...readFailureCooldowns(failureStorageKey, failedAt),
-                            [firstCallableLead._id]: failedAt + cooldownDuration,
-                        });
                     }
                     return;
                 }
@@ -307,6 +288,8 @@ export default function EmployeeAutoCaller() {
                     return;
                 }
                 reservedEmployeeCode = employee.employeeCode;
+                reservedLeadId = firstCallableLead._id;
+                reservationToken = reservation.reservationToken;
                 if (isDisposed) return;
 
                 const currentPendingComment = getAutoCallPendingComment(employee.employeeCode);
@@ -357,6 +340,7 @@ export default function EmployeeAutoCaller() {
                         await markCallBridgeDialStarted(employee.employeeCode, {
                             timeoutMs: AUTO_CALL_API_TIMEOUT_MS,
                             leadId: firstCallableLead._id,
+                            reservationToken,
                         });
                     } catch {
                         clearAutoCallPendingComment(employee.employeeCode, firstCallableLead._id);
@@ -374,17 +358,17 @@ export default function EmployeeAutoCaller() {
                         return;
                     }
 
-                    launchPhoneCall(normalizedPhone);
+                    launchPhoneCall(normalizedPhone, bridgeStatus.provider);
                     callWasLaunched = true;
 
-                    const callConfirmed = await waitForConfirmedCall(employee.employeeCode, bridgeStatus.lastCallEndedAt);
+                    const callConfirmed = await waitForConfirmedCall(
+                        employee.employeeCode,
+                        bridgeStatus.lastCallEndedAt
+                    );
+                    providerCallConfirmed = callConfirmed;
 
                     if (!callConfirmed) {
-                        clearAutoCallPendingComment(employee.employeeCode, firstCallableLead._id);
-                        saveFailureCooldowns(failureStorageKey, {
-                            ...readFailureCooldowns(failureStorageKey, Date.now()),
-                            [firstCallableLead._id]: Date.now() + AUTO_CALL_FAILURE_COOLDOWN_MS,
-                        });
+                        // Keep the first lead selected so a missed provider confirmation cannot advance the queue.
                     }
 
                     try {
@@ -393,6 +377,7 @@ export default function EmployeeAutoCaller() {
                             {
                                 activityActorName: employee.name,
                                 activityActorType: "employee",
+                                employeeId: employee._id,
                                 callOutcome: callConfirmed ? "confirmed" : "failed",
                             },
                             { timeoutMs: AUTO_CALL_API_TIMEOUT_MS }
@@ -401,20 +386,17 @@ export default function EmployeeAutoCaller() {
                         // The next cycle must continue even if activity logging is unavailable.
                     }
 
-                    if (!callConfirmed) {
-                        try {
-                            await releaseCallBridgeCall(employee.employeeCode, { timeoutMs: AUTO_CALL_API_TIMEOUT_MS });
-                        } catch {
-                            // The original lease expires automatically if release cannot be confirmed.
-                        }
-                    }
                 }
             } catch {
                 // A timed-out or unavailable dependency is retried by the next cycle.
             } finally {
-                if (reservedEmployeeCode && !callWasLaunched) {
+                if (reservedEmployeeCode && (!callWasLaunched || !providerCallConfirmed)) {
                     try {
-                        await releaseCallBridgeCall(reservedEmployeeCode, { timeoutMs: AUTO_CALL_API_TIMEOUT_MS });
+                        await releaseCallBridgeCall(reservedEmployeeCode, {
+                            timeoutMs: AUTO_CALL_API_TIMEOUT_MS,
+                            leadId: reservedLeadId,
+                            reservationToken,
+                        });
                     } catch {
                         // The lease still expires if the cleanup request cannot reach the server.
                     }

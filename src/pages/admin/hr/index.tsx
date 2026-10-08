@@ -1,10 +1,10 @@
 import type { FormEvent } from "react";
 import { useEffect, useMemo, useState } from "react";
-import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useSearchParams } from "react-router";
 import { FiBriefcase, FiDownload, FiEdit2, FiFileText, FiPhone, FiPlus, FiRefreshCw, FiSearch, FiStar, FiTrash2, FiUsers, FiX } from "react-icons/fi";
 import AdminLayout from "../adminLayout";
-import { getEmployeeAttendance, type AttendanceRecord } from "../../../api/attendance";
+import { getEmployeesAttendance, type AttendanceQuery, type AttendanceRecord } from "../../../api/attendance";
 import { deleteEmployee, getEmployees, normalizeEmployeeAvailabilityStatus, updateEmployee, type Employee, type EmployeeInput } from "../../../api/employees";
 import {
     archiveApplicant,
@@ -541,15 +541,35 @@ export default function AdminHr() {
         }
         permanentlyDeleteEmployeeMutation.mutate(archivedDeleteTarget.id);
     };
-    const attendanceQueries = useQueries({
-        queries: attendanceEmployees.map((employee) => ({
-            queryKey: ["employee-attendance", employee._id],
-            queryFn: () => getEmployeeAttendance(employee._id),
-            enabled: activeTab === "Attendance",
-            refetchInterval: activeTab === "Attendance" ? 15_000 : false,
-            refetchOnWindowFocus: true,
-        })),
+    const attendanceEmployeeIds = useMemo(
+        () => attendanceEmployees.map((employee) => employee._id),
+        [attendanceEmployees]
+    );
+    const attendanceRequestParams = useMemo(
+        () => getAttendanceRequestParams(attendanceSingleDate, attendanceDateFrom, attendanceDateTo),
+        [attendanceDateFrom, attendanceDateTo, attendanceSingleDate]
+    );
+    const attendanceQuery = useQuery({
+        queryKey: ["employee-attendance", "batch", attendanceEmployeeIds, attendanceRequestParams],
+        queryFn: () => getEmployeesAttendance(attendanceEmployeeIds, attendanceRequestParams),
+        enabled: activeTab === "Attendance" && attendanceEmployeeIds.length > 0,
+        refetchInterval: activeTab === "Attendance"
+            ? attendanceRequestParams.all
+                ? 120_000
+                : 30_000
+            : false,
+        refetchOnWindowFocus: true,
     });
+    const attendanceRecordsByEmployee = useMemo(() => {
+        const recordsByEmployee = new Map<string, AttendanceRecord[]>();
+        (attendanceQuery.data || []).forEach((record) => {
+            const employeeId = String(record.employee || "");
+            const records = recordsByEmployee.get(employeeId) || [];
+            records.push(record);
+            recordsByEmployee.set(employeeId, records);
+        });
+        return recordsByEmployee;
+    }, [attendanceQuery.data]);
     const attendanceTableSettings = useMemo(() => attendancePhTimeSettings(systemSettings), [systemSettings]);
     const attendanceFilterDateKeys = useMemo(
         () => getAttendanceFilterDateKeys(attendanceSingleDate, attendanceDateFrom, attendanceDateTo, ATTENDANCE_TIME_ZONE),
@@ -557,9 +577,9 @@ export default function AdminHr() {
     );
     const attendanceTableRows = useMemo(
         () =>
-            attendanceEmployees.flatMap((employee, index) =>
+            attendanceEmployees.flatMap((employee) =>
                 buildAttendanceRowsForFilter(
-                    attendanceQueries[index]?.data || [],
+                    attendanceRecordsByEmployee.get(employee._id) || [],
                     attendanceTableSettings,
                     attendanceFilterDateKeys,
                     attendanceSingleDate,
@@ -568,10 +588,10 @@ export default function AdminHr() {
                 )
                     .map((record) => ({ ...record, employee }))
             ),
-        [attendanceDateFrom, attendanceDateTo, attendanceEmployees, attendanceFilterDateKeys, attendanceQueries, attendanceSingleDate, attendanceTableSettings]
+        [attendanceDateFrom, attendanceDateTo, attendanceEmployees, attendanceFilterDateKeys, attendanceRecordsByEmployee, attendanceSingleDate, attendanceTableSettings]
     );
-    const attendanceTableLoading = employeesLoading || attendanceQueries.some((query) => query.isLoading || query.isFetching);
-    const attendanceTableError = employeesError || attendanceQueries.some((query) => query.isError);
+    const attendanceTableLoading = employeesLoading || attendanceQuery.isLoading || attendanceQuery.isFetching;
+    const attendanceTableError = employeesError || attendanceQuery.isError;
     const attendanceTotalPages = Math.max(1, Math.ceil(attendanceTableRows.length / attendancePageSize));
     const currentAttendancePage = Math.min(attendancePage, attendanceTotalPages);
     const pagedAttendanceRows = attendanceTableRows.slice(
@@ -698,12 +718,18 @@ export default function AdminHr() {
         if (!attendanceEmployees.length || exportingAttendance) return;
         setExportingAttendance(true);
         try {
-            const attendanceByEmployee = await Promise.all(
-                attendanceEmployees.map(async (employee) => ({
-                    employee,
-                    records: await getEmployeeAttendance(employee._id),
-                }))
-            );
+            const records = await getEmployeesAttendance(attendanceEmployeeIds, attendanceRequestParams);
+            const recordsByEmployee = new Map<string, AttendanceRecord[]>();
+            records.forEach((record) => {
+                const employeeId = String(record.employee || "");
+                const employeeRecords = recordsByEmployee.get(employeeId) || [];
+                employeeRecords.push(record);
+                recordsByEmployee.set(employeeId, employeeRecords);
+            });
+            const attendanceByEmployee = attendanceEmployees.map((employee) => ({
+                employee,
+                records: recordsByEmployee.get(employee._id) || [],
+            }));
             const rows = attendanceByEmployee.flatMap(({ employee, records }) =>
                 buildAttendanceRowsForFilter(
                     records,
@@ -1535,6 +1561,31 @@ function getAttendanceFilterDateKeys(singleDate: string, dateFrom: string, dateT
     }
 
     return keys;
+}
+
+function getAttendanceRequestParams(
+    singleDate: string,
+    dateFrom: string,
+    dateTo: string
+): Pick<AttendanceQuery, "all" | "from" | "to"> {
+    const startKey = singleDate || dateFrom;
+    const endKey = singleDate || dateTo || dateFrom;
+
+    if (!startKey || !endKey) {
+        return { all: true };
+    }
+
+    const start = new Date(`${startKey}T00:00:00+08:00`);
+    const end = new Date(`${endKey}T00:00:00+08:00`);
+
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
+        return { all: true };
+    }
+
+    return {
+        from: new Date(start.getTime() - 24 * 60 * 60 * 1000).toISOString(),
+        to: new Date(end.getTime() + 2 * 24 * 60 * 60 * 1000).toISOString(),
+    };
 }
 
 function buildAbsentAttendanceRow(dateKey: string): AttendanceHistoryRow {

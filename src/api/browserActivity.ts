@@ -94,4 +94,5 @@ export async function clearBrowserActivityData() {
 }
 
 export const browserActivityExtensionPackageUrl = `${backendOrigin}/api/browser-activity/extension-package`;
+export const liveViewAgentPackageUrl = `${backendOrigin}/api/browser-activity/live-view-agent-package`;
 export const browserActivityWebStoreUrl = import.meta.env.VITE_CRM_EXTENSION_WEB_STORE_URL as string | undefined;

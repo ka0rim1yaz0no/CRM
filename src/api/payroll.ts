@@ -12,6 +12,16 @@ export type PayrollRecord = {
     department: string;
     payType: PayrollPayType;
     grossPay: number;
+    basicPay?: number;
+    workingDays?: number;
+    minuteRate?: number;
+    lateMinutes?: number;
+    excessLunchMinutes?: number;
+    excessBreakMinutes?: number;
+    absenceMinutes?: number;
+    earlyTimeOutMinutes?: number;
+    deductibleMinutes?: number;
+    incompleteShiftDays?: number;
     deductions: number;
     netPay: number;
     attendanceDays?: number;
@@ -54,11 +64,16 @@ export type PayrollDtrRow = {
     dateKey: string;
     date: string;
     day: string;
-    status: "Present" | "Late" | "Overtime" | "Absent" | "Weekend";
+    status: "Present" | "Late" | "Overtime" | "Absent" | "Weekend" | "Scheduled" | "In Progress" | "Needs Review";
     isWeekend: boolean;
     timeIn: string;
     timeOut: string;
     lunchHours: number;
+    lateMinutes: number;
+    excessLunchMinutes: number;
+    excessBreakMinutes: number;
+    absenceMinutes: number;
+    earlyTimeOutMinutes: number;
     grossHours: number;
     lateHours: number;
     regularHours: number;
@@ -85,12 +100,22 @@ export type PayrollDtr = {
         lateDays: number;
         lateHours: number;
         workingDays: number;
+        monthlyWorkingDays: number;
         workedHours: number;
         overtimeHours: number;
         missingHours: number;
         scheduledHours: number;
         grossPay: number;
+        basicPay: number;
         hourlyRate: number;
+        minuteRate: number;
+        lateMinutes: number;
+        excessLunchMinutes: number;
+        excessBreakMinutes: number;
+        absenceMinutes: number;
+        earlyTimeOutMinutes: number;
+        deductibleMinutes: number;
+        incompleteShiftDays: number;
         deductions: number;
         netPay: number;
     };
@@ -139,6 +164,11 @@ export async function updatePayrollRecord(id: string, record: PayrollRecordInput
 
 export async function updatePayrollOvertime(id: string, overtimeHours: number) {
     const response = await api.patch<PayrollRecord>(`/payroll/records/${id}/overtime`, { overtimeHours });
+    return response.data;
+}
+
+export async function updateEmployeeBasicPay(employeeId: string, basicPay: number) {
+    const response = await api.patch<PayrollRecord>(`/payroll/employees/${encodeURIComponent(employeeId)}/basic-pay`, { basicPay });
     return response.data;
 }
 

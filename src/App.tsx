@@ -4,6 +4,8 @@ import { lazy, Suspense } from 'react'
 import type { ReactNode } from 'react'
 import { getAuthUser } from './api/authStorage'
 import { isPocOperationsUser } from './lib/roleAccess'
+import { EmployeeLiveShareProvider } from './components/EmployeeLiveShare'
+import EmployeeVoiceCall from './components/EmployeeVoiceCall'
 
 const FeatureRoute = lazy(() => import('./components/FeatureRoute'))
 const Login = lazy(() => import('./pages/Login'))
@@ -36,9 +38,11 @@ const AdminTasks = lazy(() => import('./pages/admin/tasks'))
 const AdminTaskDetail = lazy(() => import('./pages/admin/tasks/detail'))
 const AdminReports = lazy(() => import('./pages/admin/reports'))
 const AdminTracker = lazy(() => import('./pages/admin/tracker'))
+const AdminEvaluations = lazy(() => import('./pages/admin/evaluations'))
 const PayrollPage = lazy(() => import('./pages/admin/payroll'))
 const PayrollComputePage = lazy(() => import('./pages/admin/payrollCompute'))
 const Credentials = lazy(() => import('./pages/admin/credentials'))
+const HempIndustrySurvey = lazy(() => import('./pages/survey/HempIndustrySurvey'))
 
 function RouteLoading() {
   return <div className="min-h-screen bg-[#070910] p-6 text-sm text-white/50">Loading workspace...</div>
@@ -96,6 +100,7 @@ function RoutedApp() {
     <Suspense key={location.pathname} fallback={<RouteLoading />}>
         <Routes location={location}>
           <Route path="/login" element={<Login />} />
+          <Route path="/survey/help-save-the-hemp-industry" element={<HempIndustrySurvey />} />
           <Route path="/dashboard" element={<ProtectedRoute type="employee"><FeatureRoute feature="dashboard" scope="employee"><Dashboard /></FeatureRoute></ProtectedRoute>} />
           <Route path="/leads" element={<ProtectedRoute type="employee"><FeatureRoute feature="leads" scope="employee"><Leads /></FeatureRoute></ProtectedRoute>} />
           <Route path="/tasks" element={<ProtectedRoute type="employee"><FeatureRoute feature="tasks" scope="employee"><Tasks /></FeatureRoute></ProtectedRoute>} />
@@ -132,6 +137,7 @@ function RoutedApp() {
           <Route path="/admin/tasks/:taskId" element={<ProtectedRoute type="admin"><FeatureRoute feature="tasks" scope="admin"><AdminTaskDetail /></FeatureRoute></ProtectedRoute>} />
           <Route path="/admin/reports" element={<ProtectedRoute type="admin"><FeatureRoute feature="tracking" scope="admin"><AdminReports /></FeatureRoute></ProtectedRoute>} />
           <Route path="/admin/tracker" element={<ProtectedRoute type="admin"><FeatureRoute feature="tracking" scope="admin"><AdminTracker /></FeatureRoute></ProtectedRoute>} />
+          <Route path="/admin/evaluations" element={<ProtectedRoute type="admin"><FeatureRoute feature="hr" scope="admin"><AdminEvaluations /></FeatureRoute></ProtectedRoute>} />
           <Route path="/admin/knowledge-base" element={<ProtectedRoute type="admin"><FeatureRoute feature="knowledge-base" scope="admin"><AdminKnowledgeBase /></FeatureRoute></ProtectedRoute>} />
           <Route path="/admin/knowledge-base/announcements/new" element={<ProtectedRoute type="admin"><FeatureRoute feature="knowledge-base" scope="admin"><AdminAnnouncementForm /></FeatureRoute></ProtectedRoute>} />
           <Route path="/admin/knowledge-base/announcements/:entryId/edit" element={<ProtectedRoute type="admin"><FeatureRoute feature="knowledge-base" scope="admin"><AdminAnnouncementForm /></FeatureRoute></ProtectedRoute>} />
@@ -152,7 +158,10 @@ function RoutedApp() {
 function App() {
   return (
     <BrowserRouter>
-      <RoutedApp />
+      <EmployeeLiveShareProvider>
+        <EmployeeVoiceCall />
+        <RoutedApp />
+      </EmployeeLiveShareProvider>
     </BrowserRouter>
   )
 }

@@ -3,8 +3,16 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import type { Request, Response } from "express";
 import { Types } from "mongoose";
+import {
+  autoCallDisabledReason,
+  getCallProvider,
+  isAutoCallDisabledForEmployee,
+  isSupportedAutoCallClientVersion,
+  legacyAutoCallClientVersion,
+} from "../config/callProvider";
 import { getBusinessAccessForEmployeeCode } from "../models/BusinessUserAccess";
 import {
+  getCallBridgeAttemptModel,
   getCallBridgeDeviceModel,
   getCallBridgePairingModel,
   getCallBridgeScheduleModel,
@@ -18,6 +26,12 @@ import {
   normalizeBrowserSessionStartedAt,
   shouldRejectOlderBrowserSession,
 } from "../services/callBridgeSession";
+import { getRingCentralMonitorStatus } from "../services/ringCentralCallMonitor";
+import { isRingCentralOutcomeShadowEnabled } from "../services/ringCentralCallClassification";
+import {
+  hasEmployeeCommentForAutoCall,
+  isLeadEligibleForAutoCall,
+} from "../services/leadAutoCallEligibility";
 import { emitCallDashboardUpdated } from "../socket";
 
 const pairingLifetimeMs = 10 * 60 * 1000;
@@ -25,13 +39,35 @@ const heartbeatFreshnessMs = 20 * 1000;
 const callLeaseMs = 90 * 1000;
 const postCallDelayMs = 30 * 1000;
 const dialIntentMs = 30 * 1000;
+const activeCallIdleConfirmationMs = 8 * 1000;
 const callBridgePackageFileName = "assistly-call-bridge.zip";
+const ringCentralProviderVersion = "ringcentral-api-v1";
 const validBridgeStates = new Set<CallBridgeState>(["idle", "active", "unknown"]);
 
-type LeadDialBlock = "LEAD_NOT_FOUND" | "LEAD_ALREADY_COMMENTED";
+type LeadDialBlock = "LEAD_NOT_FOUND" | "LEAD_NOT_ASSIGNED" | "LEAD_ALREADY_COMMENTED" | "LEAD_NOT_CALLABLE";
+const autoCallClientUpdateCode = "AUTO_CALL_CLIENT_UPDATE_REQUIRED";
+const autoCallClientUpdateMessage = "Refresh the CRM to load the current auto-call safety update.";
 
 function cleanString(value: unknown, maxLength = 240) {
   return String(value || "").trim().slice(0, maxLength);
+}
+
+function rejectUnsupportedAutoCallClient(request: Request, response: Response) {
+  if (isSupportedAutoCallClientVersion(request.header("x-crm-auto-call-version"))) {
+    return false;
+  }
+
+  response.status(409).json({
+    allowed: false,
+    code: autoCallClientUpdateCode,
+    message: autoCallClientUpdateMessage,
+    reason: autoCallClientUpdateMessage,
+  });
+  return true;
+}
+
+function isLegacyAutoCallClient(request: Request) {
+  return cleanString(request.header("x-crm-auto-call-version"), 80) === legacyAutoCallClientVersion;
 }
 
 function hashSecret(value: string) {
@@ -57,25 +93,53 @@ function bridgeState(value: unknown): CallBridgeState {
   return validBridgeStates.has(normalizedValue) ? normalizedValue : "unknown";
 }
 
-async function getLeadDialBlock(leadId: string): Promise<LeadDialBlock | null> {
+async function getLeadDialBlock(
+  leadId: string,
+  employeeId: string,
+  employeeNames: string[] = []
+): Promise<LeadDialBlock | null> {
   if (!leadId || !Types.ObjectId.isValid(leadId)) {
     return "LEAD_NOT_FOUND";
   }
 
-  const phOffsetMs = 8 * 60 * 60 * 1000;
-  const shiftedNow = new Date(Date.now() + phOffsetMs);
-  const startTime = Date.UTC(shiftedNow.getUTCFullYear(), shiftedNow.getUTCMonth(), shiftedNow.getUTCDate()) - phOffsetMs;
-  const commentRange = { $gte: new Date(startTime), $lt: new Date(startTime + 24 * 60 * 60 * 1000) };
-  const [leadExists, commentedLeadExists] = await Promise.all([
-    Lead.exists({ _id: leadId }),
-    Lead.exists({
-      _id: leadId,
-      comments: { $elemMatch: { authorType: "employee", createdAt: commentRange } },
-    }),
-  ]);
+  const lead = await Lead.findById(leadId)
+    .select("assignedAgent assignedAgentName status followUpAt comments.authorName comments.authorType comments.createdAt")
+    .lean();
 
-  if (!leadExists) return "LEAD_NOT_FOUND";
-  return commentedLeadExists ? "LEAD_ALREADY_COMMENTED" : null;
+  if (!lead) return "LEAD_NOT_FOUND";
+  const normalizedEmployeeNames = new Set(employeeNames.map((value) => cleanString(value).toLowerCase()).filter(Boolean));
+  const isAssignedToEmployee =
+    String(lead.assignedAgent || "") === employeeId ||
+    normalizedEmployeeNames.has(cleanString(lead.assignedAgentName).toLowerCase());
+
+  if (!isAssignedToEmployee) return "LEAD_NOT_ASSIGNED";
+  if (isLeadEligibleForAutoCall(lead, new Date(), employeeNames)) return null;
+
+  const hasEmployeeComment = hasEmployeeCommentForAutoCall(lead, employeeNames);
+  return hasEmployeeComment ? "LEAD_ALREADY_COMMENTED" : "LEAD_NOT_CALLABLE";
+}
+
+function leadDialBlockMessage(block: LeadDialBlock) {
+  if (block === "LEAD_NOT_ASSIGNED") {
+    return "This lead is no longer assigned to the calling employee.";
+  }
+
+  if (block === "LEAD_ALREADY_COMMENTED") {
+    return "This lead already has an employee comment and no follow-up is due.";
+  }
+
+  return block === "LEAD_NOT_CALLABLE" ? "This lead is no longer eligible for auto-call." : "The selected lead was not found.";
+}
+
+function clearedCallReservationFields() {
+  return {
+    callLeaseUntil: null,
+    reservedBusinessId: "",
+    reservedLeadId: "",
+    reservationTokenHash: "",
+    lastDialStartedAt: null,
+    dialIntentUntil: null,
+  };
 }
 
 function callBridgePackageCandidates() {
@@ -87,7 +151,10 @@ function callBridgePackageCandidates() {
 }
 
 async function devicesForEmployee(employeeCode: string) {
-  return getCallBridgeDeviceModel().find({ employeeCode }).sort({ lastSeenAt: -1 }).lean();
+  const providerFilter = getCallProvider() === "ringcentral"
+    ? { bridgeVersion: ringCentralProviderVersion }
+    : { bridgeVersion: { $ne: ringCentralProviderVersion } };
+  return getCallBridgeDeviceModel().find({ employeeCode, ...providerFilter }).sort({ lastSeenAt: -1 }).lean();
 }
 
 function aggregateBridgeStatus(
@@ -95,6 +162,8 @@ function aggregateBridgeStatus(
   schedule: { callLeaseUntil?: Date | null; nextCallAllowedAt?: Date | null; lastCallEndedAt?: Date | null } | null,
   now = new Date()
 ) {
+  const provider = getCallProvider();
+  const providerName = provider === "ringcentral" ? "RingCentral" : "Nextiva";
   const freshAfter = new Date(now.getTime() - heartbeatFreshnessMs);
   const freshDevices = devices.filter((device) => new Date(device.lastSeenAt) >= freshAfter);
   const activeDevice = freshDevices.find((device) => device.state === "active");
@@ -106,26 +175,27 @@ function aggregateBridgeStatus(
   const delayActive = Boolean(nextCallAllowedAt && nextCallAllowedAt > now);
 
   let state: "offline" | "unknown" | "idle" | "calling" | "active" = "offline";
-  let reason = "Call Bridge is offline.";
+  let reason = provider === "ringcentral" ? "RingCentral API is not connected." : "Call Bridge is offline.";
 
   if (freshDevices.length > 0 && activeDevice) {
     state = "active";
-    reason = "A Nextiva call is active.";
+    reason = `A ${providerName} call is active.`;
   } else if (freshDevices.length > 0 && leaseActive) {
     state = "calling";
-    reason = "A Nextiva call is starting.";
+    reason = `A ${providerName} call is starting.`;
   } else if (freshDevices.length > 0 && !nextivaProcessDetected) {
     state = "unknown";
-    reason = "Nextiva is not running.";
+    reason = provider === "ringcentral" ? "RingCentral API is unavailable." : "Nextiva is not running.";
   } else if (freshDevices.length > 0 && delayActive) {
     state = "idle";
     reason = "Waiting 30 seconds after the previous call.";
   } else if (freshDevices.length > 0) {
     state = "idle";
-    reason = "Call Bridge is ready.";
+    reason = provider === "ringcentral" ? "RingCentral is ready." : "Call Bridge is ready.";
   }
 
   return {
+    provider,
     connected: freshDevices.length > 0,
     ready:
       freshDevices.length > 0 &&
@@ -295,6 +365,55 @@ export async function activateCallBridgeForEmployee(request: Request, response: 
   const now = new Date();
   const browserSessionStartedAt = normalizeBrowserSessionStartedAt(request.body.browserSessionStartedAt, now);
 
+  if (getCallProvider() === "ringcentral") {
+    if (!employeeCode || employeeCode !== headerEmployeeCode || headerUserType !== "employee") {
+      response.status(403).json({ message: "A valid employee session is required." });
+      return;
+    }
+
+    if (isAutoCallDisabledForEmployee(employeeCode)) {
+      response.json({
+        activated: false,
+        switchable: true,
+        employeeCode,
+        deviceName: "RingCentral extension",
+        reason: autoCallDisabledReason,
+      });
+      return;
+    }
+
+    const employee = await Employee.findOne({ employeeCode, status: { $ne: "Archived" } })
+      .select("employeeCode role")
+      .lean();
+    if (!employee || !cleanString(employee.role).toLowerCase().includes("sales")) {
+      response.status(403).json({ message: "Only active sales employees can use RingCentral auto call." });
+      return;
+    }
+
+    const businessId = request.business?.id || "";
+    const businessAccessIds = await getBusinessAccessForEmployeeCode(employeeCode);
+    if (businessAccessIds.length > 0 && !businessAccessIds.includes(businessId)) {
+      response.status(403).json({ message: "This employee cannot use RingCentral for the selected business." });
+      return;
+    }
+
+    const monitor = getRingCentralMonitorStatus(employeeCode);
+    response.json({
+      activated: monitor.configured && monitor.connected && monitor.mapped,
+      switchable: true,
+      employeeCode,
+      deviceName: monitor.deviceName,
+      reason: !monitor.configured
+        ? "RingCentral API credentials are not configured."
+        : !monitor.connected
+          ? monitor.lastError || "RingCentral API is connecting."
+          : !monitor.mapped
+            ? "This employee is not mapped to a RingCentral extension."
+            : "RingCentral is ready.",
+    });
+    return;
+  }
+
   if (
     !employeeCode ||
     employeeCode !== headerEmployeeCode ||
@@ -405,9 +524,7 @@ export async function activateCallBridgeForEmployee(request: Request, response: 
         { employeeCode: previousEmployeeCode },
         {
           $set: {
-            callLeaseUntil: null,
-            lastDialStartedAt: null,
-            dialIntentUntil: null,
+            ...clearedCallReservationFields(),
             lastCallStartedAt: null,
           },
         }
@@ -416,11 +533,9 @@ export async function activateCallBridgeForEmployee(request: Request, response: 
         { employeeCode },
         {
           $set: {
-            callLeaseUntil: null,
+            ...clearedCallReservationFields(),
             nextCallAllowedAt,
             lastCallEndedAt: latestCallEndedAt,
-            lastDialStartedAt: null,
-            dialIntentUntil: null,
             lastCallStartedAt: null,
           },
           $setOnInsert: { employeeCode },
@@ -468,7 +583,25 @@ export async function updateCallBridgeHeartbeat(request: Request, response: Resp
   const previousState = device.state;
   const previousNextivaProcessDetected = device.nextivaProcessDetected;
   const previousAudioSessionActive = device.audioSessionActive;
-  const nextState = bridgeState(request.body.state);
+  const requestedState = bridgeState(request.body.state);
+  let nextState = requestedState;
+
+  if (requestedState === "active") {
+    device.inactiveSince = null;
+  } else if (previousState === "active") {
+    const inactiveSince = device.inactiveSince ? new Date(device.inactiveSince) : null;
+
+    if (!inactiveSince) {
+      device.inactiveSince = now;
+      nextState = "active";
+    } else if (now.getTime() - inactiveSince.getTime() < activeCallIdleConfirmationMs) {
+      nextState = "active";
+    } else {
+      device.inactiveSince = null;
+    }
+  } else {
+    device.inactiveSince = null;
+  }
 
   device.state = nextState;
   device.nextivaProcessDetected = Boolean(request.body.nextivaProcessDetected);
@@ -483,30 +616,29 @@ export async function updateCallBridgeHeartbeat(request: Request, response: Resp
 
   await device.save();
 
-  if (nextState === "active") {
+  const heartbeatControlsCallState = getCallProvider() === "nextiva" && device.bridgeVersion !== ringCentralProviderVersion;
+
+  if (heartbeatControlsCallState && nextState === "active") {
     await getCallBridgeScheduleModel().findOneAndUpdate(
       { employeeCode: device.employeeCode },
       {
         $set: {
-          callLeaseUntil: null,
-          dialIntentUntil: null,
+          ...clearedCallReservationFields(),
           ...(previousState !== "active" ? { lastCallStartedAt: now } : {}),
         },
         $setOnInsert: { employeeCode: device.employeeCode },
       },
       { upsert: true, setDefaultsOnInsert: true }
     );
-  } else if (previousState === "active") {
+  } else if (heartbeatControlsCallState && previousState === "active") {
     await getCallBridgeScheduleModel().findOneAndUpdate(
       { employeeCode: device.employeeCode },
       {
         $set: {
-          callLeaseUntil: null,
+          ...clearedCallReservationFields(),
           lastCallEndedAt: now,
           nextCallAllowedAt: new Date(now.getTime() + postCallDelayMs),
           lastCallStartedAt: null,
-          lastDialStartedAt: null,
-          dialIntentUntil: null,
         },
         $setOnInsert: { employeeCode: device.employeeCode },
       },
@@ -534,29 +666,160 @@ export async function getCallBridgeStatus(request: Request, response: Response) 
     getCallBridgeScheduleModel().findOne({ employeeCode }).lean(),
   ]);
 
+  if (isAutoCallDisabledForEmployee(employeeCode)) {
+    response.json({
+      employeeCode,
+      provider: getCallProvider(),
+      connected: false,
+      ready: false,
+      state: "offline",
+      reason: autoCallDisabledReason,
+      nextivaProcessDetected: false,
+      deviceName: getCallProvider() === "ringcentral" ? "RingCentral extension" : "",
+      bridgeVersion: getCallProvider() === "ringcentral" ? ringCentralProviderVersion : "",
+      lastSeenAt: null,
+      callLeaseUntil: schedule?.callLeaseUntil || null,
+      nextCallAllowedAt: schedule?.nextCallAllowedAt || null,
+      lastCallEndedAt: schedule?.lastCallEndedAt || null,
+    });
+    return;
+  }
+
+  if (getCallProvider() === "ringcentral" && devices.length === 0) {
+    const monitor = getRingCentralMonitorStatus(employeeCode);
+    response.json({
+      employeeCode,
+      provider: "ringcentral",
+      connected: false,
+      ready: false,
+      state: "offline",
+      reason: !monitor.configured
+        ? "RingCentral API credentials are not configured."
+        : !monitor.connected
+          ? monitor.lastError || "RingCentral API is connecting."
+          : !monitor.mapped
+            ? "This employee is not mapped to a RingCentral extension."
+            : "RingCentral call state is initializing.",
+      nextivaProcessDetected: false,
+      deviceName: monitor.deviceName,
+      bridgeVersion: ringCentralProviderVersion,
+      lastSeenAt: null,
+      callLeaseUntil: schedule?.callLeaseUntil || null,
+      nextCallAllowedAt: schedule?.nextCallAllowedAt || null,
+      lastCallEndedAt: schedule?.lastCallEndedAt || null,
+    });
+    return;
+  }
+
   response.json({
     employeeCode,
     ...aggregateBridgeStatus(devices, schedule),
   });
 }
 
+export async function getLatestCallBridgeAttempt(request: Request, response: Response) {
+  const employeeCode = cleanString(request.query.employeeCode, 80);
+  const leadId = cleanString(request.query.leadId, 80);
+  const headerEmployeeCode = cleanString(request.header("x-crm-user-code"), 80);
+  const headerUserType = cleanString(request.header("x-crm-user-type"), 30).toLowerCase();
+
+  if (!employeeCode || headerUserType !== "employee" || employeeCode !== headerEmployeeCode) {
+    response.status(403).json({ message: "Only the calling employee can view this call attempt." });
+    return;
+  }
+
+  if (!leadId || !Types.ObjectId.isValid(leadId)) {
+    response.status(400).json({ message: "A valid lead is required." });
+    return;
+  }
+
+  const shadowMode = isRingCentralOutcomeShadowEnabled();
+  if (!shadowMode) {
+    response.json({ shadowMode: false, attempt: null });
+    return;
+  }
+
+  const monitor = getRingCentralMonitorStatus(employeeCode);
+
+  const attempt = await getCallBridgeAttemptModel().findOne({
+    employeeCode,
+    businessId: request.business?.id || "",
+    leadId,
+    reservedAt: { $gte: new Date(Date.now() - 24 * 60 * 60_000) },
+  }).sort({ reservedAt: -1 }).lean();
+
+  response.json({
+    shadowMode: true,
+    monitor,
+    attempt: attempt
+      ? {
+          id: String(attempt._id),
+          phase: attempt.phase,
+          outcome: attempt.outcome,
+          outcomeReason: attempt.outcomeReason,
+          classificationConfidence: attempt.classificationConfidence || "",
+          classificationSource: attempt.classificationSource || "",
+          providerResult: attempt.providerResult,
+          statusCodes: attempt.statusCodes || [],
+          reservedAt: attempt.reservedAt,
+          dialStartedAt: attempt.dialStartedAt,
+          answeredAt: attempt.answeredAt,
+          endedAt: attempt.endedAt,
+          classifiedAt: attempt.classifiedAt,
+          durationSeconds: attempt.durationSeconds,
+        }
+      : null,
+  });
+}
+
 export async function reserveCallBridgeCall(request: Request, response: Response) {
   const employeeCode = cleanString(request.body.employeeCode, 80);
   const leadId = cleanString(request.body.leadId, 80);
+  const businessId = cleanString(request.business?.id, 80);
 
-  if (!employeeCode) {
-    response.status(400).json({ message: "Employee code is required." });
+  if (!employeeCode || cleanString(request.header("x-crm-user-code"), 80) !== employeeCode ||
+    cleanString(request.header("x-crm-user-type"), 30).toLowerCase() !== "employee") {
+    response.status(403).json({ message: "Only the calling employee can reserve an automatic call." });
+    return;
+  }
+
+  if (!leadId || !Types.ObjectId.isValid(leadId) || !businessId) {
+    response.status(400).json({ message: "A valid lead and business are required for automatic calls." });
+    return;
+  }
+
+  if (rejectUnsupportedAutoCallClient(request, response)) return;
+
+
+  if (isAutoCallDisabledForEmployee(employeeCode)) {
+    const schedule = await getCallBridgeScheduleModel().findOne({ employeeCode }).lean();
+    response.status(409).json({
+      allowed: false,
+      employeeCode,
+      ready: false,
+      state: "offline",
+      reason: autoCallDisabledReason,
+      callLeaseUntil: schedule?.callLeaseUntil || null,
+      nextCallAllowedAt: schedule?.nextCallAllowedAt || null,
+      lastCallEndedAt: schedule?.lastCallEndedAt || null,
+    });
     return;
   }
 
   const now = new Date();
   const Device = getCallBridgeDeviceModel();
   const freshAfter = new Date(now.getTime() - heartbeatFreshnessMs);
-  const [freshDevices, employee] = await Promise.all([
-    Device.find({ employeeCode, lastSeenAt: { $gte: freshAfter } }).lean(),
+  const providerFilter = getCallProvider() === "ringcentral"
+    ? { bridgeVersion: ringCentralProviderVersion }
+    : { bridgeVersion: { $ne: ringCentralProviderVersion } };
+  const [freshDevices, employee, reservedLead] = await Promise.all([
+    Device.find({ employeeCode, lastSeenAt: { $gte: freshAfter }, ...providerFilter }).lean(),
     Employee.findOne({ employeeCode, status: { $ne: "Archived" } })
-      .select("employeeCode role availabilityStatus")
+      .select("name employeeCode aliases role availabilityStatus")
       .lean(),
+    leadId && Types.ObjectId.isValid(leadId)
+      ? Lead.findById(leadId).select("phone").lean()
+      : null,
   ]);
 
   const employeeIsOnline = employee && normalizeEmployeeAvailabilityStatus(employee.availabilityStatus) === "ONLINE";
@@ -579,7 +842,8 @@ export async function reserveCallBridgeCall(request: Request, response: Response
   }
 
   if (leadId) {
-    const leadDialBlock = await getLeadDialBlock(leadId);
+    const employeeNames = [employee.name, employee.employeeCode, ...(employee.aliases || [])].filter(Boolean);
+    const leadDialBlock = await getLeadDialBlock(leadId, String(employee._id), employeeNames);
 
     if (leadDialBlock) {
       const schedule = await getCallBridgeScheduleModel().findOne({ employeeCode }).lean();
@@ -589,9 +853,7 @@ export async function reserveCallBridgeCall(request: Request, response: Response
         employeeCode,
         ...aggregateBridgeStatus(freshDevices, schedule, now),
         ready: false,
-        reason: leadDialBlock === "LEAD_ALREADY_COMMENTED"
-          ? "This lead already has an employee comment today."
-          : "The selected lead was not found.",
+        reason: leadDialBlockMessage(leadDialBlock),
       });
       return;
     }
@@ -619,6 +881,7 @@ export async function reserveCallBridgeCall(request: Request, response: Response
   );
 
   const leaseUntil = new Date(now.getTime() + callLeaseMs);
+  const reservationToken = randomToken();
   const schedule = await Schedule.findOneAndUpdate(
     {
       employeeCode,
@@ -630,6 +893,9 @@ export async function reserveCallBridgeCall(request: Request, response: Response
     {
       $set: {
         callLeaseUntil: leaseUntil,
+        reservedBusinessId: businessId,
+        reservedLeadId: leadId,
+        reservationTokenHash: hashSecret(reservationToken),
         lastReservedAt: now,
         lastDialStartedAt: null,
         dialIntentUntil: null,
@@ -649,54 +915,192 @@ export async function reserveCallBridgeCall(request: Request, response: Response
     return;
   }
 
+  if (getCallProvider() === "ringcentral" && leadId && reservedLead) {
+    const Attempt = getCallBridgeAttemptModel();
+    const monitor = getRingCentralMonitorStatus(employeeCode);
+    await Attempt.updateMany(
+      {
+        employeeCode,
+        outcome: "pending",
+        providerSessionId: { $exists: false },
+        phase: { $in: ["reserved", "dialing", "ringing"] },
+      },
+      {
+        $set: {
+          phase: "failed",
+          outcomeReason: "Superseded by a newer CRM call reservation",
+          lastError: "RingCentral did not confirm the previous dial",
+        },
+      }
+    );
+    await Attempt.create({
+      employeeCode,
+      employeeName: employee.name || employee.employeeCode,
+      businessId: request.business?.id || "",
+      leadId,
+      phone: cleanString(reservedLead.phone, 80),
+      provider: "ringcentral",
+      extensionId: monitor.extensionId,
+      extensionNumber: monitor.extensionNumber,
+      phase: "reserved",
+      outcome: "pending",
+      outcomeReason: "",
+      providerResult: "Awaiting RingCentral session",
+      statusCodes: [],
+      reservedAt: now,
+      dialStartedAt: null,
+      ringingAt: null,
+      answeredAt: null,
+      endedAt: null,
+      classifiedAt: null,
+      durationSeconds: 0,
+      recordingId: "",
+      callStatLogId: "",
+      lastError: "",
+    });
+  }
+
   response.json({
     allowed: true,
     employeeCode,
     state: "calling",
     callLeaseUntil: leaseUntil,
+    reservationToken,
   });
   emitCallDashboardUpdated(freshDevices.flatMap((device) => device.businessIds));
 }
 
 export async function markCallBridgeDialStarted(request: Request, response: Response) {
   const employeeCode = cleanString(request.body.employeeCode, 80);
-  const leadId = cleanString(request.body.leadId, 80);
+  let leadId = cleanString(request.body.leadId, 80);
+  const reservationToken = cleanString(request.body.reservationToken, 200);
+  let businessId = cleanString(request.business?.id, 80);
+  const legacyClient = isLegacyAutoCallClient(request);
   if (!employeeCode || cleanString(request.header("x-crm-user-code"), 80) !== employeeCode ||
     cleanString(request.header("x-crm-user-type"), 30).toLowerCase() !== "employee") {
     response.status(403).json({ message: "Only the calling employee can mark a dial start." });
     return;
   }
 
+
+  if (rejectUnsupportedAutoCallClient(request, response)) return;
+
   const now = new Date();
   const Schedule = getCallBridgeScheduleModel();
 
+  // The v3 browser can lose its active-business header during the route change
+  // between reserve and dial-start. Recover only from this employee's live lease.
+  if (legacyClient && (!Types.ObjectId.isValid(leadId) || !businessId)) {
+    const liveReservation = await Schedule.findOne({
+      employeeCode,
+      callLeaseUntil: { $gt: now },
+      lastDialStartedAt: null,
+    })
+      .select("reservedBusinessId reservedLeadId")
+      .lean();
+
+    if (liveReservation) {
+      leadId = cleanString(liveReservation.reservedLeadId, 80);
+      businessId = cleanString(liveReservation.reservedBusinessId, 80);
+    }
+  }
+
+  let matchedTokenlessReservation = false;
+  if (!legacyClient && !reservationToken && Types.ObjectId.isValid(leadId) && businessId) {
+    matchedTokenlessReservation = Boolean(await Schedule.exists({
+      employeeCode,
+      callLeaseUntil: { $gt: now },
+      lastDialStartedAt: null,
+      reservedBusinessId: businessId,
+      reservedLeadId: leadId,
+      reservationTokenHash: { $ne: "" },
+    }));
+  }
+
+  if (!leadId || !Types.ObjectId.isValid(leadId) ||
+    (!legacyClient && !reservationToken && !matchedTokenlessReservation) || !businessId) {
+    response.status(400).json({
+      code: "INVALID_CALL_RESERVATION",
+      message: "A valid automatic-call reservation is required before dialing.",
+    });
+    return;
+  }
+
+  if (isAutoCallDisabledForEmployee(employeeCode)) {
+    await getCallBridgeScheduleModel().findOneAndUpdate(
+      { employeeCode },
+      { $set: clearedCallReservationFields() }
+    );
+    response.status(409).json({ message: autoCallDisabledReason });
+    return;
+  }
+
   if (leadId) {
-    const leadDialBlock = await getLeadDialBlock(leadId);
+    const employee = await Employee.findOne({ employeeCode, status: { $ne: "Archived" } })
+      .select("name employeeCode aliases")
+      .lean();
+    const employeeNames = employee
+      ? [employee.name, employee.employeeCode, ...(employee.aliases || [])].filter(Boolean)
+      : [employeeCode];
+    const leadDialBlock = await getLeadDialBlock(leadId, String(employee?._id || ""), employeeNames);
 
     if (leadDialBlock) {
       await Schedule.findOneAndUpdate(
-        { employeeCode },
-        { $set: { callLeaseUntil: null, lastDialStartedAt: null, dialIntentUntil: null } }
+        {
+          employeeCode,
+          reservedBusinessId: businessId,
+          reservedLeadId: leadId,
+          ...(legacyClient || matchedTokenlessReservation ? {} : { reservationTokenHash: hashSecret(reservationToken) }),
+        },
+        { $set: clearedCallReservationFields() }
       );
       response.status(409).json({
         code: leadDialBlock,
-        message: leadDialBlock === "LEAD_ALREADY_COMMENTED"
-          ? "This lead already has an employee comment today."
-          : "The selected lead was not found.",
+        message: leadDialBlockMessage(leadDialBlock),
       });
       return;
     }
   }
 
   const schedule = await Schedule.findOneAndUpdate(
-    { employeeCode, callLeaseUntil: { $gt: now }, lastDialStartedAt: null },
+    {
+      employeeCode,
+      callLeaseUntil: { $gt: now },
+      lastDialStartedAt: null,
+      reservedBusinessId: businessId,
+      reservedLeadId: leadId,
+      ...(legacyClient || matchedTokenlessReservation ? {} : { reservationTokenHash: hashSecret(reservationToken) }),
+    },
     { $set: { lastDialStartedAt: now, dialIntentUntil: new Date(now.getTime() + dialIntentMs) } },
     { returnDocument: "after" }
   );
 
   if (!schedule) {
-    response.status(409).json({ message: "A current call reservation is required before dialing." });
+    response.status(409).json({
+      code: "CALL_RESERVATION_MISMATCH",
+      message: "This call no longer owns the current lead reservation. The dial was stopped.",
+    });
     return;
+  }
+
+  if (getCallProvider() === "ringcentral" && leadId) {
+    await getCallBridgeAttemptModel().findOneAndUpdate(
+      {
+        employeeCode,
+        businessId: request.business?.id || "",
+        leadId,
+        outcome: "pending",
+        phase: "reserved",
+      },
+      {
+        $set: {
+          phase: "dialing",
+          dialStartedAt: now,
+          providerResult: "Dial handed to RingCentral",
+        },
+      },
+      { sort: { reservedAt: -1 }, returnDocument: "after" }
+    );
   }
 
   const devices = await devicesForEmployee(employeeCode);
@@ -706,35 +1110,88 @@ export async function markCallBridgeDialStarted(request: Request, response: Resp
 
 export async function releaseCallBridgeCall(request: Request, response: Response) {
   const employeeCode = cleanString(request.body.employeeCode, 80);
+  const leadId = cleanString(request.body.leadId, 80);
+  const reservationToken = cleanString(request.body.reservationToken, 200);
+  const businessId = cleanString(request.business?.id, 80);
+  const legacyClient = !leadId && !reservationToken;
 
-  if (!employeeCode) {
-    response.status(400).json({ message: "Employee code is required." });
+  if (!employeeCode || cleanString(request.header("x-crm-user-code"), 80) !== employeeCode ||
+    cleanString(request.header("x-crm-user-type"), 30).toLowerCase() !== "employee") {
+    response.status(403).json({ message: "Only the calling employee can release an automatic call." });
+    return;
+  }
+
+  if (!legacyClient && rejectUnsupportedAutoCallClient(request, response)) return;
+
+  if ((!legacyClient && (!leadId || !Types.ObjectId.isValid(leadId) || !reservationToken)) || !businessId) {
+    response.status(400).json({
+      code: "INVALID_CALL_RESERVATION",
+      message: "A valid automatic-call reservation is required before release.",
+    });
     return;
   }
 
   const now = new Date();
   const Device = getCallBridgeDeviceModel();
   const freshAfter = new Date(now.getTime() - heartbeatFreshnessMs);
-  const freshDevices = await Device.find({ employeeCode, lastSeenAt: { $gte: freshAfter } }).lean();
+  const providerFilter = getCallProvider() === "ringcentral"
+    ? { bridgeVersion: ringCentralProviderVersion }
+    : { bridgeVersion: { $ne: ringCentralProviderVersion } };
+  const freshDevices = await Device.find({ employeeCode, lastSeenAt: { $gte: freshAfter }, ...providerFilter }).lean();
   const schedule = await getCallBridgeScheduleModel().findOne({ employeeCode }).lean();
 
   if (freshDevices.some((device) => device.state === "active")) {
     response.status(409).json({
       employeeCode,
       ...aggregateBridgeStatus(freshDevices, schedule, now),
-      reason: "The reservation cannot be released while a Nextiva call is active.",
+      reason: `The reservation cannot be released while a ${getCallProvider() === "ringcentral" ? "RingCentral" : "Nextiva"} call is active.`,
     });
     return;
   }
 
   const releasedSchedule = await getCallBridgeScheduleModel().findOneAndUpdate(
-    { employeeCode },
     {
-      $set: { callLeaseUntil: null, lastDialStartedAt: null, dialIntentUntil: null },
-      $setOnInsert: { employeeCode },
+      employeeCode,
+      reservedBusinessId: businessId,
+      ...(legacyClient ? {} : {
+        reservedLeadId: leadId,
+        reservationTokenHash: hashSecret(reservationToken),
+      }),
     },
-    { returnDocument: "after", upsert: true, setDefaultsOnInsert: true }
+    {
+      $set: clearedCallReservationFields(),
+    },
+    { returnDocument: "after" }
   );
+
+  if (!releasedSchedule) {
+    response.status(409).json({
+      code: "CALL_RESERVATION_MISMATCH",
+      message: "This browser no longer owns the current call reservation.",
+    });
+    return;
+  }
+
+  if (getCallProvider() === "ringcentral") {
+    await getCallBridgeAttemptModel().updateMany(
+      {
+        employeeCode,
+        businessId,
+        leadId,
+        outcome: "pending",
+        providerSessionId: { $exists: false },
+        phase: { $in: ["reserved", "dialing", "ringing"] },
+        reservedAt: { $gte: new Date(now.getTime() - 5 * 60_000) },
+      },
+      {
+        $set: {
+          phase: "failed",
+          outcomeReason: "RingCentral did not confirm the dial within 30 seconds",
+          lastError: "No provider telephony session was received",
+        },
+      }
+    );
+  }
 
   response.json({
     employeeCode,

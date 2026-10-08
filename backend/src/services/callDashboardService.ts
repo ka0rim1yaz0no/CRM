@@ -105,16 +105,19 @@ export function callDashboardStatus(input: {
   offPhoneStartedAt?: Date | null;
   now: Date;
   shift: { start: Date; end: Date };
+  provider?: "nextiva" | "ringcentral";
 }) {
   const { availabilityStatus, devices, schedule, attendance, offPhoneStartedAt, now, shift } = input;
+  const providerName = input.provider === "ringcentral" ? "RingCentral" : "Nextiva";
   const inShift = now >= shift.start && now < shift.end;
   const withinShift = (date: Date | null | undefined) => date && inShift
     ? new Date(Math.min(now.getTime(), Math.max(shift.start.getTime(), date.getTime())))
     : null;
   if (!inShift) {
-    return availabilityStatus === "OFF THE PHONE"
-      ? { status: "OFF THE PHONE" as const, statusStartedAt: null, transitionUntil: null, detail: "Outside call shift" }
-      : { status: "OFFLINE" as const, statusStartedAt: null, transitionUntil: null, detail: "Outside call shift" };
+    const presenceStatus = availabilityStatus === "ONLINE" || availabilityStatus === "BREAK" || availabilityStatus === "LUNCH" || availabilityStatus === "OFF THE PHONE"
+      ? availabilityStatus
+      : "OFFLINE";
+    return { status: presenceStatus as "ONLINE" | "BREAK" | "LUNCH" | "OFF THE PHONE" | "OFFLINE", statusStartedAt: null, transitionUntil: null, detail: "Outside call shift" };
   }
 
   const sortedEvents = [...attendance].sort((a, b) => a.timeIn.getTime() - b.timeIn.getTime());
@@ -134,7 +137,7 @@ export function callDashboardStatus(input: {
       status: "ON CALL" as const,
       statusStartedAt: withinShift(schedule?.lastCallStartedAt || active.lastStateChangedAt),
       transitionUntil: null,
-      detail: "Nextiva call active",
+      detail: `${providerName} call active`,
     };
   }
 
@@ -144,6 +147,15 @@ export function callDashboardStatus(input: {
       statusStartedAt: withinShift(offPhoneStartedAt),
       transitionUntil: null,
       detail: "Off the phone",
+    };
+  }
+
+  if (availabilityStatus === "BREAK" || availabilityStatus === "LUNCH") {
+    return {
+      status: availabilityStatus,
+      statusStartedAt: withinShift(offlineAt),
+      transitionUntil: null,
+      detail: availabilityStatus === "BREAK" ? "On break" : "At lunch",
     };
   }
 
@@ -158,10 +170,10 @@ export function callDashboardStatus(input: {
 
   if (ready && schedule?.lastDialStartedAt && schedule.dialIntentUntil && schedule.dialIntentUntil > now) {
     return {
-      status: "OFFLINE" as const,
+      status: "ONLINE" as const,
       statusStartedAt: withinShift(schedule.lastDialStartedAt),
       transitionUntil: schedule.dialIntentUntil,
-      detail: "Opening Nextiva · call not confirmed",
+      detail: `Opening ${providerName} · call not confirmed`,
     };
   }
 
@@ -179,7 +191,7 @@ export function callDashboardStatus(input: {
 
   if (ready) {
     return {
-      status: "OFFLINE" as const,
+      status: "ONLINE" as const,
       statusStartedAt: withinShift(latestDate(
         schedule?.dialIntentUntil && schedule.dialIntentUntil <= now ? schedule.dialIntentUntil : null,
         waitingUntil && waitingUntil <= now ? waitingUntil : null,
@@ -195,9 +207,13 @@ export function callDashboardStatus(input: {
     ? new Date(latestDevice.lastSeenAt.getTime() + heartbeatFreshnessMs)
     : null;
   return {
-    status: "OFFLINE" as const,
+    status: "ONLINE" as const,
     statusStartedAt: withinShift(latestDate(disconnectedAt, latestDevice && fresh.length ? latestDevice.lastStateChangedAt : null, offlineAt)),
     transitionUntil: null,
-    detail: fresh.length ? "Nextiva unavailable" : "Call Bridge disconnected",
+    detail: fresh.length
+      ? `Online · ${providerName} unavailable`
+      : input.provider === "ringcentral"
+        ? "Online · RingCentral API disconnected"
+        : "Online · Call Bridge disconnected",
   };
 }

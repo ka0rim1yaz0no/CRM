@@ -1,6 +1,7 @@
 import type { Request, Response } from "express";
 import { LeaveRequest, type LeaveRequestStatus, type LeaveRequestType } from "../models/LeaveRequest";
 import { recordEmployeeTransaction } from "./employeeTransactionController";
+import { syncSharedEmployeeRecords } from "../services/employeeRecordSyncService";
 
 const leaveRequestTypes: LeaveRequestType[] = ["Vacation", "Sick", "Emergency", "Personal", "Other"];
 const leaveRequestStatuses: LeaveRequestStatus[] = ["Pending", "Approved", "Rejected"];
@@ -109,12 +110,14 @@ function validateLeaveRequestInput(
 }
 
 export async function listEmployeeLeaveRequests(request: Request, response: Response) {
+  if (request.business?.id) await syncSharedEmployeeRecords(request.business.id);
   const employeeId = String(request.params.employeeId);
   const leaveRequests = await LeaveRequest.find({ employee: employeeId }).sort({ createdAt: -1 });
   response.json(leaveRequests);
 }
 
 export async function listLeaveRequests(request: Request, response: Response) {
+  if (request.business?.id) await syncSharedEmployeeRecords(request.business.id);
   const filter: Record<string, unknown> = {};
   const employeeId = String(request.query.employee || "").trim();
   const status = normalizeStatus(request.query.status);

@@ -59,7 +59,7 @@ test("dial launch is provisional until Nextiva activity, and call status stays i
   const dialStartedAt = at("2026-09-15T16:01:50Z");
   const dialIntentUntil = at("2026-09-15T16:02:20Z");
   const launching = callDashboardStatus({ ...base, schedule: { lastDialStartedAt: dialStartedAt, dialIntentUntil } });
-  assert.equal(launching.status, "OFFLINE");
+  assert.equal(launching.status, "ONLINE");
   assert.equal(launching.statusStartedAt?.toISOString(), dialStartedAt.toISOString());
   assert.equal(launching.transitionUntil?.toISOString(), dialIntentUntil.toISOString());
 
@@ -71,7 +71,7 @@ test("dial launch is provisional until Nextiva activity, and call status stays i
   assert.equal(callDashboardStatus({ ...base, devices: [{ ...device, state: "active", lastStateChangedAt: at("2026-09-15T16:01:55Z") }], availabilityStatus: "BREAK" }).status, "ON CALL");
 
   const outside = callDashboardStatus({ ...base, now: at("2026-09-16T01:00:00Z"), devices: [{ ...device, state: "active", lastSeenAt: at("2026-09-16T00:59:55Z") }] });
-  assert.equal(outside.status, "OFFLINE");
+  assert.equal(outside.status, "ONLINE");
   assert.equal(outside.statusStartedAt, null);
 });
 
@@ -98,15 +98,15 @@ test("call waiting is only the 30 seconds after a call ends", () => {
   assert.equal(waiting.transitionUntil?.toISOString(), schedule.nextCallAllowedAt.toISOString());
 
   const ended = callDashboardStatus({ ...base, schedule, now: at("2026-09-15T16:02:30Z"), devices: [{ ...device, lastSeenAt: at("2026-09-15T16:02:30Z") }] });
-  assert.equal(ended.status, "OFFLINE");
+  assert.equal(ended.status, "ONLINE");
   assert.equal(ended.statusStartedAt?.toISOString(), schedule.nextCallAllowedAt.toISOString());
   assert.equal(ended.detail, "Ready to dial");
 
   const noPreviousCall = callDashboardStatus({ ...base, now: at("2026-09-15T16:02:10Z") });
-  assert.equal(noPreviousCall.status, "OFFLINE");
+  assert.equal(noPreviousCall.status, "ONLINE");
 
   const stale = callDashboardStatus({ ...base, schedule, now: at("2026-09-15T16:02:10Z"), devices: [{ ...device, lastSeenAt: at("2026-09-15T16:01:00Z") }] });
-  assert.equal(stale.status, "OFFLINE");
+  assert.equal(stale.status, "ONLINE");
 });
 
 test("off-the-phone availability is its own status and uses the open attendance punch", () => {
@@ -140,7 +140,7 @@ test("off-the-phone availability is its own status and uses the open attendance 
     devices: [],
     now: at("2026-09-15T16:07:00Z"),
     shift,
-  }).status, "OFFLINE");
+  }).status, "ONLINE");
 
   const outside = callDashboardStatus({
     availabilityStatus: "OFF THE PHONE",
@@ -151,4 +151,13 @@ test("off-the-phone availability is its own status and uses the open attendance 
   });
   assert.equal(outside.status, "OFF THE PHONE");
   assert.equal(outside.statusStartedAt, null);
+});
+
+test("preserves online, break and lunch attendance states without a call bridge", () => {
+  const shift = { start: at("2026-09-15T15:00:00Z"), end: at("2026-09-16T00:00:00Z") };
+  const base = { attendance: [], devices: [], now: at("2026-09-15T16:00:00Z"), shift };
+
+  assert.equal(callDashboardStatus({ ...base, availabilityStatus: "ONLINE" }).status, "ONLINE");
+  assert.equal(callDashboardStatus({ ...base, availabilityStatus: "BREAK" }).status, "BREAK");
+  assert.equal(callDashboardStatus({ ...base, availabilityStatus: "LUNCH" }).status, "LUNCH");
 });

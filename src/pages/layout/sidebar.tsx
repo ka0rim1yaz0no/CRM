@@ -9,6 +9,7 @@ import {
   FiCheckSquare,
   FiClock,
   FiLogOut,
+  FiMessageCircle,
   FiSettings,
   FiTarget,
   FiUsers,
@@ -20,6 +21,7 @@ import { clearAuthUser, getAuthUser } from "../../api/authStorage";
 import { getKnowledgeBaseEntries } from "../../api/knowledgeBase";
 import { getTasks } from "../../api/tasks";
 import { useFeatureFlags } from "../../hooks/useFeatureFlags";
+import { useMessageNotifications } from "../../hooks/useMessageNotifications";
 import {
   ANNOUNCEMENT_SEEN_EVENT,
   getAnnouncementTimestamp,
@@ -50,6 +52,7 @@ const navItems = [
     feature: "knowledge-base",
   },
   { label: "Teams", path: "/teams", icon: FiUsers, feature: "teams" },
+  { label: "Messages", path: "/messages", icon: FiMessageCircle, feature: "messages" },
   {
     label: "Calendar",
     path: "/calendar",
@@ -94,6 +97,7 @@ function isOutsideSalesEmployee(authUser: ReturnType<typeof getAuthUser>) {
 export default function SideBar() {
   const { isEnabled } = useFeatureFlags();
   const authUser = getAuthUser();
+  const { unreadMessageCount } = useMessageNotifications();
   const employeeId = authUser?.userType === "employee" ? authUser.user._id : "";
   const isOutsideSalesUser = isOutsideSalesEmployee(authUser);
   const isPocOperations = isPocOperationsUser(authUser);
@@ -202,6 +206,8 @@ export default function SideBar() {
                   ? newAnnouncementCount
                   : label === "Tasks"
                     ? openTaskCount
+                    : label === "Messages"
+                      ? unreadMessageCount
                     : 0;
 
               return (

@@ -1,4 +1,5 @@
 import { api } from "../lib/api";
+import { isLeadEligibleForAutoCall } from "../lib/employeeAutoCall";
 import { normalizePhoneForCall } from "../lib/phoneNumber";
 import type { Employee } from "./employees";
 import type { Team } from "./teams";
@@ -36,6 +37,12 @@ export type Lead = {
     placeProvider?: "" | "google" | "tomtom";
     providerPlaceId?: string;
     notes: string;
+    callsByEmployee?: Array<{
+        employee?: string;
+        employeeName?: string;
+        count?: number;
+        lastCallAt?: string | null;
+    }>;
     comments?: Array<{
         _id?: string;
         authorName: string;
@@ -277,6 +284,8 @@ export type AgentLeadProgress = {
     employeeId: string;
     employeeName: string;
     employeeCode: string;
+    businessId: string;
+    businessName: string;
     role: string;
     team: string;
     status: string;
@@ -314,6 +323,8 @@ export type AgentLeadActivity = {
 export type AgentLeadMonthlyRow = {
     employeeId: string;
     employeeName: string;
+    businessId: string;
+    businessName: string;
     role: string;
     team: string;
     leadsAdded: number;
@@ -341,6 +352,7 @@ export type AgentLeadMonthlyRow = {
 
 export type AgentLeadDashboard = {
     generatedAt: string;
+    business: { id: string; name: string };
     summary: AgentLeadDashboardSummary;
     agents: AgentLeadProgress[];
     selectedMonth: string;
@@ -445,6 +457,7 @@ export async function getAdminLeadCounts(params: {
     assignedAgentNames?: string[];
     search?: string;
     state?: string;
+    unassigned?: boolean;
 } = {}) {
     const response = await api.get<LeadCountResult>("/admin-leads/counts", {
         params: {
@@ -499,17 +512,6 @@ export async function getNextAutoCallLead(params: {
     const excludedLeadIds = new Set(params.excludedLeadIds || []);
     let page = 1;
 
-    const getPhilippineDate = (value: string | Date) => new Intl.DateTimeFormat("en-CA", {
-        timeZone: "Asia/Manila",
-        year: "numeric",
-        month: "2-digit",
-        day: "2-digit",
-    }).format(new Date(value));
-    const currentPhilippineDate = getPhilippineDate(new Date());
-    const wasCommentedByEmployeeToday = (lead: Lead) => (lead.comments || []).some(
-        (comment) => comment.authorType === "employee" && getPhilippineDate(comment.createdAt) === currentPhilippineDate
-    );
-
     while (true) {
         const leadPage = await getMyLeads({
             employeeId: params.employeeId,
@@ -518,10 +520,11 @@ export async function getNextAutoCallLead(params: {
             queue: "ALL",
             page,
             limit: 50,
+            autoCallEligible: true,
         }, options);
         const callableLead = leadPage.leads
             .filter((item) => !excludedLeadIds.has(item._id))
-            .filter((item) => !wasCommentedByEmployeeToday(item))
+            .filter((item) => isLeadEligibleForAutoCall(item, new Date(), params.employeeNames))
             .map((lead) => ({ lead, normalizedPhone: normalizePhoneForCall(lead.phone) }))
             .find((item) => Boolean(item.normalizedPhone));
 
@@ -684,6 +687,7 @@ export async function addLeadComment(
 type LeadActivityActorInput = {
     activityActorName?: string;
     activityActorType?: "admin" | "employee" | "system";
+    employeeId?: string;
 };
 
 export async function recordLeadCall(
@@ -842,6 +846,11 @@ export type LeadCallLogItem = {
     employeeTeam?: string;
     outcome?: LeadCallOutcome;
     calledAt?: string;
+    provider?: string;
+    providerSessionId?: string;
+    providerResult?: string;
+    verificationSource?: "manual" | "ringcentral";
+    durationSeconds?: number;
 };
 
 export type LeadCallStat = {
@@ -878,6 +887,8 @@ export type LeadCallSummaryLead = {
 export type EmployeeLeadCallSummary = {
     employeeId: string;
     employeeName: string;
+    crmBusinessId: string;
+    crmBusinessName: string;
     employeeRole: string;
     employeeTeam: string;
     totalCalls: number;

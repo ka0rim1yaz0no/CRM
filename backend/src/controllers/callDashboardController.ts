@@ -1,5 +1,6 @@
 import type { Request, Response } from "express";
 import { isConfiguredAdminCode } from "../config/adminUsers";
+import { autoCallDisabledReason, getCallProvider, isAutoCallDisabledForEmployee } from "../config/callProvider";
 import { Attendance } from "../models/Attendance";
 import { Employee } from "../models/Employee";
 import { getCallBridgeDeviceModel, getCallBridgeScheduleModel } from "../models/CallBridge";
@@ -27,17 +28,29 @@ export async function getCallDashboard(request: Request, response: Response) {
     settings.officialShiftStartTime || "23:00",
     settings.officialShiftEndTime || "08:00"
   );
+  const business = {
+    id: String(request.business?.id || ""),
+    name: String(request.business?.name || "Current business"),
+  };
 
   if (!employees.length) {
-    response.json({ generatedAt: now, shift, employees: [] });
+    response.json({ generatedAt: now, business, shift, employees: [] });
     return;
   }
 
   const employeeCodes = employees.map((employee) => employee.employeeCode).filter(Boolean);
+  const callProvider = getCallProvider();
+  const providerDeviceFilter = callProvider === "ringcentral"
+    ? { bridgeVersion: "ringcentral-api-v1" }
+    : { bridgeVersion: { $ne: "ringcentral-api-v1" } };
   const employeeIds = employees.map((employee) => employee._id);
   const attendanceFrom = new Date(shift.start.getTime() - 24 * 60 * 60 * 1000);
   const [devices, schedules, attendance, latestTransitionRows] = await Promise.all([
-    getCallBridgeDeviceModel().find({ employeeCode: { $in: employeeCodes }, businessIds: request.business?.id })
+    // A paired bridge belongs to the employee/device and stays valid when the
+    // employee changes CRM businesses. Older pairings may not list every newer
+    // business assignment, so filtering devices by businessIds creates a false
+    // "Call Bridge disconnected" status despite fresh heartbeats.
+    getCallBridgeDeviceModel().find({ employeeCode: { $in: employeeCodes }, ...providerDeviceFilter })
       .select("employeeCode state audioSessionActive nextivaProcessDetected lastSeenAt lastStateChangedAt")
       .lean(),
     getCallBridgeScheduleModel().find({ employeeCode: { $in: employeeCodes } })
@@ -85,15 +98,22 @@ export async function getCallDashboard(request: Request, response: Response) {
       offPhoneStartedAt: offPhone.activeStartedAt,
       now,
       shift,
+      provider: callProvider,
     });
+    const dashboardStatus = isAutoCallDisabledForEmployee(employee.employeeCode) &&
+      status.status === "ONLINE" && status.detail === "Ready to dial"
+      ? { ...status, detail: autoCallDisabledReason }
+      : status;
 
     return {
       employeeId: String(employee._id),
       employeeCode: employee.employeeCode,
       name: employee.name || employee.employeeCode,
+      businessId: business.id,
+      businessName: business.name,
       role: employee.role,
       team: employee.team,
-      ...status,
+      ...dashboardStatus,
       offPhoneCompletedMs: offPhone.completedMs,
       offPhoneActiveStartedAt: offPhone.activeStartedAt,
       offPhoneTotalMs: offPhone.totalMs,
@@ -101,5 +121,5 @@ export async function getCallDashboard(request: Request, response: Response) {
   }).sort((first, second) => first.name.localeCompare(second.name));
 
   response.set("Cache-Control", "no-store");
-  response.json({ generatedAt: now, shift, employees: rows });
+  response.json({ generatedAt: now, business, shift, employees: rows });
 }

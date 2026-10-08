@@ -37,6 +37,7 @@ const noisyBulkEventTypes = new Set([
 const trackingPausedAvailabilityStatuses = new Set(["BREAK", "LUNCH"]);
 const uploadRoot = path.resolve(process.cwd(), "uploads", "browser-screenshots");
 const extensionPackageFileName = "assistly-crm-activity-tracker.zip";
+const liveViewAgentPackageFileName = "assistly-live-view-agent.zip";
 
 function extensionKey() {
   return process.env.CRM_EXTENSION_KEY || "dev-crm-extension-key";
@@ -104,6 +105,14 @@ function extensionPackageCandidates() {
     path.resolve(process.cwd(), "..", "crmext", "dist", extensionPackageFileName),
     path.resolve(process.cwd(), "crmext", "dist", extensionPackageFileName),
     path.resolve(process.cwd(), "dist", extensionPackageFileName),
+  ];
+}
+
+function liveViewAgentPackageCandidates() {
+  return [
+    path.resolve(process.cwd(), "..", "liveview-agent", "dist", liveViewAgentPackageFileName),
+    path.resolve(process.cwd(), "liveview-agent", "dist", liveViewAgentPackageFileName),
+    path.resolve(process.cwd(), "dist", liveViewAgentPackageFileName),
   ];
 }
 
@@ -434,6 +443,22 @@ export async function downloadBrowserActivityExtension(_request: Request, respon
 
   response.status(404).json({
     message: "Extension package is not built yet. Run npm run extension:package, then try again.",
+  });
+}
+
+export async function downloadLiveViewAgent(_request: Request, response: Response) {
+  for (const packagePath of liveViewAgentPackageCandidates()) {
+    try {
+      await fs.access(packagePath);
+      response.download(packagePath, liveViewAgentPackageFileName);
+      return;
+    } catch {
+      // Try the next deployed layout.
+    }
+  }
+
+  response.status(404).json({
+    message: "Live View Agent package is not built yet. Run npm run live-view-agent:package, then try again.",
   });
 }
 

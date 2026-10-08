@@ -12,20 +12,15 @@ export async function syncEmployeeAvailabilityAcrossBusinesses(
   if (!normalizedEmployeeCode) return updatedEmployees;
 
   await runForEachBusiness(async (business) => {
-    await Employee.updateMany(
+    const employee = await Employee.findOneAndUpdate(
       { employeeCode: normalizedEmployeeCode, status: { $ne: "Archived" } },
       { $set: { availabilityStatus, availabilityStatusReason } },
-      { runValidators: true }
+      { returnDocument: "after", runValidators: true }
     );
 
-    const employees = await Employee.find(
-      { employeeCode: normalizedEmployeeCode, status: { $ne: "Archived" } },
-      { _id: 1 }
-    );
-
-    employees.forEach((employee) => {
+    if (employee) {
       updatedEmployees.push({ businessId: business.id, employeeId: String(employee._id) });
-    });
+    }
   });
 
   return updatedEmployees;

@@ -22,6 +22,7 @@ import AdminLayout from "../adminLayout";
 import {
     browserActivityExtensionPackageUrl,
     browserActivityWebStoreUrl,
+    liveViewAgentPackageUrl,
     clearBrowserActivityData,
     getBrowserActivityEvents,
     getBrowserActivityScreenshots,
@@ -31,7 +32,7 @@ import { getEmployeeSummaries } from "../../../api/employees";
 import { getSystemSettings } from "../../../api/systemSettings";
 import { backendOrigin } from "../../../lib/backendUrl";
 import { parsePhDateTimeInput, formatPhDateTime } from "../../../lib/dateTime";
-import { socket } from "../../../lib/socket";
+import { connectAuthenticatedSocket, socket } from "../../../lib/socket";
 
 const classificationFilters = ["ALL", "work", "non-work", "unknown"] as const;
 const trackerRefetchIntervalMs = 10_000;
@@ -424,10 +425,28 @@ export default function AdminTracker() {
             );
         };
         peer.onconnectionstatechange = () => {
-            if (["failed", "disconnected"].includes(peer.connectionState)) {
+            if (peer.connectionState === "failed") {
                 setLiveSession((session) =>
                     session?.requestId === requestId
-                        ? { ...session, status: "error", message: "Live connection was interrupted." }
+                        ? { ...session, status: "error", message: "Live connection failed. Start a new Live View request." }
+                        : session
+                );
+                return;
+            }
+
+            if (peer.connectionState === "disconnected") {
+                setLiveSession((session) =>
+                    session?.requestId === requestId
+                        ? { ...session, status: "connecting", message: "Live connection is reconnecting..." }
+                        : session
+                );
+                return;
+            }
+
+            if (["connected", "completed"].includes(peer.connectionState)) {
+                setLiveSession((session) =>
+                    session?.requestId === requestId
+                        ? { ...session, status: "live", message: "Entire-screen live share is active." }
                         : session
                 );
             }
@@ -472,12 +491,20 @@ export default function AdminTracker() {
             }
 
             cleanupLiveView(false);
+            const reasonMessages: Record<string, string> = {
+                "screen-share-ended": "Chrome ended the employee's screen capture.",
+                "employee-stopped": "The employee stopped Live View.",
+                "employee-left-crm": "The employee logged out or left the CRM session.",
+                "admin-stopped": "Live View was stopped by an administrator.",
+                failed: "The live connection failed.",
+                closed: "The live connection was closed.",
+            };
             setLiveSession((session) =>
                 session
                     ? {
                           ...session,
                           status: "ended",
-                          message: payload.reason === "screen-share-ended" ? "Employee stopped sharing their screen." : "Live screen share ended.",
+                          message: reasonMessages[payload.reason || ""] || "Live screen share ended.",
                       }
                     : session
             );
@@ -514,7 +541,7 @@ export default function AdminTracker() {
             setLiveSession((session) => (session ? { ...session, status: "error", message: payload.message || "Live share failed." } : session));
         };
 
-        socket.connect();
+        connectAuthenticatedSocket();
         socket.on("connect", registerPresence);
         socket.on("live-share:accepted", handleAccepted);
         socket.on("live-share:declined", handleDeclined);
@@ -571,12 +598,12 @@ export default function AdminTracker() {
             employeeId: selectedEmployee._id,
             employeeName: selectedEmployee.name,
             status: "requesting",
-            message: "Waiting for employee browser to start entire-screen capture...",
+            message: "Waiting for the employee to allow Live View...",
         };
 
         liveSessionRef.current = nextSession;
         setLiveSession(nextSession);
-        socket.connect();
+        connectAuthenticatedSocket();
         socket.emit("presence:register", { userType: "admin", adminName: "Admin" });
         socket.emit("live-share:request", {
             requestId,
@@ -589,7 +616,7 @@ export default function AdminTracker() {
             if (liveSessionRef.current?.requestId === requestId && liveSessionRef.current.status === "requesting") {
                 setLiveSession((session) =>
                     session?.requestId === requestId
-                        ? { ...session, status: "error", message: "No live stream yet. The employee must be logged into CRM and Chrome must allow automatic entire-screen capture." }
+                        ? { ...session, status: "error", message: "No response yet. The employee must be logged into CRM and click Allow Live View." }
                         : session
                 );
             }
@@ -682,6 +709,26 @@ export default function AdminTracker() {
                     >
                         <FiDownload className="size-4" aria-hidden="true" />
                         Get Extension
+                    </a>
+                </section>
+
+                <section className="flex flex-col gap-3 rounded-lg border border-emerald-100 bg-white p-4 shadow-sm sm:flex-row sm:items-center sm:justify-between">
+                    <div className="flex min-w-0 items-center gap-3">
+                        <span className="flex size-10 shrink-0 items-center justify-center rounded-lg bg-emerald-50 text-emerald-700">
+                            <FiMonitor className="size-5" aria-hidden="true" />
+                        </span>
+                        <div className="min-w-0">
+                            <h3 className="text-sm font-semibold text-slate-950">Live View Agent</h3>
+                            <p className="mt-1 truncate text-xs text-slate-500">Separate managed-browser installer; Call Bridge is not changed.</p>
+                        </div>
+                    </div>
+                    <a
+                        className="inline-flex h-10 shrink-0 items-center justify-center gap-2 rounded-lg bg-emerald-600 px-3 text-sm font-semibold text-white shadow-sm transition hover:bg-emerald-700"
+                        href={liveViewAgentPackageUrl}
+                        download
+                    >
+                        <FiDownload className="size-4" aria-hidden="true" />
+                        Get Live View Agent
                     </a>
                 </section>
 
@@ -926,7 +973,7 @@ export default function AdminTracker() {
                             }
                         }}
                     >
-                        <div className="flex max-h-[92vh] w-full max-w-[72rem] flex-col overflow-hidden rounded-lg border border-slate-200 bg-white shadow-2xl shadow-slate-950/30">
+                        <div className="flex h-[94vh] w-[96vw] max-w-[96rem] flex-col overflow-hidden rounded-lg border border-slate-200 bg-white shadow-2xl shadow-slate-950/30">
                             <div className="flex items-start justify-between gap-4 border-b border-slate-200 px-5 py-4">
                                 <div className="flex min-w-0 items-start gap-3">
                                     <span className="flex size-10 shrink-0 items-center justify-center rounded-lg bg-violet-50 text-violet-700">
@@ -936,7 +983,7 @@ export default function AdminTracker() {
                                         <p className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">Live View</p>
                                         <h3 className="mt-1 text-lg font-semibold text-slate-950">Employee screen share</h3>
                                         <p className="mt-1 text-sm leading-6 text-slate-500">
-                                            Starts an entire-screen live capture request on the employee CRM session. Managed Chrome must allow automatic capture for no-prompt sharing.
+                                            Requests an entire-screen live view from the employee CRM session. The employee must allow the request before sharing starts.
                                         </p>
                                     </div>
                                 </div>
@@ -950,7 +997,7 @@ export default function AdminTracker() {
                                 </button>
                             </div>
 
-                            <div className="grid min-h-0 flex-1 gap-4 overflow-y-auto p-5 xl:grid-cols-[18rem_minmax(0,1fr)]">
+                            <div className="grid min-h-0 flex-1 gap-4 overflow-y-auto p-5 xl:grid-cols-[15rem_minmax(0,1fr)]">
                                 <aside className="space-y-3">
                                     <label className="block">
                                         <span className="mb-2 block text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">Employee</span>
@@ -1012,11 +1059,11 @@ export default function AdminTracker() {
                                     )}
                                 </aside>
 
-                                <div className="min-h-[28rem] overflow-hidden rounded-lg border border-slate-200 bg-slate-950">
+                                <div className="min-h-[32rem] overflow-hidden rounded-lg border border-slate-200 bg-slate-950 xl:min-h-0">
                                     {liveSession?.status === "live" || liveSession?.status === "connecting" ? (
-                                        <video ref={liveVideoRef} className="aspect-video h-full min-h-[28rem] w-full bg-slate-950 object-contain" autoPlay playsInline muted />
+                                        <video ref={liveVideoRef} className="aspect-video h-full min-h-[32rem] w-full bg-slate-950 object-contain xl:min-h-0" autoPlay playsInline muted />
                                     ) : (
-                                        <div className="flex aspect-video min-h-[28rem] flex-col items-center justify-center gap-3 bg-slate-100 p-6 text-center">
+                                        <div className="flex aspect-video h-full min-h-[32rem] flex-col items-center justify-center gap-3 bg-slate-100 p-6 text-center xl:min-h-0">
                                             <span className="flex size-12 items-center justify-center rounded-full bg-white text-slate-500 shadow-sm">
                                                 <FiVideoOff className="size-5" aria-hidden="true" />
                                             </span>

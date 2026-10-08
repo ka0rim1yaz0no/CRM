@@ -230,6 +230,23 @@ async function hasCurrentBusinessAccess(employee: { employeeCode?: unknown; busi
   return accessBusinessIds.includes(getCurrentBusinessId());
 }
 
+async function syncSharedEmployeeFields(
+  employeeCode: string,
+  fallbackBusinessAccessIds: unknown,
+  fields: Record<string, unknown>
+) {
+  const controlledBusinessIds = await getBusinessAccessForEmployeeCode(employeeCode);
+  const businessIds = validBusinessAccessIds(
+    controlledBusinessIds.length ? controlledBusinessIds : fallbackBusinessAccessIds
+  );
+
+  for (const businessId of businessIds) {
+    await runWithBusiness(businessId, async () => {
+      await Employee.updateOne({ employeeCode }, { $set: fields }, { runValidators: true });
+    });
+  }
+}
+
 export async function listEmployees(request: Request, response: Response) {
   const isSummary = String(request.query.summary || "").toLowerCase() === "true";
   const includeArchived = String(request.query.includeArchived || "").toLowerCase() === "true";
@@ -334,6 +351,9 @@ export async function updateEmployeeProfile(request: Request, response: Response
     contactRelationship: toText(request.body.contactRelationship),
     emergencyContactNumber: toText(request.body.emergencyContactNumber),
     personalNotes: toText(request.body.personalNotes),
+    bankName: toText(request.body.bankName),
+    bankAccountName: toText(request.body.bankAccountName),
+    bankAccountNumber: toText(request.body.bankAccountNumber),
   };
 
   const employee = await Employee.findByIdAndUpdate(
@@ -347,6 +367,8 @@ export async function updateEmployeeProfile(request: Request, response: Response
     return;
   }
 
+  await syncSharedEmployeeFields(employee.employeeCode, employee.businessAccessIds, profilePayload);
+
   response.json({
     message: "Personal details saved successfully.",
     employee: withNormalizedAvailability(employee.toObject()),
@@ -358,7 +380,6 @@ export async function updateEmployeeBankDetails(request: Request, response: Resp
     bankName: toText(request.body.bankName),
     bankAccountName: toText(request.body.bankAccountName),
     bankAccountNumber: toText(request.body.bankAccountNumber),
-    bankRoutingNumber: toText(request.body.bankRoutingNumber),
   };
 
   const employee = await Employee.findByIdAndUpdate(
@@ -371,6 +392,8 @@ export async function updateEmployeeBankDetails(request: Request, response: Resp
     response.status(404).json({ message: "Employee not found" });
     return;
   }
+
+  await syncSharedEmployeeFields(employee.employeeCode, employee.businessAccessIds, bankPayload);
 
   response.json(withNormalizedAvailability(employee.toObject()));
 }

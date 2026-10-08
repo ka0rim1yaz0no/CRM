@@ -34,6 +34,8 @@ import { callBridgeRouter } from "./routes/callBridgeRoutes";
 import { callDashboardRouter } from "./routes/callDashboardRoutes";
 import { tomTomQuotaRouter } from "./routes/tomTomQuotaRoutes";
 import { businessContextMiddleware, createBusiness, getPublicBusinesses, updateBusinessDisplayName } from "./config/tenancy";
+import { publicSurveyRouter } from "./routes/publicSurveyRoutes";
+import { employeeEvaluationRouter } from "./routes/employeeEvaluationRoutes";
 
 const appDirectory = path.dirname(fileURLToPath(import.meta.url));
 const backendRootDirectory = path.resolve(appDirectory, "..");
@@ -176,6 +178,7 @@ export function createApp() {
   });
 
   app.use("/api/tomtom-quota", tomTomQuotaRouter);
+  app.use("/api/public/surveys", publicSurveyRouter);
 
   app.use("/api", businessContextMiddleware);
 
@@ -198,6 +201,7 @@ export function createApp() {
   app.use("/api/knowledge-base", knowledgeBaseRouter);
   app.use("/api/credentials", credentialRouter);
   app.use("/api/payroll", payrollRouter);
+  app.use("/api/evaluations", employeeEvaluationRouter);
   app.use("/api/reports", reportRouter);
   app.use("/api/messages", messageRouter);
   app.use("/api/browser-activity", browserActivityRouter);

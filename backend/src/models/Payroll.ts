@@ -12,6 +12,16 @@ export type PayrollRecordDocument = {
   department: string;
   payType: PayrollPayType;
   grossPay: number;
+  basicPay: number;
+  workingDays: number;
+  minuteRate: number;
+  lateMinutes: number;
+  excessLunchMinutes: number;
+  excessBreakMinutes: number;
+  absenceMinutes: number;
+  earlyTimeOutMinutes: number;
+  deductibleMinutes: number;
+  incompleteShiftDays: number;
   deductions: number;
   netPay: number;
   attendanceDays: number;
@@ -47,6 +57,16 @@ const payrollRecordSchema = new Schema<PayrollRecordDocument>(
     department: { type: String, required: true, trim: true },
     payType: { type: String, enum: ["Monthly", "Semi-monthly", "Weekly", "Hourly", "Contract"], required: true, trim: true, default: "Semi-monthly" },
     grossPay: { type: Number, required: true, min: 0 },
+    basicPay: { type: Number, min: 0, default: 0 },
+    workingDays: { type: Number, min: 0, default: 0 },
+    minuteRate: { type: Number, min: 0, default: 0 },
+    lateMinutes: { type: Number, min: 0, default: 0 },
+    excessLunchMinutes: { type: Number, min: 0, default: 0 },
+    excessBreakMinutes: { type: Number, min: 0, default: 0 },
+    absenceMinutes: { type: Number, min: 0, default: 0 },
+    earlyTimeOutMinutes: { type: Number, min: 0, default: 0 },
+    deductibleMinutes: { type: Number, min: 0, default: 0 },
+    incompleteShiftDays: { type: Number, min: 0, default: 0 },
     deductions: { type: Number, required: true, min: 0 },
     netPay: { type: Number, required: true, min: 0 },
     attendanceDays: { type: Number, min: 0, default: 0 },

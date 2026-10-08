@@ -1,4 +1,5 @@
 export const APP_TIME_ZONE = "America/Chicago";
+export const LEAD_SCHEDULE_TIME_ZONE = "America/New_York";
 const CDT_OFFSET_MS = 5 * 60 * 60 * 1000;
 
 const dateTimeFormatter = new Intl.DateTimeFormat("en-US", {
@@ -50,6 +51,53 @@ function makeFormatter(options: Intl.DateTimeFormatOptions) {
     return new Intl.DateTimeFormat("en-US", options);
 }
 
+function zonedDateTimeParts(value: Date, timeZone: string) {
+    const parts = new Intl.DateTimeFormat("en-CA", {
+        timeZone,
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        hourCycle: "h23",
+    }).formatToParts(value);
+    const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+
+    return {
+        year: Number(values.year),
+        month: Number(values.month),
+        day: Number(values.day),
+        hour: Number(values.hour === "24" ? "00" : values.hour),
+        minute: Number(values.minute),
+    };
+}
+
+function zonedDateTimeToUtc(
+    year: number,
+    month: number,
+    day: number,
+    hour: number,
+    minute: number,
+    timeZone: string
+) {
+    const requestedWallClock = Date.UTC(year, month - 1, day, hour, minute);
+    let utcTime = requestedWallClock;
+
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+        const actual = zonedDateTimeParts(new Date(utcTime), timeZone);
+        const actualWallClock = Date.UTC(actual.year, actual.month - 1, actual.day, actual.hour, actual.minute);
+        const adjustment = requestedWallClock - actualWallClock;
+
+        if (adjustment === 0) {
+            return new Date(utcTime);
+        }
+
+        utcTime += adjustment;
+    }
+
+    return null;
+}
+
 export function formatCstDateTime(value?: Date | string | null) {
     if (!value) {
         return "";
@@ -75,6 +123,67 @@ export function formatCstTime(value?: Date | string | null) {
 
     const date = new Date(value);
     return Number.isNaN(date.getTime()) ? "" : `${timeFormatter.format(new Date(date.getTime() - CDT_OFFSET_MS))} CDT`;
+}
+
+export function formatLeadScheduleDateTime(value?: Date | string | null) {
+    if (!value) {
+        return "";
+    }
+
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return "";
+
+    return makeFormatter({
+        timeZone: LEAD_SCHEDULE_TIME_ZONE,
+        month: "short",
+        day: "numeric",
+        year: "numeric",
+        hour: "numeric",
+        minute: "2-digit",
+        timeZoneName: "short",
+    }).format(date);
+}
+
+export function formatLeadScheduleDate(value?: Date | string | null) {
+    return formatDateInTimeZone(value, LEAD_SCHEDULE_TIME_ZONE);
+}
+
+export function formatLeadScheduleDateTimeInput(value?: Date | string | null) {
+    if (!value) {
+        return "";
+    }
+
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return "";
+    const parts = zonedDateTimeParts(date, LEAD_SCHEDULE_TIME_ZONE);
+
+    return [
+        String(parts.year).padStart(4, "0"),
+        String(parts.month).padStart(2, "0"),
+        String(parts.day).padStart(2, "0"),
+    ].join("-") + `T${String(parts.hour).padStart(2, "0")}:${String(parts.minute).padStart(2, "0")}`;
+}
+
+export function getCurrentLeadScheduleDateTimeInput() {
+    return formatLeadScheduleDateTimeInput(new Date());
+}
+
+export function parseLeadScheduleDateTimeInput(value: string) {
+    const match = value.trim().match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/);
+
+    if (!match) {
+        return null;
+    }
+
+    const [, year, month, day, hour, minute] = match;
+    return zonedDateTimeToUtc(
+        Number(year),
+        Number(month),
+        Number(day),
+        Number(hour),
+        Number(minute),
+        LEAD_SCHEDULE_TIME_ZONE
+    );
 }
 
 export function formatPhDate(value?: Date | string | null) {

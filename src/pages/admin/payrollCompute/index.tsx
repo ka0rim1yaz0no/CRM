@@ -32,10 +32,14 @@ function computePayroll(record: PayrollRecord) {
     const approvedOtHours = Number(record.overtimeHours || 0);
     const grossPay = Number(record.grossPay || 0);
     const deductions = Number(record.deductions || 0);
-    const hourlyRate = scheduledHours > 0 ? grossPay / (scheduledHours + approvedOtHours) : 0;
-    const workingDays = scheduledHours > 0 ? scheduledHours / regularHoursPerDay : 0;
+    const basePay = Number(record.basicPay ?? grossPay);
+    const workingDays = Number(record.workingDays || 0);
+    const hourlyRate = Number(record.minuteRate || 0) > 0
+        ? Number(record.minuteRate) * 60
+        : workingDays > 0
+            ? (basePay * 2) / workingDays / regularHoursPerDay
+            : 0;
     const dailyRate = hourlyRate * regularHoursPerDay;
-    const basePay = hourlyRate * scheduledHours;
     const approvedOtPay = hourlyRate * approvedOtHours;
     const deductionHours = hourlyRate > 0 ? deductions / hourlyRate : 0;
     const netPay = grossPay - deductions;
@@ -68,9 +72,10 @@ function renderRecord({ record, dtr }: PayrollComputeRow) {
         "",
         "PAY RATE",
         `Scheduled hours = ${round(computed.scheduledHours)}h`,
-        `Working days = ${round(computed.scheduledHours)} scheduled hours / ${regularHoursPerDay}h = ${round(computed.workingDays)} days`,
-        `Basic pay = ${money(computed.basePay)}`,
-        `Daily rate = ${money(computed.basePay)} / ${round(computed.workingDays)} days = ${money(computed.dailyRate)}`,
+        `Monthly-cycle working days = ${round(computed.workingDays)} days`,
+        `Cutoff basic pay = ${money(computed.basePay)}`,
+        `Monthly salary = ${money(computed.basePay)} x 2 = ${money(computed.basePay * 2)}`,
+        `Daily rate = ${money(computed.basePay * 2)} / ${round(computed.workingDays)} days = ${money(computed.dailyRate)}`,
         `Hourly rate = ${money(computed.dailyRate)} / ${regularHoursPerDay}h = ${money(computed.hourlyRate)}`,
         "",
         "EARNINGS",

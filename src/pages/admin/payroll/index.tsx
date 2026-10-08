@@ -38,6 +38,7 @@ import {
     restorePayrollRecord,
     runPayroll,
     updatePayrollOvertime,
+    updateEmployeeBasicPay,
     type PayrollItemCategory,
     type PayrollDtrRow,
     type PayrollListItem,
@@ -64,7 +65,6 @@ const emptyBankForm = {
     bankName: "",
     bankAccountName: "",
     bankAccountNumber: "",
-    bankRoutingNumber: "",
 };
 
 const emptyItemForm = {
@@ -114,6 +114,8 @@ function StatusBadge({ status }: { status: string }) {
 
 function dtrStatusClass(status: PayrollDtrRow["status"]) {
     if (status === "Overtime") return "border-violet-300 bg-violet-50 text-violet-700";
+    if (status === "In Progress") return "border-sky-300 bg-sky-50 text-sky-700";
+    if (status === "Needs Review") return "border-orange-300 bg-orange-50 text-orange-700";
     if (status === "Late") return "border-rose-300 bg-rose-50 text-rose-700";
     if (status === "Present") return "border-emerald-300 bg-emerald-50 text-emerald-700";
     if (status === "Weekend") return "border-slate-300 bg-slate-100 text-slate-600";
@@ -166,12 +168,6 @@ type PayslipCutoffOption = {
     payDate: string;
 };
 
-type PayrollCutoffRange = {
-    startDay: number;
-    endDay: number;
-    payDay: number;
-};
-
 function formatPeriodDate(date: Date) {
     return date.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
 }
@@ -192,35 +188,34 @@ function sanitizeCutoffDay(value: number | undefined, fallback: number) {
     return Math.min(Math.max(Math.round(value ?? fallback), 1), 31);
 }
 
-function payrollCutoffRanges(settings?: SystemSettings): PayrollCutoffRange[] {
-    return [
-        {
-            startDay: sanitizeCutoffDay(settings?.payrollFirstCutoffStartDay, 6),
-            endDay: sanitizeCutoffDay(settings?.payrollFirstCutoffEndDay, 20),
-            payDay: sanitizeCutoffDay(settings?.payrollFirstCutoffPayDay, 25),
-        },
-        {
-            startDay: sanitizeCutoffDay(settings?.payrollSecondCutoffStartDay, 21),
-            endDay: sanitizeCutoffDay(settings?.payrollSecondCutoffEndDay, 5),
-            payDay: sanitizeCutoffDay(settings?.payrollSecondCutoffPayDay, 10),
-        },
-    ];
+function payrollCutoffOption(year: number, month: number, startDay: number, endDay: number, payDay: number): PayslipCutoffOption {
+    const crossesMonth = startDay > endDay;
+    const start = new Date(year, month, clampCalendarDay(startDay, year, month));
+    const endMonth = crossesMonth ? month + 1 : month;
+    const end = new Date(year, endMonth, clampCalendarDay(endDay, year, endMonth));
+    const payDateMonth = payDay < end.getDate() ? end.getMonth() + 1 : end.getMonth();
+    const payDate = new Date(end.getFullYear(), payDateMonth, clampCalendarDay(payDay, end.getFullYear(), payDateMonth));
+    const value = `${formatPeriodDate(start)} - ${formatPeriodDate(end)}`;
+    return { value, label: value, payDate: formatPeriodDate(payDate) };
 }
 
-function cutoffOptionFromStartMonth(range: PayrollCutoffRange, year: number, month: number): PayslipCutoffOption {
-    const crossesMonth = range.startDay > range.endDay;
-    const start = new Date(year, month, clampCalendarDay(range.startDay, year, month));
-    const endMonth = crossesMonth ? month + 1 : month;
-    const end = new Date(year, endMonth, clampCalendarDay(range.endDay, year, endMonth));
-    const payDateMonth = range.payDay < end.getDate() ? end.getMonth() + 1 : end.getMonth();
-    const payDate = new Date(end.getFullYear(), payDateMonth, clampCalendarDay(range.payDay, end.getFullYear(), payDateMonth));
-    const value = `${formatPeriodDate(start)} - ${formatPeriodDate(end)}`;
-
-    return {
-        value,
-        label: value,
-        payDate: formatPeriodDate(payDate),
-    };
+function semiMonthlyPayrollOptions(year: number, month: number, settings?: SystemSettings) {
+    return [
+        payrollCutoffOption(
+            year,
+            month,
+            sanitizeCutoffDay(settings?.payrollFirstCutoffStartDay, 6),
+            sanitizeCutoffDay(settings?.payrollFirstCutoffEndDay, 20),
+            sanitizeCutoffDay(settings?.payrollFirstCutoffPayDay, 25)
+        ),
+        payrollCutoffOption(
+            year,
+            month,
+            sanitizeCutoffDay(settings?.payrollSecondCutoffStartDay, 21),
+            sanitizeCutoffDay(settings?.payrollSecondCutoffEndDay, 5),
+            sanitizeCutoffDay(settings?.payrollSecondCutoffPayDay, 10)
+        ),
+    ];
 }
 
 function weeklyCutoffOptions(reference: Date, weeks = 8): PayslipCutoffOption[] {
@@ -257,13 +252,11 @@ function payslipCutoffOptions(record: PayrollRecord | null, settings?: SystemSet
     const options =
         settings?.payrollBillingCycle === "Weekly"
             ? weeklyCutoffOptions(baseReference, Math.max(52, weeksBetween(baseReference, oldestReference) + 8))
-            : payrollCutoffRanges(settings)
-                  .flatMap((range) =>
-                      Array.from({ length: Math.max(24, monthsBetween(baseReference, oldestReference) + 8) }, (_, index) => {
-                          const month = new Date(baseReference.getFullYear(), baseReference.getMonth() - index, 1);
-                          return cutoffOptionFromStartMonth(range, month.getFullYear(), month.getMonth());
-                      })
-                  )
+            : Array.from({ length: Math.max(24, monthsBetween(baseReference, oldestReference) + 8) }, (_, index) => {
+                  const month = new Date(baseReference.getFullYear(), baseReference.getMonth() - index, 1);
+                  return semiMonthlyPayrollOptions(month.getFullYear(), month.getMonth(), settings);
+              })
+                  .flat()
                   .filter((option) => (parsePayPeriodStart(option.value)?.getTime() || 0) <= baseReferenceTime)
                   .sort((first, second) => parsePayPeriodStart(second.value)!.getTime() - parsePayPeriodStart(first.value)!.getTime());
     const uniqueOptions = Array.from(new Map(options.map((option) => [option.value, option])).values());
@@ -375,17 +368,33 @@ function PayslipDocument({
 }) {
     const payDate = record.paidOn && record.paidOn !== "-" ? record.paidOn : new Date().toLocaleDateString("en-US");
     const attendanceDays = record.attendanceDays ?? 0;
-    const workingDays = workingDaysForPayPeriod(record.payPeriod, attendanceDays, payrollRunDay);
+    const workingDays = record.workingDays ?? workingDaysForPayPeriod(record.payPeriod, attendanceDays, payrollRunDay);
     const absentDays = record.absentDays ?? Math.max(workingDays - attendanceDays, 0);
     const lateHours = record.lateHours ?? 0;
-    const workedHours = record.workedHours ?? 0;
     const overtimeHours = record.overtimeHours ?? 0;
-    const scheduledHours = record.scheduledHours ?? 0;
-    const payableWorkedHours = Math.min(workedHours, scheduledHours);
-    const missingHours = Math.round(Math.max(scheduledHours - payableWorkedHours, 0) * 100) / 100;
-    const hourlyRate = scheduledHours > 0 ? record.grossPay / (scheduledHours + overtimeHours) : 0;
-    const basePay = Math.round(hourlyRate * scheduledHours * 100) / 100;
-    const overtimePay = Math.max(0, Math.round(hourlyRate * overtimeHours * 100) / 100);
+    const basePay = record.basicPay ?? record.grossPay;
+    const minuteRate = record.minuteRate ?? (workingDays > 0 ? (basePay * 2) / workingDays / 8 / 60 : 0);
+    const hourlyRate = minuteRate * 60;
+    const overtimePay = Math.max(0, Math.round((record.grossPay - basePay) * 100) / 100);
+    const deductionMinutes = [
+        { label: "Late", minutes: record.lateMinutes ?? Math.round(lateHours * 60) },
+        { label: "Excess lunch", minutes: record.excessLunchMinutes ?? 0 },
+        { label: "Excess break", minutes: record.excessBreakMinutes ?? 0 },
+        { label: "Undertime", minutes: record.earlyTimeOutMinutes ?? 0 },
+        { label: "Absence", minutes: record.absenceMinutes ?? 0 },
+    ];
+    const totalDeductionMinutes = deductionMinutes.reduce((sum, item) => sum + item.minutes, 0);
+    const lastDeductionIndex = deductionMinutes.reduce((last, item, index) => item.minutes > 0 ? index : last, -1);
+    let allocatedDeductions = 0;
+    const deductionRows = deductionMinutes.map((item, index) => {
+        const amount = totalDeductionMinutes === 0
+            ? 0
+            : index === lastDeductionIndex
+                ? Math.round((record.deductions - allocatedDeductions) * 100) / 100
+                : Math.round((record.deductions * item.minutes / totalDeductionMinutes) * 100) / 100;
+        allocatedDeductions += amount;
+        return { ...item, amount };
+    });
 
     return (
         <div className="payslip-print bg-white p-8 text-[11px] leading-tight text-slate-950">
@@ -424,7 +433,7 @@ function PayslipDocument({
                         ["Working Days", String(workingDays)],
                         ["Days Present", String(attendanceDays)],
                         ["Absent", formatDays(absentDays)],
-                        ["Late", formatHoursMinutes(lateHours)],
+                        ["Late", `${record.lateMinutes ?? Math.round(lateHours * 60)} min`],
                         ["Approved OT Hours", formatHoursMinutes(overtimeHours)],
                         ["Hourly Rate", money(hourlyRate)],
                     ].map(([label, value]) => (
@@ -469,12 +478,14 @@ function PayslipDocument({
                             </tr>
                         </thead>
                         <tbody>
-                            <tr>
-                                <td className="border border-slate-200 px-3 py-2">Attendance deductions ({formatHoursMinutes(missingHours)})</td>
-                                <td className="border border-slate-200 px-3 py-2 text-right font-semibold">{money(record.deductions)}</td>
-                            </tr>
+                            {deductionRows.map((item) => (
+                                <tr key={item.label}>
+                                    <td className="border border-slate-200 px-3 py-2">{item.label} ({item.minutes} min)</td>
+                                    <td className="border border-slate-200 px-3 py-2 text-right font-semibold">{money(item.amount)}</td>
+                                </tr>
+                            ))}
                             <tr className="bg-slate-50">
-                                <td className="border border-slate-200 px-3 py-2 font-bold">Total Deductions</td>
+                                <td className="border border-slate-200 px-3 py-2 font-bold">Total Deductions ({record.deductibleMinutes ?? 0} min)</td>
                                 <td className="border border-slate-200 px-3 py-2 text-right font-bold">{money(record.deductions)}</td>
                             </tr>
                         </tbody>
@@ -594,6 +605,8 @@ export default function PayrollPage() {
     const [selectedRecordIds, setSelectedRecordIds] = useState<string[]>([]);
     const [bankEditEmployee, setBankEditEmployee] = useState<Employee | null>(null);
     const [bankForm, setBankForm] = useState(emptyBankForm);
+    const [basicPayTarget, setBasicPayTarget] = useState<PayrollRecord | null>(null);
+    const [basicPayInput, setBasicPayInput] = useState("");
 
     const itemCategory = activeTab === "Employee Payroll" || activeTab === "Bank Accounts" || activeTab === "Archived" ? undefined : (activeTab as PayrollItemCategory);
 
@@ -669,6 +682,15 @@ export default function PayrollPage() {
             workedHours: payslipDtr.summary.workedHours,
             overtimeHours: payslipDtr.summary.overtimeHours,
             scheduledHours: payslipDtr.summary.scheduledHours,
+            basicPay: payslipDtr.summary.basicPay,
+            workingDays: payslipDtr.summary.monthlyWorkingDays,
+            minuteRate: payslipDtr.summary.minuteRate,
+            lateMinutes: payslipDtr.summary.lateMinutes,
+            excessLunchMinutes: payslipDtr.summary.excessLunchMinutes,
+            excessBreakMinutes: payslipDtr.summary.excessBreakMinutes,
+            absenceMinutes: payslipDtr.summary.absenceMinutes,
+            earlyTimeOutMinutes: payslipDtr.summary.earlyTimeOutMinutes,
+            deductibleMinutes: payslipDtr.summary.deductibleMinutes,
             paidOn: payslipDtr.payDate,
             payPeriod: payslipDtr.payPeriod,
         };
@@ -680,6 +702,14 @@ export default function PayrollPage() {
         onSuccess: (record) => {
             refreshPayroll();
             setDtrRecord(record);
+        },
+    });
+    const updateBasicPayMutation = useMutation({
+        mutationFn: ({ employeeId, basicPay }: { employeeId: string; basicPay: number }) => updateEmployeeBasicPay(employeeId, basicPay),
+        onSuccess: () => {
+            refreshPayroll();
+            setBasicPayTarget(null);
+            setBasicPayInput("");
         },
     });
     const archiveRecordMutation = useMutation({ mutationFn: archivePayrollRecord, onSuccess: () => { refreshPayroll(); closeDeletePrompt(); } });
@@ -845,7 +875,6 @@ export default function PayrollPage() {
             bankName: employee.bankName || "",
             bankAccountName: employee.bankAccountName || "",
             bankAccountNumber: employee.bankAccountNumber || "",
-            bankRoutingNumber: employee.bankRoutingNumber || "",
         });
     };
 
@@ -1072,7 +1101,8 @@ export default function PayrollPage() {
                                                 />
                                             </th>
                                             <th className="w-[24%] px-3 py-3"><DataTableSortHeader field="employeeName" sortBy={sortBy} sortDir={sortDir} onSort={changeSort}>Employee</DataTableSortHeader></th>
-                                            <th className="w-[14%] px-3 py-3"><DataTableSortHeader field="employeeId" sortBy={sortBy} sortDir={sortDir} onSort={changeSort}>Employee ID</DataTableSortHeader></th>
+                                            <th className="w-[12%] px-3 py-3"><DataTableSortHeader field="employeeId" sortBy={sortBy} sortDir={sortDir} onSort={changeSort}>Employee ID</DataTableSortHeader></th>
+                                            <th className="w-[10%] px-3 py-3">Basic Pay</th>
                                             <th className="w-[6%] px-3 py-3">Days</th>
                                             <th className="w-[7%] px-3 py-3">Hours</th>
                                             <th className="w-[10%] px-3 py-3"><DataTableSortHeader field="netPay" sortBy={sortBy} sortDir={sortDir} onSort={changeSort}>Net Pay</DataTableSortHeader></th>
@@ -1081,9 +1111,9 @@ export default function PayrollPage() {
                                         </tr>
                                     </thead>
                                     <tbody className="divide-y divide-slate-200">
-                                        {isPayrollLoading && <tr><td className="px-3 py-4 text-sm !text-slate-500" colSpan={8}>Loading payroll...</td></tr>}
-                                        {isPayrollError && <tr><td className="px-3 py-4 text-sm text-red-600" colSpan={8}>Unable to load payroll.</td></tr>}
-                                        {!isPayrollLoading && !isPayrollError && visibleEmployees.length === 0 && <tr><td className="px-3 py-4 text-sm !text-slate-500" colSpan={8}>No payroll records found.</td></tr>}
+                                        {isPayrollLoading && <tr><td className="px-3 py-4 text-sm !text-slate-500" colSpan={9}>Loading payroll...</td></tr>}
+                                        {isPayrollError && <tr><td className="px-3 py-4 text-sm text-red-600" colSpan={9}>Unable to load payroll.</td></tr>}
+                                        {!isPayrollLoading && !isPayrollError && visibleEmployees.length === 0 && <tr><td className="px-3 py-4 text-sm !text-slate-500" colSpan={9}>No payroll records found.</td></tr>}
                                         {visibleEmployees.map((employee) => {
                                             const initials = employee.employeeName.split(" ").map((part) => part[0]).join("").slice(0, 2).toUpperCase();
 
@@ -1120,12 +1150,16 @@ export default function PayrollPage() {
                                                         </div>
                                                     </td>
                                                     <td className="truncate px-3 py-2.5 !text-slate-700">{employee.employeeId}</td>
+                                                    <td className="px-3 py-2.5 font-semibold !text-slate-950">{money(employee.basicPay ?? employee.grossPay)}</td>
                                                     <td className="px-3 py-2.5 !text-slate-700">{employee.attendanceDays ?? 0}</td>
                                                     <td className="px-3 py-2.5 !text-slate-700">{employee.workedHours ?? 0}h</td>
                                                     <td className="px-3 py-2.5 font-semibold !text-slate-950">{money(employee.netPay)}</td>
                                                     <td className="px-3 py-2.5"><StatusBadge status={employee.status} /></td>
                                                     <td className="px-3 py-2.5 text-center" onClick={(event) => event.stopPropagation()}>
                                                         <div className="flex flex-nowrap justify-center gap-0.5">
+                                                            <button className="inline-flex size-7 items-center justify-center rounded-md !text-slate-600 transition hover:bg-slate-100 hover:!text-slate-950" type="button" onClick={() => { setBasicPayTarget(employee); setBasicPayInput(String(employee.basicPay ?? employee.grossPay ?? 0)); }} aria-label={`Edit basic pay for ${employee.employeeName}`} title="Edit basic pay">
+                                                                <FiEdit2 className="size-3.5" />
+                                                            </button>
                                                             <button className="inline-flex size-7 items-center justify-center rounded-md !text-[#2563eb] transition hover:bg-[#2563eb]/10 hover:!text-[#1d4ed8]" type="button" onClick={() => setDtrRecord(employee)} aria-label={`View DTR for ${employee.employeeName}`} title="View DTR">
                                                                 <FiClock className="size-3.5" />
                                                             </button>
@@ -1364,14 +1398,22 @@ export default function PayrollPage() {
                                     <div className="space-y-4">
                                         <div className="grid gap-3 md:grid-cols-4">
                                             {[
-                                                ["Working Days", employeeDtr.summary.workingDays],
+                                                ["Cutoff Working Days", employeeDtr.summary.workingDays],
+                                                ["Monthly Rate Days", employeeDtr.summary.monthlyWorkingDays],
+                                                ["Basic Pay", money(employeeDtr.summary.basicPay)],
                                                 ["Days Present", employeeDtr.summary.attendanceDays],
                                                 ["Absent", formatDays(employeeDtr.summary.absentDays)],
-                                                ["Late", formatHoursMinutes(employeeDtr.summary.lateHours)],
+                                                ["Late", `${employeeDtr.summary.lateMinutes} min`],
+                                                ["Excess Lunch", `${employeeDtr.summary.excessLunchMinutes} min`],
+                                                ["Excess Break", `${employeeDtr.summary.excessBreakMinutes} min`],
+                                                ["Absence", `${employeeDtr.summary.absenceMinutes} min`],
+                                                ["Early Time Out", `${employeeDtr.summary.earlyTimeOutMinutes} min`],
+                                                ["Needs Review", employeeDtr.summary.incompleteShiftDays],
                                                 ["Regular Hours", formatHoursMinutes(employeeDtr.summary.workedHours)],
                                                 ["Potential OT", formatHoursMinutes(employeeDtr.summary.overtimeHours)],
                                                 ["Approved OT", formatHoursMinutes(dtrRecord.overtimeHours || 0)],
                                                 ["Hourly Rate", money(employeeDtr.summary.hourlyRate)],
+                                                ["Per Minute", money(employeeDtr.summary.minuteRate)],
                                                 ["Deductions", money(employeeDtr.summary.deductions)],
                                                 ["Net Pay", money(employeeDtr.summary.netPay)],
                                             ].map(([label, value]) => (
@@ -1396,7 +1438,10 @@ export default function PayrollPage() {
                                                             <th className="px-3 py-3 text-right">Regular</th>
                                                             <th className="px-3 py-3 text-right">Potential OT</th>
                                                             <th className="px-3 py-3 text-right">Late</th>
-                                                            <th className="px-3 py-3 text-right">Missing</th>
+                                                            <th className="px-3 py-3 text-right">Lunch Over</th>
+                                                            <th className="px-3 py-3 text-right">Break Over</th>
+                                                            <th className="px-3 py-3 text-right">Absent</th>
+                                                            <th className="px-3 py-3 text-right">Early Out</th>
                                                         </tr>
                                                     </thead>
                                                     <tbody className="divide-y divide-slate-200 bg-white">
@@ -1416,7 +1461,10 @@ export default function PayrollPage() {
                                                                 <td className="px-3 py-3 text-right !text-black">{row.regularHours}h</td>
                                                                 <td className="px-3 py-3 text-right font-semibold text-violet-700">{row.overtimeHours}h</td>
                                                                 <td className="px-3 py-3 text-right font-semibold text-rose-700">{formatHoursMinutes(row.lateHours)}</td>
-                                                                <td className="px-3 py-3 text-right font-semibold text-amber-700">{row.missingHours}h</td>
+                                                                <td className="px-3 py-3 text-right font-semibold text-amber-700">{row.excessLunchMinutes} min</td>
+                                                                <td className="px-3 py-3 text-right font-semibold text-amber-700">{row.excessBreakMinutes} min</td>
+                                                                <td className="px-3 py-3 text-right font-semibold text-rose-700">{row.absenceMinutes} min</td>
+                                                                <td className="px-3 py-3 text-right font-semibold text-rose-700">{row.earlyTimeOutMinutes} min</td>
                                                             </tr>
                                                         ))}
                                                     </tbody>
@@ -1633,7 +1681,6 @@ export default function PayrollPage() {
                                     ["Bank name", "bankName"],
                                     ["Account name", "bankAccountName"],
                                     ["Account number", "bankAccountNumber"],
-                                    ["Routing / branch code", "bankRoutingNumber"],
                                 ].map(([label, field]) => (
                                     <label key={field}>
                                         <span className="text-xs font-medium uppercase tracking-[0.14em] text-white/35">{label}</span>
@@ -1719,6 +1766,26 @@ export default function PayrollPage() {
                                 </button>
                             </div>
                         </div>
+                    </div>
+                )}
+
+                {basicPayTarget && (
+                    <div className="modal-backdrop-enter fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4 backdrop-blur-sm" onMouseDown={(event) => { if (event.target === event.currentTarget) setBasicPayTarget(null); }}>
+                        <form className="modal-panel-enter w-full max-w-[28rem] overflow-hidden rounded-lg border border-white/10 bg-[#0d1018] shadow-2xl shadow-black/40" onSubmit={(event) => { event.preventDefault(); const value = Number(basicPayInput); if (Number.isFinite(value) && value >= 0) updateBasicPayMutation.mutate({ employeeId: basicPayTarget.employeeId, basicPay: value }); }}>
+                            <div className="flex items-center justify-between border-b border-white/10 px-5 py-4">
+                                <div><p className="text-xs font-semibold uppercase tracking-[0.14em] text-white/35">Monthly Basic Pay</p><h3 className="mt-1 text-lg font-semibold text-white">{basicPayTarget.employeeName}</h3></div>
+                                <button className="flex size-8 items-center justify-center rounded-lg border border-white/10 bg-white/[0.05] text-white/60" type="button" onClick={() => setBasicPayTarget(null)} aria-label="Close"><FiX className="size-4" /></button>
+                            </div>
+                            <div className="p-5">
+                                <label className="text-xs font-semibold uppercase tracking-[0.14em] text-white/45">Monthly salary for each 6th-5th cycle</label>
+                                <input className="mt-2 h-11 w-full rounded-lg border border-white/10 bg-black/20 px-3 text-sm font-semibold text-white outline-none focus:border-[#842cff]" type="number" min="0" step="0.01" required autoFocus value={basicPayInput} onChange={(event) => setBasicPayInput(event.target.value)} />
+                                <p className="mt-2 text-xs leading-5 text-white/45">The system divides this by the period's Monday-Friday working days, then by 8 hours and 60 minutes.</p>
+                            </div>
+                            <div className="flex justify-end gap-2 border-t border-white/10 px-5 py-3">
+                                <button className="h-10 rounded-lg border border-white/10 bg-white/[0.05] px-4 text-sm font-semibold text-white/60" type="button" onClick={() => setBasicPayTarget(null)}>Cancel</button>
+                                <button className="h-10 rounded-lg bg-[#842cff] px-4 text-sm font-semibold text-white disabled:opacity-60" type="submit" disabled={updateBasicPayMutation.isPending}>Save Basic Pay</button>
+                            </div>
+                        </form>
                     </div>
                 )}
 

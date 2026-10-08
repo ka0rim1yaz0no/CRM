@@ -4,12 +4,18 @@ import { tenantModel } from "../config/tenancy";
 export type LeadCallOutcome = "connected" | "not_connected" | "voicemail";
 
 export type LeadCallLogItem = {
+    _id?: Types.ObjectId;
     employee: Types.ObjectId;
     employeeName: string;
     employeeRole: string;
     employeeTeam: string;
     outcome: LeadCallOutcome;
     calledAt: Date;
+    provider?: string;
+    providerSessionId?: string;
+    providerResult?: string;
+    verificationSource?: "manual" | "ringcentral";
+    durationSeconds?: number;
 };
 
 export type LeadCallStatDocument = {
@@ -61,6 +67,31 @@ const leadCallLogItemSchema = new Schema<LeadCallLogItem>(
         calledAt: {
             type: Date,
             default: Date.now,
+        },
+        provider: {
+            type: String,
+            trim: true,
+            default: "",
+        },
+        providerSessionId: {
+            type: String,
+            trim: true,
+            default: "",
+        },
+        providerResult: {
+            type: String,
+            trim: true,
+            default: "",
+        },
+        verificationSource: {
+            type: String,
+            enum: ["manual", "ringcentral"],
+            default: "manual",
+        },
+        durationSeconds: {
+            type: Number,
+            min: 0,
+            default: 0,
         },
     },
     {
@@ -141,6 +172,8 @@ leadCallStatSchema.index({ lastNotConnectedAt: -1 });
 leadCallStatSchema.index({ lastVoicemailAt: -1 });
 leadCallStatSchema.index({ "callLogs.employee": 1 });
 leadCallStatSchema.index({ "callLogs.outcome": 1 });
+leadCallStatSchema.index({ "callLogs.calledAt": -1 });
+leadCallStatSchema.index({ "callLogs.providerSessionId": 1 });
 
 export const LeadCallStat = tenantModel<LeadCallStatDocument>(
     "LeadCallStat",

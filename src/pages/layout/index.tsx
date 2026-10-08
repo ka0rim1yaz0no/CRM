@@ -40,7 +40,6 @@ export default function MainLayout({ children }: Props) {
             <div className="pointer-events-none fixed inset-0 bg-[linear-gradient(90deg,rgba(255,255,255,0.025)_1px,transparent_1px),linear-gradient(180deg,rgba(255,255,255,0.018)_1px,transparent_1px)] bg-[size:4rem_4rem] opacity-20" />
             <SideBar />
             <EmployeeAutoCaller />
-            <EmployeeLiveShare />
             <main className="relative flex h-screen flex-col pl-[16rem]">
                 <Navbar />
                 <div
@@ -50,6 +49,7 @@ export default function MainLayout({ children }: Props) {
                     ].join(" ")}
                     onScroll={handleScroll}
                 >
+                    <EmployeeLiveShare />
                     {children}
                 </div>
             </main>

@@ -6,7 +6,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 Import-Module Microsoft.PowerShell.Security -ErrorAction Stop
-$BridgeVersion = "0.3.0"
+$BridgeVersion = "0.4.0"
 $InstallDirectory = Join-Path $env:LOCALAPPDATA "Assistly\CallBridge"
 $ConfigPath = Join-Path $InstallDirectory "config.json"
 $LogPath = Join-Path $InstallDirectory "bridge.log"
@@ -115,11 +115,13 @@ namespace Assistly.CallBridge
             [PreserveSig] int SetDuckingPreference(bool optOut);
         }
 
-        public static int[] ActiveCaptureProcessIds()
+        public static int[] ActiveAudioProcessIds()
         {
             var processIds = new HashSet<int>();
             AddActiveProcessIds(processIds, EDataFlow.Capture, ERole.Multimedia);
             AddActiveProcessIds(processIds, EDataFlow.Capture, ERole.Communications);
+            AddActiveProcessIds(processIds, EDataFlow.Render, ERole.Multimedia);
+            AddActiveProcessIds(processIds, EDataFlow.Render, ERole.Communications);
             var result = new int[processIds.Count];
             processIds.CopyTo(result);
             return result;
@@ -214,8 +216,8 @@ function Get-NextivaDetection {
     }
 
     $nextivaProcessIds = @($nextivaProcesses | ForEach-Object { [int]$_.Id })
-    $activeCaptureProcessIds = @([Assistly.CallBridge.AudioProbe]::ActiveCaptureProcessIds())
-    $audioSessionActive = @($activeCaptureProcessIds | Where-Object { $nextivaProcessIds -contains $_ }).Count -gt 0
+    $activeAudioProcessIds = @([Assistly.CallBridge.AudioProbe]::ActiveAudioProcessIds())
+    $audioSessionActive = @($activeAudioProcessIds | Where-Object { $nextivaProcessIds -contains $_ }).Count -gt 0
 
     return [pscustomobject]@{
         State = if ($audioSessionActive) { "active" } else { "idle" }

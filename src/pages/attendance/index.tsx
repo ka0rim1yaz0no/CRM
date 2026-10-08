@@ -498,6 +498,11 @@ function formatBreakTimer(milliseconds: number) {
     return [hours, minutes, seconds].map((value) => String(value).padStart(2, "0")).join(":");
 }
 
+function attendanceRequestError(error: unknown, fallback: string) {
+    const message = (error as { response?: { data?: { message?: unknown } } })?.response?.data?.message;
+    return typeof message === "string" && message.trim() ? message : fallback;
+}
+
 function getRecordTime(record?: AttendanceRecord | null) {
     return record?.timeIn ? new Date(record.timeIn).getTime() : 0;
 }
@@ -572,14 +577,14 @@ export default function AttendancePage() {
 
     const { data: attendance = [], isLoading, isFetching } = useQuery({
         queryKey: attendanceQueryKey(employeeId),
-        queryFn: () => getEmployeeAttendance(employeeId),
+        queryFn: () => getEmployeeAttendance(employeeId, { limit: 250 }),
         enabled: Boolean(employeeId),
     });
     const { data: systemSettings } = useQuery({
         queryKey: ["system-settings"],
         queryFn: getSystemSettings,
     });
-    const { data: employeeProfile } = useQuery({
+    const { data: employeeProfile, isLoading: isEmployeeLoading } = useQuery({
         queryKey: ["employee", employeeId],
         queryFn: () => getEmployeeSummary(employeeId),
         enabled: Boolean(employeeId),
@@ -598,10 +603,12 @@ export default function AttendancePage() {
     const latestSlotTimeIn = latestSlotRecords.find((record) => isAttendanceTimeInSource(record.source));
     const latestSlotTimeOut = latestSlotRecords.find((record) => record.source === "Logout" || record.source === "Time Out");
     const latestSlotHasOpenAttendance = Boolean(
-        latestSlotTimeIn && (!latestSlotTimeOut || getRecordTime(latestSlotTimeIn) > getRecordTime(latestSlotTimeOut))
+        latestSlotKey === nowSlotKey
+        && latestSlotTimeIn
+        && (!latestSlotTimeOut || getRecordTime(latestSlotTimeIn) > getRecordTime(latestSlotTimeOut))
     );
     const actionSlotKey = latestSlotKey && latestSlotHasOpenAttendance ? latestSlotKey : nowSlotKey;
-    const displaySlotKey = latestSlotKey || nowSlotKey;
+    const displaySlotKey = latestSlotKey === nowSlotKey ? latestSlotKey : nowSlotKey;
     const actionSlotRecords = [...(recordsBySlot[actionSlotKey] || [])].sort((left, right) => new Date(right.timeIn).getTime() - new Date(left.timeIn).getTime());
     const slotRecords = [...(recordsBySlot[displaySlotKey] || [])].sort((left, right) => new Date(right.timeIn).getTime() - new Date(left.timeIn).getTime());
     const slotLabel = formatAttendanceSlotLabel(displaySlotKey);
@@ -622,7 +629,7 @@ export default function AttendancePage() {
     const breakInCount = activeCycleRecords.filter((record) => record.source === "Break In").length;
     const latestBreakOutRecord = activeCycleRecords.find((record) => record.source === "Break Out");
     const latestBreakOutTime = latestBreakOutRecord ? new Date(latestBreakOutRecord.timeIn).getTime() : 0;
-    const hasBreakGapElapsed = !latestBreakOutTime || Date.now() - latestBreakOutTime >= 30 * 60 * 1000;
+    const hasBreakGapElapsed = !latestBreakOutTime || nowMs - latestBreakOutTime >= 30 * 60 * 1000;
     const latestActionStatus: EmployeeAvailabilityStatus =
         latestActionSource === "Break Out"
             ? "BREAK"
@@ -706,13 +713,25 @@ export default function AttendancePage() {
         updateEmployeeStatusCache(availabilityStatus);
     };
 
+    const refreshAttendanceState = () => {
+        void Promise.all([
+            queryClient.invalidateQueries({ queryKey: attendanceQueryKey(employeeId) }),
+            queryClient.invalidateQueries({ queryKey: ["employee", employeeId] }),
+        ]);
+    };
+
+    const handleAttendanceError = (error: unknown, fallback: string) => {
+        refreshAttendanceState();
+        setMessage(attendanceRequestError(error, fallback));
+    };
+
     const timeInMutation = useMutation({
         mutationFn: () => timeInEmployee(employeeId),
         onSuccess: (record) => {
             updateAttendanceCache(record, "ONLINE");
             setMessage("Status changed to ONLINE.");
         },
-        onError: () => setMessage("Unable to change status to ONLINE. Please try again."),
+        onError: (error) => handleAttendanceError(error, "Unable to change status to ONLINE. Please try again."),
     });
 
     const timeOutMutation = useMutation({
@@ -723,9 +742,9 @@ export default function AttendancePage() {
             setShowOfflineConfirm(false);
             setMessage("Status changed to OFFLINE.");
         },
-        onError: () => {
+        onError: (error) => {
             setShowOfflineConfirm(false);
-            setMessage("Unable to change status to OFFLINE. Please try again.");
+            handleAttendanceError(error, "Unable to change status to OFFLINE. Please try again.");
         },
     });
 
@@ -735,7 +754,7 @@ export default function AttendancePage() {
             updateAttendanceCache(record, "BREAK");
             setMessage("Status changed to Break.");
         },
-        onError: () => setMessage("Unable to change status to Break. Please try again."),
+        onError: (error) => handleAttendanceError(error, "Unable to change status to Break. Please try again."),
     });
 
     const breakInMutation = useMutation({
@@ -744,7 +763,7 @@ export default function AttendancePage() {
             updateAttendanceCache(record, "ONLINE");
             setMessage("Status changed to ONLINE.");
         },
-        onError: () => setMessage("Unable to change status to ONLINE. Please try again."),
+        onError: (error) => handleAttendanceError(error, "Unable to change status to ONLINE. Please try again."),
     });
 
     const lunchBreakOutMutation = useMutation({
@@ -753,7 +772,7 @@ export default function AttendancePage() {
             updateAttendanceCache(record, "LUNCH");
             setMessage("Status changed to LUNCH.");
         },
-        onError: () => setMessage("Unable to change status to LUNCH. Please try again."),
+        onError: (error) => handleAttendanceError(error, "Unable to change status to LUNCH. Please try again."),
     });
 
     const lunchBreakInMutation = useMutation({
@@ -762,7 +781,7 @@ export default function AttendancePage() {
             updateAttendanceCache(record, "ONLINE");
             setMessage("Status changed to ONLINE.");
         },
-        onError: () => setMessage("Unable to change status to ONLINE. Please try again."),
+        onError: (error) => handleAttendanceError(error, "Unable to change status to ONLINE. Please try again."),
     });
 
     const activityStatusMutation = useMutation({
@@ -783,7 +802,7 @@ export default function AttendancePage() {
             setManualOffPhoneStartedAt(status === "OFF THE PHONE" ? Date.now() : null);
             setMessage(`Status changed to ${statusLabels[availabilityStatus]}.`);
         },
-        onError: () => setMessage("Unable to change status. Please try again."),
+        onError: (error) => handleAttendanceError(error, "Unable to change status. Please try again."),
     });
 
     const isSaving =
@@ -805,7 +824,7 @@ export default function AttendancePage() {
     };
 
     const statusDisabled = (status: EmployeeAvailabilityStatus) => {
-        if (!employeeId || isSaving || status === currentStatus) return true;
+        if (!employeeId || isLoading || isEmployeeLoading || isSaving || status === currentStatus) return true;
         if (status === "ONLINE") return !canSetOnline;
         if (status === "OFFLINE") return !canSetOffline;
         if (status === "LUNCH") return !canSetLunch;
@@ -868,7 +887,7 @@ export default function AttendancePage() {
                         </div>
                         <button
                             type="button"
-                            onClick={() => queryClient.invalidateQueries({ queryKey: attendanceQueryKey(employeeId) })}
+                            onClick={refreshAttendanceState}
                             className="inline-flex h-10 items-center gap-2 rounded-lg border border-[#9b8ab8] bg-white px-4 text-sm font-semibold text-slate-900 shadow-sm transition hover:bg-[#f4efff]"
                         >
                             <FiRefreshCw className={isFetching ? "animate-spin" : ""} />

@@ -24,14 +24,24 @@ export type AttendanceInput = Pick<AttendanceRecord, "source"> & {
     timeIn: string;
 };
 
-export async function getEmployeeAttendance(employeeId: string, params?: { archived?: boolean }) {
-    const response = await api.get<AttendanceRecord[]>(`/employees/${employeeId}/attendance`, { params });
+export type AttendanceQuery = {
+    archived?: boolean;
+    all?: boolean;
+    limit?: number;
+    from?: string;
+    to?: string;
+};
+
+export async function getEmployeeAttendance(employeeId: string, params: AttendanceQuery = {}) {
+    const response = await api.get<AttendanceRecord[]>(`/employees/${employeeId}/attendance`, {
+        params: params.all ? params : { limit: params.limit ?? 300, ...params },
+    });
     return response.data;
 }
 
-export async function getEmployeesAttendance(employeeIds: string[]) {
+export async function getEmployeesAttendance(employeeIds: string[], params: Pick<AttendanceQuery, "all" | "from" | "to"> = {}) {
     const response = await api.get<AttendanceRecord[]>("/attendance", {
-        params: { employeeIds: employeeIds.join(",") },
+        params: { employeeIds: employeeIds.join(","), ...params },
     });
     return response.data;
 }

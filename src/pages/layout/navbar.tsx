@@ -1,16 +1,15 @@
 import type { FormEvent } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { FiBell, FiChevronDown, FiMessageCircle, FiSearch } from "react-icons/fi";
+import { FiBell, FiChevronDown, FiSearch, FiX } from "react-icons/fi";
 import { Link, useLocation, useNavigate } from "react-router";
-import { switchEmployeeBusiness } from "../../api/auth";
+import { getEmployeeBusinesses, switchEmployeeBusiness } from "../../api/auth";
 import { getAuthUser, setAuthUser } from "../../api/authStorage";
 import { getBusinesses } from "../../api/businesses";
 import { getActiveBusinessId, setActiveBusinessId } from "../../api/businessStorage";
 import { getMyLeads, type Lead } from "../../api/leads";
 import { getEmployeeNotices, markEmployeeNoticeRead, markEmployeeNoticesRead } from "../../api/notices";
 import { useClickOutside } from "../../hooks/useClickOutside";
-import { useMessageNotifications } from "../../hooks/useMessageNotifications";
 import { formatPhDateTime } from "../../lib/dateTime";
 import { refreshSocketBusinessContext } from "../../lib/socket";
 import { emitToast } from "../../components/ToastProvider";
@@ -36,6 +35,7 @@ export default function Navbar() {
     const authUser = getAuthUser();
     const [isBusinessOpen, setIsBusinessOpen] = useState(false);
     const [isNotificationsOpen, setIsNotificationsOpen] = useState(false);
+    const [dismissedNoticeIds, setDismissedNoticeIds] = useState<Set<string>>(() => new Set());
     const [leadSearch, setLeadSearch] = useState("");
     const [debouncedLeadSearch, setDebouncedLeadSearch] = useState("");
     const [isLeadSearchOpen, setIsLeadSearchOpen] = useState(false);
@@ -69,7 +69,6 @@ export default function Navbar() {
         staleTime: 15_000,
     });
     const leadSearchResults = leadSearchData?.leads || [];
-    const { messageNotifications, unreadMessageCount, markMessageRead, markAllMessagesRead } = useMessageNotifications();
     const { data: notices = [] } = useQuery({
         queryKey: ["employee-notices", employeeId],
         queryFn: () => getEmployeeNotices(employeeId),
@@ -77,12 +76,21 @@ export default function Navbar() {
         refetchInterval: 30_000,
         staleTime: 15_000,
     });
-    const unreadNoticeCount = notices.filter((notice) => !notice.isRead).length;
-    const unreadCount = unreadNoticeCount + unreadMessageCount;
+    const visibleNotices = notices.filter((notice) => !dismissedNoticeIds.has(notice._id));
+    const unreadNoticeCount = visibleNotices.filter((notice) => !notice.isRead).length;
+    const unreadCount = unreadNoticeCount;
     const { data: publicBusinesses = [] } = useQuery({
         queryKey: ["businesses"],
         queryFn: getBusinesses,
         staleTime: 30_000,
+    });
+    const { data: refreshedAllowedBusinesses } = useQuery({
+        queryKey: ["employee-business-access", authUser?.user.employeeCode],
+        queryFn: () => getEmployeeBusinesses(authUser?.user.employeeCode || ""),
+        enabled: authUser?.userType === "employee" && Boolean(authUser.user.employeeCode),
+        refetchInterval: 30_000,
+        refetchOnWindowFocus: true,
+        staleTime: 15_000,
     });
     const businessNamesById = useMemo(
         () => new Map(publicBusinesses.map((business) => [business.id, business.name])),
@@ -93,7 +101,8 @@ export default function Navbar() {
         : authUser?.business
             ? [authUser.business]
             : [];
-    const allowedBusinesses = sessionAllowedBusinesses.map((business) => ({
+    const allowedBusinessSource = refreshedAllowedBusinesses ?? sessionAllowedBusinesses;
+    const allowedBusinesses = allowedBusinessSource.map((business) => ({
         ...business,
         name: businessNamesById.get(business.id) || business.name,
     }));
@@ -124,7 +133,11 @@ export default function Navbar() {
                 throw new Error("Employee session is required.");
             }
 
-            return switchEmployeeBusiness(authUser.user.employeeCode, activeBusinessId, targetBusinessId);
+            return switchEmployeeBusiness(
+                authUser.user.employeeCode,
+                activeBusiness?.id || activeBusinessId,
+                targetBusinessId
+            );
         },
         onSuccess: (nextAuthUser) => {
             const nextBusinessId = nextAuthUser.business?.id;
@@ -288,7 +301,6 @@ export default function Navbar() {
                                             type="button"
                                             onClick={() => {
                                                 if (unreadNoticeCount > 0) markAllNoticesReadMutation.mutate();
-                                                if (unreadMessageCount > 0) markAllMessagesRead();
                                             }}
                                         >
                                             Mark all read
@@ -296,40 +308,14 @@ export default function Navbar() {
                                     )}
                                 </div>
                                 <div className="content-scroll max-h-96 overflow-y-auto p-2">
-                                    {messageNotifications.length === 0 && notices.length === 0 && (
+                                    {visibleNotices.length === 0 && (
                                         <p className="rounded-lg border border-white/10 bg-white/[0.035] p-4 text-sm text-white/45">No notifications yet.</p>
                                     )}
-                                    {messageNotifications.map((notification) => (
+                                    {visibleNotices.map((notice) => (
+                                        <div key={notice._id} className="relative mb-2">
                                         <Link
-                                            key={notification.id}
                                             className={[
-                                                "mb-2 block w-full rounded-lg border p-3 text-left transition",
-                                                notification.isRead
-                                                    ? "border-white/10 bg-white/[0.025] text-white/55 hover:bg-white/[0.05]"
-                                                    : "theme-primary-border theme-primary-soft-bg text-white hover:bg-white/[0.08]",
-                                            ].join(" ")}
-                                            to={notification.href}
-                                            onClick={() => {
-                                                markMessageRead(notification.id);
-                                                setIsNotificationsOpen(false);
-                                            }}
-                                        >
-                                            <div className="flex items-start justify-between gap-3">
-                                                <p className="line-clamp-1 text-sm font-semibold">Message from {notification.senderName}</p>
-                                                {!notification.isRead && <span className="mt-1 size-2 shrink-0 rounded-full bg-[var(--primary-soft)]" />}
-                                            </div>
-                                            <p className="mt-1 line-clamp-1 text-xs font-semibold text-white/60">{notification.title}</p>
-                                            <p className="mt-1 line-clamp-2 text-xs leading-5 text-white/55">{notification.body}</p>
-                                            <p className="mt-2 text-[0.68rem] font-semibold uppercase tracking-[0.12em] text-white/35">
-                                                Message · {formatPhDateTime(notification.createdAt)}
-                                            </p>
-                                        </Link>
-                                    ))}
-                                    {notices.map((notice) => (
-                                        <Link
-                                            key={notice._id}
-                                            className={[
-                                                "block w-full rounded-lg border p-3 text-left transition",
+                                                "block w-full rounded-lg border p-3 pr-11 text-left transition",
                                                 notice.isRead
                                                     ? "border-white/10 bg-white/[0.025] text-white/55 hover:bg-white/[0.05]"
                                                     : "theme-primary-border theme-primary-soft-bg text-white hover:bg-white/[0.08]",
@@ -337,6 +323,7 @@ export default function Navbar() {
                                             to={notice.href || `/profile?tab=notices&notice=${notice._id}`}
                                             onClick={() => {
                                                 if (!notice.isRead) markNoticeReadMutation.mutate(notice._id);
+                                                setDismissedNoticeIds((current) => new Set(current).add(notice._id));
                                                 setIsNotificationsOpen(false);
                                             }}
                                         >
@@ -349,25 +336,20 @@ export default function Navbar() {
                                                 {notice.severity} · {formatPhDateTime(notice.createdAt)}
                                             </p>
                                         </Link>
+                                        <button
+                                            className="absolute right-2 top-2 flex size-7 items-center justify-center rounded-md text-white/45 transition hover:bg-white/10 hover:text-white"
+                                            type="button"
+                                            aria-label="Dismiss notification"
+                                            onClick={() => setDismissedNoticeIds((current) => new Set(current).add(notice._id))}
+                                        >
+                                            <FiX className="size-4" aria-hidden="true" />
+                                        </button>
+                                        </div>
                                     ))}
                                 </div>
                             </div>
                         )}
                     </div>
-
-                    <Link
-                        className="relative flex size-11 shrink-0 items-center justify-center rounded-lg border border-white/10 bg-white/[0.06] text-white/70 transition hover:bg-white/10 hover:text-white focus:outline-none focus:ring-2 focus:ring-[color-mix(in_srgb,var(--primary)_60%,transparent)]"
-                        to="/messages"
-                        aria-label="Messages"
-                        onClick={markAllMessagesRead}
-                    >
-                        <FiMessageCircle className="size-5" aria-hidden="true" />
-                        {unreadMessageCount > 0 && (
-                            <span className="theme-primary-solid absolute right-1.5 top-1.5 min-w-5 rounded-full px-1.5 py-0.5 text-[0.65rem] font-bold leading-none text-white">
-                                {unreadMessageCount > 9 ? "9+" : unreadMessageCount}
-                            </span>
-                        )}
-                    </Link>
 
                     {authUser?.userType === "employee" && activeBusiness && (
                         <div ref={businessRef} className="relative">

@@ -136,11 +136,12 @@ export function groupAttendanceRecordsBySlot<TRecord extends AttendanceSlotRecor
         .forEach((record) => {
             const isShiftStart = isAttendanceTimeInSource(record.source);
             const recordSlotKey = formatAttendanceSlotKey(record.timeIn, settings);
-            const slotKey = isShiftStart || !activeSlotKey ? recordSlotKey : activeSlotKey;
+            const startsAnotherSlot = Boolean(recordSlotKey && recordSlotKey !== activeSlotKey);
+            const slotKey = isShiftStart || !activeSlotKey || startsAnotherSlot ? recordSlotKey : activeSlotKey;
             if (!slotKey) return;
 
             groups[slotKey] = [...(groups[slotKey] || []), record];
-            if (isShiftStart) activeSlotKey = slotKey;
+            if (isShiftStart || startsAnotherSlot) activeSlotKey = slotKey;
         });
 
     return groups;

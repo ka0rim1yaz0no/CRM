@@ -25,15 +25,22 @@ export default function Teams() {
             : employees[0] || null,
         [authUser, employees],
     );
-    const currentTeam = useMemo(() => teams.find((team) => team.name === currentEmployee?.team) || null, [currentEmployee?.team, teams]);
+    const currentTeam = useMemo(
+        () => teams.find((team) => team.members.some((member) => member._id === currentEmployee?._id) || team.lead?._id === currentEmployee?._id)
+            || teams.find((team) => team.name === currentEmployee?.team)
+            || null,
+        [currentEmployee?._id, currentEmployee?.team, teams]
+    );
     const teammates = useMemo(
-        () => employees.filter(
-            (employee) =>
-                employee.status !== "Archived" &&
-                employee._id !== currentEmployee?._id &&
-                employee.team === currentEmployee?.team
-        ),
-        [currentEmployee?._id, currentEmployee?.team, employees],
+        () => {
+            if (currentTeam) {
+                const members = [...currentTeam.members, ...(currentTeam.lead ? [currentTeam.lead] : [])];
+                return Array.from(new Map(members.map((employee) => [employee._id, employee])).values())
+                    .filter((employee) => employee.status !== "Archived" && employee._id !== currentEmployee?._id);
+            }
+            return employees.filter((employee) => employee.status !== "Archived" && employee._id !== currentEmployee?._id && employee.team === currentEmployee?.team);
+        },
+        [currentEmployee?._id, currentEmployee?.team, currentTeam, employees],
     );
 
     return (
@@ -43,7 +50,7 @@ export default function Teams() {
                     <div className="flex flex-wrap items-center justify-between gap-4 border-b border-white/10 px-5 py-4">
                         <div>
                             <p className="text-xs font-medium uppercase tracking-[0.16em] text-white/35">Current Team</p>
-                            <h2 className="mt-1 text-xl font-semibold text-white">{currentEmployee?.team || "Unassigned"}</h2>
+                            <h2 className="mt-1 text-xl font-semibold text-white">{currentTeam?.name || currentEmployee?.team || "Unassigned"}</h2>
                             <p className="mt-1 text-sm text-white/45">
                                 {currentEmployee?.name || "Employee"} - {currentEmployee?.role || "No role"}
                             </p>

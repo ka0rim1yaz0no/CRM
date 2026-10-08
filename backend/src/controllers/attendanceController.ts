@@ -1,9 +1,12 @@
 import type { Request, Response } from "express";
 import { Types } from "mongoose";
 import { Attendance, type AttendanceSource, type AttendanceStatus } from "../models/Attendance";
+import { runWithBusiness } from "../config/tenancy";
+import { updateAttendanceAcrossBusinesses } from "../services/employeeAttendanceSyncService";
 import { syncEmployeeAvailabilityAcrossBusinesses } from "../services/employeeAvailabilityService";
 import { Employee, normalizeEmployeeAvailabilityStatus } from "../models/Employee";
 import { recordEmployeeTransaction } from "./employeeTransactionController";
+import { recalculateEmployeePayrollAfterAttendanceEdit } from "./payrollController";
 import { emitCallDashboardUpdated, emitEmployeeAvailabilityUpdated } from "../socket";
 import { getSystemSettings } from "./systemSettingsController";
 
@@ -60,6 +63,20 @@ function zonedDateTimeToUtc(year: number, month: number, day: number, hour: numb
   }
 
   return new Date(utcTime);
+}
+
+function attendanceSlotKey(value: Date, timeZone: string, shiftStart: string, shiftEnd: string) {
+  const parts = zonedParts(value, timeZone);
+  const shiftStartMinutes = minutesFromTime(shiftStart);
+  const shiftEndMinutes = minutesFromTime(shiftEnd);
+  const actualMinutes = parts.hour * 60 + parts.minute;
+  const slotDate = new Date(Date.UTC(parts.year, parts.month - 1, parts.day));
+
+  if (shiftEndMinutes <= shiftStartMinutes && actualMinutes <= shiftEndMinutes) {
+    slotDate.setUTCDate(slotDate.getUTCDate() - 1);
+  }
+
+  return slotDate.toISOString().slice(0, 10);
 }
 
 async function getTimeInStatus(timeIn: Date) {
@@ -126,14 +143,26 @@ async function getTodayAttendance(employeeId: Types.ObjectId | string) {
   }).sort({ timeIn: 1 });
 }
 
-async function getActiveAttendanceSlot(employeeId: Types.ObjectId | string) {
+async function getActiveAttendanceSlot(employeeId: Types.ObjectId | string, includePreviousShift = false) {
   const timeIn = await Attendance.findOne({
     employee: employeeId,
     isArchived: false,
     source: { $in: timeInSources },
   }).sort({ timeIn: -1 });
 
-  if (!timeIn) return { timeIn: null, timeOut: null, records: [] as Awaited<ReturnType<typeof Attendance.find>> };
+  if (!timeIn) return { timeIn: null, timeOut: null, records: [] as Awaited<ReturnType<typeof Attendance.find>>, recoveryTimeOut: null as Date | null };
+
+  const settings = await getSystemSettings();
+  const timeZone = settings.attendanceTimeZone || "Asia/Manila";
+  const shiftStart = settings.officialShiftStartTime || "23:00";
+  const shiftEnd = settings.officialShiftEndTime || "08:00";
+  const activeSlotKey = attendanceSlotKey(timeIn.timeIn, timeZone, shiftStart, shiftEnd);
+  const currentSlotKey = attendanceSlotKey(new Date(), timeZone, shiftStart, shiftEnd);
+
+  // An unclosed prior shift must not block time-in, breaks, or lunch on a new shift.
+  if (activeSlotKey !== currentSlotKey && !includePreviousShift) {
+    return { timeIn: null, timeOut: null, records: [] as Awaited<ReturnType<typeof Attendance.find>>, recoveryTimeOut: null as Date | null };
+  }
 
   const timeOut = await Attendance.findOne({
     employee: employeeId,
@@ -151,7 +180,14 @@ async function getActiveAttendanceSlot(employeeId: Types.ObjectId | string) {
     },
   }).sort({ timeIn: 1 });
 
-  return { timeIn, timeOut, records };
+  const [slotYear, slotMonth, slotDay] = activeSlotKey.split("-").map(Number);
+  const [shiftEndHour, shiftEndMinute] = shiftEnd.split(":").map(Number);
+  const isOvernightShift = minutesFromTime(shiftEnd) <= minutesFromTime(shiftStart);
+  const recoveryTimeOut = activeSlotKey === currentSlotKey
+    ? null
+    : zonedDateTimeToUtc(slotYear, slotMonth, slotDay + (isOvernightShift ? 1 : 0), shiftEndHour, shiftEndMinute, timeZone);
+
+  return { timeIn, timeOut, records, recoveryTimeOut };
 }
 
 function countAttendanceSource(records: Array<{ source: AttendanceSource }>, source: AttendanceSource) {
@@ -176,14 +212,31 @@ export async function recordEmployeeTimeIn(employeeId: Types.ObjectId | string) 
   });
 }
 
-export async function recordEmployeeTimeOut(employeeId: Types.ObjectId | string) {
-  const now = new Date();
+export async function recordEmployeeTimeOut(employeeId: Types.ObjectId | string, occurredAt = new Date()) {
   return Attendance.create({
     employee: employeeId,
-    timeIn: now,
+    timeIn: occurredAt,
     source: "Time Out",
-    attendanceStatus: await getTimeOutStatus(now),
+    attendanceStatus: await getTimeOutStatus(occurredAt),
   });
+}
+
+export function shouldAutomaticallyCloseAttendanceSlot({
+  recoveryTimeOut: _recoveryTimeOut,
+  now: _now,
+}: {
+  isInsideShift: boolean;
+  hasCurrentOpenSlot: boolean;
+  recoveryTimeOut: Date | null;
+  now: Date;
+}) {
+  // Attendance is employee-controlled. Shift boundaries never create a time-out
+  // record or force availability offline.
+  return false;
+}
+
+export async function closeExpiredAttendanceSlots(_now = new Date()) {
+  return [] as string[];
 }
 
 export async function recordEmployeeBreakOut(employeeId: Types.ObjectId | string) {
@@ -557,7 +610,7 @@ export async function timeOutEmployee(request: Request, response: Response) {
     return;
   }
 
-  const activeSlot = await getActiveAttendanceSlot(employee._id);
+  const activeSlot = await getActiveAttendanceSlot(employee._id, true);
   const latestSource = latestAttendanceSource(activeSlot.records);
 
   if (!activeSlot.timeIn || activeSlot.timeOut) {
@@ -594,7 +647,7 @@ export async function timeOutEmployee(request: Request, response: Response) {
     await recordEmployeeOffPhoneIn(employee._id);
   }
 
-  const attendance = await recordEmployeeTimeOut(employee._id);
+  const attendance = await recordEmployeeTimeOut(employee._id, new Date());
   emitEmployeeAvailabilityUpdated({
     employeeId: String(updatedEmployee._id),
     availabilityStatus: updatedEmployee.availabilityStatus,
@@ -613,10 +666,22 @@ export async function timeOutEmployee(request: Request, response: Response) {
 export async function listEmployeeAttendance(request: Request, response: Response) {
   const employeeId = String(request.params.employeeId);
   const showArchived = String(request.query.archived || "") === "true";
-  const attendance = await Attendance.find({
+  const includeAll = String(request.query.all || "") === "true";
+  const requestedLimit = Number(request.query.limit);
+  const limit = includeAll ? 0 : Math.min(1_000, Math.max(1, Number.isFinite(requestedLimit) ? Math.floor(requestedLimit) : 300));
+  const from = new Date(String(request.query.from || ""));
+  const to = new Date(String(request.query.to || ""));
+  const timeIn = {
+    ...(!Number.isNaN(from.getTime()) ? { $gte: from } : {}),
+    ...(!Number.isNaN(to.getTime()) ? { $lte: to } : {}),
+  };
+  const attendanceQuery = Attendance.find({
     employee: employeeId,
     ...(showArchived ? { isArchived: true } : { isArchived: { $ne: true } }),
-  }).sort({ timeIn: -1 });
+    ...(Object.keys(timeIn).length > 0 ? { timeIn } : {}),
+  }).sort({ timeIn: -1 }).lean();
+  if (limit > 0) attendanceQuery.limit(limit);
+  const attendance = await attendanceQuery;
 
   response.json(attendance);
 }
@@ -636,9 +701,25 @@ export async function listEmployeesAttendance(request: Request, response: Respon
     return;
   }
 
+  const includeAll = String(request.query.all || "") === "true";
+  const requestedFrom = new Date(String(request.query.from || ""));
+  const requestedTo = new Date(String(request.query.to || ""));
+  const from = !Number.isNaN(requestedFrom.getTime())
+    ? requestedFrom
+    : includeAll
+      ? null
+      : new Date(Date.now() - 72 * 60 * 60 * 1000);
+  const to = !Number.isNaN(requestedTo.getTime()) ? requestedTo : null;
+
   const attendance = await Attendance.find({
     employee: { $in: employeeIds },
     isArchived: { $ne: true },
+    ...((from || to) ? {
+      timeIn: {
+        ...(from ? { $gte: from } : {}),
+        ...(to ? { $lte: to } : {}),
+      },
+    } : {}),
   }).sort({ timeIn: -1 }).lean();
 
   response.json(attendance);
@@ -689,22 +770,52 @@ export async function updateEmployeeAttendance(request: Request, response: Respo
     return;
   }
 
-  const attendance = await Attendance.findOneAndUpdate(
-    { _id: request.params.attendanceId, employee: employeeId },
-    {
-      timeIn,
-      source,
-      attendanceStatus: await getAttendanceStatus(source, timeIn),
-    },
-    { returnDocument: "after", runValidators: true }
-  );
-
+  const attendance = await Attendance.findOne({ _id: request.params.attendanceId, employee: employeeId });
   if (!attendance) {
     response.status(404).json({ message: "Attendance record not found" });
     return;
   }
 
-  if (request.business?.id) emitCallDashboardUpdated([request.business.id]);
+  const previousTime = attendance.timeIn;
+  const previousSource = attendance.source;
+  attendance.timeIn = timeIn;
+  attendance.source = source;
+  attendance.attendanceStatus = await getAttendanceStatus(source, timeIn);
+  await attendance.save();
+
+  const employee = await Employee.findById(employeeId).select("name employeeCode").lean();
+  await recordEmployeeTransaction({
+    employee: attendance.employee,
+    category: "Attendance",
+    title: "Attendance edited",
+    description: `${employee?.name || "Employee"}'s ${source} time was corrected by admin.`,
+    metadata: {
+      attendanceId: String(attendance._id),
+      source,
+      previousTime: previousTime.toISOString(),
+      updatedTime: timeIn.toISOString(),
+    },
+  });
+  const affectedEmployees = employee?.employeeCode
+    ? await updateAttendanceAcrossBusinesses(employee.employeeCode, {
+        timeIn: previousTime,
+        source: previousSource,
+      }, {
+        timeIn,
+        source,
+        attendanceStatus: attendance.attendanceStatus,
+        isArchived: false,
+      })
+    : [{ businessId: request.business?.id || "", employeeId }];
+
+  for (const affected of affectedEmployees) {
+    if (!affected.businessId) continue;
+    await runWithBusiness(affected.businessId, () =>
+      recalculateEmployeePayrollAfterAttendanceEdit(affected.employeeId, previousTime, timeIn)
+    );
+  }
+
+  emitCallDashboardUpdated(affectedEmployees.map((item) => item.businessId));
   response.json(attendance);
 }
 

@@ -31,17 +31,78 @@ export type CallBridgeDeviceDocument = {
   bridgeVersion: string;
   lastSeenAt: Date;
   lastStateChangedAt: Date;
+  inactiveSince?: Date | null;
 };
 
 export type CallBridgeScheduleDocument = {
   employeeCode: string;
   callLeaseUntil: Date | null;
+  reservedBusinessId: string;
+  reservedLeadId: string;
+  reservationTokenHash: string;
   nextCallAllowedAt: Date | null;
   lastReservedAt: Date | null;
   lastCallEndedAt: Date | null;
   lastDialStartedAt: Date | null;
   dialIntentUntil: Date | null;
   lastCallStartedAt: Date | null;
+};
+
+export type CallBridgeAttemptPhase =
+  | "reserved"
+  | "dialing"
+  | "ringing"
+  | "answered"
+  | "voicemail"
+  | "ended"
+  | "classifying"
+  | "classified"
+  | "failed";
+
+export type CallBridgeAttemptOutcome =
+  | "pending"
+  | "connected"
+  | "not_connected"
+  | "voicemail"
+  | "unclassified";
+
+export type CallBridgeClassificationConfidence = "" | "high" | "probable" | "needs_review";
+export type CallBridgeClassificationSource =
+  | ""
+  | "manual"
+  | "ringcentral_events"
+  | "ringcentral_call_log"
+  | "ringcentral_recording";
+
+export type CallBridgeAttemptDocument = {
+  employeeCode: string;
+  employeeName: string;
+  businessId: string;
+  leadId: string;
+  phone: string;
+  provider: "ringcentral";
+  extensionId: string;
+  extensionNumber: string;
+  providerSessionId?: string;
+  phase: CallBridgeAttemptPhase;
+  outcome: CallBridgeAttemptOutcome;
+  outcomeReason: string;
+  classificationConfidence: CallBridgeClassificationConfidence;
+  classificationSource: CallBridgeClassificationSource;
+  providerResult: string;
+  statusCodes: string[];
+  reservedAt: Date;
+  dialStartedAt: Date | null;
+  ringingAt: Date | null;
+  answeredAt: Date | null;
+  endedAt: Date | null;
+  classifiedAt: Date | null;
+  durationSeconds: number;
+  recordingId: string;
+  callStatLogId: string;
+  lastError: string;
+  createdAt?: Date;
+  updatedAt?: Date;
 };
 
 const pairingSchema = new Schema<CallBridgePairingDocument>(
@@ -77,6 +138,7 @@ const deviceSchema = new Schema<CallBridgeDeviceDocument>(
     bridgeVersion: { type: String, trim: true, default: "" },
     lastSeenAt: { type: Date, required: true, default: Date.now, index: true },
     lastStateChangedAt: { type: Date, required: true, default: Date.now },
+    inactiveSince: { type: Date, default: null },
   },
   { timestamps: true }
 );
@@ -89,6 +151,9 @@ const scheduleSchema = new Schema<CallBridgeScheduleDocument>(
   {
     employeeCode: { type: String, required: true, trim: true, unique: true, index: true },
     callLeaseUntil: { type: Date, default: null },
+    reservedBusinessId: { type: String, trim: true, default: "" },
+    reservedLeadId: { type: String, trim: true, default: "" },
+    reservationTokenHash: { type: String, trim: true, default: "" },
     nextCallAllowedAt: { type: Date, default: null },
     lastReservedAt: { type: Date, default: null },
     lastCallEndedAt: { type: Date, default: null },
@@ -98,6 +163,60 @@ const scheduleSchema = new Schema<CallBridgeScheduleDocument>(
   },
   { timestamps: true }
 );
+
+const attemptSchema = new Schema<CallBridgeAttemptDocument>(
+  {
+    employeeCode: { type: String, required: true, trim: true, index: true },
+    employeeName: { type: String, required: true, trim: true },
+    businessId: { type: String, required: true, trim: true, index: true },
+    leadId: { type: String, required: true, trim: true, index: true },
+    phone: { type: String, trim: true, default: "" },
+    provider: { type: String, enum: ["ringcentral"], default: "ringcentral" },
+    extensionId: { type: String, trim: true, default: "" },
+    extensionNumber: { type: String, trim: true, default: "" },
+    providerSessionId: { type: String, trim: true },
+    phase: {
+      type: String,
+      enum: ["reserved", "dialing", "ringing", "answered", "voicemail", "ended", "classifying", "classified", "failed"],
+      default: "reserved",
+      index: true,
+    },
+    outcome: {
+      type: String,
+      enum: ["pending", "connected", "not_connected", "voicemail", "unclassified"],
+      default: "pending",
+      index: true,
+    },
+    outcomeReason: { type: String, trim: true, default: "" },
+    classificationConfidence: {
+      type: String,
+      enum: ["", "high", "probable", "needs_review"],
+      default: "",
+    },
+    classificationSource: {
+      type: String,
+      enum: ["", "manual", "ringcentral_events", "ringcentral_call_log", "ringcentral_recording"],
+      default: "",
+    },
+    providerResult: { type: String, trim: true, default: "" },
+    statusCodes: { type: [String], default: [] },
+    reservedAt: { type: Date, required: true, default: Date.now },
+    dialStartedAt: { type: Date, default: null },
+    ringingAt: { type: Date, default: null },
+    answeredAt: { type: Date, default: null },
+    endedAt: { type: Date, default: null, index: true },
+    classifiedAt: { type: Date, default: null, index: true },
+    durationSeconds: { type: Number, min: 0, default: 0 },
+    recordingId: { type: String, trim: true, default: "" },
+    callStatLogId: { type: String, trim: true, default: "" },
+    lastError: { type: String, trim: true, default: "" },
+  },
+  { timestamps: true }
+);
+
+attemptSchema.index({ employeeCode: 1, providerSessionId: 1 });
+attemptSchema.index({ employeeCode: 1, classifiedAt: 1, reservedAt: -1 });
+attemptSchema.index({ businessId: 1, leadId: 1, reservedAt: -1 });
 
 function getControlConnection() {
   const databaseName = process.env.CONTROL_DATABASE_NAME || "crm_control";
@@ -125,5 +244,13 @@ export function getCallBridgeScheduleModel() {
   return (
     connection.models.CallBridgeSchedule ||
     connection.model<CallBridgeScheduleDocument>("CallBridgeSchedule", scheduleSchema)
+  );
+}
+
+export function getCallBridgeAttemptModel() {
+  const connection = getControlConnection();
+  return (
+    connection.models.CallBridgeAttempt ||
+    connection.model<CallBridgeAttemptDocument>("CallBridgeAttempt", attemptSchema)
   );
 }

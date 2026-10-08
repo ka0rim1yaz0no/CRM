@@ -1,4 +1,4 @@
-const backendPort = "4000";
+const backendPort = String(import.meta.env.VITE_BACKEND_PORT || "4000");
 
 function isIpAddress(hostname: string) {
   return /^(?:\d{1,3}\.){3}\d{1,3}$/.test(hostname);

@@ -16,3 +16,21 @@ export async function getEmployeeTransactions(employeeId: string, date?: string)
     });
     return response.data;
 }
+
+export type EmployeeActivityPage = {
+    items: EmployeeTransaction[];
+    hasMore: boolean;
+    nextOffset: number | null;
+    metrics: {
+        activeLeads: number;
+        closedDeals: number;
+        callAttempts: number;
+    } | null;
+};
+
+export async function getEmployeeRecentActivity(employeeId: string, offset = 0, limit = 10) {
+    const response = await api.get<EmployeeActivityPage>(`/employees/${employeeId}/recent-activity`, {
+        params: { offset, limit },
+    });
+    return response.data;
+}

@@ -4,6 +4,7 @@ import {
   createBrowserActivityEvents,
   createBrowserActivityScreenshot,
   downloadBrowserActivityExtension,
+  downloadLiveViewAgent,
   getBrowserActivityTrackingStatus,
   listBrowserActivityEvents,
   listBrowserActivityScreenshots,
@@ -19,4 +20,5 @@ browserActivityRouter.get("/events", listBrowserActivityEvents);
 browserActivityRouter.get("/screenshots/file/:dateKey/:fileName", serveBrowserActivityScreenshotFile);
 browserActivityRouter.get("/screenshots", listBrowserActivityScreenshots);
 browserActivityRouter.get("/extension-package", downloadBrowserActivityExtension);
+browserActivityRouter.get("/live-view-agent-package", downloadLiveViewAgent);
 browserActivityRouter.delete("/", clearBrowserActivityData);

@@ -20,7 +20,11 @@ uploads
 *.zip
 *.rar
 *.7z
+*.tgz
 *.local
+.codex-tmp/
+backend/.codex-tmp/
+survey-dist/
 
 # Editor directories and files
 .vscode/*

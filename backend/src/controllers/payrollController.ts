@@ -1,7 +1,9 @@
 import type { Request, Response } from "express";
 import type { SortOrder } from "mongoose";
 import { Types } from "mongoose";
+import { getBusinessById, getCurrentBusinessId, runWithBusiness } from "../config/tenancy";
 import { Attendance } from "../models/Attendance";
+import { getBusinessAccessForEmployeeCode, normalizeBusinessAccessIds } from "../models/BusinessUserAccess";
 import { Employee } from "../models/Employee";
 import type { PayrollItemCategory, PayrollListItemDocument, PayrollPayType, PayrollStatus } from "../models/Payroll";
 import { PayrollListItem, PayrollRecord } from "../models/Payroll";
@@ -44,17 +46,29 @@ type PayrollAttendanceSummary = {
   overtimeHours: number;
   missingHours: number;
   scheduledHours: number;
+  lateMinutes: number;
+  excessLunchMinutes: number;
+  excessBreakMinutes: number;
+  absenceMinutes: number;
+  earlyTimeOutMinutes: number;
+  deductibleMinutes: number;
+  incompleteShiftDays: number;
 };
 
 type PayrollDtrRow = {
   dateKey: string;
   date: string;
   day: string;
-  status: "Present" | "Late" | "Overtime" | "Absent" | "Weekend";
+  status: "Present" | "Late" | "Overtime" | "Absent" | "Weekend" | "Scheduled" | "In Progress" | "Needs Review";
   isWeekend: boolean;
   timeIn: string;
   timeOut: string;
   lunchHours: number;
+  lateMinutes: number;
+  excessLunchMinutes: number;
+  excessBreakMinutes: number;
+  absenceMinutes: number;
+  earlyTimeOutMinutes: number;
   grossHours: number;
   lateHours: number;
   regularHours: number;
@@ -93,6 +107,17 @@ function startOfDay(date: Date) {
   return new Date(date.getFullYear(), date.getMonth(), date.getDate());
 }
 
+function payrollCalendarToday() {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Manila",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date());
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return new Date(Number(values.year), Number(values.month) - 1, Number(values.day));
+}
+
 function cutoffPeriodFromStartMonth(range: PayrollCutoffRange, year: number, month: number): PayrollCutoffPeriod {
   const crossesMonth = range.startDay > range.endDay;
   const start = new Date(year, month, clampDay(range.startDay, year, month));
@@ -121,15 +146,18 @@ function formatPeriodDate(date: Date) {
   return date.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
 }
 
-function resolveCurrentCutoff(cycle = "Monthly", settings?: PayrollCutoffSettings) {
-  const now = new Date();
+export function resolveCutoffForDate(referenceDate: Date, cycle = "Monthly", settings?: PayrollCutoffSettings) {
   if (cycle !== "Semi-monthly") return null;
-  const today = startOfDay(now);
-  const periods = cutoffPeriodsNear(now, settings);
+  const today = startOfDay(referenceDate);
+  const periods = cutoffPeriodsNear(referenceDate, settings);
   return periods.find((period) => startOfDay(period.payDate).getTime() >= today.getTime()) || periods[periods.length - 1] || null;
 }
 
-function scheduledPayDateForPeriod(payPeriod: string, settings?: PayrollCutoffSettings) {
+function resolveCurrentCutoff(cycle = "Monthly", settings?: PayrollCutoffSettings) {
+  return resolveCutoffForDate(payrollCalendarToday(), cycle, settings);
+}
+
+export function scheduledPayDateForPeriod(payPeriod: string, settings?: PayrollCutoffSettings) {
   const explicitRange = payPeriod.match(/^([A-Za-z]+ \d{1,2}, \d{4})\s+-\s+([A-Za-z]+ \d{1,2}, \d{4})$/);
   if (!explicitRange) return null;
 
@@ -149,20 +177,17 @@ function scheduledPayDateForPeriod(payPeriod: string, settings?: PayrollCutoffSe
 }
 
 function currentPeriod(cycle = "Monthly", settings?: PayrollCutoffSettings) {
-  const now = new Date();
-
-  if (cycle === "Weekly") {
-    const weekStart = new Date(now);
-    weekStart.setDate(now.getDate() - now.getDay());
-    return `Week of ${weekStart.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" })}`;
-  }
-
   if (cycle === "Semi-monthly") {
     const cutoff = resolveCurrentCutoff(cycle, settings);
     if (cutoff) return `${formatPeriodDate(cutoff.start)} - ${formatPeriodDate(cutoff.end)}`;
   }
 
-  return now.toLocaleDateString("en-US", { month: "long", year: "numeric" });
+  const now = payrollCalendarToday();
+  const start = now.getDate() >= 6
+    ? new Date(now.getFullYear(), now.getMonth(), 6)
+    : new Date(now.getFullYear(), now.getMonth() - 1, 6);
+  const end = new Date(start.getFullYear(), start.getMonth() + 1, 5);
+  return `${formatPeriodDate(start)} - ${formatPeriodDate(end)}`;
 }
 
 function scheduledPayDateLabel(cycle = "Monthly", settings?: PayrollCutoffSettings, payPeriod = "") {
@@ -272,7 +297,73 @@ function lateHoursForSlot(
   const allowedStartMinutes = slotDayNumber * 1440 + minutesFromTime(settings?.officialShiftStartTime || "23:00") + Math.max(Number(settings?.lateGraceMinutes || 0), 0);
   const actualMinutes = actualDayNumber * 1440 + actual.minutes;
 
-  return roundHours(Math.max(0, (actualMinutes - allowedStartMinutes) / 60));
+  return Math.max(0, (actualMinutes - allowedStartMinutes) / 60);
+}
+
+function absoluteZonedMinutes(value: Date | undefined, timeZone: string) {
+  const parts = zonedAttendanceParts(value, timeZone);
+  if (!parts) return null;
+  return Math.floor(Date.UTC(parts.year, parts.month - 1, parts.day) / 86400000) * 1440 + parts.minutes;
+}
+
+function scheduledShiftEndMinutes(slotKey: string, settings?: PayrollCutoffSettings & {
+  officialShiftStartTime?: string | null;
+  officialShiftEndTime?: string | null;
+}) {
+  const slotDate = dateFromDateKey(slotKey);
+  if (!slotDate) return null;
+  const startMinutes = minutesFromTime(settings?.officialShiftStartTime || "23:00");
+  const endMinutes = minutesFromTime(settings?.officialShiftEndTime || "08:00");
+  const slotDay = Math.floor(slotDate.getTime() / 86400000);
+  return (slotDay + (endMinutes <= startMinutes ? 1 : 0)) * 1440 + endMinutes;
+}
+
+function earlyTimeOutMinutesForSlot(value: Date | undefined, slotKey: string, settings?: PayrollCutoffSettings & {
+  attendanceTimeZone?: string | null;
+  officialShiftStartTime?: string | null;
+  officialShiftEndTime?: string | null;
+}) {
+  if (!value) return 0;
+  const timeZone = settings?.attendanceTimeZone || "Asia/Manila";
+  const actualMinutes = absoluteZonedMinutes(value, timeZone);
+  const shiftEndMinutes = scheduledShiftEndMinutes(slotKey, settings);
+  if (actualMinutes === null || shiftEndMinutes === null) return 0;
+  return Math.max(0, shiftEndMinutes - actualMinutes);
+}
+
+function shiftHasEnded(slotKey: string, settings?: PayrollCutoffSettings & {
+  attendanceTimeZone?: string | null;
+  officialShiftStartTime?: string | null;
+  officialShiftEndTime?: string | null;
+}) {
+  const nowMinutes = absoluteZonedMinutes(new Date(), settings?.attendanceTimeZone || "Asia/Manila");
+  const shiftEndMinutes = scheduledShiftEndMinutes(slotKey, settings);
+  return nowMinutes !== null && shiftEndMinutes !== null && nowMinutes >= shiftEndMinutes;
+}
+
+function elapsedMinutes(start?: Date | null, end?: Date | null) {
+  if (!start || !end || end <= start) return 0;
+  return Math.max(0, Math.round((end.getTime() - start.getTime()) / 60000));
+}
+
+function excessSessionMinutes<TRecord extends { source: string; timeIn: Date }>(
+  records: TRecord[],
+  outSource: string,
+  inSource: string,
+  allowanceMinutes: number,
+  shiftEnd?: Date | null
+) {
+  let open: Date | null = null;
+  let excess = 0;
+  for (const record of records) {
+    if (record.source === outSource && !open) open = record.timeIn;
+    if (record.source === inSource && open) {
+      excess += Math.max(0, elapsedMinutes(open, record.timeIn) - allowanceMinutes);
+      open = null;
+    }
+  }
+  if (open && shiftEnd && shiftEnd > open) excess += Math.max(0, elapsedMinutes(open, shiftEnd) - allowanceMinutes);
+  return excess;
 }
 
 function formatDtrDate(value: string) {
@@ -394,7 +485,33 @@ function countWorkingDays(start: Date, end: Date) {
   return days;
 }
 
-function periodRange(payPeriod: string) {
+function monthlyCycleRangeForPayPeriod(payPeriod: string) {
+  const cutoff = periodRange(payPeriod);
+  const cycleStart = new Date(cutoff.start.getFullYear(), cutoff.start.getMonth(), 6);
+  const cycleEnd = new Date(cycleStart.getFullYear(), cycleStart.getMonth() + 1, 6);
+  return { start: cycleStart, end: cycleEnd };
+}
+
+export function monthlyWorkingDaysForPayPeriod(payPeriod: string) {
+  const cycle = monthlyCycleRangeForPayPeriod(payPeriod);
+  return countWorkingDays(cycle.start, cycle.end);
+}
+
+export function payrollRatesForCutoff(monthlySalaryValue: number, payPeriod: string) {
+  const monthlySalary = roundMoney(Math.max(Number(monthlySalaryValue) || 0, 0));
+  const monthlyWorkingDays = monthlyWorkingDaysForPayPeriod(payPeriod);
+  const cutoffBasePay = roundMoney(monthlySalary / 2);
+  const hourlyRate = monthlyWorkingDays > 0 ? monthlySalary / monthlyWorkingDays / 8 : 0;
+  return {
+    monthlySalary,
+    monthlyWorkingDays,
+    cutoffBasePay,
+    hourlyRate,
+    minuteRate: hourlyRate / 60,
+  };
+}
+
+export function periodRange(payPeriod: string) {
   const now = new Date();
   const explicitRange = payPeriod.match(/^([A-Za-z]+ \d{1,2}, \d{4})\s+-\s+([A-Za-z]+ \d{1,2}, \d{4})$/);
   if (explicitRange) {
@@ -450,7 +567,6 @@ async function attendancePayrollDtr(employeeId: Types.ObjectId, payPeriod: strin
   const officialLunchHours = 1;
   const scheduledGrossHours = hoursFromTimeRange(settings.officialShiftStartTime || "23:00", settings.officialShiftEndTime || "08:00") || 9;
   const scheduledDailyHours = Math.max(1, scheduledGrossHours - officialLunchHours);
-  const lateGraceHours = Math.max(Number(settings.lateGraceMinutes || 0), 0) / 60;
   const workingDays = countWorkingDays(start, end);
   const queryEnd = new Date(end);
   queryEnd.setDate(queryEnd.getDate() + 1);
@@ -469,31 +585,66 @@ async function attendancePayrollDtr(employeeId: Types.ObjectId, payPeriod: strin
     const lunchOut = firstRecord(dayRecords, ["Lunch Break Out"]);
     const lunchIn = lastRecord(dayRecords, ["Lunch Break In"]);
     const hasValidShift = Boolean(timeIn && timeOut && timeOut.timeIn > timeIn.timeIn);
-    const assumedGrossHours = timeIn && !hasValidShift && !isWeekendSlot ? scheduledGrossHours : 0;
-    const grossHours = hasValidShift && timeIn && timeOut ? (timeOut.timeIn.getTime() - timeIn.timeIn.getTime()) / 3600000 : assumedGrossHours;
+    const completedShift = shiftHasEnded(slotKey, settings);
+    const isOpenShift = Boolean(timeIn && !timeOut && !completedShift);
+    const needsReview = Boolean(timeIn && !hasValidShift && completedShift);
+    const timeZone = settings.attendanceTimeZone || "Asia/Manila";
+    const shiftEndMinutes = scheduledShiftEndMinutes(slotKey, settings);
+    const currentMinutes = absoluteZonedMinutes(new Date(), timeZone);
+    const clockInMinutes = absoluteZonedMinutes(timeIn?.timeIn, timeZone);
+    const openShiftHours = isOpenShift && shiftEndMinutes !== null && currentMinutes !== null && clockInMinutes !== null
+      ? Math.max(0, Math.min(currentMinutes, shiftEndMinutes) - clockInMinutes) / 60
+      : 0;
+    const grossHours = hasValidShift && timeIn && timeOut
+      ? (timeOut.timeIn.getTime() - timeIn.timeIn.getTime()) / 3600000
+      : openShiftHours;
     const actualLunchHours = lunchOut && lunchIn && lunchIn.timeIn > lunchOut.timeIn ? (lunchIn.timeIn.getTime() - lunchOut.timeIn.getTime()) / 3600000 : 0;
-    const lunchHours = timeIn ? Math.min(grossHours, isWeekendSlot ? actualLunchHours : officialLunchHours) : 0;
-    const status: PayrollDtrRow["status"] = timeIn
-      ? isWeekendSlot
-        ? "Overtime"
-        : timeIn.attendanceStatus === "Late"
-          ? "Late"
-          : "Present"
-      : isWeekendSlot
-        ? "Weekend"
-        : "Absent";
-    const lateHours = status === "Late" ? lateHoursForSlot(timeIn?.timeIn, slotKey, settings) : 0;
+    const lunchHours = timeIn
+      ? Math.min(grossHours, isWeekendSlot || isOpenShift ? actualLunchHours : officialLunchHours)
+      : 0;
+    const calculatedLateHours = !isWeekendSlot ? lateHoursForSlot(timeIn?.timeIn, slotKey, settings) : 0;
+    const status: PayrollDtrRow["status"] = isOpenShift
+      ? "In Progress"
+      : needsReview
+        ? "Needs Review"
+        : timeIn
+          ? isWeekendSlot
+            ? "Overtime"
+            : calculatedLateHours > 0
+              ? "Late"
+              : "Present"
+          : isWeekendSlot
+            ? "Weekend"
+            : completedShift
+              ? "Absent"
+              : "Scheduled";
+    const lateHours = timeIn && !isWeekendSlot ? calculatedLateHours : 0;
+    const lateMinutes = Math.round(lateHours * 60);
+    const excessLunchMinutes = isWeekendSlot ? 0 : excessSessionMinutes(dayRecords, "Lunch Break Out", "Lunch Break In", 60, timeOut?.timeIn);
+    const excessBreakMinutes = isWeekendSlot ? 0 : excessSessionMinutes(dayRecords, "Break Out", "Break In", 15, timeOut?.timeIn);
+    const absenceMinutes = status === "Absent" ? Math.round(scheduledDailyHours * 60) : 0;
+    const earlyTimeOutMinutes = !isWeekendSlot && timeIn && timeOut && completedShift
+      ? earlyTimeOutMinutesForSlot(timeOut.timeIn, slotKey, settings)
+      : 0;
     const dailyWorked = Math.max(0, grossHours - lunchHours);
     const scheduledHours = isWeekendSlot ? 0 : scheduledDailyHours;
-    const earlyShortageHours = timeIn && hasValidShift ? Math.max(0, scheduledDailyHours - dailyWorked - (status === "Late" ? lateGraceHours : 0)) : 0;
+    const earlyShortageHours = timeIn && hasValidShift ? Math.max(0, scheduledDailyHours - dailyWorked) : 0;
     const missingHours = isWeekendSlot
       ? 0
+      : isOpenShift || needsReview
+        ? 0
       : !timeIn
         ? scheduledDailyHours
         : !hasValidShift
           ? lateHours
           : Math.max(lateHours, earlyShortageHours);
-    const regularHours = isWeekendSlot ? 0 : Math.max(0, scheduledDailyHours - missingHours);
+    const regularHours = isWeekendSlot
+      ? 0
+      : isOpenShift
+        ? Math.min(dailyWorked, scheduledDailyHours)
+        : needsReview
+          ? 0
+          : Math.max(0, scheduledDailyHours - missingHours);
     const overtimeHours = isWeekendSlot ? dailyWorked : 0;
 
     return {
@@ -505,8 +656,13 @@ async function attendancePayrollDtr(employeeId: Types.ObjectId, payPeriod: strin
       timeIn: formatDtrTime(timeIn?.timeIn, settings.attendanceTimeZone || "Asia/Manila"),
       timeOut: formatDtrTime(timeOut?.timeIn, settings.attendanceTimeZone || "Asia/Manila"),
       lunchHours: roundHours(lunchHours),
+      lateMinutes,
+      excessLunchMinutes,
+      excessBreakMinutes,
+      absenceMinutes,
+      earlyTimeOutMinutes,
       grossHours: roundHours(grossHours),
-      lateHours,
+      lateHours: roundHours(lateHours),
       regularHours: roundHours(regularHours),
       overtimeHours: roundHours(overtimeHours),
       missingHours: roundHours(missingHours),
@@ -529,6 +685,13 @@ async function attendancePayrollDtr(employeeId: Types.ObjectId, payPeriod: strin
     overtimeHours: roundHours(filteredRows.reduce((sum, row) => sum + row.overtimeHours, 0)),
     missingHours: roundHours(filteredRows.reduce((sum, row) => sum + row.missingHours, 0)),
     scheduledHours: roundHours(workingDays * scheduledDailyHours),
+    lateMinutes: filteredRows.reduce((sum, row) => sum + row.lateMinutes, 0),
+    excessLunchMinutes: filteredRows.reduce((sum, row) => sum + row.excessLunchMinutes, 0),
+    excessBreakMinutes: filteredRows.reduce((sum, row) => sum + row.excessBreakMinutes, 0),
+    absenceMinutes: filteredRows.reduce((sum, row) => sum + row.absenceMinutes, 0),
+    earlyTimeOutMinutes: filteredRows.reduce((sum, row) => sum + row.earlyTimeOutMinutes, 0),
+    deductibleMinutes: filteredRows.reduce((sum, row) => sum + row.lateMinutes + row.excessLunchMinutes + row.excessBreakMinutes + row.absenceMinutes + row.earlyTimeOutMinutes, 0),
+    incompleteShiftDays: filteredRows.filter((row) => row.status === "Needs Review").length,
   };
 
   return {
@@ -574,25 +737,25 @@ async function seedPayroll() {
   ]);
 }
 
-async function syncEmployeePayrollRecords(payPeriod = "", payDate = "") {
+async function syncEmployeePayrollRecords(payPeriod = "", payDate = "", employeeCodes: string[] = []) {
   const settings = await getSystemSettings();
   const resolvedPayPeriod = payPeriod || currentPeriod(settings.payrollBillingCycle, settings);
-  const resolvedPayType = payTypeForCycle(settings.payrollBillingCycle);
+  const resolvedPayType: PayrollPayType = payTypeForCycle(settings.payrollBillingCycle);
   const resolvedPayDate = selectedPayDateLabel(payDate) || scheduledPayDateLabel(settings.payrollBillingCycle, settings, resolvedPayPeriod);
-  const employees = await Employee.find({ status: { $ne: "Archived" } }).sort({ employeeCode: 1 });
+  const monthlyWorkingDays = monthlyWorkingDaysForPayPeriod(resolvedPayPeriod);
+  const employeeFilter: Record<string, unknown> = { status: { $ne: "Archived" } };
+  if (employeeCodes.length) employeeFilter.employeeCode = { $in: employeeCodes };
+  const employees = await Employee.find(employeeFilter).sort({ employeeCode: 1 });
   const records = [];
 
   for (const employee of employees) {
-    const cycleGrossPay = grossPayForCycle(toMoney(employee.salary), settings.payrollBillingCycle);
+    const { monthlyWorkingDays, cutoffBasePay, hourlyRate, minuteRate } = payrollRatesForCutoff(toMoney(employee.salary), resolvedPayPeriod);
     const attendance = await attendancePayrollSummary(employee._id, resolvedPayPeriod);
-    const scheduledHours = Math.max(attendance.scheduledHours, 0);
-    const missingHours = Math.max(attendance.missingHours, 0);
-    const hourlyRate = scheduledHours > 0 ? cycleGrossPay / scheduledHours : 0;
     const existingRecords = await PayrollRecord.find({ employeeId: employee.employeeCode, payPeriod: resolvedPayPeriod, isArchived: false }).sort({ updatedAt: -1, createdAt: -1 });
     const existingRecord = existingRecords[0];
     const approvedOvertimeHours = existingRecord?.overtimeApproved ? toMoney(existingRecord.overtimeHours) : 0;
-    const grossPay = roundMoney(cycleGrossPay + approvedOvertimeHours * hourlyRate);
-    const deductions = Math.min(grossPay, roundMoney(missingHours * hourlyRate));
+    const grossPay = roundMoney(cutoffBasePay + approvedOvertimeHours * hourlyRate);
+    const deductions = Math.min(grossPay, roundMoney(attendance.deductibleMinutes * minuteRate));
 
     if (existingRecords.length > 1) {
       await PayrollRecord.updateMany(
@@ -608,6 +771,16 @@ async function syncEmployeePayrollRecords(payPeriod = "", payDate = "") {
         existingRecord.department = employee.team || employee.role || "General";
         existingRecord.payType = resolvedPayType;
         existingRecord.grossPay = grossPay;
+        existingRecord.basicPay = cutoffBasePay;
+        existingRecord.workingDays = monthlyWorkingDays;
+        existingRecord.minuteRate = minuteRate;
+        existingRecord.lateMinutes = attendance.lateMinutes;
+        existingRecord.excessLunchMinutes = attendance.excessLunchMinutes;
+        existingRecord.excessBreakMinutes = attendance.excessBreakMinutes;
+        existingRecord.absenceMinutes = attendance.absenceMinutes;
+        existingRecord.earlyTimeOutMinutes = attendance.earlyTimeOutMinutes;
+        existingRecord.deductibleMinutes = attendance.deductibleMinutes;
+        existingRecord.incompleteShiftDays = attendance.incompleteShiftDays;
         existingRecord.deductions = deductions;
         existingRecord.netPay = Math.max(grossPay - deductions, 0);
         existingRecord.paidOn = resolvedPayDate;
@@ -619,6 +792,9 @@ async function syncEmployeePayrollRecords(payPeriod = "", payDate = "") {
         existingRecord.workedHours = attendance.workedHours;
         existingRecord.overtimeHours = approvedOvertimeHours;
         existingRecord.scheduledHours = attendance.scheduledHours;
+        if (existingRecord.status === "Pending" || existingRecord.status === "Review") {
+          existingRecord.status = attendance.incompleteShiftDays > 0 ? "Review" : cutoffBasePay > 0 ? "Pending" : "Review";
+        }
         await existingRecord.save();
       }
 
@@ -634,6 +810,16 @@ async function syncEmployeePayrollRecords(payPeriod = "", payDate = "") {
         department: employee.team || employee.role || "General",
         payType: resolvedPayType,
         grossPay,
+        basicPay: cutoffBasePay,
+        workingDays: monthlyWorkingDays,
+        minuteRate,
+        lateMinutes: attendance.lateMinutes,
+        excessLunchMinutes: attendance.excessLunchMinutes,
+        excessBreakMinutes: attendance.excessBreakMinutes,
+        absenceMinutes: attendance.absenceMinutes,
+        earlyTimeOutMinutes: attendance.earlyTimeOutMinutes,
+        deductibleMinutes: attendance.deductibleMinutes,
+        incompleteShiftDays: attendance.incompleteShiftDays,
         deductions,
         netPay: Math.max(grossPay - deductions, 0),
         attendanceDays: attendance.attendanceDays,
@@ -645,7 +831,7 @@ async function syncEmployeePayrollRecords(payPeriod = "", payDate = "") {
         overtimeHours: 0,
         overtimeApproved: false,
         scheduledHours: attendance.scheduledHours,
-        status: grossPay > 0 ? "Pending" : "Review",
+        status: attendance.incompleteShiftDays > 0 || grossPay <= 0 ? "Review" : "Pending",
         paidOn: resolvedPayDate,
         payPeriod: resolvedPayPeriod,
       })
@@ -653,6 +839,41 @@ async function syncEmployeePayrollRecords(payPeriod = "", payDate = "") {
   }
 
   return records;
+}
+
+function payrollPeriodForAttendanceDate(value: Date, settings: PayrollCutoffSettings) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Manila",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(value);
+  const fields = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  const calendarDate = new Date(Number(fields.year), Number(fields.month) - 1, Number(fields.day));
+  const cutoff = cutoffPeriodsNear(calendarDate, settings).find((period) =>
+    calendarDate.getTime() >= startOfDay(period.start).getTime() &&
+    calendarDate.getTime() <= startOfDay(period.end).getTime()
+  );
+  return cutoff ? `${formatPeriodDate(cutoff.start)} - ${formatPeriodDate(cutoff.end)}` : "";
+}
+
+export async function recalculateEmployeePayrollAfterAttendanceEdit(
+  employeeObjectId: string,
+  previousTime: Date,
+  updatedTime: Date
+) {
+  const employee = await Employee.findById(employeeObjectId).select("employeeCode status").lean();
+  if (!employee || employee.status === "Archived") return;
+
+  const settings = await getSystemSettings();
+  const payPeriods = new Set([
+    payrollPeriodForAttendanceDate(previousTime, settings),
+    payrollPeriodForAttendanceDate(updatedTime, settings),
+  ]);
+
+  for (const payPeriod of payPeriods) {
+    if (payPeriod) await syncEmployeePayrollRecords(payPeriod, "", [employee.employeeCode]);
+  }
 }
 
 export async function getPayrollDtr(request: Request, response: Response) {
@@ -672,10 +893,9 @@ export async function getPayrollDtr(request: Request, response: Response) {
     return;
   }
 
-  const grossPay = grossPayForCycle(toMoney(employee.salary), settings.payrollBillingCycle);
+  const { monthlyWorkingDays, cutoffBasePay, hourlyRate, minuteRate } = payrollRatesForCutoff(toMoney(employee.salary), payPeriod);
   const dtr = await attendancePayrollDtr(employee._id, payPeriod);
-  const hourlyRate = dtr.summary.scheduledHours > 0 ? grossPay / dtr.summary.scheduledHours : 0;
-  const deductions = Math.min(grossPay, roundMoney(dtr.summary.missingHours * hourlyRate));
+  const deductions = Math.min(cutoffBasePay, roundMoney(dtr.summary.deductibleMinutes * minuteRate));
 
   response.json({
     employee: {
@@ -689,13 +909,56 @@ export async function getPayrollDtr(request: Request, response: Response) {
     payType: payTypeForCycle(settings.payrollBillingCycle),
     summary: {
       ...dtr.summary,
-      grossPay: roundMoney(grossPay),
+      monthlyWorkingDays,
+      grossPay: cutoffBasePay,
+      basicPay: cutoffBasePay,
       hourlyRate: roundMoney(hourlyRate),
+      minuteRate,
       deductions,
-      netPay: Math.max(roundMoney(grossPay) - deductions, 0),
+      netPay: Math.max(cutoffBasePay - deductions, 0),
     },
     rows: dtr.rows,
   });
+}
+
+export async function updateEmployeeBasicPay(request: Request, response: Response) {
+  const employeeId = String(request.params.employeeId || "").trim();
+  const basicPay = toMoney(request.body.basicPay, -1);
+  if (basicPay < 0) {
+    response.status(400).json({ message: "Basic pay must be zero or greater" });
+    return;
+  }
+
+  const employee = await Employee.findOne({ employeeCode: employeeId });
+  if (!employee) {
+    response.status(404).json({ message: "Employee not found" });
+    return;
+  }
+
+  const controlledBusinessIds = await getBusinessAccessForEmployeeCode(employeeId);
+  const employeeBusinessIds = normalizeBusinessAccessIds(employee.businessAccessIds);
+  const businessIds = Array.from(new Set([
+    ...(controlledBusinessIds.length ? controlledBusinessIds : employeeBusinessIds),
+    getCurrentBusinessId(),
+  ])).filter((businessId) => Boolean(getBusinessById(businessId)));
+
+  for (const businessId of businessIds) {
+    await runWithBusiness(businessId, async () => {
+      const businessEmployee = await Employee.findOne({ employeeCode: employeeId, status: { $ne: "Archived" } });
+      if (!businessEmployee) return;
+
+      businessEmployee.salary = basicPay;
+      await businessEmployee.save();
+      const businessSettings = await getSystemSettings();
+      const businessPayPeriod = currentPeriod(businessSettings.payrollBillingCycle, businessSettings);
+      await syncEmployeePayrollRecords(businessPayPeriod, "", [employeeId]);
+    });
+  }
+
+  const settings = await getSystemSettings();
+  const payPeriod = currentPeriod(settings.payrollBillingCycle, settings);
+  const record = await PayrollRecord.findOne({ employeeId, payPeriod, isArchived: false }).sort({ updatedAt: -1 });
+  response.json(record);
 }
 
 export async function updatePayrollOvertime(request: Request, response: Response) {
@@ -709,14 +972,12 @@ export async function updatePayrollOvertime(request: Request, response: Response
 
   const settings = await getSystemSettings();
   const employee = await Employee.findOne({ employeeCode: record.employeeId });
-  const baseGrossPay = employee
-    ? grossPayForCycle(toMoney(employee.salary), settings.payrollBillingCycle)
-    : Math.max(0, toMoney(record.grossPay) - toMoney(record.overtimeHours) * (record.scheduledHours > 0 ? toMoney(record.grossPay) / record.scheduledHours : 0));
-  let scheduledHours = toMoney(record.scheduledHours);
-
-  if (!scheduledHours && employee) {
+  const rates = payrollRatesForCutoff(employee ? toMoney(employee.salary) : toMoney(record.basicPay) * 2, record.payPeriod);
+  const baseGrossPay = rates.cutoffBasePay;
+  const monthlyWorkingDays = rates.monthlyWorkingDays;
+  const hourlyRate = rates.hourlyRate;
+  if (employee) {
     const attendance = await attendancePayrollSummary(employee._id, record.payPeriod);
-    scheduledHours = attendance.scheduledHours;
     record.attendanceDays = attendance.attendanceDays;
     record.absentDays = attendance.absentDays;
     record.absentHours = attendance.absentHours;
@@ -724,10 +985,20 @@ export async function updatePayrollOvertime(request: Request, response: Response
     record.lateHours = attendance.lateHours;
     record.workedHours = attendance.workedHours;
     record.scheduledHours = attendance.scheduledHours;
-    record.deductions = Math.min(baseGrossPay, roundMoney(attendance.missingHours * (scheduledHours > 0 ? baseGrossPay / scheduledHours : 0)));
+    const minuteRate = rates.minuteRate;
+    record.basicPay = baseGrossPay;
+    record.workingDays = monthlyWorkingDays;
+    record.minuteRate = minuteRate;
+    record.lateMinutes = attendance.lateMinutes;
+    record.excessLunchMinutes = attendance.excessLunchMinutes;
+    record.excessBreakMinutes = attendance.excessBreakMinutes;
+    record.absenceMinutes = attendance.absenceMinutes;
+    record.earlyTimeOutMinutes = attendance.earlyTimeOutMinutes;
+    record.deductibleMinutes = attendance.deductibleMinutes;
+    record.incompleteShiftDays = attendance.incompleteShiftDays;
+    record.deductions = Math.min(baseGrossPay, roundMoney(attendance.deductibleMinutes * minuteRate));
   }
 
-  const hourlyRate = scheduledHours > 0 ? baseGrossPay / scheduledHours : 0;
   const grossPay = roundMoney(baseGrossPay + overtimeHours * hourlyRate);
 
   record.overtimeHours = overtimeHours;

@@ -2,6 +2,7 @@ import type { Request, Response } from "express";
 import { Types } from "mongoose";
 import { Employee, normalizeEmployeeAvailabilityStatus } from "../models/Employee";
 import { Lead } from "../models/Lead";
+import { LeadCallStat } from "../models/leadCallStat";
 import { scoreLeadsByPotential } from "../services/leadScoringService";
 import { geocodeLocation, reverseGeocodeLocality, searchAllGooglePlaces, searchGooglePlaces, searchGooglePlacesPages, type GooglePlaceLead, type GooglePlacesLocationBias } from "../services/googlePlacesService";
 import { getTomTomUsage, searchTomTomPlaceQueries, type TomTomPlaceLead } from "../services/tomTomSearchService";
@@ -11,6 +12,11 @@ import { isLeadAutoAssignmentEnabled } from "./systemSettingsController";
 import { formatPhDate } from "../utils/dateTime";
 import { emitLeadChanged } from "../socket";
 import { getCurrentBusinessId, runForEachBusiness } from "../config/tenancy";
+import { AUTO_CALL_COMMENT_COOLDOWN_MS, isLeadEligibleForAutoCall } from "../services/leadAutoCallEligibility";
+import { getCallProvider } from "../config/callProvider";
+import { getCallBridgeAttemptModel } from "../models/CallBridge";
+import { getRingCentralMonitorStatus } from "../services/ringCentralCallMonitor";
+import { isRingCentralOutcomeShadowEnabled } from "../services/ringCentralCallClassification";
 
 const populateLead = [
   { path: "assignedAgent", select: "name employeeCode aliases role team status" },
@@ -375,8 +381,6 @@ function activityPush(label: string, detail: string, actor: LeadActivityActor, s
   };
 }
 
-const cdtOffsetMs = 5 * 60 * 60 * 1000;
-
 function formatScheduledTime(value: Date, timeZone: string) {
   const parts = new Intl.DateTimeFormat("en-US", {
     timeZone,
@@ -391,8 +395,13 @@ function formatScheduledTime(value: Date, timeZone: string) {
   return `${valueFor("hour")}:${valueFor("minute")} ${valueFor("dayPeriod")} ${valueFor("month")} ${valueFor("day")}, ${valueFor("year")}`;
 }
 
-function formatScheduledCdtTime(value: Date) {
-  return formatScheduledTime(new Date(value.getTime() - cdtOffsetMs), "UTC");
+function formatScheduledEasternTime(value: Date) {
+  const timeZoneName = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    timeZoneName: "short",
+  }).formatToParts(value).find((part) => part.type === "timeZoneName")?.value || "ET";
+
+  return `${formatScheduledTime(value, "America/New_York")} ${timeZoneName}`;
 }
 
 function formatScheduledPhTime(value: Date) {
@@ -432,6 +441,13 @@ type AgentDashboardLead = {
   _id: Types.ObjectId;
   leadName?: string;
   businessName?: string;
+  businessAddress?: string;
+  email?: string;
+  phone?: string;
+  website?: string;
+  googlePlaceId?: string;
+  providerPlaceId?: string;
+  placeProvider?: string;
   source?: string;
   category?: string;
   status?: (typeof leadStatuses)[number];
@@ -460,6 +476,8 @@ type AgentDashboardRow = {
   employeeId: string;
   employeeName: string;
   employeeCode: string;
+  businessId: string;
+  businessName: string;
   role: string;
   team: string;
   status: string;
@@ -486,6 +504,8 @@ type AgentDashboardRow = {
 type AgentDashboardMonthlyRow = {
   employeeId: string;
   employeeName: string;
+  businessId: string;
+  businessName: string;
   role: string;
   team: string;
   leadsAdded: number;
@@ -753,11 +773,16 @@ function isWithinDashboardDateRange(value: Date | string | null | undefined, ran
   return time > 0 && time >= range.start.getTime() && time <= range.end.getTime();
 }
 
-function makeAgentDashboardRow(employee: AgentDashboardEmployee): AgentDashboardRow {
+function makeAgentDashboardRow(
+  employee: AgentDashboardEmployee,
+  business: { id?: string; name?: string } | undefined
+): AgentDashboardRow {
   return {
     employeeId: String(employee._id),
     employeeName: String(employee.name || "Employee"),
     employeeCode: String(employee.employeeCode || ""),
+    businessId: String(business?.id || ""),
+    businessName: String(business?.name || "Current business"),
     role: String(employee.role || "Agent"),
     team: String(employee.team || "Unassigned"),
     status: String(employee.status || "Active"),
@@ -786,6 +811,8 @@ function makeAgentDashboardMonthlyRow(row: AgentDashboardRow): AgentDashboardMon
   return {
     employeeId: row.employeeId,
     employeeName: row.employeeName,
+    businessId: row.businessId,
+    businessName: row.businessName,
     role: row.role,
     team: row.team,
     leadsAdded: 0,
@@ -864,16 +891,6 @@ function getDashboardActivityResultStatus(item: { label?: string; detail?: strin
   const match = detail.match(/\b(?:status to|to)\s+(NEW|Follow up|Ongoing comms|Qualified|Ongoing Negotiation|Dead|Archived)\b/i);
 
   return getDashboardLeadStatus(match?.[1]);
-}
-
-function isDashboardCallActivity(item: { label?: string; detail?: string }) {
-  const label = normalizeLeadValue(String(item.label || ""));
-  const detail = normalizeLeadValue(String(item.detail || ""));
-
-  return (
-    /\b(call|called|calling|callback)\b/.test(label) ||
-    /\b(phone call|call placed|called|callback)\b/.test(detail)
-  );
 }
 
 function emitLeadMutation(action: string, lead: unknown) {
@@ -1140,6 +1157,32 @@ function dedupeLeads<T extends PopulatedLead>(leads: T[]) {
   });
 
   return Array.from(leadsByKey.values());
+}
+
+async function resolveActiveLeadDuplicateGroups(leadIds: string[]) {
+  const selectedLeads = await Lead.find({
+    _id: { $in: leadIds },
+    status: { $ne: "Archived" },
+  })
+    .select("googlePlaceId providerPlaceId placeProvider businessName businessAddress phone website")
+    .lean();
+  const selectedKeys = new Set(selectedLeads.map((lead) => getLeadDedupKey(lead)));
+
+  if (selectedKeys.size === 0) {
+    return { leadIds: [] as Types.ObjectId[], logicalLeadCount: 0 };
+  }
+
+  const activeLeads = await Lead.find({ status: { $ne: "Archived" } })
+    .select("_id googlePlaceId providerPlaceId placeProvider businessName businessAddress phone website")
+    .lean();
+  const expandedLeadIds = activeLeads
+    .filter((lead) => selectedKeys.has(getLeadDedupKey(lead)))
+    .map((lead) => lead._id);
+
+  return {
+    leadIds: expandedLeadIds,
+    logicalLeadCount: selectedKeys.size,
+  };
 }
 
 function dedupePlaces(places: ImportablePlaceLead[]) {
@@ -1826,13 +1869,13 @@ function isScheduledForToday(lead: { status?: string; followUpAt?: Date | string
   return Boolean(lead.followUpAt && formatPhDate(lead.followUpAt) === formatPhDate(new Date()));
 }
 
-function isScheduledDueNow(lead: { status?: string; followUpAt?: Date | string | null }) {
+function isScheduledDueNow(lead: { status?: string; followUpAt?: Date | string | null }, now = new Date()) {
   if (lead.status === "Qualified") {
     return false;
   }
 
   const followUpTime = parseLeadQueueTime(lead.followUpAt);
-  return followUpTime !== null && followUpTime <= Date.now();
+  return followUpTime !== null && followUpTime <= now.getTime();
 }
 
 function getManualCommentTime(lead: {
@@ -1898,54 +1941,6 @@ function getLeadDeprioritizedTime(lead: {
   return times.length > 0 ? Math.max(...times) : null;
 }
 
-function getContactActivityTime(lead: {
-  comments?: { authorName?: string; createdAt?: Date | string | null }[];
-  activity?: { label?: string; createdAt?: Date | string | null }[];
-}) {
-  const contactActivityLabels = new Set(["comment added", "lead updated", "status updated", "status changed", "follow up scheduled"]);
-  const times = [
-    ...(lead.comments || [])
-      .filter((comment) => comment.authorName !== "CSV Import")
-      .map((comment) => parseLeadQueueTime(comment.createdAt)),
-    ...(lead.activity || [])
-      .filter((item) => contactActivityLabels.has(String(item.label || "").toLowerCase()))
-      .map((item) => parseLeadQueueTime(item.createdAt)),
-  ].filter((time): time is number => time !== null);
-
-  return times.length > 0 ? Math.max(...times) : null;
-}
-
-function hasManualCommentToday(lead: {
-  comments?: { authorName?: string; createdAt?: Date | string | null }[];
-  activity?: { label?: string; createdAt?: Date | string | null }[];
-}) {
-  const today = formatPhDate(new Date());
-  return (lead.comments || []).some(
-    (comment) => comment.authorName !== "CSV Import" && formatPhDate(comment.createdAt) === today
-  ) || (lead.activity || []).some(
-    (item) => String(item.label || "").toLowerCase() === "comment added" && formatPhDate(item.createdAt) === today
-  );
-}
-
-function isHiddenFromEmployeeQueueToday(lead: {
-  followUpAt?: Date | string | null;
-  comments?: { authorName?: string; createdAt?: Date | string | null }[];
-  activity?: { label?: string; createdAt?: Date | string | null }[];
-}) {
-  if (!hasManualCommentToday(lead)) {
-    return false;
-  }
-
-  const followUpTime = parseLeadQueueTime(lead.followUpAt);
-
-  if (followUpTime === null || followUpTime > Date.now()) {
-    return true;
-  }
-
-  const contactTime = getContactActivityTime(lead);
-  return contactTime !== null && contactTime >= followUpTime;
-}
-
 function getCurrentPhDayRange() {
   const phOffsetMs = 8 * 60 * 60 * 1000;
   const shiftedNow = new Date(Date.now() + phOffsetMs);
@@ -1982,15 +1977,59 @@ function createContactedTodayFilter() {
   };
 }
 
-function createEmployeeCommentedTodayFilter() {
-  const { start, end } = getCurrentPhDayRange();
+function createAutoCallEligibleFilter(now = new Date(), employeeNames: string[] = []) {
+  const normalizedEmployeeNames = Array.from(
+    new Set(employeeNames.map((name) => normalizeLeadValue(name)).filter(Boolean))
+  );
+  const identityConditions: Record<string, unknown>[] = [{ $eq: ["$$comment.authorType", "employee"] }];
 
-  return {
-    comments: {
-      $elemMatch: {
-        authorType: "employee",
-        createdAt: { $gte: start, $lt: end },
+  if (normalizedEmployeeNames.length > 0) {
+    identityConditions.push({
+      $in: [
+        { $toLower: { $trim: { input: { $ifNull: ["$$comment.authorName", ""] } } } },
+        normalizedEmployeeNames,
+      ],
+    });
+  }
+
+  const matchingCommentCount = (dateCondition: Record<string, unknown>) => ({
+    $size: {
+      $filter: {
+        input: { $ifNull: ["$comments", []] },
+        as: "comment",
+        cond: { $and: [...identityConditions, dateCondition] },
       },
+    },
+  });
+  const recentCommentCount = matchingCommentCount({
+    $gt: ["$$comment.createdAt", new Date(now.getTime() - AUTO_CALL_COMMENT_COOLDOWN_MS)],
+  });
+  const commentSinceFollowUpCount = matchingCommentCount({
+    $gte: ["$$comment.createdAt", "$followUpAt"],
+  });
+  return {
+    $expr: {
+      $and: [
+        {
+          $or: [
+            { $eq: [{ $ifNull: ["$followUpAt", null] }, null] },
+            { $lte: ["$followUpAt", now] },
+          ],
+        },
+        {
+          $or: [
+            { $eq: [recentCommentCount, 0] },
+            {
+              $and: [
+                { $eq: ["$status", "Follow up"] },
+                { $ne: [{ $ifNull: ["$followUpAt", null] }, null] },
+                { $lte: ["$followUpAt", now] },
+                { $eq: [commentSinceFollowUpCount, 0] },
+              ],
+            },
+          ],
+        },
+      ],
     },
   };
 }
@@ -2018,15 +2057,16 @@ function sortLeadsForAgentWorkQueue<
     activity?: { label?: string; detail?: string; createdAt?: Date | string | null }[];
     createdAt?: Date;
   }
->(leads: T[]) {
+>(leads: T[], employeeNames: string[] = [], now = new Date()) {
   return [...leads].sort((first, second) => {
     const getQueueRank = (lead: T) => {
-      const hasCommentToday = hasManualCommentToday(lead);
-      const scheduledDueNow = isScheduledDueNow(lead);
+      const isAutoCallEligible = isLeadEligibleForAutoCall(lead, now, employeeNames);
+      const hasRecentEmployeeComment = !isAutoCallEligible && lead.status === "NEW";
+      const scheduledDueNow = isScheduledDueNow(lead, now);
 
-      if (scheduledDueNow && !isHiddenFromEmployeeQueueToday(lead)) return 0;
+      if (scheduledDueNow && isAutoCallEligible) return 0;
       const scheduledToday = isScheduledForToday(lead);
-      if (lead.status === "NEW" && !hasCommentToday && !scheduledToday) return 1;
+      if (lead.status === "NEW" && !hasRecentEmployeeComment && !scheduledToday) return 1;
       if (lead.status === "NEW" && !scheduledToday) return 2;
       if (lead.status === "Follow up" && !scheduledToday) return 3;
       if (scheduledToday) return 5;
@@ -2574,7 +2614,7 @@ export async function listMyLeads(request: Request, response: Response) {
   }
 
   if (autoCallEligible) {
-    andFilters.push({ $nor: [createEmployeeCommentedTodayFilter()] });
+    andFilters.push(createAutoCallEligibleFilter(new Date(), employeeNames));
   }
 
   const filter: Record<string, unknown> = { $and: andFilters };
@@ -2616,19 +2656,62 @@ export async function listMyLeads(request: Request, response: Response) {
   ].join(" ");
 
   const shouldClientPageQueue = tab === "my" && !searchAll && Object.keys(searchFilter).length === 0;
-  const leadQuery = Lead.find(filter)
+  if (shouldClientPageQueue) {
+    // Queue ordering needs every candidate, but hydrating every matching lead
+    // (including populated relations and history) on each auto-call check is
+    // prohibitively expensive. Sort lightweight candidates and hydrate only the
+    // requested page.
+    const candidates = await Lead.find(filter)
+      .select("leadName businessName businessAddress email phone website status assignedAgent assignedAgentName followUpAt followUpPriority comments activity createdAt updatedAt")
+      .slice("comments", -10)
+      .slice("activity", 20)
+      .sort({ createdAt: -1, _id: 1 })
+      .lean();
+    const sortedCandidates = sortLeadsForAgentWorkQueue(
+      dedupeLeads(candidates as unknown as PopulatedLead[]),
+      employeeNames,
+    );
+    const effectiveTotal = sortedCandidates.length;
+    const pageCandidates = sortedCandidates.slice((page - 1) * limit, page * limit);
+    const pageIds = pageCandidates.map((lead) => lead._id);
+    const pageDocuments = pageIds.length > 0
+      ? await Lead.find({ _id: { $in: pageIds } })
+        .select(leadFields)
+        .slice("comments", -10)
+        .slice("activity", 20)
+        .populate("assignedAgent", "name employeeCode aliases")
+        .populate("assignedTeam", "name")
+      : [];
+    const documentsById = new Map(pageDocuments.map((lead) => [String(lead._id), lead]));
+    const pagedLeads = pageIds
+      .map((leadId) => documentsById.get(String(leadId)))
+      .filter(Boolean);
+
+    response.json({
+      leads: pagedLeads,
+      tab,
+      page,
+      limit,
+      total: effectiveTotal,
+      stateOptions,
+      hasMore: page * limit < effectiveTotal,
+      nextPage: page * limit < effectiveTotal ? page + 1 : null,
+    });
+    return;
+  }
+
+  const leads = await Lead.find(filter)
     .select(leadFields)
     .slice("comments", -10)
     .slice("activity", 20)
     .populate("assignedAgent", "name employeeCode aliases")
     .populate("assignedTeam", "name")
-    .sort(shouldClientPageQueue ? { createdAt: -1, _id: 1 } : { updatedAt: -1, createdAt: -1 });
-  const leads = shouldClientPageQueue
-    ? await leadQuery.limit(1000)
-    : await leadQuery.skip((page - 1) * limit).limit(limit);
-  const preparedLeads = dedupeLeads(leads);
-  const sortedLeads = searchAll ? preparedLeads : sortLeadsForAgentWorkQueue(preparedLeads);
-  const pagedLeads = shouldClientPageQueue ? sortedLeads.slice((page - 1) * limit, page * limit) : sortedLeads;
+    .sort({ updatedAt: -1, createdAt: -1 })
+    .skip((page - 1) * limit)
+    .limit(limit);
+  const pagedLeads = searchAll
+    ? dedupeLeads(leads)
+    : sortLeadsForAgentWorkQueue(dedupeLeads(leads), employeeNames);
 
   response.json({
     leads: pagedLeads,
@@ -2656,61 +2739,106 @@ export async function listAdminLeads(request: Request, response: Response) {
   ]);
   const tab = normalizeAdminLeadTab(request.params.tab || request.query.tab);
   const isQueueTab = tab === "leads" || tab === "unassigned";
-  const queryLimit = isQueueTab ? (isExportMode ? limit : 1000) : limit;
+  const detailFields = [
+    "leadName",
+    "position",
+    "businessName",
+    "businessAddress",
+    "email",
+    "phone",
+    "website",
+    "source",
+    "category",
+    "createdByName",
+    "createdByType",
+    "status",
+    "assignedAgent",
+    "assignedAgentName",
+    "autoAssignedAt",
+    "assignedTeam",
+    "favoriteByEmployees",
+    "googlePlaceId",
+    "notes",
+    "comments",
+    "activity",
+    "followUpAt",
+    "followUpNote",
+    "followUpPriority",
+    "aiScore",
+    "aiScoreReason",
+    "aiScoreSource",
+    "aiScoredAt",
+    "createdAt",
+    "updatedAt",
+  ].join(" ");
+
+  if (!isExportMode) {
+    // Deduplication must happen before pagination on every tab. Queue ordering
+    // additionally depends on schedule and activity data from the complete
+    // result set. Load lightweight candidates first, then populate only the
+    // visible page so counts and page boundaries stay exact.
+    const candidates = await Lead.find(filter)
+      .select("leadName businessName businessAddress email phone website status followUpAt comments activity createdAt updatedAt")
+      .slice("comments", -10)
+      .slice("activity", 30)
+      .sort(isQueueTab ? { createdAt: -1, _id: 1 } : { updatedAt: -1, createdAt: -1 })
+      .lean();
+    const dedupedCandidates = dedupeLeads(candidates as unknown as PopulatedLead[]);
+    const sortedCandidates = isQueueTab
+      ? sortLeadsForAgentWorkQueue(dedupedCandidates)
+      : dedupedCandidates;
+    const effectiveTotal = sortedCandidates.length;
+    const pageCandidates = sortedCandidates.slice((page - 1) * limit, page * limit);
+    const pageIds = pageCandidates.map((lead) => lead._id);
+    const pageDocuments = pageIds.length > 0
+      ? await Lead.find({ _id: { $in: pageIds } })
+        .select(detailFields)
+        .slice("comments", -10)
+        .slice("activity", 30)
+        .populate(populateLead)
+      : [];
+    const documentsById = new Map(pageDocuments.map((lead) => [String(lead._id), lead]));
+    const pagedLeads = pageIds
+      .map((leadId) => documentsById.get(String(leadId)))
+      .filter(Boolean);
+
+    response.json({
+      leads: pagedLeads,
+      tab,
+      page,
+      limit,
+      total: effectiveTotal,
+      stateOptions,
+      hasMore: page * limit < effectiveTotal,
+      nextPage: page * limit < effectiveTotal ? page + 1 : null,
+    });
+    return;
+  }
+
   const leads = await Lead.find(filter)
     .select(
-      [
-        "leadName",
-        "position",
-        "businessName",
-        "businessAddress",
-        "email",
-        "phone",
-        "website",
-        "source",
-        "category",
-        "createdByName",
-        "createdByType",
-        "status",
-        "assignedAgent",
-        "assignedAgentName",
-        "autoAssignedAt",
-        "assignedTeam",
-        "favoriteByEmployees",
-        "googlePlaceId",
-        "notes",
-        "comments",
-        "activity",
-        "followUpAt",
-        "followUpNote",
-        "followUpPriority",
-        "aiScore",
-        "aiScoreReason",
-        "aiScoreSource",
-        "aiScoredAt",
-        "createdAt",
-        "updatedAt",
-      ].join(" ")
+      detailFields
     )
     .slice("comments", -10)
     .slice("activity", 30)
     .populate(populateLead)
     .sort(isQueueTab ? { createdAt: -1, _id: 1 } : { updatedAt: -1, createdAt: -1 })
-    .limit(queryLimit)
+    .limit(limit)
     .skip(isQueueTab ? 0 : (page - 1) * limit);
   const exportLeads = isExportMode ? leads : dedupeLeads(leads);
   const sortedLeads = isQueueTab ? sortLeadsForAgentWorkQueue(exportLeads) : exportLeads;
   const pagedLeads = isQueueTab ? sortedLeads.slice((page - 1) * limit, page * limit) : sortedLeads;
+  const effectiveTotal = isQueueTab ? sortedLeads.length : total;
 
   response.json({
     leads: pagedLeads,
     tab,
     page,
     limit,
-    total,
+    total: effectiveTotal,
     stateOptions,
-    hasMore: page * limit < total,
-    nextPage: page * limit < total ? page + 1 : null,
+    hasMore: page * limit < effectiveTotal,
+    nextPage: page * limit < effectiveTotal ? page + 1 : null,
   });
 }
 
@@ -2802,17 +2930,37 @@ export async function readAgentLeadDashboard(request: Request, response: Respons
   const phToday = formatPhDate(new Date());
   const selectedMonth = normalizeDashboardMonth(request.query.month);
   const selectedCallDate = normalizeDashboardDate(request.query.callDate);
-  const phCallDate = formatPhDate(parseDateRangeBoundary(selectedCallDate, "start") || new Date());
+  const callDateStart = parseDateRangeBoundary(selectedCallDate, "start") || new Date(0);
+  const callDateEnd = parseDateRangeBoundary(selectedCallDate, "end") || new Date();
+  const phCallDate = formatPhDate(callDateStart);
   const selectedDateRange = createDashboardSelectedDateRange(request, selectedMonth);
+  const callLogStart = new Date(Math.min(callDateStart.getTime(), selectedDateRange.start.getTime()));
+  const callLogEnd = new Date(Math.max(callDateEnd.getTime(), selectedDateRange.end.getTime()));
   const now = Date.now();
-  const employees = (await Employee.find({ status: { $ne: "Archived" } })
-    .select("name employeeCode aliases role team status availabilityStatus")
-    .lean()) as unknown as AgentDashboardEmployee[];
-  const leads = (await Lead.find({})
-    .select("leadName businessName source category status assignedAgent assignedAgentName comments activity followUpAt updatedAt createdAt")
-    .sort({ updatedAt: -1, createdAt: -1 })
-    .lean()) as unknown as AgentDashboardLead[];
+  const [employees, leads, callLogs] = await Promise.all([
+    Employee.find({ status: { $ne: "Archived" } })
+      .select("name employeeCode aliases role team status availabilityStatus")
+      .lean() as unknown as Promise<AgentDashboardEmployee[]>,
+    Lead.find({})
+      .select("leadName businessName businessAddress email phone website googlePlaceId providerPlaceId placeProvider source category status assignedAgent assignedAgentName comments activity followUpAt updatedAt createdAt")
+      .sort({ updatedAt: -1, createdAt: -1 })
+      .lean() as unknown as Promise<AgentDashboardLead[]>,
+    LeadCallStat.aggregate<{ employeeId: string; employeeName: string; calledAt: Date }>([
+      { $match: { "callLogs.calledAt": { $gte: callLogStart, $lte: callLogEnd } } },
+      { $unwind: "$callLogs" },
+      { $match: { "callLogs.calledAt": { $gte: callLogStart, $lte: callLogEnd } } },
+      {
+        $project: {
+          _id: 0,
+          employeeId: { $toString: "$callLogs.employee" },
+          employeeName: "$callLogs.employeeName",
+          calledAt: "$callLogs.calledAt",
+        },
+      },
+    ]),
+  ]);
   const rows = new Map<string, AgentDashboardRow>();
+  const canonicalLeads = dedupeLeads(leads as unknown as PopulatedLead[]) as unknown as AgentDashboardLead[];
   const employeeById = new Map<string, AgentDashboardEmployee>();
   const employeeByName = new Map<string, AgentDashboardEmployee>();
   const likelyAgentIds = new Set<string>();
@@ -2854,7 +3002,7 @@ export async function readAgentLeadDashboard(request: Request, response: Respons
       return existingRow;
     }
 
-    const row = makeAgentDashboardRow(employee);
+    const row = makeAgentDashboardRow(employee, request.business);
     rows.set(employeeId, row);
 
     return row;
@@ -2915,7 +3063,7 @@ export async function readAgentLeadDashboard(request: Request, response: Respons
     row: AgentDashboardRow | null,
     lead: AgentDashboardLead,
     event: { label: string; detail: string; createdAt?: Date | string | null },
-    options: { isComment?: boolean; isCall?: boolean } = {}
+    options: { isComment?: boolean } = {}
   ) => {
     if (!row) {
       return;
@@ -2936,10 +3084,6 @@ export async function readAgentLeadDashboard(request: Request, response: Respons
         row.commentsToday += 1;
       }
 
-    }
-
-    if (options.isCall && isSamePhDay(event.createdAt, phCallDate)) {
-      row.callsToday += 1;
     }
 
     if (createdAtTime > 0) {
@@ -2971,12 +3115,42 @@ export async function readAgentLeadDashboard(request: Request, response: Respons
     }
   });
 
+  callLogs.forEach((callLog) => {
+    const employee = employeeById.get(String(callLog.employeeId || ""));
+    const row = employee
+      ? ensureEmployeeRow(employee)
+      : ensureNamedRow(String(callLog.employeeName || ""));
+
+    if (!row) {
+      return;
+    }
+
+    const calledAt = callLog.calledAt;
+    const callMonth = getPhMonthKey(calledAt);
+
+    if (callMonth) {
+      monthlyOptions.add(callMonth);
+    }
+
+    if (isSamePhDay(calledAt, phCallDate)) {
+      row.callsToday += 1;
+    }
+
+    if (isWithinDashboardDateRange(calledAt, selectedDateRange)) {
+      ensureMonthlyRow(row).calls += 1;
+    }
+
+    if (dateTimeValue(calledAt) > dateTimeValue(row.lastActivityAt)) {
+      row.lastActivityAt = calledAt;
+    }
+  });
+
   let totalOpenLeads = 0;
   let unassignedLeads = 0;
   let qualifiedLeads = 0;
   let negotiationLeads = 0;
 
-  leads.forEach((lead) => {
+  canonicalLeads.forEach((lead) => {
     const status = lead.status || "NEW";
     const isActiveLead = status !== "Dead" && status !== "Archived";
     const leadStatusBucket = getDashboardLeadStatusBucket(status);
@@ -3081,7 +3255,6 @@ export async function readAgentLeadDashboard(request: Request, response: Respons
 
       const label = item.label || "Activity";
       const normalizedLabel = normalizeLeadValue(label);
-      const isCallActivity = isDashboardCallActivity(item);
       const activityStatus = getDashboardActivityResultStatus(item);
       const actorRow = item.actorType === "employee" ? ensureNamedRow(String(item.actorName || "")) : null;
       const statusOwnerRow = actorRow || (activityStatus ? assignedRow : null);
@@ -3090,7 +3263,6 @@ export async function readAgentLeadDashboard(request: Request, response: Respons
         const monthlyRow = ensureMonthlyRow(statusOwnerRow);
 
         if (actorRow && normalizedLabel !== "comment added") monthlyRow.actions += 1;
-        if (actorRow && isCallActivity) monthlyRow.calls += 1;
         trackMonthlyTouch(monthlyRow, lead, item.createdAt);
       }
 
@@ -3102,12 +3274,12 @@ export async function readAgentLeadDashboard(request: Request, response: Respons
         label: normalizedLabel === "follow up scheduled" ? "Rescheduled" : label,
         detail: item.detail || `${actorRow.employeeName || item.actorName || "Employee"} updated ${getLeadDisplayName(lead)}.`,
         createdAt: item.createdAt,
-      }, { isCall: isCallActivity });
+      });
     });
   });
 
   const agents = Array.from(rows.values())
-    .filter((row) => isDashboardAgentRole(row.role) && (likelyAgentIds.has(row.employeeId) || row.assignedLeads > 0 || row.dead > 0 || row.activityToday > 0 || Boolean(row.lastActivityAt)))
+    .filter((row) => isDashboardAgentRole(row.role) && (likelyAgentIds.has(row.employeeId) || row.assignedLeads > 0 || row.dead > 0 || row.callsToday > 0 || row.activityToday > 0 || Boolean(row.lastActivityAt)))
     .map((row) => {
       const { touchedLeadIdsToday, ...publicRow } = row;
       const touchedLeadsToday = touchedLeadIdsToday.size;
@@ -3140,6 +3312,10 @@ export async function readAgentLeadDashboard(request: Request, response: Respons
 
   response.json({
     generatedAt: new Date(),
+    business: {
+      id: String(request.business?.id || ""),
+      name: String(request.business?.name || "Current business"),
+    },
     summary: {
       totalActiveAgents: agents.length,
       onlineAgents: agents.filter((agent) => agent.availabilityStatus !== "OFFLINE").length,
@@ -3206,30 +3382,28 @@ export async function readAgentLeadDashboard(request: Request, response: Respons
 
 export async function countAdminLeads(request: Request, response: Response) {
   const baseFilter = createAdminBaseFilter(request);
-  const statusCounts = await Lead.aggregate<{ _id: string; count: number }>([
-    { $match: baseFilter },
-    { $group: { _id: "$status", count: { $sum: 1 } } },
-  ]);
+  const leads = await Lead.find(baseFilter)
+    .select("status assignedAgent assignedAgentName email phone website businessName businessAddress createdAt")
+    .sort({ createdAt: -1, _id: 1 })
+    .lean();
   const counts: Record<string, number> = Object.fromEntries(leadStatuses.map((statusName) => [statusName, 0]));
 
-  statusCounts.forEach((item) => {
-    counts[item._id || "NEW"] = item.count;
+  leadStatuses.forEach((statusName) => {
+    counts[statusName] = dedupeLeads(
+      leads.filter((lead) => (lead.status || "NEW") === statusName) as unknown as PopulatedLead[]
+    ).length;
   });
 
-  counts.ALL = await Lead.countDocuments({
-    ...baseFilter,
-    status: { $ne: "Archived" },
-  });
-  const unassignedAndFilters = Array.isArray(baseFilter.$and) ? baseFilter.$and : [];
-  counts.Unassigned = await Lead.countDocuments({
-    ...baseFilter,
-    status: { $in: ["NEW", "Follow up", "Ongoing comms", "Qualified", "Ongoing Negotiation"] },
-    $and: [
-      ...unassignedAndFilters,
-      { $or: [{ assignedAgent: null }, { assignedAgent: { $exists: false } }] },
-      { $or: [{ assignedAgentName: "" }, { assignedAgentName: { $exists: false } }] },
-    ],
-  });
+  counts.ALL = dedupeLeads(
+    leads.filter((lead) => lead.status !== "Archived") as unknown as PopulatedLead[]
+  ).length;
+  counts.Unassigned = dedupeLeads(
+    leads.filter((lead) =>
+      ["NEW", "Follow up", "Ongoing comms", "Qualified", "Ongoing Negotiation"].includes(lead.status || "NEW") &&
+      !lead.assignedAgent &&
+      !String(lead.assignedAgentName || "").trim()
+    ) as unknown as PopulatedLead[]
+  ).length;
 
   response.json(counts);
 }
@@ -3357,17 +3531,6 @@ function escapeRegExp(value: string) {
 function createAdminBaseFilter(request: Request, options: { includeStateFilter?: boolean } = {}) {
   const includeStateFilter = options.includeStateFilter !== false;
 
-  const assignedAgent = request.query.assignedAgent
-    ? String(request.query.assignedAgent)
-    : "";
-
-  const assignedAgentNames = request.query.assignedAgentNames
-    ? String(request.query.assignedAgentNames)
-      .split(",")
-      .map((name) => name.trim())
-      .filter(Boolean)
-    : [];
-
   const searchFilter = createLeadSearchFilter(String(request.query.search || ""));
   const assignmentFilters = createAdminAssignmentFilters(request);
   const andFilters: Record<string, unknown>[] = [];
@@ -3392,24 +3555,11 @@ function createAdminBaseFilter(request: Request, options: { includeStateFilter?:
     }
   }
 
-  if (assignedAgent || assignedAgentNames?.length) {
-    const agentOrFilters: any[] = [];
-
-    if (assignedAgent && Types.ObjectId.isValid(String(assignedAgent))) {
-      agentOrFilters.push({
-        assignedAgent: new Types.ObjectId(String(assignedAgent)),
-      });
-    }
-
-    if (assignedAgentNames?.length) {
-      agentOrFilters.push({
-        assignedAgentName: {
-          $in: assignedAgentNames.map((name) => new RegExp(`^${escapeRegExp(name)}$`, "i")),
-        },
-      });
-    }
-
-    andFilters.push({ $or: agentOrFilters });
+  if (String(request.query.unassigned || "").toLowerCase() === "true") {
+    andFilters.push(
+      { $or: [{ assignedAgent: null }, { assignedAgent: { $exists: false } }] },
+      { $or: [{ assignedAgentName: "" }, { assignedAgentName: { $exists: false } }] },
+    );
   }
 
   return andFilters.length > 0 ? { $and: andFilters } : {};
@@ -3972,8 +4122,18 @@ export async function assignLead(request: Request, response: Response) {
   }
 
   const actor = getActivityActor(request);
-  const lead = await Lead.findOneAndUpdate(
-    { _id: leadId, status: { $ne: "Archived" } },
+  const duplicateGroup = await resolveActiveLeadDuplicateGroups([leadId]);
+
+  if (duplicateGroup.leadIds.length === 0) {
+    const existingLead = await Lead.exists({ _id: leadId });
+    response.status(existingLead ? 409 : 404).json({
+      message: existingLead ? "Archived leads cannot be reassigned." : "Lead not found",
+    });
+    return;
+  }
+
+  await Lead.updateMany(
+    { _id: { $in: duplicateGroup.leadIds }, status: { $ne: "Archived" } },
     {
       $set: {
         assignedAgent: new Types.ObjectId(assignedAgent),
@@ -3987,15 +4147,12 @@ export async function assignLead(request: Request, response: Response) {
           : `${actor.actorName} assigned this lead to ${employee.name}.`,
         actor
       ),
-    },
-    { returnDocument: "after", runValidators: true }
-  ).populate(populateLead);
+    }
+  );
+  const lead = await Lead.findById(leadId).populate(populateLead);
 
   if (!lead) {
-    const existingLead = await Lead.exists({ _id: leadId });
-    response.status(existingLead ? 409 : 404).json({
-      message: existingLead ? "Archived leads cannot be reassigned." : "Lead not found",
-    });
+    response.status(404).json({ message: "Lead not found" });
     return;
   }
 
@@ -4029,7 +4186,7 @@ export async function scheduleLeadFollowUp(request: Request, response: Response)
   const scheduledLeadLabel = scheduledLeadName ? `lead ${scheduledLeadName}` : "this lead";
   const activityDetail = [
     `${actor.actorName} scheduled ${scheduledLeadLabel}:`,
-    `CDT: ${formatScheduledCdtTime(followUpAt)}`,
+    `Eastern Time: ${formatScheduledEasternTime(followUpAt)}`,
     `PH Time: ${formatScheduledPhTime(followUpAt)}`,
   ].join("\n");
   const statusAfterScheduling = existingLead.status === "Ongoing Negotiation"
@@ -4078,11 +4235,6 @@ export async function addLeadComment(request: Request, response: Response) {
   const actor: LeadActivityActor = { actorName: authorName, actorType: authorType as LeadActivityActor["actorType"] };
   const commentActivity = leadActivity("Comment added", `${authorName} added a comment.`, actor);
   const statusActivity = leadActivity("Status changed", `${authorName} moved this lead to Follow up after adding a comment.`, actor);
-  const setFields: Record<string, unknown> = {
-    followUpAt: null,
-    followUpNote: "",
-    followUpPriority: 0,
-  };
 
   let lead = await Lead.findOneAndUpdate(
     { _id: request.params.id, status: "NEW" },
@@ -4094,7 +4246,7 @@ export async function addLeadComment(request: Request, response: Response) {
           $position: 0,
         },
       },
-      $set: { ...setFields, status: "Follow up" },
+      $set: { status: "Follow up" },
     },
     { returnDocument: "after", runValidators: true }
   ).populate(populateLead);
@@ -4110,7 +4262,6 @@ export async function addLeadComment(request: Request, response: Response) {
             $position: 0,
           },
         },
-        $set: setFields,
       },
       { returnDocument: "after", runValidators: true }
     ).populate(populateLead);
@@ -4140,15 +4291,154 @@ export async function recordLeadCall(request: Request, response: Response) {
   const callFailedToStart = request.body.callOutcome === "failed";
   const activityLabel = callFailedToStart ? "Call failed to start" : "Call placed";
   const activityDetail = callFailedToStart
-    ? `${actor.actorName} could not start a Nextiva call to ${leadLabel}${phoneText}.`
+    ? `${actor.actorName} could not start a call to ${leadLabel}${phoneText}.`
     : `${actor.actorName} called ${leadLabel}${phoneText}.`;
-  const lead = await Lead.findByIdAndUpdate(
-    leadId,
-    {
-      $push: activityPush(activityLabel, activityDetail, actor),
-    },
-    { returnDocument: "after", runValidators: true }
-  ).populate(populateLead);
+  let lead;
+
+  if (!callFailedToStart) {
+    const headerEmployeeCode = String(request.header("x-crm-user-code") || "").trim();
+    const headerUserType = String(request.header("x-crm-user-type") || "").trim().toLowerCase();
+    const employeeId = String(request.body.employeeId || "").trim();
+    const employee = headerUserType === "employee" && headerEmployeeCode
+      ? await Employee.findOne({ employeeCode: headerEmployeeCode, status: { $ne: "Archived" } })
+          .select("_id name role team employeeCode")
+          .lean()
+      : Types.ObjectId.isValid(employeeId)
+        ? await Employee.findById(employeeId).select("_id name role team employeeCode").lean()
+        : null;
+
+    if (!employee) {
+      response.status(401).json({ message: "Employee session not found." });
+      return;
+    }
+
+    const now = new Date();
+    const employeeName = employee.name || employee.employeeCode || "Employee";
+    const employeeRole = employee.role || "";
+    const employeeTeam = employee.team ? String(employee.team) : "";
+
+    if (
+      getCallProvider() === "ringcentral"
+      && isRingCentralOutcomeShadowEnabled()
+      && !request.body.callOutcome
+      && request.business?.id
+    ) {
+      const Attempt = getCallBridgeAttemptModel();
+      const monitor = getRingCentralMonitorStatus(employee.employeeCode);
+      const recentThreshold = new Date(now.getTime() - 30_000);
+      await Attempt.updateMany(
+        {
+          employeeCode: employee.employeeCode,
+          businessId: request.business.id,
+          providerSessionId: { $exists: false },
+          phase: { $in: ["reserved", "dialing", "ringing"] },
+          reservedAt: { $lt: recentThreshold },
+        },
+        {
+          $set: {
+            phase: "failed",
+            outcomeReason: "RingCentral did not attach a provider session within 30 seconds.",
+            lastError: "No matching RingCentral telephony session was received",
+          },
+        }
+      );
+      const existingAttempt = await Attempt.findOne({
+        employeeCode: employee.employeeCode,
+        businessId: request.business.id,
+        leadId,
+        providerSessionId: { $exists: false },
+        phase: { $in: ["reserved", "dialing", "ringing"] },
+        reservedAt: { $gte: recentThreshold },
+      }).lean();
+
+      if (!existingAttempt) {
+        await Attempt.create({
+          employeeCode: employee.employeeCode,
+          employeeName,
+          businessId: request.business.id,
+          leadId,
+          phone: String(existingLead.phone || "").trim(),
+          provider: "ringcentral",
+          extensionId: monitor.extensionId,
+          extensionNumber: monitor.extensionNumber,
+          phase: "dialing",
+          outcome: "pending",
+          outcomeReason: "",
+          classificationConfidence: "",
+          classificationSource: "",
+          providerResult: "Manual call handed to RingCentral",
+          statusCodes: [],
+          reservedAt: now,
+          dialStartedAt: now,
+          ringingAt: null,
+          answeredAt: null,
+          endedAt: null,
+          classifiedAt: null,
+          durationSeconds: 0,
+          recordingId: "",
+          callStatLogId: "",
+          lastError: "",
+        });
+      }
+    }
+
+    const callLog = {
+      employee: employee._id,
+      employeeName,
+      employeeRole,
+      employeeTeam,
+      calledAt: now,
+    };
+    const activity = activityPush(activityLabel, activityDetail, actor).activity;
+
+    lead = await Lead.findOneAndUpdate(
+      { _id: leadId, "callsByEmployee.employee": employee._id },
+      {
+        $inc: { callCount: 1, "callsByEmployee.$.count": 1 },
+        $set: {
+          lastCallAt: now,
+          "callsByEmployee.$.lastCallAt": now,
+          "callsByEmployee.$.employeeName": employeeName,
+          "callsByEmployee.$.employeeRole": employeeRole,
+          "callsByEmployee.$.employeeTeam": employeeTeam,
+        },
+        $push: { callLogs: callLog, activity },
+      },
+      { returnDocument: "after", runValidators: true }
+    ).populate(populateLead);
+
+    if (!lead) {
+      lead = await Lead.findOneAndUpdate(
+        {
+          _id: leadId,
+          callsByEmployee: { $not: { $elemMatch: { employee: employee._id } } },
+        },
+        {
+          $inc: { callCount: 1 },
+          $set: { lastCallAt: now },
+          $push: {
+            callsByEmployee: {
+              employee: employee._id,
+              employeeName,
+              employeeRole,
+              employeeTeam,
+              count: 1,
+              lastCallAt: now,
+            },
+            callLogs: callLog,
+            activity,
+          },
+        },
+        { returnDocument: "after", runValidators: true }
+      ).populate(populateLead);
+    }
+  } else {
+    lead = await Lead.findByIdAndUpdate(
+      leadId,
+      { $push: activityPush(activityLabel, activityDetail, actor) },
+      { returnDocument: "after", runValidators: true }
+    ).populate(populateLead);
+  }
 
   if (!lead) {
     response.status(404).json({ message: "Lead not found" });
@@ -4231,11 +4521,19 @@ export async function updateLeadStatus(request: Request, response: Response) {
 }
 
 export async function toggleLeadFavorite(request: Request, response: Response) {
-  const employeeId = String(request.body.employeeId || "").trim();
+  const requestedEmployeeId = String(request.body.employeeId || "").trim();
+  const employeeCode = String(request.header("x-crm-user-code") || "").trim();
+  const userType = String(request.header("x-crm-user-type") || "").trim().toLowerCase();
   const isFavorite = Boolean(request.body.favorite);
+  const sessionEmployee = userType === "employee" && employeeCode
+    ? await Employee.findOne({ employeeCode, status: { $ne: "Archived" } }).select("_id").lean()
+    : null;
+  const employeeId = sessionEmployee?._id
+    ? String(sessionEmployee._id)
+    : requestedEmployeeId;
 
   if (!Types.ObjectId.isValid(employeeId)) {
-    response.status(400).json({ message: "Valid employeeId is required" });
+    response.status(400).json({ message: "An active employee session is required" });
     return;
   }
 
@@ -4270,14 +4568,22 @@ export async function autoAssignLead(request: Request, response: Response) {
   }
 
   const assignedAgentName = await getEmployeeName(assignedAgent);
-  const lead = await Lead.findByIdAndUpdate(
-    request.params.id,
+  const leadId = String(request.params.id);
+  const duplicateGroup = await resolveActiveLeadDuplicateGroups([leadId]);
+
+  if (duplicateGroup.leadIds.length === 0) {
+    response.status(404).json({ message: "Lead not found" });
+    return;
+  }
+
+  await Lead.updateMany(
+    { _id: { $in: duplicateGroup.leadIds }, status: { $ne: "Archived" } },
     {
-      $set: { assignedAgent, autoAssignedAt: new Date() },
+      $set: { assignedAgent, assignedAgentName, autoAssignedAt: new Date() },
       $push: activityPush("Assigned", `Admin auto assigned this lead${assignedAgentName ? ` to ${assignedAgentName}` : ""}.`, { actorName: "Admin", actorType: "admin" }),
-    },
-    { returnDocument: "after", runValidators: true }
-  ).populate(populateLead);
+    }
+  );
+  const lead = await Lead.findById(leadId).populate(populateLead);
 
   if (!lead) {
     response.status(404).json({ message: "Lead not found" });
@@ -4416,10 +4722,17 @@ export async function bulkAssignLeads(request: Request, response: Response) {
     return;
   }
 
+  const duplicateGroups = await resolveActiveLeadDuplicateGroups(leadIds);
+
+  if (duplicateGroups.logicalLeadCount === 0) {
+    response.json({ assignedCount: 0 });
+    return;
+  }
+
   if (assignedAgent === "UNASSIGNED") {
     const actor = getActivityActor(request);
     const result = await Lead.updateMany(
-      { _id: { $in: leadIds }, status: { $ne: "Archived" } },
+      { _id: { $in: duplicateGroups.leadIds }, status: { $ne: "Archived" } },
       {
         $set: {
           assignedAgent: null,
@@ -4431,7 +4744,7 @@ export async function bulkAssignLeads(request: Request, response: Response) {
     );
 
     emitLeadChanged({ action: "bulk-unassigned", leadIds, assignedAgentId: null });
-    response.json({ assignedCount: result.modifiedCount });
+    response.json({ assignedCount: duplicateGroups.logicalLeadCount, updatedRecordCount: result.modifiedCount });
     return;
   }
 
@@ -4449,7 +4762,7 @@ export async function bulkAssignLeads(request: Request, response: Response) {
 
   const actor = getActivityActor(request);
   const result = await Lead.updateMany(
-    { _id: { $in: leadIds }, status: { $ne: "Archived" } },
+    { _id: { $in: duplicateGroups.leadIds }, status: { $ne: "Archived" } },
     {
       $set: {
         assignedAgent: new Types.ObjectId(assignedAgent),
@@ -4461,7 +4774,7 @@ export async function bulkAssignLeads(request: Request, response: Response) {
   );
 
   emitLeadChanged({ action: "bulk-assigned", leadIds, assignedAgentId: assignedAgent });
-  response.json({ assignedCount: result.modifiedCount });
+  response.json({ assignedCount: duplicateGroups.logicalLeadCount, updatedRecordCount: result.modifiedCount });
 }
 
 export async function restoreAllArchivedLeads(request: Request, response: Response) {

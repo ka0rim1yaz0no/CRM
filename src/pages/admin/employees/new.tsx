@@ -571,6 +571,27 @@ export default function AdminEmployeeNew() {
                                 placeholder="Private HR notes"
                             />
                         </label>
+
+                        <div className="lg:col-span-2 border-t border-slate-200 pt-5">
+                            <p className={labelClass}>Bank Details</p>
+                        </div>
+                        {[
+                            ["Bank Name", "bankName", "Bank or financial institution"],
+                            ["Account Name", "bankAccountName", "Name on the account"],
+                            ["Account Number", "bankAccountNumber", "Account number"],
+                        ].map(([label, field, placeholder]) => (
+                            <label key={field}>
+                                <span className={labelClass}>{label}</span>
+                                <input
+                                    className={inputClass}
+                                    value={String(employee[field as keyof EmployeeInput] || "")}
+                                    onChange={(event) => updateEmployeeForm(field as keyof EmployeeInput, event.target.value)}
+                                    inputMode={field.includes("Number") ? "numeric" : undefined}
+                                    autoComplete="off"
+                                    placeholder={placeholder}
+                                />
+                            </label>
+                        ))}
                     </div>
 
                     <div className="flex flex-wrap justify-end gap-3 border-t border-slate-200 px-6 py-4">

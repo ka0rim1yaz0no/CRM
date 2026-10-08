@@ -4,9 +4,11 @@ export type CallDashboardRow = {
     employeeId: string;
     employeeCode: string;
     name: string;
+    businessId: string;
+    businessName: string;
     role: string;
     team: string;
-    status: "ON CALL" | "OFFLINE" | "CALL WAITING" | "OFF THE PHONE";
+    status: "ON CALL" | "ONLINE" | "OFFLINE" | "CALL WAITING" | "OFF THE PHONE" | "BREAK" | "LUNCH";
     statusStartedAt: string | null;
     transitionUntil: string | null;
     detail: string;
@@ -17,6 +19,7 @@ export type CallDashboardRow = {
 
 export type CallDashboardSnapshot = {
     generatedAt: string;
+    business: { id: string; name: string };
     shift: { start: string; end: string };
     employees: CallDashboardRow[];
 };

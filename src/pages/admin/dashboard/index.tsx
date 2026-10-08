@@ -5106,10 +5106,10 @@
 //     );
 // }
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
 import { Link, useNavigate } from "react-router";
-import { useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
     FiActivity,
     FiBarChart2,
@@ -5132,12 +5132,15 @@ import {
 } from "react-icons/fi";
 import AdminLayout from "../adminLayout";
 import CallDashboardPanel from "../../../components/CallDashboardPanel";
+import { getBusinesses } from "../../../api/businesses";
+import { getActiveBusinessId } from "../../../api/businessStorage";
 import { getEmployeeSummaries, normalizeEmployeeAvailabilityStatus, type Employee } from "../../../api/employees";
 import { getEmployeeAttendance, getEmployeesAttendance, type AttendanceRecord } from "../../../api/attendance";
 import { getAgentLeadDashboard, getLead, getLeadCallSummary, type AgentLeadActivity, type AgentLeadMonthlyRow, type AgentLeadProgress, type Lead, type LeadCallStat } from "../../../api/leads";
 import { buildOffPhoneAttendanceSessions, type OffPhoneAttendanceSession } from "../../../lib/attendanceRecords";
 import { isAttendanceTimeOutUndertime } from "../../../lib/attendanceSlots";
 import { formatPhDate, formatPhDateTime, formatPhTime } from "../../../lib/dateTime";
+import { socket } from "../../../lib/socket";
 
 const numberFormatter = new Intl.NumberFormat("en-US");
 const monthLabelFormatter = new Intl.DateTimeFormat("en-US", { month: "long", year: "numeric" });
@@ -5173,6 +5176,13 @@ function formatDateInputValue(date: Date) {
     const day = String(date.getDate()).padStart(2, "0");
 
     return `${year}-${month}-${day}`;
+}
+
+function formatTimeInputValue(date: Date) {
+    const hours = String(date.getHours()).padStart(2, "0");
+    const minutes = String(date.getMinutes()).padStart(2, "0");
+
+    return `${hours}:${minutes}`;
 }
 
 function parseDateInputValue(value?: string) {
@@ -5354,14 +5364,14 @@ type LeadHistoryItem = {
 
 type OnlineStatusEmployeeRow = Pick<
     AgentLeadProgress,
-    "employeeId" | "employeeName" | "role" | "team" | "availabilityStatus" | "assignedLeads"
+    "employeeId" | "employeeName" | "businessName" | "role" | "team" | "availabilityStatus" | "assignedLeads"
 >;
 
 function isArchivedEmployee(employee: Employee) {
     return String(employee.status || "").trim().toLowerCase() === "archived";
 }
 
-function buildOnlineStatusRows(employees: Employee[], agents: AgentLeadProgress[]): OnlineStatusEmployeeRow[] {
+function buildOnlineStatusRows(employees: Employee[], agents: AgentLeadProgress[], businessName: string): OnlineStatusEmployeeRow[] {
     const agentById = new Map(agents.map((agent) => [agent.employeeId, agent]));
     const agentByName = new Map(agents.map((agent) => [agent.employeeName.trim().toLowerCase(), agent]));
 
@@ -5373,6 +5383,7 @@ function buildOnlineStatusRows(employees: Employee[], agents: AgentLeadProgress[
             return {
                 employeeId: employee._id,
                 employeeName: employee.name || employee.employeeCode || "Employee",
+                businessName: matchedAgent?.businessName || businessName,
                 role: employee.role || "Employee",
                 team: employee.team || "Unassigned",
                 availabilityStatus: employee.availabilityStatus || matchedAgent?.availabilityStatus || "OFFLINE",
@@ -5535,8 +5546,6 @@ function EmptyPanel({ title, message }: { title: string; message: string }) {
 }
 
 function AgentProgressRow({ agent }: { agent: AgentLeadProgress }) {
-    const currentTotal = agent.newLeads + agent.followUps + agent.qualified + agent.dead;
-
     return (
         <tr className="text-sm text-slate-700 transition hover:bg-slate-50">
             <td className="min-w-[13rem] px-3 py-3">
@@ -5546,11 +5555,11 @@ function AgentProgressRow({ agent }: { agent: AgentLeadProgress }) {
                     </span>
                     <div className="min-w-0">
                         <p className="truncate font-semibold text-slate-950">{agent.employeeName}</p>
-                        <p className="mt-0.5 truncate text-xs text-slate-500">{agent.role} · {agent.team}</p>
+                        <p className="mt-0.5 truncate text-xs text-slate-500">{[agent.role, agent.team, agent.businessName].filter(Boolean).join(" · ")}</p>
                     </div>
                 </div>
             </td>
-            <td className="px-3 py-3 text-center font-semibold text-slate-950">{formatNumber(currentTotal)}</td>
+            <td className="px-3 py-3 text-center font-semibold text-slate-950">{formatNumber(agent.assignedLeads)}</td>
             <td className="px-3 py-3 text-center">{formatNumber(agent.newLeads)}</td>
             <td className="px-3 py-3 text-center">{formatNumber(agent.followUps)}</td>
             <td className="px-3 py-3 text-center">{formatNumber(agent.callsToday)}</td>
@@ -5590,7 +5599,7 @@ function MonthlyAgentRow({ row, onQualifiedClick }: { row: AgentLeadMonthlyRow; 
                     </span>
                     <div className="min-w-0">
                         <p className="truncate font-semibold text-slate-900">{row.employeeName}</p>
-                        <p className="mt-0.5 truncate text-xs text-slate-500">{row.role} · {row.team}</p>
+                        <p className="mt-0.5 truncate text-xs text-slate-500">{[row.role, row.team, row.businessName].filter(Boolean).join(" · ")}</p>
                     </div>
                 </div>
             </td>
@@ -6133,6 +6142,25 @@ function getCurrentShiftDateValue() {
     return getShiftDateValueFromStart(getShiftStartDateFromTimestamp(new Date().toISOString()));
 }
 
+function getAttendanceQueryRange(selectedDate: string, dateFrom: string, dateTo: string) {
+    const startDate = parseDateInputValue(selectedDate || dateFrom);
+    const endDate = parseDateInputValue(selectedDate || dateTo);
+
+    if (startDate) {
+        startDate.setHours(SHIFT_START_HOUR, 0, 0, 0);
+    }
+
+    if (endDate) {
+        endDate.setHours(SHIFT_START_HOUR, 0, 0, 0);
+        endDate.setTime(endDate.getTime() + SHIFT_LENGTH_MS);
+    }
+
+    return {
+        from: startDate?.toISOString(),
+        to: endDate?.toISOString(),
+    };
+}
+
 function getShiftLabel(row: AttendanceShiftRow) {
     return `${formatPhDateTime(row.shiftStart.toISOString())} to ${formatPhDateTime(row.shiftEnd.toISOString())}`;
 }
@@ -6338,19 +6366,28 @@ function AttendancePanel({
     employee,
     attendance,
     attendanceGroups = [],
+    selectedAttendanceDate,
+    attendanceDateFrom,
+    attendanceDateTo,
+    onSelectedAttendanceDateChange,
+    onAttendanceDateFromChange,
+    onAttendanceDateToChange,
     isPlaceholder = false,
 }: {
     employee?: Employee | null;
     attendance: AttendanceRecord[];
     attendanceGroups?: AttendanceEmployeeGroup[];
+    selectedAttendanceDate: string;
+    attendanceDateFrom: string;
+    attendanceDateTo: string;
+    onSelectedAttendanceDateChange: (value: string) => void;
+    onAttendanceDateFromChange: (value: string) => void;
+    onAttendanceDateToChange: (value: string) => void;
     isPlaceholder?: boolean;
 }) {
     const isAllEmployeesView = !employee && !isPlaceholder;
     const status = normalizeEmployeeAvailabilityStatus(employee?.availabilityStatus);
     const todayDateValue = getCurrentShiftDateValue();
-    const [selectedAttendanceDate, setSelectedAttendanceDate] = useState(todayDateValue);
-    const [attendanceDateFrom, setAttendanceDateFrom] = useState("");
-    const [attendanceDateTo, setAttendanceDateTo] = useState("");
     const [selectedShiftRow, setSelectedShiftRow] = useState<AttendanceShiftRow | null>(null);
     const sortedAllAttendance = useMemo(() => latestAttendance(attendance), [attendance]);
     const allShiftRows = useMemo(() => {
@@ -6394,22 +6431,22 @@ function AttendancePanel({
             ? `Shift date range: ${attendanceDateFrom ? formatDateOrDash(attendanceDateFrom) : "Start"} to ${attendanceDateTo ? formatDateOrDash(attendanceDateTo) : "End"}`
             : "Showing all attendance shifts";
     const clearAttendanceFilters = () => {
-        setSelectedAttendanceDate("");
-        setAttendanceDateFrom("");
-        setAttendanceDateTo("");
+        onSelectedAttendanceDateChange("");
+        onAttendanceDateFromChange("");
+        onAttendanceDateToChange("");
     };
     const applyTodayAttendanceFilter = () => {
-        setSelectedAttendanceDate(todayDateValue);
-        setAttendanceDateFrom("");
-        setAttendanceDateTo("");
+        onSelectedAttendanceDateChange(todayDateValue);
+        onAttendanceDateFromChange("");
+        onAttendanceDateToChange("");
     };
     const applyThisMonthAttendanceFilter = () => {
         const today = new Date();
         const monthStart = formatDateInputValue(new Date(today.getFullYear(), today.getMonth(), 1));
 
-        setSelectedAttendanceDate("");
-        setAttendanceDateFrom(monthStart);
-        setAttendanceDateTo(todayDateValue);
+        onSelectedAttendanceDateChange("");
+        onAttendanceDateFromChange(monthStart);
+        onAttendanceDateToChange(todayDateValue);
     };
     const metricCards = [
         {
@@ -6480,10 +6517,10 @@ function AttendancePanel({
                                 disabled={isPlaceholder}
                                 value={selectedAttendanceDate}
                                 onChange={(event) => {
-                                    setSelectedAttendanceDate(event.target.value);
+                                    onSelectedAttendanceDateChange(event.target.value);
                                     if (event.target.value) {
-                                        setAttendanceDateFrom("");
-                                        setAttendanceDateTo("");
+                                        onAttendanceDateFromChange("");
+                                        onAttendanceDateToChange("");
                                     }
                                 }}
                                 className="mt-1 h-10 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm font-semibold text-slate-800 shadow-sm focus:border-violet-500 focus:outline-none focus:ring-2 focus:ring-violet-200"
@@ -6497,9 +6534,9 @@ function AttendancePanel({
                                 disabled={isPlaceholder}
                                 value={attendanceDateFrom}
                                 onChange={(event) => {
-                                    setAttendanceDateFrom(event.target.value);
+                                    onAttendanceDateFromChange(event.target.value);
                                     if (event.target.value) {
-                                        setSelectedAttendanceDate("");
+                                        onSelectedAttendanceDateChange("");
                                     }
                                 }}
                                 className="mt-1 h-10 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm font-semibold text-slate-800 shadow-sm focus:border-violet-500 focus:outline-none focus:ring-2 focus:ring-violet-200"
@@ -6513,9 +6550,9 @@ function AttendancePanel({
                                 disabled={isPlaceholder}
                                 value={attendanceDateTo}
                                 onChange={(event) => {
-                                    setAttendanceDateTo(event.target.value);
+                                    onAttendanceDateToChange(event.target.value);
                                     if (event.target.value) {
-                                        setSelectedAttendanceDate("");
+                                        onSelectedAttendanceDateChange("");
                                     }
                                 }}
                                 className="mt-1 h-10 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm font-semibold text-slate-800 shadow-sm focus:border-violet-500 focus:outline-none focus:ring-2 focus:ring-violet-200"
@@ -7047,6 +7084,8 @@ type EmployeeLeadCallRow = {
 type EmployeeCallSummaryRow = {
     employeeId: string;
     employeeName: string;
+    crmBusinessId: string;
+    crmBusinessName: string;
     employeeRole: string;
     employeeTeam: string;
     totalCalls: number;
@@ -7213,6 +7252,8 @@ function buildEmployeeCallRows(leadCallStats: LeadCallStat[]): EmployeeCallSumma
                 rowsByEmployee.set(employeeId, {
                     employeeId,
                     employeeName: log.employeeName || "Employee",
+                    crmBusinessId: "",
+                    crmBusinessName: "Current business",
                     employeeRole: log.employeeRole || "",
                     employeeTeam: log.employeeTeam || "",
                     totalCalls: 0,
@@ -7409,6 +7450,29 @@ function combineDateAndTime(dateValue: string, timeValue: string) {
     return `${dateValue}T${safeTime}`;
 }
 
+function getCallSummaryFilterRange(
+    dateFrom: string,
+    timeFrom: string,
+    dateTo: string,
+    timeTo: string
+) {
+    const from = dateFrom
+        ? new Date(combineDateAndTime(dateFrom, timeFrom || "00:00"))
+        : null;
+    const to = dateTo
+        ? new Date(combineDateAndTime(dateTo, timeTo || "23:59"))
+        : null;
+
+    if (from && to && dateFrom === dateTo && to.getTime() <= from.getTime()) {
+        to.setDate(to.getDate() + 1);
+    }
+
+    return {
+        from: from?.toISOString(),
+        to: to?.toISOString(),
+    };
+}
+
 function getCallLogTime(value?: string | null) {
     if (!value) {
         return 0;
@@ -7505,6 +7569,7 @@ void filterLeadCallStatsByDateTimeRange;
 
 export default function AdminDashboard() {
     const navigate = useNavigate();
+    const queryClient = useQueryClient();
     const [selectedActivity, setSelectedActivity] = useState<AgentLeadActivity | null>(null);
     const [qualifiedLeadRow, setQualifiedLeadRow] = useState<AgentLeadMonthlyRow | null>(null);
     const [selectedMonth, setSelectedMonth] = useState(() => getMonthInputValue(new Date()));
@@ -7517,6 +7582,9 @@ export default function AdminDashboard() {
     const [attendanceEmployeeSearch, setAttendanceEmployeeSearch] = useState("");
     const [isAttendanceEmployeeMenuOpen, setIsAttendanceEmployeeMenuOpen] = useState(false);
     const [, setIsAttendanceSelectionCleared] = useState(false);
+    const [attendanceSelectedShiftDate, setAttendanceSelectedShiftDate] = useState(() => getCurrentShiftDateValue());
+    const [attendanceDateFrom, setAttendanceDateFrom] = useState("");
+    const [attendanceDateTo, setAttendanceDateTo] = useState("");
     const [agentPage, setAgentPage] = useState(1);
     const [monthlyPage, setMonthlyPage] = useState(1);
     const selectedMonthlyRange = useMemo(() => getMonthlyDashboardDateRange(selectedMonth), [selectedMonth]);
@@ -7524,8 +7592,38 @@ export default function AdminDashboard() {
     const { data, isLoading, isError, refetch, isFetching } = useQuery({
         queryKey: ["agent-lead-dashboard", selectedMonth, selectedMonthlyRange.dateFrom, selectedMonthlyRange.dateTo, selectedCallDate],
         queryFn: () => getAgentLeadDashboard({ month: selectedMonth, dateFrom: selectedMonthlyRange.dateFrom, dateTo: selectedMonthlyRange.dateTo, callDate: selectedCallDate }),
-        refetchInterval: 60_000,
+        refetchInterval: 15_000,
+        refetchOnWindowFocus: true,
     });
+    const businessesQuery = useQuery({
+        queryKey: ["businesses"],
+        queryFn: getBusinesses,
+        staleTime: 60_000,
+    });
+    const activeBusinessId = getActiveBusinessId() || data?.business?.id || "";
+    const activeBusinessName = businessesQuery.data?.find((business) => business.id === activeBusinessId)?.name
+        || data?.business?.name
+        || "Current business";
+    useEffect(() => {
+        let refreshTimeoutId: number | undefined;
+
+        const refreshLeadProgress = () => {
+            window.clearTimeout(refreshTimeoutId);
+            refreshTimeoutId = window.setTimeout(() => {
+                void refetch();
+                void queryClient.invalidateQueries({ queryKey: ["lead-call-summary", "admin"] });
+            }, 750);
+        };
+
+        socket.on("lead:changed", refreshLeadProgress);
+        socket.on("lead-call-stat:updated", refreshLeadProgress);
+
+        return () => {
+            window.clearTimeout(refreshTimeoutId);
+            socket.off("lead:changed", refreshLeadProgress);
+            socket.off("lead-call-stat:updated", refreshLeadProgress);
+        };
+    }, [queryClient, refetch]);
     const employeesQuery = useQuery({
         queryKey: ["employees", "summary", "dashboard-online-status"],
         queryFn: getEmployeeSummaries,
@@ -7574,9 +7672,13 @@ export default function AdminDashboard() {
             return searchableText.includes(searchValue);
         });
     }, [departmentFilteredAttendanceEmployeeOptions, attendanceEmployeeSearch]);
+    const attendanceQueryRange = useMemo(
+        () => getAttendanceQueryRange(attendanceSelectedShiftDate, attendanceDateFrom, attendanceDateTo),
+        [attendanceSelectedShiftDate, attendanceDateFrom, attendanceDateTo]
+    );
     const attendanceRecordsQuery = useQuery({
-        queryKey: ["admin-dashboard-attendance-records", effectiveAttendanceEmployeeId],
-        queryFn: () => getEmployeeAttendance(effectiveAttendanceEmployeeId),
+        queryKey: ["admin-dashboard-attendance-records", effectiveAttendanceEmployeeId, attendanceQueryRange.from, attendanceQueryRange.to],
+        queryFn: () => getEmployeeAttendance(effectiveAttendanceEmployeeId, { limit: 300, ...attendanceQueryRange }),
         enabled: Boolean(effectiveAttendanceEmployeeId),
         refetchInterval: 15_000,
         refetchOnWindowFocus: true,
@@ -7586,20 +7688,40 @@ export default function AdminDashboard() {
         [departmentFilteredAttendanceEmployeeOptions]
     );
     const allAttendanceQuery = useQuery({
-        queryKey: ["admin-dashboard-attendance-records", "all", allAttendanceEmployeeIds],
-        queryFn: () => getEmployeesAttendance(allAttendanceEmployeeIds),
+        queryKey: ["admin-dashboard-attendance-records", "all", allAttendanceEmployeeIds, attendanceQueryRange.from, attendanceQueryRange.to],
+        queryFn: () => getEmployeesAttendance(allAttendanceEmployeeIds, attendanceQueryRange),
         enabled: !effectiveAttendanceEmployeeId && allAttendanceEmployeeIds.length > 0,
         refetchInterval: 30_000,
         refetchOnWindowFocus: true,
     });
+    useEffect(() => {
+        const refreshAttendance = () => {
+            void queryClient.invalidateQueries({ queryKey: ["admin-dashboard-attendance-records"] });
+            void queryClient.invalidateQueries({ queryKey: ["employees", "summary", "dashboard-online-status"] });
+        };
+
+        socket.on("employee:availability-updated", refreshAttendance);
+        socket.on("call-dashboard:updated", refreshAttendance);
+
+        return () => {
+            socket.off("employee:availability-updated", refreshAttendance);
+            socket.off("call-dashboard:updated", refreshAttendance);
+        };
+    }, [queryClient]);
     const selectedLeadId = selectedActivity?.leadId || "";
     const leadHistoryQuery = useQuery({
         queryKey: ["dashboard-lead-history", selectedLeadId],
         queryFn: () => getLead(selectedLeadId),
         enabled: Boolean(selectedLeadId),
     });
-    const agents = useMemo(() => mergeAgentProgressRows(data?.agents || []), [data?.agents]);
-    const monthlyAgents = useMemo(() => mergeAgentMonthlyRows(data?.monthlyAgents || []), [data?.monthlyAgents]);
+    const agents = useMemo(
+        () => mergeAgentProgressRows(data?.agents || []).map((row) => ({ ...row, businessId: activeBusinessId, businessName: activeBusinessName })),
+        [activeBusinessId, activeBusinessName, data?.agents]
+    );
+    const monthlyAgents = useMemo(
+        () => mergeAgentMonthlyRows(data?.monthlyAgents || []).map((row) => ({ ...row, businessId: activeBusinessId, businessName: activeBusinessName })),
+        [activeBusinessId, activeBusinessName, data?.monthlyAgents]
+    );
     const summary = data?.summary;
     const totalAgentPages = Math.max(Math.ceil(agents.length / agentRowsPerPage), 1);
     const currentAgentPage = Math.min(agentPage, totalAgentPages);
@@ -7624,7 +7746,7 @@ export default function AdminDashboard() {
     const topAgents = agents.slice(0, 5);
     const onlineStatusAgents = useMemo(() => {
         if (employeesQuery.data) {
-            return buildOnlineStatusRows(employeesQuery.data, agents);
+            return buildOnlineStatusRows(employeesQuery.data, agents, activeBusinessName);
         }
 
         return [...agents].sort((first, second) => {
@@ -7634,7 +7756,7 @@ export default function AdminDashboard() {
 
             return first.employeeName.localeCompare(second.employeeName);
         });
-    }, [agents, employeesQuery.data]);
+    }, [activeBusinessName, agents, employeesQuery.data]);
     const availableAgentCount = onlineStatusAgents.filter(
         (agent) => normalizeEmployeeAvailabilityStatus(agent.availabilityStatus) !== "OFFLINE"
     ).length;
@@ -7751,18 +7873,22 @@ export default function AdminDashboard() {
     const [callFilterTimeFrom, setCallFilterTimeFrom] = useState("23:00");
     const [callFilterDateTo, setCallFilterDateTo] = useState("");
     const [callFilterTimeTo, setCallFilterTimeTo] = useState("08:00");
+    const callSummaryFilterRange = useMemo(
+        () => getCallSummaryFilterRange(
+            callFilterDateFrom,
+            callFilterTimeFrom,
+            callFilterDateTo,
+            callFilterTimeTo
+        ),
+        [callFilterDateFrom, callFilterTimeFrom, callFilterDateTo, callFilterTimeTo]
+    );
 
     const leadCallStatsQuery = useQuery({
         queryKey: ["lead-call-summary", "admin", callFilterDateFrom, callFilterTimeFrom, callFilterDateTo, callFilterTimeTo],
-        queryFn: () => getLeadCallSummary({
-            from: callFilterDateFrom
-                ? new Date(combineDateAndTime(callFilterDateFrom, callFilterTimeFrom || "00:00")).toISOString()
-                : undefined,
-            to: callFilterDateTo
-                ? new Date(combineDateAndTime(callFilterDateTo, callFilterTimeTo || "23:59")).toISOString()
-                : undefined,
-        }),
-        refetchInterval: 60_000,
+        queryFn: () => getLeadCallSummary(callSummaryFilterRange),
+        placeholderData: keepPreviousData,
+        refetchInterval: 15_000,
+        refetchOnWindowFocus: true,
     });
 
     const selectedAttendanceRecords = attendanceRecordsQuery.data || [];
@@ -7782,9 +7908,11 @@ export default function AdminDashboard() {
     const employeeCallRows = useMemo(() => {
         return (leadCallStatsQuery.data || []).map((row) => ({
             ...row,
+            crmBusinessId: activeBusinessId,
+            crmBusinessName: activeBusinessName,
             leads: row.leads.map((lead) => ({ ...lead, callLogs: [] })),
         }));
-    }, [leadCallStatsQuery.data]);
+    }, [activeBusinessId, activeBusinessName, leadCallStatsQuery.data]);
 
     const totalCallLeadCount = useMemo(
         () => new Set(employeeCallRows.flatMap((row) => row.leads.map((lead) => lead.leadId))).size,
@@ -7872,7 +8000,7 @@ export default function AdminDashboard() {
                     <KpiCard label="Productivity Today" value={formatNumber(summary?.activityToday)} helper={`${formatNumber(summary?.commentsToday)} employee comments logged`} icon={FiTrendingUp} accent="purple" />
                 </div>
 
-                <CallDashboardPanel />
+                <CallDashboardPanel businessName={activeBusinessName} />
 
                 {isError && (
                     <section className="rounded-lg border border-red-200 bg-red-50 p-4 text-red-700">
@@ -8169,7 +8297,7 @@ export default function AdminDashboard() {
                                 </p>
 
                                 <h3 className="mt-1 text-base font-semibold text-slate-900">
-                                    {leadCallStatsQuery.isLoading || leadCallStatsQuery.isFetching
+                                    {leadCallStatsQuery.isLoading && !leadCallStatsQuery.data
                                         ? "Loading call data"
                                         : `${formatNumber(totalLoggedLeadCalls)} connected calls`}
                                 </h3>
@@ -8231,9 +8359,13 @@ export default function AdminDashboard() {
                                     type="button"
                                     className="mt-5 h-9 rounded-lg border border-slate-300 bg-white px-3 text-sm font-semibold text-slate-700 transition hover:border-[#842cff]/40 hover:text-[#6426d9]"
                                     onClick={() => {
-                                        const today = formatDateInputValue(new Date());
-                                        setCallFilterDateFrom(today);
-                                        setCallFilterDateTo(today);
+                                        const shiftStart = getShiftStartDateFromTimestamp(new Date().toISOString());
+                                        const shiftEnd = getShiftEndDate(shiftStart);
+
+                                        setCallFilterDateFrom(formatDateInputValue(shiftStart));
+                                        setCallFilterTimeFrom(formatTimeInputValue(shiftStart));
+                                        setCallFilterDateTo(formatDateInputValue(shiftEnd));
+                                        setCallFilterTimeTo(formatTimeInputValue(shiftEnd));
                                     }}
                                 >
                                     Today
@@ -8246,7 +8378,9 @@ export default function AdminDashboard() {
                                         const firstDay = new Date(today.getFullYear(), today.getMonth(), 1);
 
                                         setCallFilterDateFrom(formatDateInputValue(firstDay));
+                                        setCallFilterTimeFrom("00:00");
                                         setCallFilterDateTo(formatDateInputValue(today));
+                                        setCallFilterTimeTo(formatTimeInputValue(today));
                                     }}
                                 >
                                     This Month
@@ -8281,7 +8415,7 @@ export default function AdminDashboard() {
                             </div>
                         </div>
                         <div className="flex w-full flex-col p-4 pt-0">
-                            {leadCallStatsQuery.isLoading || leadCallStatsQuery.isFetching ? (
+                            {leadCallStatsQuery.isLoading && !leadCallStatsQuery.data ? (
                                 <div className="mt-4">
                                     <EmptyPanel
                                         title="Loading call counts"
@@ -8328,9 +8462,9 @@ export default function AdminDashboard() {
                                                             {row.employeeName || "No employee"}
                                                         </p>
 
-                                                        {(row.employeeRole || row.employeeTeam) && (
+                                                        {(row.employeeRole || row.employeeTeam || row.crmBusinessName) && (
                                                             <p className="mt-0.5 truncate text-xs text-slate-500">
-                                                                {[row.employeeRole, row.employeeTeam]
+                                                                {[row.employeeRole, row.employeeTeam, row.crmBusinessName]
                                                                     .filter(Boolean)
                                                                     .join(" · ")}
                                                             </p>
@@ -8377,7 +8511,7 @@ export default function AdminDashboard() {
                                 </div>
                             )}
                         </div>
-                        <div className="border-t-6 border-slate-300 bg-slate-50/80 p-4">
+                        <div className="hidden" aria-hidden="true">
                             <div className="mb-4 flex flex-col gap-3 rounded-lg border border-slate-300 bg-white p-4 sm:flex-row sm:items-end sm:justify-between">
                                 <div>
                                     <p className="text-xl font-semibold uppercase tracking-[0.14em] text-slate-800">Employee Attendance</p>
@@ -8505,9 +8639,9 @@ export default function AdminDashboard() {
                             {employeesQuery.isLoading || attendanceRecordsQuery.isLoading || isAllAttendanceLoading ? (
                                 <EmptyPanel title="Loading attendance" message="Getting employee attendance records for the selected employee." />
                             ) : selectedAttendanceEmployee ? (
-                                <AttendancePanel employee={selectedAttendanceEmployee} attendance={selectedAttendanceRecords} />
+                                <AttendancePanel employee={selectedAttendanceEmployee} attendance={selectedAttendanceRecords} selectedAttendanceDate={attendanceSelectedShiftDate} attendanceDateFrom={attendanceDateFrom} attendanceDateTo={attendanceDateTo} onSelectedAttendanceDateChange={setAttendanceSelectedShiftDate} onAttendanceDateFromChange={setAttendanceDateFrom} onAttendanceDateToChange={setAttendanceDateTo} />
                             ) : (
-                                <AttendancePanel employee={null} attendance={[]} attendanceGroups={allAttendanceGroups} />
+                                <AttendancePanel employee={null} attendance={[]} attendanceGroups={allAttendanceGroups} selectedAttendanceDate={attendanceSelectedShiftDate} attendanceDateFrom={attendanceDateFrom} attendanceDateTo={attendanceDateTo} onSelectedAttendanceDateChange={setAttendanceSelectedShiftDate} onAttendanceDateFromChange={setAttendanceDateFrom} onAttendanceDateToChange={setAttendanceDateTo} />
                             )}
                         </div>
                         {/* Attendance panel */}
@@ -8555,7 +8689,7 @@ export default function AdminDashboard() {
                                                 <span className={`mt-1.5 size-2.5 shrink-0 rounded-full ${availabilityDotClass(agent.availabilityStatus)}`} />
                                                 <div className="min-w-0">
                                                     <p className="truncate text-sm font-semibold text-slate-950">{agent.employeeName}</p>
-                                                    <p className="mt-1 truncate text-xs text-slate-500">{agent.role} · {agent.team}</p>
+                                                    <p className="mt-1 truncate text-xs text-slate-500">{[agent.role, agent.team, agent.businessName].filter(Boolean).join(" · ")}</p>
                                                     <p className="mt-1 text-xs text-slate-500">{formatNumber(agent.assignedLeads)} active leads</p>
                                                 </div>
                                             </div>

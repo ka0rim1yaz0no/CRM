@@ -135,7 +135,7 @@ export default function AdminAttendanceForm() {
     );
     const { data: employeeAttendance = [], isLoading: isAttendanceLoading } = useQuery({
         queryKey: ["employee-attendance", selectedEmployeeId],
-        queryFn: () => getEmployeeAttendance(selectedEmployeeId),
+        queryFn: () => getEmployeeAttendance(selectedEmployeeId, { all: true }),
         enabled: Boolean(selectedEmployeeId),
     });
     const attendanceRows = useMemo(

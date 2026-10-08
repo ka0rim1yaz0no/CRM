@@ -7,6 +7,7 @@
     "dev": "vite",
     "dev:backend": "npm run dev --prefix backend",
     "call-bridge:package": "powershell -NoProfile -ExecutionPolicy Bypass -File callbridge/package-call-bridge.ps1",
+    "live-view-agent:package": "powershell -NoProfile -ExecutionPolicy Bypass -File liveview-agent/package-live-view-agent.ps1",
     "extension:package": "powershell -NoProfile -ExecutionPolicy Bypass -File crmext/package-extension.ps1",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
