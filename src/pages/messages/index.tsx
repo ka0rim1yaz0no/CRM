@@ -2,7 +2,7 @@ import type { FormEvent, KeyboardEvent } from "react";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useLocation, useSearchParams } from "react-router";
-import { FiCheck, FiChevronLeft, FiChevronRight, FiCornerUpLeft, FiDownload, FiEdit2, FiFile, FiHash, FiMessageCircle, FiPaperclip, FiPhone, FiPlus, FiSearch, FiSend, FiTrash2, FiUsers, FiX } from "react-icons/fi";
+import { FiCheck, FiChevronLeft, FiChevronRight, FiCornerUpLeft, FiDownload, FiEdit2, FiFile, FiHash, FiMessageCircle, FiPaperclip, FiPhone, FiPlus, FiSearch, FiSend, FiSmile, FiTrash2, FiUsers, FiX } from "react-icons/fi";
 import MainLayout from "../layout";
 import AdminLayout from "../admin/adminLayout";
 import {
@@ -61,6 +61,7 @@ function getInitials(value: string) {
 const acceptedMessageFileTypes = "image/png,image/jpeg,image/webp,image/gif,video/mp4,video/webm,video/ogg,video/quicktime,audio/mpeg,audio/mp4,audio/wav,audio/ogg,audio/webm,application/pdf,text/plain,text/csv,.doc,.docx,.xls,.xlsx";
 const maxMessageAttachmentBytes = 50 * 1024 * 1024;
 const maxMessageAttachments = 6;
+const messageEmojiOptions = ["😀", "😂", "😊", "😍", "😅", "😎", "🤔", "😢", "😮", "😡", "👍", "👎", "👏", "🙏", "🎉", "❤️", "🔥", "✅", "⭐", "💬"];
 
 type DraftConversation = {
     type: "direct" | "team";
@@ -147,6 +148,7 @@ export default function Messages() {
     const [selectedConversationId, setSelectedConversationId] = useState<string | null>(null);
     const [draftConversation, setDraftConversation] = useState<DraftConversation | null>(null);
     const [messageText, setMessageText] = useState("");
+    const [isEmojiPickerOpen, setIsEmojiPickerOpen] = useState(false);
     const [messageFiles, setMessageFiles] = useState<File[]>([]);
     const [editingMessage, setEditingMessage] = useState<Message | null>(null);
     const [replyingTo, setReplyingTo] = useState<Message | null>(null);
@@ -163,6 +165,7 @@ export default function Messages() {
     const [teamMemberSearch, setTeamMemberSearch] = useState("");
     const [teamEditorError, setTeamEditorError] = useState("");
     const messagesScrollRef = useRef<HTMLDivElement>(null);
+    const messageInputRef = useRef<HTMLTextAreaElement>(null);
     const shouldFollowMessagesRef = useRef(true);
     const directorySearchRef = useRef<HTMLInputElement>(null);
     const attachmentInputRef = useRef<HTMLInputElement>(null);
@@ -714,6 +717,12 @@ export default function Messages() {
         sendCurrentMessage();
     };
 
+    const addMessageEmoji = (emoji: string) => {
+        setMessageText((current) => `${current}${emoji}`);
+        setIsEmojiPickerOpen(false);
+        window.requestAnimationFrame(() => messageInputRef.current?.focus());
+    };
+
     const openTeamEditor = (team: Team | null = null) => {
         setTeamEditor({ team, name: team?.name || "", members: team?.members.map((member) => member._id) || [] });
         setTeamMemberSearch("");
@@ -1032,7 +1041,36 @@ export default function Messages() {
                         >
                             <FiPaperclip className="size-5" aria-hidden="true" />
                         </button>
+                        <div className="relative shrink-0">
+                            <button
+                                className="flex size-10 items-center justify-center rounded-full text-slate-500 transition hover:bg-white hover:text-[#0084ff] disabled:cursor-not-allowed disabled:text-slate-300"
+                                type="button"
+                                aria-label="Add emoji"
+                                title="Add emoji"
+                                aria-expanded={isEmojiPickerOpen}
+                                disabled={(!selectedConversation && !draftConversation) || sendMessageMutation.isPending || editMessageMutation.isPending}
+                                onClick={() => setIsEmojiPickerOpen((open) => !open)}
+                            >
+                                <FiSmile className="size-5" aria-hidden="true" />
+                            </button>
+                            {isEmojiPickerOpen && (
+                                <div className="absolute bottom-12 left-0 z-20 grid w-56 grid-cols-5 gap-1 rounded-xl border border-slate-200 bg-white p-2 shadow-xl" role="dialog" aria-label="Choose an emoji">
+                                    {messageEmojiOptions.map((emoji) => (
+                                        <button
+                                            key={emoji}
+                                            className="grid size-9 place-items-center rounded-lg text-xl transition hover:bg-[#e7f3ff]"
+                                            type="button"
+                                            aria-label={`Add ${emoji}`}
+                                            onClick={() => addMessageEmoji(emoji)}
+                                        >
+                                            {emoji}
+                                        </button>
+                                    ))}
+                                </div>
+                            )}
+                        </div>
                         <textarea
+                            ref={messageInputRef}
                             className="max-h-28 min-h-10 min-w-0 flex-1 resize-none bg-transparent px-2 py-2 text-sm leading-6 text-slate-950 outline-none placeholder:text-slate-400"
                             value={messageText}
                             onChange={(event) => setMessageText(event.target.value)}
