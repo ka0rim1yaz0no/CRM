@@ -8,7 +8,8 @@ export type MediaAssetDocument = {
   url: string;
   mimeType: string;
   assetType: MediaAssetType;
-  branch: string;
+  role: string;
+  branch?: string;
   size: number;
   data?: Buffer;
   isArchived: boolean;
@@ -20,6 +21,7 @@ const mediaAssetSchema = new Schema<MediaAssetDocument>(
     url: { type: String, required: true, trim: true },
     mimeType: { type: String, required: true, trim: true },
     assetType: { type: String, enum: ["Image", "Video"], required: true },
+    role: { type: String, trim: true, default: "All roles" },
     branch: { type: String, trim: true, default: "" },
     size: { type: Number, default: 0 },
     data: { type: Buffer, select: false },

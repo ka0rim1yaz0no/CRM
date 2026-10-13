@@ -1,8 +1,8 @@
 import type { Request, Response } from "express";
 import { Types } from "mongoose";
 import { Attendance, type AttendanceSource, type AttendanceStatus } from "../models/Attendance";
-import { runWithBusiness } from "../config/tenancy";
-import { updateAttendanceAcrossBusinesses } from "../services/employeeAttendanceSyncService";
+import { getConfiguredBusinesses, runWithBusiness } from "../config/tenancy";
+import { syncEmployeeAttendanceAcrossBusinesses, syncEmployeesAttendanceAcrossBusinesses, updateAttendanceAcrossBusinesses } from "../services/employeeAttendanceSyncService";
 import { syncEmployeeAvailabilityAcrossBusinesses } from "../services/employeeAvailabilityService";
 import { Employee, normalizeEmployeeAvailabilityStatus } from "../models/Employee";
 import { recordEmployeeTransaction } from "./employeeTransactionController";
@@ -26,6 +26,14 @@ const attendanceSources: AttendanceSource[] = [
 const timeInSources: AttendanceSource[] = ["Login", "Time In"];
 const timeOutSources: AttendanceSource[] = ["Logout", "Time Out"];
 const breakOutGapMs = 30 * 60 * 1000;
+
+export function workedMinutesToTimeOut(timeIn: Date, workedMinutes: number, lunchMinutes: number) {
+  return new Date(timeIn.getTime() + (workedMinutes + lunchMinutes) * 60_000);
+}
+
+export function isTimeInLate(timeIn: Date, allowedStart: Date) {
+  return timeIn.getTime() >= allowedStart.getTime() + 60_000;
+}
 
 function minutesFromTime(value = "23:00") {
   const [hours, minutes] = value.split(":").map((part) => Number(part));
@@ -97,7 +105,7 @@ async function getTimeInStatus(timeIn: Date) {
 
   const [startHour, startMinute] = officialShiftStartTime.split(":").map((part) => Number(part));
   const allowedStart = zonedDateTimeToUtc(shiftStartDay.year, shiftStartDay.month, shiftStartDay.day, startHour, startMinute + (settings.lateGraceMinutes || 0), timeZone);
-  return timeIn.getTime() > allowedStart.getTime() ? "Late" : "On time";
+  return isTimeInLate(timeIn, allowedStart) ? "Late" : "On time";
 }
 
 async function getTimeOutStatus(timeOut: Date): Promise<AttendanceStatus> {
@@ -235,6 +243,10 @@ export function shouldAutomaticallyCloseAttendanceSlot({
   return false;
 }
 
+export function canEditWorkedMinutes(hasManualTimeOut: boolean) {
+  return hasManualTimeOut;
+}
+
 export async function closeExpiredAttendanceSlots(_now = new Date()) {
   return [] as string[];
 }
@@ -322,6 +334,7 @@ export async function timeInEmployee(request: Request, response: Response) {
   const businessEmployees = await syncEmployeeAvailabilityAcrossBusinesses(employee.employeeCode, updatedEmployee.availabilityStatus);
 
   const attendance = await recordEmployeeTimeIn(employee._id);
+  await syncEmployeeAttendanceAcrossBusinesses(employee.employeeCode);
   emitEmployeeAvailabilityUpdated({
     employeeId: String(updatedEmployee._id),
     availabilityStatus: updatedEmployee.availabilityStatus,
@@ -397,6 +410,7 @@ export async function breakOutEmployee(request: Request, response: Response) {
   const businessEmployees = await syncEmployeeAvailabilityAcrossBusinesses(employee.employeeCode, updatedEmployee.availabilityStatus);
 
   const attendance = await recordEmployeeBreakOut(employee._id);
+  await syncEmployeeAttendanceAcrossBusinesses(employee.employeeCode);
   emitEmployeeAvailabilityUpdated({
     employeeId: String(updatedEmployee._id),
     availabilityStatus: updatedEmployee.availabilityStatus,
@@ -451,6 +465,7 @@ export async function breakInEmployee(request: Request, response: Response) {
   const businessEmployees = await syncEmployeeAvailabilityAcrossBusinesses(employee.employeeCode, updatedEmployee.availabilityStatus);
 
   const attendance = await recordEmployeeBreakIn(employee._id);
+  await syncEmployeeAttendanceAcrossBusinesses(employee.employeeCode);
   emitEmployeeAvailabilityUpdated({
     employeeId: String(updatedEmployee._id),
     availabilityStatus: updatedEmployee.availabilityStatus,
@@ -513,6 +528,7 @@ export async function lunchBreakOutEmployee(request: Request, response: Response
   const businessEmployees = await syncEmployeeAvailabilityAcrossBusinesses(employee.employeeCode, updatedEmployee.availabilityStatus);
 
   const attendance = await recordEmployeeLunchBreakOut(employee._id);
+  await syncEmployeeAttendanceAcrossBusinesses(employee.employeeCode);
   emitEmployeeAvailabilityUpdated({
     employeeId: String(updatedEmployee._id),
     availabilityStatus: updatedEmployee.availabilityStatus,
@@ -567,6 +583,7 @@ export async function lunchBreakInEmployee(request: Request, response: Response)
   const businessEmployees = await syncEmployeeAvailabilityAcrossBusinesses(employee.employeeCode, updatedEmployee.availabilityStatus);
 
   const attendance = await recordEmployeeLunchBreakIn(employee._id);
+  await syncEmployeeAttendanceAcrossBusinesses(employee.employeeCode);
   emitEmployeeAvailabilityUpdated({
     employeeId: String(updatedEmployee._id),
     availabilityStatus: updatedEmployee.availabilityStatus,
@@ -648,6 +665,7 @@ export async function timeOutEmployee(request: Request, response: Response) {
   }
 
   const attendance = await recordEmployeeTimeOut(employee._id, new Date());
+  await syncEmployeeAttendanceAcrossBusinesses(employee.employeeCode);
   emitEmployeeAvailabilityUpdated({
     employeeId: String(updatedEmployee._id),
     availabilityStatus: updatedEmployee.availabilityStatus,
@@ -675,6 +693,13 @@ export async function listEmployeeAttendance(request: Request, response: Respons
     ...(!Number.isNaN(from.getTime()) ? { $gte: from } : {}),
     ...(!Number.isNaN(to.getTime()) ? { $lte: to } : {}),
   };
+  const employee = Types.ObjectId.isValid(employeeId)
+    ? await Employee.findById(employeeId).select("employeeCode").lean()
+    : null;
+  if (employee?.employeeCode) {
+    await syncEmployeeAttendanceAcrossBusinesses(employee.employeeCode);
+  }
+
   const attendanceQuery = Attendance.find({
     employee: employeeId,
     ...(showArchived ? { isArchived: true } : { isArchived: { $ne: true } }),
@@ -700,6 +725,12 @@ export async function listEmployeesAttendance(request: Request, response: Respon
     response.json([]);
     return;
   }
+
+  const employees = await Employee.find({
+    _id: { $in: employeeIds },
+    status: { $ne: "Archived" },
+  }).select("employeeCode").lean();
+  await syncEmployeesAttendanceAcrossBusinesses(employees.map((employee) => employee.employeeCode));
 
   const includeAll = String(request.query.all || "") === "true";
   const requestedFrom = new Date(String(request.query.from || ""));
@@ -747,6 +778,7 @@ export async function createEmployeeAttendance(request: Request, response: Respo
     source,
     attendanceStatus: await getAttendanceStatus(source, timeIn),
   });
+  await syncEmployeeAttendanceAcrossBusinesses(employee.employeeCode);
 
   await recordEmployeeTransaction({
     employee: employee._id,
@@ -819,6 +851,104 @@ export async function updateEmployeeAttendance(request: Request, response: Respo
   response.json(attendance);
 }
 
+export async function updateEmployeeWorkedMinutes(request: Request, response: Response) {
+  if (String(request.header("x-crm-user-type") || "").trim().toLowerCase() !== "admin") {
+    response.status(403).json({ message: "Only administrators can edit worked minutes." });
+    return;
+  }
+
+  const employeeId = String(request.params.employeeId || "").trim();
+  const timeInRecordId = String(request.body.timeInRecordId || "").trim();
+  const workedMinutes = Number(request.body.workedMinutes);
+
+  if (!Types.ObjectId.isValid(employeeId) || !Types.ObjectId.isValid(timeInRecordId) ||
+    !Number.isInteger(workedMinutes) || workedMinutes < 0 || workedMinutes > 24 * 60) {
+    response.status(400).json({ message: "Worked minutes must be a whole number from 0 to 1440." });
+    return;
+  }
+
+  const employee = await Employee.findOne({ _id: employeeId, status: { $ne: "Archived" } }).select("_id name employeeCode").lean();
+  const timeInRecord = await Attendance.findOne({
+    _id: timeInRecordId,
+    employee: employeeId,
+    source: { $in: timeInSources },
+    isArchived: { $ne: true },
+  });
+  if (!employee || !timeInRecord) {
+    response.status(404).json({ message: "Attendance time-in record not found." });
+    return;
+  }
+
+  const settings = await getSystemSettings();
+  const timeZone = settings.attendanceTimeZone || "Asia/Manila";
+  const shiftStart = settings.officialShiftStartTime || "23:00";
+  const shiftEnd = settings.officialShiftEndTime || "08:00";
+  const slotKey = attendanceSlotKey(timeInRecord.timeIn, timeZone, shiftStart, shiftEnd);
+  const candidateRecords = await Attendance.find({
+    employee: employeeId,
+    isArchived: { $ne: true },
+    timeIn: {
+      $gte: new Date(timeInRecord.timeIn.getTime() - 12 * 60 * 60 * 1000),
+      $lte: new Date(timeInRecord.timeIn.getTime() + 36 * 60 * 60 * 1000),
+    },
+  }).sort({ timeIn: 1 });
+  const slotRecords = candidateRecords.filter((record) => attendanceSlotKey(record.timeIn, timeZone, shiftStart, shiftEnd) === slotKey);
+  const existingTimeOut = [...slotRecords].reverse().find((record) => timeOutSources.includes(record.source));
+  const lunchOut = slotRecords.find((record) => record.source === "Lunch Break Out");
+  const lunchIn = [...slotRecords].reverse().find((record) => record.source === "Lunch Break In");
+  const slotDay = new Date(`${slotKey}T00:00:00Z`).getUTCDay();
+  const isWeekend = slotDay === 0 || slotDay === 6;
+  const actualLunchMinutes = lunchOut && lunchIn && lunchIn.timeIn > lunchOut.timeIn
+    ? Math.round((lunchIn.timeIn.getTime() - lunchOut.timeIn.getTime()) / 60_000)
+    : 0;
+  const payrollLunchMinutes = isWeekend ? actualLunchMinutes : 60;
+  const updatedTimeOut = workedMinutesToTimeOut(timeInRecord.timeIn, workedMinutes, payrollLunchMinutes);
+  const updatedStatus = await getAttendanceStatus("Time Out", updatedTimeOut);
+  let affectedEmployees: Array<{ businessId: string; employeeId: string }> = [];
+
+  if (!canEditWorkedMinutes(Boolean(existingTimeOut))) {
+    sendAttendanceConflict(
+      response,
+      "Worked minutes cannot be edited while the employee is still timed in. The employee must time out manually first."
+    );
+    return;
+  }
+
+  if (existingTimeOut) {
+    const previousTimeOut = existingTimeOut.timeIn;
+    const previousSource = existingTimeOut.source;
+    existingTimeOut.timeIn = updatedTimeOut;
+    existingTimeOut.source = "Time Out";
+    existingTimeOut.attendanceStatus = updatedStatus;
+    await existingTimeOut.save();
+    affectedEmployees = await updateAttendanceAcrossBusinesses(employee.employeeCode, {
+      timeIn: previousTimeOut,
+      source: previousSource,
+    }, {
+      timeIn: updatedTimeOut,
+      source: "Time Out",
+      attendanceStatus: updatedStatus,
+      isArchived: false,
+    });
+  }
+
+  for (const affected of affectedEmployees) {
+    await runWithBusiness(affected.businessId, () =>
+      recalculateEmployeePayrollAfterAttendanceEdit(affected.employeeId, timeInRecord.timeIn, updatedTimeOut)
+    );
+  }
+
+  await recordEmployeeTransaction({
+    employee: employee._id,
+    category: "Attendance",
+    title: "Worked minutes edited",
+    description: `${employee.name}'s worked time was set to ${workedMinutes} minutes by admin.`,
+    metadata: { slotKey, workedMinutes, updatedTimeOut: updatedTimeOut.toISOString() },
+  });
+  emitCallDashboardUpdated(affectedEmployees.map((item) => item.businessId));
+  response.json({ workedMinutes, timeOut: updatedTimeOut.toISOString(), affectedBusinesses: affectedEmployees.length });
+}
+
 export async function archiveEmployeeAttendance(request: Request, response: Response) {
   const attendance = await Attendance.findOneAndUpdate(
     { _id: request.params.attendanceId, employee: request.params.employeeId },
@@ -829,6 +959,19 @@ export async function archiveEmployeeAttendance(request: Request, response: Resp
   if (!attendance) {
     response.status(404).json({ message: "Attendance record not found" });
     return;
+  }
+
+  const employee = await Employee.findById(request.params.employeeId).select("employeeCode").lean();
+  if (employee?.employeeCode) {
+    await updateAttendanceAcrossBusinesses(employee.employeeCode, {
+      timeIn: attendance.timeIn,
+      source: attendance.source,
+    }, {
+      timeIn: attendance.timeIn,
+      source: attendance.source,
+      attendanceStatus: attendance.attendanceStatus,
+      isArchived: true,
+    });
   }
 
   if (request.business?.id) emitCallDashboardUpdated([request.business.id]);
@@ -927,6 +1070,9 @@ export async function recordEmployeeActivity(request: Request, response: Respons
     if (nextStatus === "ONLINE" && offPhoneInCount < offPhoneOutCount) {
       attendanceRecords.push(await recordEmployeeOffPhoneIn(employee._id));
     }
+  }
+  if (attendanceRecords.length > 0) {
+    await syncEmployeeAttendanceAcrossBusinesses(employee.employeeCode);
   }
 
   await recordEmployeeTransaction({

@@ -1056,7 +1056,7 @@ export default function AdminHr() {
                                 {exportingAttendance ? "Exporting..." : "Export"}
                             </button>
                         </div>
-                        <table className="w-full min-w-[78rem] table-fixed border-separate border-spacing-0 text-left">
+                        <table className="w-full min-w-[96rem] table-fixed border-separate border-spacing-0 text-left">
                             <thead className="sticky top-[4.05rem] z-10 bg-slate-100 text-center text-[0.7rem] font-semibold text-black shadow-[12px_0_0_#f1f5f9]">
                                 <tr>
                                     <th className="w-[17%] px-2 py-2 text-left">Employee</th>
@@ -1094,7 +1094,7 @@ export default function AdminHr() {
                                     </th>
                                     <th className="w-[8%] px-2 py-2">Duration</th>
                                     <th className="w-[8%] px-2 py-2">Overtime</th>
-                                    <th className="w-[6%] px-2 py-2">Actions</th>
+                                    <th className="w-[11%] px-2 py-2">Actions</th>
                                 </tr>
                             </thead>
                             <tbody className="divide-y divide-slate-300 bg-white">
@@ -1146,7 +1146,18 @@ export default function AdminHr() {
                                         </td>
                                         <td className="px-2 py-1.5 !text-black">
                                             <div className="flex flex-col items-center justify-center gap-0.5">
-                                                <span className="max-w-[12rem] whitespace-normal">{record.offPhoneInOut}</span>
+                                                <div className="max-w-[12rem] space-y-0.5" title={record.offPhoneInOut === "-" ? undefined : record.offPhoneInOut}>
+                                                    {record.offPhoneSessionLabels.length ? (
+                                                        <>
+                                                            {record.offPhoneSessionLabels.slice(0, 3).map((session, index) => (
+                                                                <span key={`${session}-${index}`} className="block whitespace-nowrap">{session}</span>
+                                                            ))}
+                                                            {record.offPhoneSessionLabels.length > 3 && (
+                                                                <span className="block font-semibold !text-sky-700">+{record.offPhoneSessionLabels.length - 3} more sessions</span>
+                                                            )}
+                                                        </>
+                                                    ) : "-"}
+                                                </div>
                                                 {record.offPhoneDuration !== "-" && (
                                                     <span className="rounded-full border border-sky-200 bg-sky-50 px-1.5 py-px text-[0.52rem] font-semibold leading-none !text-sky-700">
                                                         {record.offPhoneDuration}
@@ -1157,7 +1168,7 @@ export default function AdminHr() {
                                         <td className="px-2 py-1.5 !text-black">{record.duration}</td>
                                         <td className="px-2 py-1.5 !text-black">{record.overtime}</td>
                                         <td className="px-2 py-1.5">
-                                            <div className="flex justify-center gap-1">
+                                            <div className="flex flex-wrap justify-center gap-1">
                                                 {record.rawRecords.length ? (
                                                     <Link
                                                         className="rounded-md border border-slate-300 bg-white px-2 py-1 text-[0.65rem] font-semibold !text-black transition hover:bg-slate-100"
@@ -1376,6 +1387,7 @@ type AttendanceHistoryRow = {
     lunchInOut: string;
     secondBreakInOut: string;
     offPhoneInOut: string;
+    offPhoneSessionLabels: string[];
     offPhoneDuration: string;
     duration: string;
     firstOverBreak: string;
@@ -1598,6 +1610,7 @@ function buildAbsentAttendanceRow(dateKey: string): AttendanceHistoryRow {
         lunchInOut: "-",
         secondBreakInOut: "-",
         offPhoneInOut: "-",
+        offPhoneSessionLabels: [],
         offPhoneDuration: "-",
         duration: "-",
         firstOverBreak: "-",
@@ -1720,6 +1733,7 @@ function buildAttendanceHistoryRows(records: AttendanceRecord[], settings?: Syst
                     })
                     .join("; ")
                 : "-";
+            const offPhoneSessionLabels = offPhoneInOut === "-" ? [] : offPhoneInOut.split("; ");
             const lunchOutTime = lunchOut ? new Date(lunchOut).getTime() : 0;
             const lunchInTime = lunchIn ? new Date(lunchIn).getTime() : lunchOutTime;
             const firstBreak = breakPairs.find((pair) => !lunchOutTime || new Date(pair.breakOut).getTime() < lunchOutTime) || breakPairs[0];
@@ -1747,7 +1761,7 @@ function buildAttendanceHistoryRows(records: AttendanceRecord[], settings?: Syst
             const hasTimeIn = Boolean(timeIn);
             const hasTimeOut = Boolean(timeOut && elapsedBetween(timeIn, timeOut) > 0);
             const assumedRegularDuration = hasTimeIn && !hasTimeOut && !isWeekendSlot ? officialShiftDurationMs : 0;
-            const rawWorkedDuration = assumedRegularDuration || Math.max(0, elapsedBetween(timeIn, timeOut) - lunchDuration - overBreakDuration);
+            const rawWorkedDuration = assumedRegularDuration || Math.max(0, elapsedBetween(timeIn, timeOut) - lunchDuration);
             const workedDuration = isWeekendSlot ? rawWorkedDuration : Math.min(rawWorkedDuration, officialShiftDurationMs);
             const undertimeDuration = !isWeekendSlot && hasTimeIn ? Math.max(officialShiftDurationMs - workedDuration, 0) : 0;
             const overtimeDuration = isWeekendSlot ? rawWorkedDuration : 0;
@@ -1761,6 +1775,7 @@ function buildAttendanceHistoryRows(records: AttendanceRecord[], settings?: Syst
                 lunchInOut: formatTimePair(lunchOut, lunchIn, timeZone),
                 secondBreakInOut: formatTimePair(secondBreak?.breakOut, secondBreak?.breakIn, timeZone),
                 offPhoneInOut,
+                offPhoneSessionLabels,
                 offPhoneDuration: formatDuration(offPhoneDuration),
                 duration: formatDuration(workedDuration),
                 firstOverBreak: formatDuration(firstOverBreakDuration),

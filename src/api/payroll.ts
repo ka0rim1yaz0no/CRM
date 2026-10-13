@@ -30,6 +30,7 @@ export type PayrollRecord = {
     lateDays?: number;
     lateHours?: number;
     workedHours?: number;
+    workedMinutesOverride?: number | null;
     overtimeHours?: number;
     overtimeApproved?: boolean;
     scheduledHours?: number;
@@ -169,6 +170,11 @@ export async function updatePayrollOvertime(id: string, overtimeHours: number) {
 
 export async function updateEmployeeBasicPay(employeeId: string, basicPay: number) {
     const response = await api.patch<PayrollRecord>(`/payroll/employees/${encodeURIComponent(employeeId)}/basic-pay`, { basicPay });
+    return response.data;
+}
+
+export async function updatePayrollWorkedMinutes(id: string, workedMinutes: number) {
+    const response = await api.patch<PayrollRecord>(`/payroll/records/${encodeURIComponent(id)}/worked-minutes`, { workedMinutes });
     return response.data;
 }
 

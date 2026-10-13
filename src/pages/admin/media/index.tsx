@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FiAlertTriangle, FiArchive, FiChevronLeft, FiChevronRight, FiDownload, FiEye, FiFile, FiGrid, FiImage, FiList, FiPlayCircle, FiPlus, FiSearch, FiX } from "react-icons/fi";
 import AdminLayout from "../adminLayout";
 import { archiveMediaAsset, getMediaAssets, uploadMediaAsset, type MediaAsset } from "../../../api/media";
-import { getBranches } from "../../../api/branches";
+import { getEmployees } from "../../../api/employees";
 import { backendOrigin } from "../../../lib/backendUrl";
 import { formatCstDate } from "../../../lib/dateTime";
 
@@ -58,7 +58,7 @@ function normalizeAsset(asset: MediaAsset): MediaAsset {
         url: toDisplayText(asset.url),
         mimeType,
         assetType: toAssetType(asset.assetType, mimeType),
-        branch: toDisplayText(asset.branch, "All branches"),
+        role: toDisplayText(asset.role, "All roles"),
         size: toAssetSize(asset.size),
         isArchived: Boolean(asset.isArchived),
         createdAt: toDisplayText(asset.createdAt),
@@ -78,9 +78,9 @@ export default function AdminMedia() {
     const queryClient = useQueryClient();
     const [search, setSearch] = useState("");
     const [activeType, setActiveType] = useState<"All" | "Image" | "Video">("All");
-    const [activeBranch, setActiveBranch] = useState("All");
+    const [activeRole, setActiveRole] = useState("All");
     const [viewMode, setViewMode] = useState<"Thumbnail" | "Table">("Thumbnail");
-    const [uploadBranch, setUploadBranch] = useState("");
+    const [uploadRole, setUploadRole] = useState("");
     const [previewAsset, setPreviewAsset] = useState<MediaAsset | null>(null);
     const [pendingArchive, setPendingArchive] = useState<MediaAsset | null>(null);
 
@@ -88,20 +88,20 @@ export default function AdminMedia() {
         queryKey: ["media"],
         queryFn: getMediaAssets,
     });
-    const { data: branches = [] } = useQuery({
-        queryKey: ["branches"],
-        queryFn: getBranches,
+    const { data: employees = [] } = useQuery({
+        queryKey: ["employees", "media-role-options"],
+        queryFn: getEmployees,
     });
     const normalizedAssets = useMemo(() => assets.map(normalizeAsset), [assets]);
-    const branchOptions = useMemo(
+    const roleOptions = useMemo(
         () =>
             Array.from(
                 new Set([
-                    ...branches.map((branch) => toDisplayText(branch.name)),
-                    ...normalizedAssets.map((asset) => asset.branch),
+                    ...employees.filter((employee) => employee.status !== "Archived").map((employee) => toDisplayText(employee.role)),
+                    ...normalizedAssets.map((asset) => asset.role),
                 ])
-            ).filter(Boolean).sort(),
-        [branches, normalizedAssets]
+            ).filter((role) => Boolean(role) && role !== "All roles").sort(),
+        [employees, normalizedAssets]
     );
 
     const uploadMutation = useMutation({
@@ -122,14 +122,14 @@ export default function AdminMedia() {
 
         return normalizedAssets.filter((asset) => {
             const matchesType = activeType === "All" || asset.assetType === activeType;
-            const matchesBranch = activeBranch === "All" || asset.branch === activeBranch;
+            const matchesRole = activeRole === "All" || asset.role === activeRole;
             const matchesSearch =
                 !normalizedSearch ||
                 asset.name.toLowerCase().includes(normalizedSearch) ||
-                (asset.branch || "").toLowerCase().includes(normalizedSearch);
-            return matchesType && matchesBranch && matchesSearch;
+                (asset.role || "").toLowerCase().includes(normalizedSearch);
+            return matchesType && matchesRole && matchesSearch;
         });
-    }, [activeBranch, activeType, normalizedAssets, search]);
+    }, [activeRole, activeType, normalizedAssets, search]);
 
     const imageCount = normalizedAssets.filter((asset) => asset.assetType === "Image").length;
     const videoCount = normalizedAssets.filter((asset) => asset.assetType === "Video").length;
@@ -152,16 +152,17 @@ export default function AdminMedia() {
                     </div>
                     <div className="flex flex-wrap items-end gap-3">
                         <label>
-                            <span className="mb-2 block text-xs font-medium uppercase tracking-[0.14em] text-slate-600">Owning Branch</span>
+                            <span className="mb-2 block text-xs font-medium uppercase tracking-[0.14em] text-slate-600">Employee Role</span>
                             <select
                                 className="h-11 min-w-[13rem] rounded-lg border border-slate-300 bg-white px-3 text-sm font-semibold text-slate-950 outline-none transition focus:border-[#842cff] focus:ring-2 focus:ring-[#842cff]/20 [&>option]:bg-white [&>option]:text-slate-950"
-                                value={uploadBranch}
-                                onChange={(event) => setUploadBranch(event.target.value)}
+                                value={uploadRole}
+                                onChange={(event) => setUploadRole(event.target.value)}
                             >
-                                <option className="bg-white text-slate-950" value="">Select branch</option>
-                                {branchOptions.map((branch) => (
-                                    <option className="bg-white text-slate-950" key={branch} value={branch}>
-                                        {branch}
+                                <option className="bg-white text-slate-950" value="">Select role</option>
+                                <option className="bg-white text-slate-950" value="All roles">All roles</option>
+                                {roleOptions.map((role) => (
+                                    <option className="bg-white text-slate-950" key={role} value={role}>
+                                        {role}
                                     </option>
                                 ))}
                             </select>
@@ -169,7 +170,7 @@ export default function AdminMedia() {
                         <label
                             className={[
                                 "flex h-11 items-center gap-2 rounded-lg px-5 text-sm font-semibold transition",
-                                uploadBranch && !uploadMutation.isPending
+                                uploadRole && !uploadMutation.isPending
                                     ? "cursor-pointer bg-[linear-gradient(135deg,#842cff,#4a0ebd)] text-white hover:brightness-110"
                                     : "cursor-not-allowed bg-slate-200 text-slate-500",
                             ].join(" ")}
@@ -181,9 +182,9 @@ export default function AdminMedia() {
                                 type="file"
                                 accept="image/*,video/mp4,video/webm,video/ogg,video/quicktime"
                                 multiple
-                                disabled={uploadMutation.isPending || !uploadBranch}
+                                disabled={uploadMutation.isPending || !uploadRole}
                                 onChange={(event) => {
-                                    Array.from(event.target.files || []).forEach((file) => uploadMutation.mutate({ file, branch: uploadBranch }));
+                                    Array.from(event.target.files || []).forEach((file) => uploadMutation.mutate({ file, role: uploadRole }));
                                     event.target.value = "";
                                 }}
                             />
@@ -229,13 +230,13 @@ export default function AdminMedia() {
                             </label>
                             <select
                                 className="h-10 min-w-[11rem] rounded-lg border border-slate-300 bg-white px-3 text-sm font-semibold text-slate-950 outline-none transition focus:border-[#842cff] focus:ring-2 focus:ring-[#842cff]/20 [&>option]:bg-white [&>option]:text-slate-950"
-                                value={activeBranch}
-                                onChange={(event) => setActiveBranch(event.target.value)}
+                                value={activeRole}
+                                onChange={(event) => setActiveRole(event.target.value)}
                             >
-                                <option className="bg-white text-slate-950" value="All">All branches</option>
-                                {branchOptions.map((branch) => (
-                                    <option className="bg-white text-slate-950" key={branch} value={branch}>
-                                        {branch}
+                                <option className="bg-white text-slate-950" value="All">All roles</option>
+                                {roleOptions.map((role) => (
+                                    <option className="bg-white text-slate-950" key={role} value={role}>
+                                        {role}
                                     </option>
                                 ))}
                             </select>
@@ -314,7 +315,7 @@ export default function AdminMedia() {
                                                 <div className="min-w-0">
                                                     <p className="truncate text-sm font-semibold text-slate-950">{asset.name}</p>
                                                     <p className="mt-1 text-xs text-slate-500">{asset.assetType} · {formatBytes(asset.size)}</p>
-                                                    <p className="mt-1 truncate text-xs font-semibold text-slate-700">{asset.branch || "No branch"}</p>
+                                                    <p className="mt-1 truncate text-xs font-semibold text-slate-700">{asset.role || "All roles"}</p>
                                                 </div>
                                                 <span className="rounded-md bg-violet-100 px-2 py-1 text-xs font-semibold text-[#5f27cd]">{asset.assetType}</span>
                                             </div>
@@ -346,7 +347,7 @@ export default function AdminMedia() {
                                 <thead className="sticky top-0 z-10 bg-slate-100 text-[0.68rem] font-semibold uppercase tracking-[0.12em] text-slate-600">
                                     <tr>
                                         <th className="w-[34%] px-4 py-3">Media</th>
-                                        <th className="w-[16%] px-4 py-3">Branch</th>
+                                        <th className="w-[16%] px-4 py-3">Role</th>
                                         <th className="w-[12%] px-4 py-3">Type</th>
                                         <th className="w-[12%] px-4 py-3">Size</th>
                                         <th className="w-[14%] px-4 py-3">Uploaded</th>
@@ -376,7 +377,7 @@ export default function AdminMedia() {
                                                     </span>
                                                 </div>
                                             </td>
-                                            <td className="truncate px-4 py-3 font-semibold text-slate-700">{asset.branch || "No branch"}</td>
+                                            <td className="truncate px-4 py-3 font-semibold text-slate-700">{asset.role || "All roles"}</td>
                                             <td className="px-4 py-3">{asset.assetType}</td>
                                             <td className="px-4 py-3">{formatBytes(asset.size)}</td>
                                             <td className="px-4 py-3 text-slate-500">
@@ -432,7 +433,7 @@ export default function AdminMedia() {
                                 <div className="min-w-0">
                                     <p className="text-xs font-medium uppercase tracking-[0.14em] text-white/35">{previewAsset.assetType} Preview</p>
                                     <h3 className="mt-1 truncate text-base font-semibold text-white">{previewAsset.name}</h3>
-                                    <p className="mt-1 truncate text-xs font-semibold text-[#d8c8ff]">{previewAsset.branch || "No branch"}</p>
+                                    <p className="mt-1 truncate text-xs font-semibold text-[#d8c8ff]">{previewAsset.role || "All roles"}</p>
                                 </div>
                                 <div className="flex items-center gap-2">
                                     <a
@@ -512,7 +513,7 @@ export default function AdminMedia() {
                                 </p>
                                 <div className="mt-4 rounded-lg border border-white/10 bg-black/24 p-3">
                                     <p className="truncate text-sm font-semibold text-white">{pendingArchive.name}</p>
-                                    <p className="mt-1 text-xs text-white/42">{pendingArchive.assetType} · {formatBytes(pendingArchive.size)} · {pendingArchive.branch || "No branch"}</p>
+                                    <p className="mt-1 text-xs text-white/42">{pendingArchive.assetType} · {formatBytes(pendingArchive.size)} · {pendingArchive.role || "All roles"}</p>
                                 </div>
                             </div>
                             <div className="flex flex-wrap justify-end gap-2 border-t border-white/10 px-5 py-4">

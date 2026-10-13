@@ -48,12 +48,14 @@ import {
     groupAttendanceRecordsBySlot,
     isWeekendAttendanceSlotKey,
     isAttendanceTimeOutUndertime,
+    isAttendanceTimeInLate,
 } from "../../../lib/attendanceSlots";
 import { buildOffPhoneAttendanceSessions, formatAttendanceDuration } from "../../../lib/attendanceRecords";
 import { socket } from "../../../lib/socket";
 import { DataTablePagination } from "../../../components/admin/DataTable";
 import { useToast } from "../../../components/ToastProvider";
 import { roleWorkspacePath } from "../../../lib/roleAccess";
+import { EvaluationWorkspace } from "../evaluations";
 
 const fallbackRoles = ["Sales Agent", "Team Lead", "Manager", "Support Agent"];
 const employmentStatuses: EmployeeStatus[] = ["Active", "Training", "Paused", "Archived"];
@@ -62,7 +64,7 @@ const employeeStatusFilters = ["Active", "Archived", "All"] as const;
 const noticeSeverities: NoticeSeverity[] = ["Info", "Warning", "Critical"];
 const todayInputValue = getCurrentCstDateInput;
 const employeeCodeCollator = new Intl.Collator("en", { numeric: true, sensitivity: "base" });
-type EmployeeRecordTab = "details" | "hr" | "leads" | "notices" | "leave" | "attendance" | "transactions";
+type EmployeeRecordTab = "details" | "hr" | "leads" | "notices" | "leave" | "attendance" | "evaluations" | "transactions";
 type AttendanceCalendarDay = {
     dateKey: string;
     label: string;
@@ -763,7 +765,7 @@ export default function AdminEmployees() {
             const isWeekendSlot = isWeekendAttendanceSlotKey(dateKey);
             const hasTimeIn = Boolean(timeInRecord);
             const hasTimeOut = Boolean(timeOutRecord);
-            const isLate = timeInRecord?.attendanceStatus === "Late";
+            const isLate = isAttendanceTimeInLate(timeInRecord, settings);
             const isUnderTime = Boolean(timeInRecord && timeOutRecord && isAttendanceTimeOutUndertime(timeOutRecord, settings));
             const status: AttendanceCalendarDay["status"] = timeInRecord
                 ? isUnderTime
@@ -1329,6 +1331,7 @@ export default function AdminEmployees() {
                 "notices",
                 "leave",
                 "attendance",
+                "evaluations",
                 "transactions",
             ].includes(requestedTab)
                 ? requestedTab as EmployeeRecordTab
@@ -2227,6 +2230,7 @@ export default function AdminEmployees() {
                                     ["notices", "Notices"],
                                     ["leave", `Leave${pendingEmployeeLeaveCount > 0 ? ` (${pendingEmployeeLeaveCount})` : ""}`],
                                     ["attendance", "Attendance"],
+                                    ["evaluations", "Evaluations"],
                                     ["transactions", "Transactions"],
                                 ].map(([tab, label]) => (
                                     <button
@@ -2238,7 +2242,9 @@ export default function AdminEmployees() {
                                                 : "!text-slate-700 after:bg-transparent hover:!text-black",
                                         ].join(" ")}
                                         type="button"
-                                        onClick={() => setEmployeeRecordTab(tab as EmployeeRecordTab)}
+                                        onClick={() => {
+                                            setEmployeeRecordTab(tab as EmployeeRecordTab);
+                                        }}
                                     >
                                         {label}
                                     </button>
@@ -3015,6 +3021,10 @@ export default function AdminEmployees() {
                                         </aside>
                                     </div>
                                 </section>
+                            )}
+
+                            {employeeRecordTab === "evaluations" && (
+                                <EvaluationWorkspace employeeCode={viewingEmployee.employeeCode} embedded />
                             )}
 
                             {employeeRecordTab === "transactions" && (

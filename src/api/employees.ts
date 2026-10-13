@@ -52,7 +52,7 @@ export type EmployeeInput = Omit<Employee, "_id">;
 export type EmployeeProfileInput = Pick<
     Employee,
     "personalPhone" | "personalEmail" | "personalAddress" | "emergencyContact" | "personalNotes" | "contactRelationship" | "emergencyContactNumber" |
-    "bankName" | "bankAccountName" | "bankAccountNumber"
+    "bankName" | "bankAccountName" | "bankAccountNumber" | "profileImage"
 >;
 
 export type EmployeeProfileUpdateResponse = {

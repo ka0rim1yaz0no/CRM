@@ -8,7 +8,8 @@ export type MediaAsset = {
     url: string;
     mimeType: string;
     assetType: MediaAssetType;
-    branch: string;
+    role: string;
+    branch?: string;
     size: number;
     isArchived: boolean;
     createdAt?: string;
@@ -19,14 +20,14 @@ export async function getMediaAssets() {
     return response.data;
 }
 
-export async function uploadMediaAsset({ file, branch }: { file: File; branch: string }) {
+export async function uploadMediaAsset({ file, role }: { file: File; role: string }) {
     const dataUrl = await new Promise<string>((resolve, reject) => {
         const reader = new FileReader();
         reader.onload = () => resolve(String(reader.result || ""));
         reader.onerror = () => reject(reader.error);
         reader.readAsDataURL(file);
     });
-    const response = await api.post<MediaAsset>("/media", { dataUrl, fileName: file.name, branch });
+    const response = await api.post<MediaAsset>("/media", { dataUrl, fileName: file.name, role });
     return response.data;
 }
 

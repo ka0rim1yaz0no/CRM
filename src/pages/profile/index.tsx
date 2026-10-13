@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSearchParams } from "react-router";
-import { FiBell, FiBriefcase, FiCalendar, FiCheck, FiCheckCircle, FiChevronDown, FiChevronLeft, FiChevronRight, FiClock, FiEdit2, FiMail, FiMapPin, FiPhone, FiRefreshCw, FiSave, FiShield, FiTrendingUp, FiX } from "react-icons/fi";
+import { FiBell, FiBriefcase, FiCalendar, FiCamera, FiCheck, FiCheckCircle, FiChevronDown, FiChevronLeft, FiChevronRight, FiClock, FiEdit2, FiMail, FiMapPin, FiPhone, FiRefreshCw, FiSave, FiShield, FiTrendingUp, FiX } from "react-icons/fi";
 import { getAuthUser, setAuthUser as setStoredAuthUser } from "../../api/authStorage";
 import { getEmployee, updateEmployeeProfile, type ContactRelationships, type EmployeeProfileInput } from "../../api/employees";
 import { getEmployeeRecentActivity } from "../../api/employeeTransactions";
@@ -29,6 +29,7 @@ const emptyProfileForm: EmployeeProfileInput = {
     bankName: "",
     bankAccountName: "",
     bankAccountNumber: "",
+    profileImage: "",
 };
 
 function profileFormFromEmployee(employee?: Partial<EmployeeProfileInput> | null): EmployeeProfileInput {
@@ -43,6 +44,7 @@ function profileFormFromEmployee(employee?: Partial<EmployeeProfileInput> | null
         bankName: employee?.bankName || "",
         bankAccountName: employee?.bankAccountName || "",
         bankAccountNumber: employee?.bankAccountNumber || "",
+        profileImage: employee?.profileImage || "",
     };
 }
 
@@ -261,6 +263,7 @@ export default function Profile() {
     const [profileForm, setProfileForm] = useState<EmployeeProfileInput>(emptyProfileForm);
     const [isProfileEditing, setIsProfileEditing] = useState(false);
     const [profileSuccessMessage, setProfileSuccessMessage] = useState("");
+    const [profileErrorMessage, setProfileErrorMessage] = useState("");
     const [leaveForm, setLeaveForm] = useState<LeaveRequestInput>(emptyLeaveForm);
     const [selectedLeaveDates, setSelectedLeaveDates] = useState<string[]>(() => [getCurrentPhDateInput()]);
     const [leaveCalendarMonth, setLeaveCalendarMonth] = useState(() => getCurrentPhDateInput().slice(0, 7));
@@ -270,10 +273,11 @@ export default function Profile() {
     const [openDropdown, setOpenDropdown] = useState<"contactRelationship" | null>(null);
     const statusButtonRel = useRef<HTMLButtonElement>(null);
     const dropdownMenuRef = useRef<HTMLDivElement>(null);
+    const profileImageInputRef = useRef<HTMLInputElement>(null);
     const requestedProfileTab = searchParams.get("tab");
     const highlightedNoticeId = searchParams.get("notice") || "";
     const { data: employeeProfile } = useQuery({
-        queryKey: ["employee", employeeId],
+        queryKey: ["employee-profile", employeeId],
         queryFn: () => getEmployee(employeeId),
         enabled: Boolean(employeeId),
     });
@@ -341,21 +345,26 @@ export default function Profile() {
         },
     });
     const updateProfileMutation = useMutation({
-        mutationFn: () => updateEmployeeProfile(employeeId, profileForm),
+        mutationFn: (payload: EmployeeProfileInput) => updateEmployeeProfile(employeeId, payload),
         onSuccess: (response) => {
             const updatedEmployee = response.employee;
+            queryClient.setQueryData(["employee-profile", employeeId], updatedEmployee);
             queryClient.setQueryData(["employee", employeeId], updatedEmployee);
+            queryClient.setQueryData(["employee-summary", employeeId], updatedEmployee);
             queryClient.invalidateQueries({ queryKey: ["employees"] });
             queryClient.invalidateQueries({ queryKey: ["employees", "summary"] });
+            queryClient.invalidateQueries({ queryKey: ["employee-dashboard-profile", employeeId] });
             if (authUser?.userType === "employee") {
                 const updatedAuthUser = { ...authUser, user: { ...authUser.user, ...updatedEmployee } };
                 setStoredAuthUser(updatedAuthUser);
                 setAuthUser(updatedAuthUser);
             }
             setProfileSuccessMessage(response.message);
+            setProfileErrorMessage("");
             setIsProfileEditing(false);
             setOpenDropdown(null);
         },
+        onError: () => setProfileErrorMessage("Unable to save profile details. Please try again."),
     });
     const createLeaveRequestMutation = useMutation({
         mutationFn: () => createEmployeeLeaveRequest(employeeId, { ...leaveForm, selectedDates: selectedLeaveDates }),
@@ -428,6 +437,29 @@ export default function Profile() {
         }
 
         setProfileForm(profileFormFromEmployee(currentEmployee));
+    };
+
+    const updateProfileImage = (file: File | undefined) => {
+        if (!file) return;
+        if (!["image/jpeg", "image/png", "image/webp", "image/gif"].includes(file.type)) {
+            setProfileErrorMessage("Choose a JPG, PNG, WebP, or GIF image.");
+            return;
+        }
+        if (file.size > 2 * 1024 * 1024) {
+            setProfileErrorMessage("Profile pictures must be 2 MB or smaller.");
+            return;
+        }
+
+        const reader = new FileReader();
+        reader.onerror = () => setProfileErrorMessage("Unable to read the selected image.");
+        reader.onload = () => {
+            const profileImage = String(reader.result || "");
+            if (!profileImage) return;
+            setProfileErrorMessage("");
+            setProfileForm((current) => ({ ...current, profileImage }));
+            updateProfileMutation.mutate({ ...profileFormFromEmployee(currentEmployee), profileImage });
+        };
+        reader.readAsDataURL(file);
     };
 
     const updateNoticeReply = (noticeId: string, value: string) => {
@@ -595,6 +627,30 @@ export default function Profile() {
                                             initials
                                         )}
                                     </div>
+                                    {employeeId && (
+                                        <>
+                                            <button
+                                                className="absolute -bottom-2 -right-2 grid size-10 place-items-center rounded-full border-2 border-[#090b13] bg-white text-black shadow-lg transition hover:bg-white/90 disabled:cursor-not-allowed disabled:opacity-60"
+                                                type="button"
+                                                title="Change profile picture"
+                                                aria-label="Change profile picture"
+                                                disabled={updateProfileMutation.isPending}
+                                                onClick={() => profileImageInputRef.current?.click()}
+                                            >
+                                                <FiCamera className="size-4" aria-hidden="true" />
+                                            </button>
+                                            <input
+                                                ref={profileImageInputRef}
+                                                className="hidden"
+                                                type="file"
+                                                accept="image/jpeg,image/png,image/webp,image/gif"
+                                                onChange={(event) => {
+                                                    updateProfileImage(event.target.files?.[0]);
+                                                    event.currentTarget.value = "";
+                                                }}
+                                            />
+                                        </>
+                                    )}
                                 </div>
 
                                 <div className="min-w-0 pb-1">
@@ -735,7 +791,7 @@ export default function Profile() {
                                                     className="inline-flex h-9 items-center gap-2 rounded-lg bg-white px-3 text-xs font-semibold text-black transition hover:bg-white/90 disabled:cursor-not-allowed disabled:opacity-50"
                                                     type="button"
                                                     disabled={!employeeId || updateProfileMutation.isPending}
-                                                    onClick={() => updateProfileMutation.mutate()}
+                                                    onClick={() => updateProfileMutation.mutate(profileForm)}
                                                 >
                                                     <FiSave className="size-4" aria-hidden="true" />
                                                     {updateProfileMutation.isPending ? "Saving..." : "Save"}
@@ -749,6 +805,11 @@ export default function Profile() {
                                     <div className="mt-4 flex items-center gap-2 rounded-lg border border-emerald-300/25 bg-emerald-300/10 px-3 py-2 text-sm font-semibold text-emerald-200">
                                         <FiCheckCircle className="size-4 shrink-0" aria-hidden="true" />
                                         <span>{profileSuccessMessage}</span>
+                                    </div>
+                                )}
+                                {profileErrorMessage && (
+                                    <div className="mt-4 rounded-lg border border-rose-300/25 bg-rose-300/10 px-3 py-2 text-sm font-semibold text-rose-200">
+                                        {profileErrorMessage}
                                     </div>
                                 )}
 

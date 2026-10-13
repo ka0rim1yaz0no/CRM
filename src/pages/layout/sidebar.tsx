@@ -121,7 +121,7 @@ export default function SideBar() {
   const [announcementSeenAt, setAnnouncementSeenAt] = useState(() =>
     readAnnouncementSeenAt(employeeId),
   );
-
+  const [isCollapsed, setIsCollapsed] = useState(() => window.localStorage.getItem("crm:sidebar-collapsed") === "true");
   const { data: announcementEntries = [] } = useQuery({
     queryKey: ["knowledge-base", "Article"],
     queryFn: () => getKnowledgeBaseEntries("Article"),
@@ -135,6 +135,12 @@ export default function SideBar() {
     enabled: Boolean(employeeId) && tasksEnabled,
     staleTime: 60_000,
   });
+
+  useEffect(() => {
+    const syncSidebar = () => setIsCollapsed(window.localStorage.getItem("crm:sidebar-collapsed") === "true");
+    window.addEventListener("crm:sidebar-toggle", syncSidebar);
+    return () => window.removeEventListener("crm:sidebar-toggle", syncSidebar);
+  }, []);
 
   useEffect(() => {
     setAnnouncementSeenAt(readAnnouncementSeenAt(employeeId));
@@ -180,21 +186,22 @@ export default function SideBar() {
   };
 
   return (
-    <aside className="theme-shell-bg fixed inset-y-0 left-0 z-10 flex w-[16rem] flex-col border-r border-white/10 text-white shadow-2xl shadow-black/20 backdrop-blur-xl">
-      <div className="flex w-full items-center justify-center border-b border-white/10 px-6 py-5">
-        <img
-          className="theme-sidebar-logo theme-sidebar-logo-dark max-w-[12rem]"
-          src="/images/logoaside.png"
-          alt="CRM"
-        />
-        <img
-          className="theme-sidebar-logo theme-sidebar-logo-light hidden max-w-[12rem]"
-          src="/images/logoaside-light.png"
-          alt="CRM"
-        />
+    <aside className={["theme-shell-bg fixed inset-y-0 left-0 z-10 flex flex-col border-r border-white/10 text-white shadow-2xl shadow-black/20 backdrop-blur-xl transition-[width] duration-200", isCollapsed ? "w-[5rem]" : "w-[16rem]"].join(" ")}>
+      <div className={["flex w-full items-center border-b border-white/10 py-5", isCollapsed ? "justify-center px-2" : "justify-center px-6"].join(" ")}>
+        {isCollapsed ? (
+          <div className="h-10 w-10 overflow-hidden" aria-label="Assistly">
+            <img className="theme-sidebar-logo theme-sidebar-logo-dark h-auto w-[9.75rem] max-w-none" src="/images/logoaside.png" alt="" />
+            <img className="theme-sidebar-logo theme-sidebar-logo-light hidden h-auto w-[9.75rem] max-w-none" src="/images/logoaside-light.png" alt="" />
+          </div>
+        ) : (
+          <>
+            <img className="theme-sidebar-logo theme-sidebar-logo-dark max-w-[12rem]" src="/images/logoaside.png" alt="Assistly" />
+            <img className="theme-sidebar-logo theme-sidebar-logo-light hidden max-w-[12rem]" src="/images/logoaside-light.png" alt="Assistly" />
+          </>
+        )}
       </div>
 
-      <div className="flex min-h-0 flex-1 flex-col justify-between px-3 py-5">
+      <div className={["flex min-h-0 flex-1 flex-col justify-between py-5", isCollapsed ? "px-2" : "px-3"].join(" ")}>
         <nav
           className="content-scroll min-h-0 overflow-y-auto pr-1"
           aria-label="Main navigation"
@@ -216,7 +223,8 @@ export default function SideBar() {
                     to={path}
                     className={({ isActive }) =>
                       [
-                        "flex h-11 items-center gap-3 rounded-lg px-4 text-sm font-medium transition",
+                        "flex h-11 items-center gap-3 rounded-lg text-sm font-medium transition",
+                        isCollapsed ? "justify-center px-2" : "px-4",
                         isActive
                           ? "bg-white text-[var(--shell-bg)] shadow-lg shadow-white/10"
                           : "text-white/70 hover:bg-white/10 hover:text-white",
@@ -224,8 +232,8 @@ export default function SideBar() {
                     }
                   >
                     <Icon className="size-5 shrink-0" aria-hidden="true" />
-                    <span className="min-w-0 flex-1 truncate">{label}</span>
-                    {badgeCount > 0 && (
+                    {!isCollapsed && <span className="min-w-0 flex-1 truncate">{label}</span>}
+                    {!isCollapsed && badgeCount > 0 && (
                       <span className="ml-auto inline-flex min-w-5 shrink-0 items-center justify-center rounded-full bg-[#6d35f5] px-1.5 py-0.5 text-[0.68rem] font-bold leading-none text-white shadow-sm shadow-[#6d35f5]/30">
                         {badgeCount > 99 ? "99+" : badgeCount}
                       </span>
@@ -241,10 +249,10 @@ export default function SideBar() {
           <NavLink
             to="/login"
             onClick={handleLogout}
-            className="flex h-11 items-center gap-3 rounded-lg px-4 text-sm font-medium text-white/70 transition hover:bg-white/10 hover:text-white"
+            className={["flex h-11 items-center gap-3 rounded-lg text-sm font-medium text-white/70 transition hover:bg-white/10 hover:text-white", isCollapsed ? "justify-center px-2" : "px-4"].join(" ")}
           >
             <FiLogOut className="size-5 shrink-0" aria-hidden="true" />
-            <span>Logout</span>
+            {!isCollapsed && <span>Logout</span>}
           </NavLink>
         </nav>
       </div>

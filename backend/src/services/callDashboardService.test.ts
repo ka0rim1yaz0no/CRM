@@ -48,6 +48,7 @@ test("dial launch is provisional until Nextiva activity, and call status stays i
     nextivaProcessDetected: true,
     lastSeenAt: at("2026-09-15T16:01:55Z"),
     lastStateChangedAt: at("2026-09-15T16:01:00Z"),
+    lastIdleAt: at("2026-09-15T16:00:55Z"),
   };
   const base = {
     availabilityStatus: "ONLINE",
@@ -64,11 +65,19 @@ test("dial launch is provisional until Nextiva activity, and call status stays i
   assert.equal(launching.transitionUntil?.toISOString(), dialIntentUntil.toISOString());
 
   const confirmedAt = at("2026-09-15T16:01:55Z");
-  const confirmed = callDashboardStatus({ ...base, devices: [{ ...device, state: "active", lastStateChangedAt: confirmedAt }], schedule: { lastCallStartedAt: confirmedAt } });
+  const confirmed = callDashboardStatus({ ...base, devices: [{ ...device, state: "active", audioSessionActive: true, lastStateChangedAt: confirmedAt }], schedule: { lastCallStartedAt: confirmedAt } });
   assert.equal(confirmed.status, "ON CALL");
   assert.equal(confirmed.statusStartedAt?.toISOString(), confirmedAt.toISOString());
   assert.equal(confirmed.transitionUntil, null);
-  assert.equal(callDashboardStatus({ ...base, devices: [{ ...device, state: "active", lastStateChangedAt: at("2026-09-15T16:01:55Z") }], availabilityStatus: "BREAK" }).status, "ON CALL");
+  const staleSchedule = at("2026-09-15T15:01:00Z");
+  const newerDeviceSession = at("2026-09-15T16:01:55Z");
+  const activeWithStaleSchedule = callDashboardStatus({
+    ...base,
+    devices: [{ ...device, state: "active", audioSessionActive: true, lastStateChangedAt: newerDeviceSession }],
+    schedule: { lastCallStartedAt: staleSchedule },
+  });
+  assert.equal(activeWithStaleSchedule.statusStartedAt?.toISOString(), newerDeviceSession.toISOString());
+  assert.equal(callDashboardStatus({ ...base, devices: [{ ...device, state: "active", audioSessionActive: true, lastStateChangedAt: at("2026-09-15T16:01:55Z") }], availabilityStatus: "BREAK" }).status, "ON CALL");
 
   const outside = callDashboardStatus({ ...base, now: at("2026-09-16T01:00:00Z"), devices: [{ ...device, state: "active", lastSeenAt: at("2026-09-16T00:59:55Z") }] });
   assert.equal(outside.status, "ONLINE");
@@ -160,4 +169,149 @@ test("preserves online, break and lunch attendance states without a call bridge"
   assert.equal(callDashboardStatus({ ...base, availabilityStatus: "ONLINE" }).status, "ONLINE");
   assert.equal(callDashboardStatus({ ...base, availabilityStatus: "BREAK" }).status, "BREAK");
   assert.equal(callDashboardStatus({ ...base, availabilityStatus: "LUNCH" }).status, "LUNCH");
+});
+
+test("treats a fresh RingCentral device as ready without a Nextiva process", () => {
+  const shift = { start: at("2026-09-15T15:00:00Z"), end: at("2026-09-16T00:00:00Z") };
+  const now = at("2026-09-15T16:00:00Z");
+  const result = callDashboardStatus({
+    availabilityStatus: "ONLINE",
+    attendance: [{ source: "Time In", timeIn: shift.start }],
+    devices: [{
+      state: "idle",
+      audioSessionActive: false,
+      nextivaProcessDetected: false,
+      lastSeenAt: now,
+      lastStateChangedAt: now,
+    }],
+    now,
+    shift,
+    provider: "ringcentral",
+  });
+
+  assert.equal(result.status, "ONLINE");
+  assert.equal(result.detail, "Ready to dial");
+});
+
+test("does not display a pre-shift stale active state as a current call", () => {
+  const shift = { start: at("2026-09-15T15:00:00Z"), end: at("2026-09-16T00:00:00Z") };
+  const now = at("2026-09-15T16:00:00Z");
+  const result = callDashboardStatus({
+    availabilityStatus: "ONLINE",
+    attendance: [{ source: "Time In", timeIn: shift.start }],
+    devices: [{
+      state: "active",
+      audioSessionActive: true,
+      nextivaProcessDetected: true,
+      lastSeenAt: now,
+      lastStateChangedAt: at("2026-09-15T14:59:00Z"),
+    }],
+    schedule: { lastCallStartedAt: at("2026-09-15T14:58:00Z") },
+    now,
+    shift,
+    provider: "nextiva",
+  });
+
+  assert.equal(result.status, "ONLINE");
+  assert.equal(result.detail, "Ready to dial");
+});
+
+test("does not display an idle audio session as an active call", () => {
+  const shift = { start: at("2026-09-15T15:00:00Z"), end: at("2026-09-16T00:00:00Z") };
+  const now = at("2026-09-15T16:00:00Z");
+  const result = callDashboardStatus({
+    availabilityStatus: "ONLINE",
+    attendance: [{ source: "Time In", timeIn: shift.start }],
+    devices: [{
+      state: "active",
+      audioSessionActive: false,
+      nextivaProcessDetected: true,
+      lastSeenAt: now,
+      lastStateChangedAt: now,
+    }],
+    now,
+    shift,
+    provider: "nextiva",
+  });
+
+  assert.equal(result.status, "ONLINE");
+  assert.notEqual(result.detail, "Nextiva call active");
+});
+
+test("does not trust an active audio session until this device observed idle", () => {
+  const shift = { start: at("2026-09-15T15:00:00Z"), end: at("2026-09-16T00:00:00Z") };
+  const now = at("2026-09-15T16:00:00Z");
+  const result = callDashboardStatus({
+    availabilityStatus: "ONLINE",
+    attendance: [{ source: "Time In", timeIn: shift.start }],
+    devices: [{
+      state: "active",
+      audioSessionActive: true,
+      nextivaProcessDetected: true,
+      lastSeenAt: now,
+      lastStateChangedAt: now,
+      lastIdleAt: null,
+    }],
+    now,
+    shift,
+    provider: "nextiva",
+  });
+
+  assert.equal(result.status, "ONLINE");
+  assert.equal(result.detail, "Ready to dial");
+});
+
+test("uses the newest bridge device instead of a duplicate active device", () => {
+  const shift = { start: at("2026-09-15T15:00:00Z"), end: at("2026-09-16T00:00:00Z") };
+  const now = at("2026-09-15T16:00:00Z");
+  const result = callDashboardStatus({
+    availabilityStatus: "ONLINE",
+    attendance: [{ source: "Time In", timeIn: shift.start }],
+    devices: [
+      {
+        state: "active",
+        audioSessionActive: true,
+        nextivaProcessDetected: true,
+        lastSeenAt: at("2026-09-15T15:59:55Z"),
+        lastStateChangedAt: at("2026-09-15T15:50:00Z"),
+      },
+      {
+        state: "idle",
+        audioSessionActive: false,
+        nextivaProcessDetected: true,
+        lastSeenAt: at("2026-09-15T15:59:59Z"),
+        lastStateChangedAt: at("2026-09-15T15:59:58Z"),
+      },
+    ],
+    schedule: { lastCallStartedAt: at("2026-09-15T15:50:00Z") },
+    now,
+    shift,
+    provider: "nextiva",
+  });
+
+  assert.equal(result.status, "ONLINE");
+  assert.equal(result.detail, "Ready to dial");
+});
+
+test("expires an active audio signal that never reports the call ending", () => {
+  const shift = { start: at("2026-09-15T15:00:00Z"), end: at("2026-09-16T00:00:00Z") };
+  const now = at("2026-09-15T17:30:00Z");
+  const result = callDashboardStatus({
+    availabilityStatus: "ONLINE",
+    attendance: [{ source: "Time In", timeIn: shift.start }],
+    devices: [{
+      state: "active",
+      audioSessionActive: true,
+      nextivaProcessDetected: true,
+      lastSeenAt: at("2026-09-15T17:29:59Z"),
+      lastStateChangedAt: at("2026-09-15T15:15:00Z"),
+    }],
+    schedule: { lastCallStartedAt: at("2026-09-15T15:15:00Z") },
+    now,
+    shift,
+    provider: "nextiva",
+  });
+
+  assert.equal(result.status, "ONLINE");
+  assert.equal(result.detail, "Ready to dial");
 });

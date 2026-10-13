@@ -13,6 +13,7 @@ type Props = {
 
 export default function MainLayout({ children }: Props) {
     const [isScrolling, setIsScrolling] = useState(false);
+    const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(() => window.localStorage.getItem("crm:sidebar-collapsed") === "true");
     const scrollTimer = useRef<number | undefined>(undefined);
 
     const handleScroll = () => {
@@ -20,6 +21,12 @@ export default function MainLayout({ children }: Props) {
         window.clearTimeout(scrollTimer.current);
         scrollTimer.current = window.setTimeout(() => setIsScrolling(false), 700);
     };
+
+    useEffect(() => {
+        const syncSidebar = () => setIsSidebarCollapsed(window.localStorage.getItem("crm:sidebar-collapsed") === "true");
+        window.addEventListener("crm:sidebar-toggle", syncSidebar);
+        return () => window.removeEventListener("crm:sidebar-toggle", syncSidebar);
+    }, []);
 
     useEffect(() => {
         const authUser = getAuthUser();
@@ -40,7 +47,7 @@ export default function MainLayout({ children }: Props) {
             <div className="pointer-events-none fixed inset-0 bg-[linear-gradient(90deg,rgba(255,255,255,0.025)_1px,transparent_1px),linear-gradient(180deg,rgba(255,255,255,0.018)_1px,transparent_1px)] bg-[size:4rem_4rem] opacity-20" />
             <SideBar />
             <EmployeeAutoCaller />
-            <main className="relative flex h-screen flex-col pl-[16rem]">
+            <main className={["relative flex h-screen flex-col transition-[padding] duration-200", isSidebarCollapsed ? "pl-[5rem]" : "pl-[16rem]"].join(" ")}>
                 <Navbar />
                 <div
                     className={[

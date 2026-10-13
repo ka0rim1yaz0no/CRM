@@ -30,6 +30,7 @@ export type PayrollRecordDocument = {
   lateDays: number;
   lateHours: number;
   workedHours: number;
+  workedMinutesOverride?: number | null;
   overtimeHours: number;
   overtimeApproved: boolean;
   scheduledHours: number;
@@ -75,6 +76,7 @@ const payrollRecordSchema = new Schema<PayrollRecordDocument>(
     lateDays: { type: Number, min: 0, default: 0 },
     lateHours: { type: Number, min: 0, default: 0 },
     workedHours: { type: Number, min: 0, default: 0 },
+    workedMinutesOverride: { type: Number, min: 0, default: null },
     overtimeHours: { type: Number, min: 0, default: 0 },
     overtimeApproved: { type: Boolean, default: false },
     scheduledHours: { type: Number, min: 0, default: 0 },

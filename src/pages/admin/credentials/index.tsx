@@ -25,13 +25,13 @@ import {
     updateCredential,
     type Credential as SavedCredential,
 } from "../../../api/credentials";
-import { getTools } from "../../../api/tools";
 import {
     DataTablePagination,
     DataTableSortHeader,
     type SortDirection,
 } from "../../../components/admin/DataTable";
 import { getBranches } from "../../../api/branches";
+import { getBusinesses } from "../../../api/businesses";
 import { getTeams } from "../../../api/teams";
 import { useClickOutside } from "../../../hooks/useClickOutside";
 
@@ -173,9 +173,9 @@ export default function Credentials() {
         queryKey: ["credentials"],
         queryFn: getCredentials,
     });
-    const { data: tools = [] } = useQuery({
-        queryKey: ["tools"],
-        queryFn: getTools,
+    const { data: businesses = [] } = useQuery({
+        queryKey: ["businesses"],
+        queryFn: getBusinesses,
     });
     const { data: branches = [] } = useQuery({
         queryKey: ["branches"],
@@ -215,7 +215,9 @@ export default function Credentials() {
             const credentialTeam = credential.team || ALL_TEAMS;
             const matchesBranch = branchFilter === ALL_COMPANIES || credential.company === branchFilter || credential.company === SHARED_COMPANY_VALUE;
             const matchesTeam = teamFilter === ALL_TEAMS || credentialTeam === teamFilter || credentialTeam === ALL_TEAMS;
-            const matchesTool = toolFilter === "All tools" || credential.platform === toolFilter;
+            const matchesTool =
+                toolFilter === "All tools" ||
+                credential.platform.trim().toLowerCase() === toolFilter.trim().toLowerCase();
             const matchesSearch =
                 !normalizedSearch ||
                 [credential.accountName, credential.username, credential.platform, credential.company, credentialTeam, credential._id]
@@ -230,28 +232,26 @@ export default function Credentials() {
     const branchOptions = useMemo(
         () => [
             ALL_COMPANIES,
-            ...Array.from(new Set([...branches.map((branch) => toDisplayText(branch.name)), ...normalizedCredentials.map((credential) => credential.company)])
-                ).filter((branch) => branch && branch !== SHARED_COMPANY_VALUE)
-                .sort(),
+            ...Array.from(
+                new Set([
+                    ...businesses.map((business) => toDisplayText(business.name)),
+                    ...branches.map((branch) => toDisplayText(branch.name)),
+                    ...normalizedCredentials.map((credential) => credential.company),
+                ])
+            )
+                .filter((company) => company && company !== SHARED_COMPANY_VALUE)
+                .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" })),
         ],
-        [branches, normalizedCredentials]
+        [branches, businesses, normalizedCredentials]
     );
-    const branchGroupNames = useMemo(() => {
-        if (branchFilter !== ALL_COMPANIES) return [branchFilter];
-        return branchOptions.filter((branch) => branch !== ALL_COMPANIES);
-    }, [branchFilter, branchOptions]);
     const expandedCredentials = useMemo(
         () =>
-            filteredCredentials.flatMap((credential) => {
-                const isSharedCredential = !credential.company || credential.company === SHARED_COMPANY_VALUE;
-                if (!isSharedCredential) {
-                    return [{ groupBranch: credential.company, credential, displayBranch: credential.company }];
-                }
-
-                const targetBranches = branchGroupNames.length ? branchGroupNames : ["Branches"];
-                return targetBranches.map((groupBranch) => ({ groupBranch, credential, displayBranch: groupBranch }));
-            }),
-        [branchGroupNames, filteredCredentials]
+            filteredCredentials.map((credential) => ({
+                groupBranch: credential.company || SHARED_COMPANY_VALUE,
+                credential,
+                displayBranch: credential.company || SHARED_COMPANY_VALUE,
+            })),
+        [filteredCredentials]
     );
 
     const sortedCredentials = useMemo(() => {
@@ -283,8 +283,15 @@ export default function Credentials() {
         return groups;
     }, []);
     const toolOptions = useMemo(
-        () => ["All tools", ...Array.from(new Set(tools.map((tool) => tool.name))).sort()],
-        [tools]
+        () => [
+            "All tools",
+            ...Array.from(
+                new Set(normalizedCredentials.map((credential) => toDisplayText(credential.platform).trim()))
+            )
+                .filter((tool) => Boolean(tool) && tool !== "All tools")
+                .sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" })),
+        ],
+        [normalizedCredentials]
     );
     const teamOptions = useMemo(
         () => [ALL_TEAMS, ...Array.from(new Set([...teams.map((team) => toDisplayText(team.name)), ...normalizedCredentials.map((credential) => credential.team || ALL_TEAMS)]))
@@ -349,9 +356,14 @@ export default function Credentials() {
             return;
         }
 
+        const selectedCompany =
+            credentialForm.company && credentialForm.company !== ALL_COMPANIES
+                ? credentialForm.company
+                : SHARED_COMPANY_VALUE;
+
         const payload = {
             ...credentialForm,
-            company: !credentialForm.company || credentialForm.company === ALL_COMPANIES ? SHARED_COMPANY_VALUE : credentialForm.company,
+            company: selectedCompany,
             team: credentialForm.team || ALL_TEAMS,
         };
         if (editingCredential) {
@@ -400,6 +412,24 @@ export default function Credentials() {
         setPage((currentPage) => Math.min(currentPage, totalPages));
     }, [totalPages]);
 
+    useEffect(() => {
+        if (toolFilter !== "All tools" && !toolOptions.includes(toolFilter)) {
+            setToolFilter("All tools");
+        }
+    }, [toolFilter, toolOptions]);
+
+    useEffect(() => {
+        if (branchFilter !== ALL_COMPANIES && !branchOptions.includes(branchFilter)) {
+            setBranchFilter(ALL_COMPANIES);
+        }
+    }, [branchFilter, branchOptions]);
+
+    useEffect(() => {
+        if (teamFilter !== ALL_TEAMS && !teamOptions.includes(teamFilter)) {
+            setTeamFilter(ALL_TEAMS);
+        }
+    }, [teamFilter, teamOptions]);
+
     return (
         <AdminLayout>
             <section className="min-h-[calc(100vh-8.5rem)]">
@@ -420,9 +450,20 @@ export default function Credentials() {
                             />
                             <FiSearch className="size-4 shrink-0" aria-hidden="true" />
                         </label>
-                        <button className="flex h-11 items-center gap-2 rounded-lg border border-white/10 bg-[#090b13]/80 px-4 text-sm font-semibold text-white/75 transition hover:bg-white/10" type="button">
+                        <button
+                            className="flex h-11 items-center gap-2 rounded-lg border border-white/10 bg-[#090b13]/80 px-4 text-sm font-semibold text-white/75 transition hover:bg-white/10 disabled:cursor-default disabled:opacity-50"
+                            type="button"
+                            disabled={branchFilter === ALL_COMPANIES && teamFilter === ALL_TEAMS && toolFilter === "All tools" && !search}
+                            onClick={() => {
+                                setBranchFilter(ALL_COMPANIES);
+                                setTeamFilter(ALL_TEAMS);
+                                setToolFilter("All tools");
+                                setSearch("");
+                            }}
+                            title="Clear all credential filters"
+                        >
                             <FiFilter className="size-4" aria-hidden="true" />
-                            Filter
+                            Clear filters
                         </button>
                         <button
                             className="flex h-11 items-center gap-2 rounded-lg bg-[linear-gradient(135deg,#842cff,#4a0ebd)] px-5 text-sm font-semibold text-white transition hover:brightness-110"
@@ -667,7 +708,20 @@ export default function Credentials() {
                             <div className="grid gap-4 p-5">
                                 <label>
                                     <span className="text-xs font-medium uppercase tracking-[0.14em] text-white/35">Website or Platform</span>
-                                    <input className="mt-2 h-11 w-full rounded-lg border border-white/10 bg-black/20 px-3 text-sm font-semibold text-white outline-none transition placeholder:text-white/30 focus:border-[#842cff] focus:ring-2 focus:ring-[#842cff]/20" value={credentialForm.platform} onChange={(event) => setCredentialForm((form) => ({ ...form, platform: event.target.value }))} placeholder="Google Workspace, Stripe, CRM..." />
+                                    <input
+                                        list="credential-tool-categories"
+                                        className="mt-2 h-11 w-full rounded-lg border border-white/10 bg-black/20 px-3 text-sm font-semibold text-white outline-none transition placeholder:text-white/30 focus:border-[#842cff] focus:ring-2 focus:ring-[#842cff]/20"
+                                        value={credentialForm.platform}
+                                        onChange={(event) => setCredentialForm((form) => ({ ...form, platform: event.target.value }))}
+                                        placeholder="Google Workspace, Stripe, CRM..."
+                                    />
+                                    <datalist id="credential-tool-categories">
+                                        {toolOptions
+                                            .filter((tool) => tool !== "All tools")
+                                            .map((tool) => (
+                                                <option key={tool} value={tool} />
+                                            ))}
+                                    </datalist>
                                 </label>
                                 <label>
                                     <span className="text-xs font-medium uppercase tracking-[0.14em] text-white/35">Account User Name</span>

@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { archiveEmployeeAttendance, breakInEmployee, breakOutEmployee, createEmployeeAttendance, listEmployeeAttendance, listEmployeesAttendance, lunchBreakInEmployee, lunchBreakOutEmployee, recordEmployeeActivity, timeInEmployee, timeOutEmployee, updateEmployeeAttendance } from "../controllers/attendanceController";
+import { archiveEmployeeAttendance, breakInEmployee, breakOutEmployee, createEmployeeAttendance, listEmployeeAttendance, listEmployeesAttendance, lunchBreakInEmployee, lunchBreakOutEmployee, recordEmployeeActivity, timeInEmployee, timeOutEmployee, updateEmployeeAttendance, updateEmployeeWorkedMinutes } from "../controllers/attendanceController";
 
 export const attendanceRouter = Router();
 
@@ -7,6 +7,7 @@ attendanceRouter.get("/attendance", listEmployeesAttendance);
 attendanceRouter.get("/employees/:employeeId/attendance", listEmployeeAttendance);
 attendanceRouter.post("/employees/:employeeId/attendance", createEmployeeAttendance);
 attendanceRouter.put("/employees/:employeeId/attendance/:attendanceId", updateEmployeeAttendance);
+attendanceRouter.patch("/employees/:employeeId/attendance/worked-minutes", updateEmployeeWorkedMinutes);
 attendanceRouter.patch("/employees/:employeeId/attendance/:attendanceId/archive", archiveEmployeeAttendance);
 attendanceRouter.post("/employees/:employeeId/attendance/time-in", timeInEmployee);
 attendanceRouter.post("/employees/:employeeId/attendance/time-out", timeOutEmployee);

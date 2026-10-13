@@ -32,7 +32,11 @@ function configuredIceServers() {
 export default function EmployeeVoiceCall() {
     useLocation();
     const authUser = getAuthUser();
-    const employee = authUser?.userType === "employee" ? authUser.user : null;
+    const currentUser = authUser?.userType === "employee"
+        ? authUser.user
+        : authUser?.userType === "admin"
+            ? { ...authUser.user, _id: "admin", name: authUser.user.name || "Admin" }
+            : null;
     const [callState, setCallState] = useState<CallState>("idle");
     const [session, setSession] = useState<VoiceCallSession | null>(null);
     const [target, setTarget] = useState<VoiceCallTarget | null>(null);
@@ -124,7 +128,7 @@ export default function EmployeeVoiceCall() {
                 callStateRef.current = "reconnecting";
                 setStatus("Reconnecting...");
                 window.setTimeout(async () => {
-                    if (peer.connectionState !== "disconnected" || call.callerId !== employee?._id) return;
+                    if (peer.connectionState !== "disconnected" || call.callerId !== currentUser?._id) return;
                     const offer = await peer.createOffer({ iceRestart: true });
                     await peer.setLocalDescription(offer);
                     socket.emit("voice-call:signal", { callId: call.callId, description: peer.localDescription });
@@ -136,7 +140,7 @@ export default function EmployeeVoiceCall() {
         };
         peerRef.current = peer;
         return peer;
-    }, [cleanUp, employee?._id, ensureMicrophone, stopRing]);
+    }, [cleanUp, currentUser?._id, ensureMicrophone, stopRing]);
 
     const endCall = useCallback((reason = "ended") => {
         if (session) socket.emit("voice-call:end", { callId: session.callId, reason });
@@ -144,14 +148,14 @@ export default function EmployeeVoiceCall() {
     }, [cleanUp, session]);
 
     useEffect(() => {
-        if (!employee) return;
+        if (!currentUser) return;
         connectAuthenticatedSocket();
 
         const startCall = async (event: Event) => {
             const nextTarget = (event as CustomEvent<VoiceCallTarget>).detail;
             if (!nextTarget?._id || callStateRef.current !== "idle") return;
             const callId = crypto.randomUUID();
-            const nextSession: VoiceCallSession = { callId, businessId: "", callerId: employee._id, callerName: employee.name, targetId: nextTarget._id, targetName: nextTarget.name };
+            const nextSession: VoiceCallSession = { callId, businessId: "", callerId: currentUser._id, callerName: currentUser.name, targetId: nextTarget._id, targetName: nextTarget.name };
             try {
                 await ensureMicrophone();
                 setTarget(nextTarget);
@@ -161,7 +165,7 @@ export default function EmployeeVoiceCall() {
                 setCallState("outgoing");
                 callStateRef.current = "outgoing";
                 playRingTone(false);
-                socket.emit("voice-call:start", { callId, targetEmployeeId: nextTarget._id });
+                socket.emit("voice-call:start", { callId, targetUserId: nextTarget._id, targetUserType: nextTarget._id === "admin" ? "admin" : "employee" });
                 callTimeoutRef.current = window.setTimeout(() => {
                     socket.emit("voice-call:end", { callId, reason: "no-answer" });
                     cleanUp("No answer.");
@@ -189,7 +193,7 @@ export default function EmployeeVoiceCall() {
             setCallState("connecting");
             callStateRef.current = "connecting";
             setStatus("Connecting...");
-            if (call.callerId !== employee._id) return;
+            if (call.callerId !== currentUser._id) return;
             const peer = await createPeer(call);
             const offer = await peer.createOffer();
             await peer.setLocalDescription(offer);
@@ -241,7 +245,7 @@ export default function EmployeeVoiceCall() {
             socket.off("voice-call:declined", failed);
             socket.off("voice-call:ended", ended);
         };
-    }, [cleanUp, createPeer, employee, ensureMicrophone, playRingTone, stopRing]);
+    }, [cleanUp, createPeer, currentUser, ensureMicrophone, playRingTone, stopRing]);
 
     const acceptCall = async () => {
         if (!session) return;
@@ -264,7 +268,7 @@ export default function EmployeeVoiceCall() {
         setMuted(nextMuted);
     };
 
-    if (!employee || callState === "idle") return <audio ref={remoteAudioRef} autoPlay />;
+    if (!currentUser || callState === "idle") return <audio ref={remoteAudioRef} autoPlay />;
 
     return (
         <div className="fixed bottom-5 right-5 z-[90] w-[min(24rem,calc(100vw-2rem))] rounded-lg border border-slate-200 bg-white p-4 text-slate-950 shadow-2xl" onClick={() => void remoteAudioRef.current?.play()}>

@@ -381,7 +381,6 @@ export function tenantModel<T>(modelName: string, schema: Schema<T>) {
     get(_target, property) {
       const activeModel = getModel() as unknown as Record<PropertyKey, unknown>;
       const value = Reflect.get(activeModel, property);
-            const update = getBusinessById;
       return typeof value === "function" ? value.bind(activeModel) : value;
     },
     set(_target, property, value) {
@@ -418,6 +417,7 @@ export function businessContextMiddleware(request: Request, response: Response, 
 
   businessContext.run(business, () => {
     request.business = business;
+    response.setHeader("X-Business-Id", business.id);
     next();
   });
 }

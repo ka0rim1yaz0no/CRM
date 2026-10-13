@@ -201,6 +201,13 @@ function flexibleExactRegex(value: string) {
   return new RegExp(`^\\s*${pattern}\\s*$`, "i");
 }
 
+function wholeTermSearchRegex(value: string) {
+  const normalizedValue = normalizeLeadValue(value);
+  const pattern = normalizedValue.split(" ").map(escapeRegex).join("\\s+");
+
+  return new RegExp(`(?:^|[^a-z0-9])${pattern}(?=$|[^a-z0-9])`, "i");
+}
+
 function normalizePhoneDigits(value: string) {
   return value.replace(/\D/g, "");
 }
@@ -241,24 +248,8 @@ function flexiblePhoneDigitsRegex(digits: string) {
   return new RegExp(`^\\D*${digits.split("").map(escapeRegex).join("\\D*")}\\D*$`);
 }
 
-function flexiblePhoneRegex(value: string) {
-  const [digits] = phoneDigitCandidates(value);
-
-  return digits ? flexiblePhoneDigitsRegex(digits) : null;
-}
-
 function flexiblePhoneRegexes(value: string) {
   return phoneDigitCandidates(value).map(flexiblePhoneDigitsRegex);
-}
-
-function phoneSearchRegex(value: string) {
-  const digits = normalizePhoneDigits(value);
-
-  if (digits.length < 3) {
-    return null;
-  }
-
-  return new RegExp(digits.split("").map(escapeRegex).join("\\D*"));
 }
 
 function normalizeWebsite(value: string) {
@@ -2504,7 +2495,8 @@ export async function listLeads(request: Request, response: Response) {
   }
 
   if (search) {
-    const searchRegex = new RegExp(escapeRegex(search), "i");
+    const searchRegex = wholeTermSearchRegex(search);
+    const phoneRegexes = flexiblePhoneRegexes(search);
     andFilters.push({
       $or: [
         { leadName: searchRegex },
@@ -2518,6 +2510,7 @@ export async function listLeads(request: Request, response: Response) {
         { status: searchRegex },
         { assignedAgentName: searchRegex },
         { notes: searchRegex },
+        ...phoneRegexes.map((phoneRegex) => ({ phone: phoneRegex })),
       ],
     });
   }
@@ -3662,9 +3655,8 @@ function createLeadSearchFilter(search: string) {
     return {};
   }
 
-  const searchRegex = new RegExp(escapeRegex(trimmedSearch), "i");
+  const searchRegex = wholeTermSearchRegex(trimmedSearch);
   const phoneRegexes = flexiblePhoneRegexes(trimmedSearch);
-  const partialPhoneRegex = phoneSearchRegex(trimmedSearch);
   const searchFields: Record<string, unknown>[] = [
     { leadName: searchRegex },
     { position: searchRegex },
@@ -3688,10 +3680,6 @@ function createLeadSearchFilter(search: string) {
   phoneRegexes.forEach((phoneRegex) => {
     searchFields.push({ phone: phoneRegex });
   });
-
-  if (partialPhoneRegex) {
-    searchFields.push({ phone: partialPhoneRegex });
-  }
 
   return {
     $or: searchFields,

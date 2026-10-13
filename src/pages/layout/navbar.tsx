@@ -1,7 +1,7 @@
 import type { FormEvent } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { FiBell, FiChevronDown, FiSearch, FiX } from "react-icons/fi";
+import { FiBell, FiChevronDown, FiChevronLeft, FiChevronRight, FiSearch, FiX } from "react-icons/fi";
 import { Link, useLocation, useNavigate } from "react-router";
 import { getEmployeeBusinesses, switchEmployeeBusiness } from "../../api/auth";
 import { getAuthUser, setAuthUser } from "../../api/authStorage";
@@ -27,6 +27,24 @@ const pageTitles: Record<string, string> = {
     "/poc/credentials": "Credentials",
 };
 
+function employeeNoticeDismissalStorageKey(employeeCode = "guest") {
+    return `employee-notifications-dismissed:${employeeCode || "guest"}`;
+}
+
+function readDismissedEmployeeNotices(storageKey: string) {
+    try {
+        const value = JSON.parse(window.localStorage.getItem(storageKey) || "[]");
+        return new Set<string>(Array.isArray(value) ? value.map(String) : []);
+    } catch {
+        return new Set<string>();
+    }
+}
+
+function employeeNoticeKey(notice: Awaited<ReturnType<typeof getEmployeeNotices>>[number], employeeCode: string) {
+    const identity = notice.sourceId || `${notice.title}:${notice.createdAt}`;
+    return `${employeeCode}:${notice.source || "notice"}:${identity}`;
+}
+
 export default function Navbar() {
     const { pathname } = useLocation();
     const navigate = useNavigate();
@@ -35,14 +53,21 @@ export default function Navbar() {
     const authUser = getAuthUser();
     const [isBusinessOpen, setIsBusinessOpen] = useState(false);
     const [isNotificationsOpen, setIsNotificationsOpen] = useState(false);
-    const [dismissedNoticeIds, setDismissedNoticeIds] = useState<Set<string>>(() => new Set());
+    const noticeDismissalStorageKey = employeeNoticeDismissalStorageKey(authUser?.user.employeeCode);
+    const [dismissedNoticeIds, setDismissedNoticeIds] = useState<Set<string>>(() => readDismissedEmployeeNotices(noticeDismissalStorageKey));
     const [leadSearch, setLeadSearch] = useState("");
     const [debouncedLeadSearch, setDebouncedLeadSearch] = useState("");
     const [isLeadSearchOpen, setIsLeadSearchOpen] = useState(false);
+    const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(() => window.localStorage.getItem("crm:sidebar-collapsed") === "true");
     const leadSearchRef = useRef<HTMLFormElement>(null);
     const notificationsRef = useRef<HTMLDivElement>(null);
     const businessRef = useRef<HTMLDivElement>(null);
     const queryClient = useQueryClient();
+    useEffect(() => {
+        const syncSidebar = () => setIsSidebarCollapsed(window.localStorage.getItem("crm:sidebar-collapsed") === "true");
+        window.addEventListener("crm:sidebar-toggle", syncSidebar);
+        return () => window.removeEventListener("crm:sidebar-toggle", syncSidebar);
+    }, []);
     const employeeId = authUser?.userType === "employee" ? authUser.user._id : "";
     const employeeLeadNames = useMemo(() => {
         if (authUser?.userType !== "employee") {
@@ -76,7 +101,8 @@ export default function Navbar() {
         refetchInterval: 30_000,
         staleTime: 15_000,
     });
-    const visibleNotices = notices.filter((notice) => !dismissedNoticeIds.has(notice._id));
+    const noticeKey = (notice: (typeof notices)[number]) => employeeNoticeKey(notice, authUser?.user.employeeCode || employeeId);
+    const visibleNotices = notices.filter((notice) => !dismissedNoticeIds.has(noticeKey(notice)));
     const unreadNoticeCount = visibleNotices.filter((notice) => !notice.isRead).length;
     const unreadCount = unreadNoticeCount;
     const { data: publicBusinesses = [] } = useQuery({
@@ -121,12 +147,23 @@ export default function Navbar() {
     const employeeInitial = employeeName.charAt(0).toUpperCase() || "E";
     const markNoticeReadMutation = useMutation({
         mutationFn: (noticeId: string) => markEmployeeNoticeRead(employeeId, noticeId),
+        onMutate: (noticeId) => queryClient.setQueryData<typeof notices>(["employee-notices", employeeId], (current = []) => current.map((notice) => notice._id === noticeId ? { ...notice, isRead: true } : notice)),
         onSuccess: () => queryClient.invalidateQueries({ queryKey: ["employee-notices", employeeId] }),
     });
     const markAllNoticesReadMutation = useMutation({
         mutationFn: () => markEmployeeNoticesRead(employeeId),
+        onMutate: () => queryClient.setQueryData<typeof notices>(["employee-notices", employeeId], (current = []) => current.map((notice) => ({ ...notice, isRead: true }))),
         onSuccess: () => queryClient.invalidateQueries({ queryKey: ["employee-notices", employeeId] }),
     });
+    const dismissNotice = (notice: (typeof notices)[number]) => {
+        const key = noticeKey(notice);
+        setDismissedNoticeIds((current) => {
+            const next = new Set(current).add(key);
+            window.localStorage.setItem(noticeDismissalStorageKey, JSON.stringify(Array.from(next)));
+            return next;
+        });
+        if (!notice.isRead) markNoticeReadMutation.mutate(notice._id);
+    };
     const switchBusinessMutation = useMutation({
         mutationFn: (targetBusinessId: string) => {
             if (!authUser || authUser.userType !== "employee") {
@@ -207,6 +244,16 @@ export default function Navbar() {
         setIsLeadSearchOpen(false);
     }, [pathname]);
 
+    useEffect(() => {
+        const syncDismissedNotices = (event: StorageEvent) => {
+            if (event.key === noticeDismissalStorageKey) {
+                setDismissedNoticeIds(readDismissedEmployeeNotices(noticeDismissalStorageKey));
+            }
+        };
+        window.addEventListener("storage", syncDismissedNotices);
+        return () => window.removeEventListener("storage", syncDismissedNotices);
+    }, [noticeDismissalStorageKey]);
+
     useClickOutside(leadSearchRef, () => setIsLeadSearchOpen(false), isLeadSearchOpen);
     useClickOutside(notificationsRef, () => setIsNotificationsOpen(false), isNotificationsOpen);
     useClickOutside(businessRef, () => setIsBusinessOpen(false), isBusinessOpen);
@@ -214,9 +261,14 @@ export default function Navbar() {
     return (
         <header className="theme-header-bg z-20 border-b border-white/10 px-6 py-4 backdrop-blur-xl">
             <div className="flex min-h-12 items-center justify-between gap-4">
-                <div className="min-w-0">
-                    <p className="text-xs font-medium uppercase tracking-[0.18em] text-white/40">Workspace</p>
-                    <h1 className="mt-1 truncate text-xl font-semibold text-white">{title}</h1>
+                <div className="flex min-w-0 items-center gap-3">
+                    <button className="grid size-9 shrink-0 place-items-center rounded-lg border border-white/15 bg-white/[0.06] text-white/75 shadow-sm transition hover:bg-white/10 hover:text-white" type="button" onClick={() => { const next = !isSidebarCollapsed; setIsSidebarCollapsed(next); window.localStorage.setItem("crm:sidebar-collapsed", String(next)); window.dispatchEvent(new Event("crm:sidebar-toggle")); }} aria-label={isSidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"} title={isSidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}>
+                        {isSidebarCollapsed ? <FiChevronRight className="size-4" /> : <FiChevronLeft className="size-4" />}
+                    </button>
+                    <div className="min-w-0">
+                        <p className="text-xs font-medium uppercase tracking-[0.18em] text-white/40">Workspace</p>
+                        <h1 className="mt-1 truncate text-xl font-semibold text-white">{title}</h1>
+                    </div>
                 </div>
 
                 <div className="flex min-w-0 flex-1 items-center justify-end gap-3">
@@ -322,8 +374,7 @@ export default function Navbar() {
                                             ].join(" ")}
                                             to={notice.href || `/profile?tab=notices&notice=${notice._id}`}
                                             onClick={() => {
-                                                if (!notice.isRead) markNoticeReadMutation.mutate(notice._id);
-                                                setDismissedNoticeIds((current) => new Set(current).add(notice._id));
+                                                dismissNotice(notice);
                                                 setIsNotificationsOpen(false);
                                             }}
                                         >
@@ -340,7 +391,7 @@ export default function Navbar() {
                                             className="absolute right-2 top-2 flex size-7 items-center justify-center rounded-md text-white/45 transition hover:bg-white/10 hover:text-white"
                                             type="button"
                                             aria-label="Dismiss notification"
-                                            onClick={() => setDismissedNoticeIds((current) => new Set(current).add(notice._id))}
+                                            onClick={() => dismissNotice(notice)}
                                         >
                                             <FiX className="size-4" aria-hidden="true" />
                                         </button>

@@ -1,6 +1,7 @@
 import { getConfiguredBusinesses, runWithBusiness } from "../config/tenancy";
 import { Attendance, type AttendanceSource, type AttendanceStatus } from "../models/Attendance";
 import { Employee } from "../models/Employee";
+import { getBusinessAccessForEmployeeCode, normalizeBusinessAccessIds } from "../models/BusinessUserAccess";
 
 type AttendanceSnapshot = {
   timeIn: Date;
@@ -18,7 +19,9 @@ export function mergeAttendanceSnapshots(recordGroups: AttendanceSnapshot[][]) {
 
   recordGroups.flat().forEach((record) => {
     if (record.isArchived) return;
-    recordsByKey.set(attendanceRecordKey(record), {
+    const key = attendanceRecordKey(record);
+    if (recordsByKey.has(key)) return;
+    recordsByKey.set(key, {
       ...record,
       timeIn: new Date(record.timeIn),
       isArchived: false,
@@ -69,12 +72,14 @@ async function writeAttendanceHistory(employeeCode: string, businessId: string, 
             source: record.source,
           },
           update: {
+            $set: {
+              attendanceStatus: record.attendanceStatus || "",
+              isArchived: false,
+            },
             $setOnInsert: {
               employee: employee._id,
               timeIn: record.timeIn,
               source: record.source,
-              attendanceStatus: record.attendanceStatus || "",
-              isArchived: false,
             },
           },
           upsert: true,
@@ -87,10 +92,12 @@ async function writeAttendanceHistory(employeeCode: string, businessId: string, 
 }
 
 async function mergedAttendanceHistory(employeeCode: string, preferredBusinessIds: string[] = []) {
-  const businessIds = Array.from(new Set([
-    ...preferredBusinessIds,
-    ...getConfiguredBusinesses().map((business) => business.id),
-  ].filter(Boolean)));
+  const businessIds = Array.from(new Set(
+    (preferredBusinessIds.length > 0
+      ? preferredBusinessIds
+      : getConfiguredBusinesses().map((business) => business.id)
+    ).filter(Boolean)
+  ));
   const histories = await Promise.all(
     businessIds.map((businessId) => readAttendanceHistory(employeeCode, businessId))
   );
@@ -98,18 +105,46 @@ async function mergedAttendanceHistory(employeeCode: string, preferredBusinessId
   return mergeAttendanceSnapshots(histories);
 }
 
+async function assignedBusinessIds(employeeCode: string) {
+  const configuredBusinessIds = new Set(getConfiguredBusinesses().map((business) => business.id));
+  const controlledBusinessIds = normalizeBusinessAccessIds(
+    await getBusinessAccessForEmployeeCode(employeeCode)
+  ).filter((businessId) => configuredBusinessIds.has(businessId));
+
+  return controlledBusinessIds.length > 0
+    ? controlledBusinessIds
+    : Array.from(configuredBusinessIds);
+}
+
 export async function syncEmployeeAttendanceAcrossBusinesses(employeeCode: string) {
   const normalizedEmployeeCode = String(employeeCode || "").trim();
   if (!normalizedEmployeeCode) return 0;
 
-  const mergedHistory = await mergedAttendanceHistory(normalizedEmployeeCode);
+  const businessIds = await assignedBusinessIds(normalizedEmployeeCode);
+  const mergedHistory = await mergedAttendanceHistory(normalizedEmployeeCode, businessIds);
   const copiedCounts = await Promise.all(
-    getConfiguredBusinesses().map((business) =>
-      writeAttendanceHistory(normalizedEmployeeCode, business.id, mergedHistory)
+    businessIds.map((businessId) =>
+      writeAttendanceHistory(normalizedEmployeeCode, businessId, mergedHistory)
     )
   );
 
   return copiedCounts.reduce((total, count) => total + count, 0);
+}
+
+export async function syncEmployeesAttendanceAcrossBusinesses(employeeCodes: string[], concurrency = 4) {
+  const pendingCodes = Array.from(new Set(
+    employeeCodes.map((employeeCode) => String(employeeCode || "").trim()).filter(Boolean)
+  ));
+  let copiedCount = 0;
+
+  for (let index = 0; index < pendingCodes.length; index += Math.max(1, concurrency)) {
+    const counts = await Promise.all(
+      pendingCodes.slice(index, index + Math.max(1, concurrency)).map(syncEmployeeAttendanceAcrossBusinesses)
+    );
+    copiedCount += counts.reduce((total, count) => total + count, 0);
+  }
+
+  return copiedCount;
 }
 
 export async function updateAttendanceAcrossBusinesses(
@@ -121,8 +156,9 @@ export async function updateAttendanceAcrossBusinesses(
   if (!normalizedEmployeeCode) return [] as Array<{ businessId: string; employeeId: string }>;
 
   const affected: Array<{ businessId: string; employeeId: string }> = [];
-  for (const business of getConfiguredBusinesses()) {
-    await runWithBusiness(business.id, async () => {
+  const businessIds = await assignedBusinessIds(normalizedEmployeeCode);
+  for (const businessId of businessIds) {
+    await runWithBusiness(businessId, async () => {
       const employee = await Employee.findOne({
         employeeCode: normalizedEmployeeCode,
         status: { $ne: "Archived" },
@@ -133,14 +169,13 @@ export async function updateAttendanceAcrossBusinesses(
         employee: employee._id,
         timeIn: previous.timeIn,
         source: previous.source,
-        isArchived: { $ne: true },
       });
 
       if (matchingRecord) {
         matchingRecord.timeIn = updated.timeIn;
         matchingRecord.source = updated.source;
         matchingRecord.attendanceStatus = updated.attendanceStatus;
-        matchingRecord.isArchived = false;
+        matchingRecord.isArchived = updated.isArchived;
         await matchingRecord.save();
       } else {
         await Attendance.updateOne(
@@ -155,14 +190,14 @@ export async function updateAttendanceAcrossBusinesses(
               timeIn: updated.timeIn,
               source: updated.source,
               attendanceStatus: updated.attendanceStatus,
-              isArchived: false,
+              isArchived: updated.isArchived,
             },
           },
           { upsert: true }
         );
       }
 
-      affected.push({ businessId: business.id, employeeId: String(employee._id) });
+      affected.push({ businessId, employeeId: String(employee._id) });
     });
   }
 

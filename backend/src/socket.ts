@@ -1,6 +1,6 @@
 import type { Server as HttpServer } from "node:http";
 import { Server, type Socket } from "socket.io";
-import { findConfiguredAdmin } from "./config/adminUsers";
+import { findConfiguredAdmin, isTrackerOnlyAdminCode } from "./config/adminUsers";
 import { getBusinessById, getCurrentBusinessId, getDefaultBusiness, runWithBusiness } from "./config/tenancy";
 import { Conversation } from "./models/Conversation";
 import { Employee } from "./models/Employee";
@@ -13,8 +13,10 @@ type VoiceCallSession = {
   callId: string;
   businessId: string;
   callerId: string;
+  callerType: "admin" | "employee";
   callerName: string;
   targetId: string;
+  targetType: "admin" | "employee";
   targetName: string;
   callerSocketId: string;
   targetSocketId: string;
@@ -23,16 +25,16 @@ type VoiceCallSession = {
 const voiceCalls = new Map<string, VoiceCallSession>();
 const employeeVoiceCalls = new Map<string, string>();
 
-function voiceEmployeeKey(businessId: string, employeeId: string) {
-  return `${businessId}:${employeeId}`;
+function voicePartyKey(businessId: string, partyType: "admin" | "employee", partyId: string) {
+  return `${businessId}:${partyType}:${partyId}`;
 }
 
 function clearVoiceCall(callId: string) {
   const call = voiceCalls.get(callId);
   if (!call) return null;
   voiceCalls.delete(callId);
-  employeeVoiceCalls.delete(voiceEmployeeKey(call.businessId, call.callerId));
-  employeeVoiceCalls.delete(voiceEmployeeKey(call.businessId, call.targetId));
+  employeeVoiceCalls.delete(voicePartyKey(call.businessId, call.callerType, call.callerId));
+  employeeVoiceCalls.delete(voicePartyKey(call.businessId, call.targetType, call.targetId));
   return call;
 }
 
@@ -68,13 +70,24 @@ function employeeRoom(businessId: string, employeeId: string) {
   return `business:${businessId}:employee:${employeeId}`;
 }
 
+function partyRoom(businessId: string, partyType: "admin" | "employee", partyId: string) {
+  return partyType === "admin" ? `business:${businessId}:admins` : employeeRoom(businessId, partyId);
+}
+
+function socketParty(socket: Socket) {
+  return {
+    type: socket.data.authUserType as "admin" | "employee",
+    id: socket.data.authUserType === "admin" ? "admin" : String(socket.data.authEmployeeId || ""),
+  };
+}
+
 function liveShareRoom(businessId: string, requestId: string) {
   return `business:${businessId}:live-share:${requestId}`;
 }
 
 function resolveSocketBusiness(socket: Socket) {
   const businessId = String(socket.handshake.auth?.businessId || socket.handshake.query?.businessId || "").trim();
-  return getBusinessById(businessId) || getDefaultBusiness();
+  return businessId ? getBusinessById(businessId) : getDefaultBusiness();
 }
 
 export function emitMessageEvents(conversationId: string, message: unknown, conversation: unknown) {
@@ -134,6 +147,10 @@ export function createSocketServer(httpServer: HttpServer) {
     const userType = String(socket.handshake.auth?.userType || "").trim().toLowerCase();
     const userCode = String(socket.handshake.auth?.userCode || "").trim();
 
+    if (!business) {
+      return next(new Error("Unknown socket business."));
+    }
+
     if (userType === "admin") {
       const admin = findConfiguredAdmin(userCode);
       if (!admin) return next(new Error("Unauthorized socket administrator."));
@@ -160,6 +177,10 @@ export function createSocketServer(httpServer: HttpServer) {
 
   io.on("connection", (socket) => {
     const business = resolveSocketBusiness(socket);
+    if (!business) {
+      socket.disconnect(true);
+      return;
+    }
     socket.data.businessId = business.id;
     socket.join(businessRoom(business.id));
     if (socket.data.authUserType === "admin") {
@@ -194,36 +215,37 @@ export function createSocketServer(httpServer: HttpServer) {
       if (canJoin) socket.join(conversationRoom(socket.data.businessId, normalizedConversationId));
     });
 
-    socket.on("voice-call:start", async (payload: { callId?: string; targetEmployeeId?: string } = {}) => {
-      if (socket.data.authUserType !== "employee" || !socket.data.authEmployeeId) return;
+    socket.on("voice-call:start", async (payload: { callId?: string; targetUserId?: string; targetEmployeeId?: string; targetUserType?: "admin" | "employee" } = {}) => {
+      if (socket.data.authUserType !== "employee" && socket.data.authUserType !== "admin") return;
       const callId = String(payload.callId || "").trim();
-      const targetId = String(payload.targetEmployeeId || "").trim();
-      const callerId = String(socket.data.authEmployeeId);
-      if (!callId || !targetId || callerId === targetId) return;
+      const targetId = String(payload.targetUserId || payload.targetEmployeeId || "").trim();
+      const caller = socketParty(socket);
+      const targetType = payload.targetUserType === "admin" ? "admin" : "employee";
+      if (!callId || !targetId || (caller.type === targetType && caller.id === targetId)) return;
 
-      const callerKey = voiceEmployeeKey(socket.data.businessId, callerId);
-      const targetKey = voiceEmployeeKey(socket.data.businessId, targetId);
+      const callerKey = voicePartyKey(socket.data.businessId, caller.type, caller.id);
+      const targetKey = voicePartyKey(socket.data.businessId, targetType, targetId);
       if (employeeVoiceCalls.has(callerKey) || employeeVoiceCalls.has(targetKey)) {
         socket.emit("voice-call:busy", { callId, message: "This employee is already on another call." });
         return;
       }
 
-      const target = await runForSocketBusiness(() => Employee.findOne({ _id: targetId, status: { $ne: "Archived" } }).select("_id name").lean());
-      if (!target) {
-        socket.emit("voice-call:unavailable", { callId, message: "This employee is unavailable." });
-        return;
-      }
-      if (!io.sockets.adapter.rooms.get(employeeRoom(socket.data.businessId, targetId))?.size) {
-        socket.emit("voice-call:unavailable", { callId, message: "This employee is not connected to the CRM." });
+      const target = targetType === "employee"
+        ? await runForSocketBusiness(() => Employee.findOne({ _id: targetId, status: { $ne: "Archived" } }).select("_id name").lean())
+        : { _id: "admin", name: findConfiguredAdmin(String(socket.data.authUserCode || ""))?.name || "Admin" };
+      if (!target || !io.sockets.adapter.rooms.get(partyRoom(socket.data.businessId, targetType, targetId))?.size) {
+        socket.emit("voice-call:unavailable", { callId, message: "This user is not connected to the CRM." });
         return;
       }
 
       const call: VoiceCallSession = {
         callId,
         businessId: socket.data.businessId,
-        callerId,
+        callerId: caller.id,
+        callerType: caller.type,
         callerName: String(socket.data.authUserName || "Employee"),
         targetId,
+        targetType,
         targetName: target.name,
         callerSocketId: socket.id,
         targetSocketId: "",
@@ -231,35 +253,37 @@ export function createSocketServer(httpServer: HttpServer) {
       voiceCalls.set(callId, call);
       employeeVoiceCalls.set(callerKey, callId);
       employeeVoiceCalls.set(targetKey, callId);
-      io.to(employeeRoom(call.businessId, targetId)).emit("voice-call:incoming", call);
+      io.to(partyRoom(call.businessId, targetType, targetId)).emit("voice-call:incoming", call);
       socket.emit("voice-call:ringing", call);
     });
 
     socket.on("voice-call:accept", (payload: { callId?: string } = {}) => {
       const call = voiceCalls.get(String(payload.callId || ""));
-      if (!call || socket.data.authUserType !== "employee" || socket.data.authEmployeeId !== call.targetId) return;
+      const party = socketParty(socket);
+      if (!call || party.type !== call.targetType || party.id !== call.targetId) return;
       if (call.targetSocketId && call.targetSocketId !== socket.id) {
         socket.emit("voice-call:ended", { callId: call.callId, reason: "answered-on-another-tab" });
         return;
       }
       call.targetSocketId = socket.id;
-      socket.to(employeeRoom(call.businessId, call.targetId)).emit("voice-call:ended", { callId: call.callId, reason: "answered-on-another-tab" });
+      socket.to(partyRoom(call.businessId, call.targetType, call.targetId)).emit("voice-call:ended", { callId: call.callId, reason: "answered-on-another-tab" });
       io.to(call.callerSocketId).emit("voice-call:accepted", call);
       io.to(call.targetSocketId).emit("voice-call:accepted", call);
     });
 
     socket.on("voice-call:decline", (payload: { callId?: string; reason?: string } = {}) => {
       const call = voiceCalls.get(String(payload.callId || ""));
-      if (!call || socket.data.authUserType !== "employee" || socket.data.authEmployeeId !== call.targetId) return;
+      const party = socketParty(socket);
+      if (!call || party.type !== call.targetType || party.id !== call.targetId) return;
       clearVoiceCall(call.callId);
-      io.to(employeeRoom(call.businessId, call.callerId)).emit("voice-call:declined", { callId: call.callId, reason: String(payload.reason || "declined") });
-      io.to(employeeRoom(call.businessId, call.targetId)).emit("voice-call:ended", { callId: call.callId, reason: "declined" });
+      io.to(partyRoom(call.businessId, call.callerType, call.callerId)).emit("voice-call:declined", { callId: call.callId, reason: String(payload.reason || "declined") });
+      io.to(partyRoom(call.businessId, call.targetType, call.targetId)).emit("voice-call:ended", { callId: call.callId, reason: "declined" });
     });
 
     socket.on("voice-call:signal", (payload: { callId?: string; description?: unknown; candidate?: unknown } = {}) => {
       const call = voiceCalls.get(String(payload.callId || ""));
-      const employeeId = String(socket.data.authEmployeeId || "");
-      if (!call || socket.data.authUserType !== "employee" || (employeeId !== call.callerId && employeeId !== call.targetId)) return;
+      const party = socketParty(socket);
+      if (!call || !((party.type === call.callerType && party.id === call.callerId) || (party.type === call.targetType && party.id === call.targetId))) return;
       if (socket.id !== call.callerSocketId && socket.id !== call.targetSocketId) return;
       const recipientSocketId = socket.id === call.callerSocketId ? call.targetSocketId : call.callerSocketId;
       if (!recipientSocketId) return;
@@ -272,8 +296,8 @@ export function createSocketServer(httpServer: HttpServer) {
 
     socket.on("voice-call:end", (payload: { callId?: string; reason?: string } = {}) => {
       const call = voiceCalls.get(String(payload.callId || ""));
-      const employeeId = String(socket.data.authEmployeeId || "");
-      if (!call || (employeeId !== call.callerId && employeeId !== call.targetId)) return;
+      const party = socketParty(socket);
+      if (!call || !((party.type === call.callerType && party.id === call.callerId) || (party.type === call.targetType && party.id === call.targetId))) return;
       clearVoiceCall(call.callId);
       io.to(call.callerSocketId).emit("voice-call:ended", { callId: call.callId, reason: String(payload.reason || "ended") });
       if (call.targetSocketId) io.to(call.targetSocketId).emit("voice-call:ended", { callId: call.callId, reason: String(payload.reason || "ended") });
@@ -293,6 +317,18 @@ export function createSocketServer(httpServer: HttpServer) {
         if (!requestId || !employeeId) {
           socket.emit("live-share:error", { requestId, message: "Employee and request id are required." });
           return;
+        }
+
+        if (isTrackerOnlyAdminCode(String(socket.data.authUserCode || ""))) {
+          const isInternalEmployee = await runForSocketBusiness(() => Employee.exists({
+            _id: employeeId,
+            team: /^internal$/i,
+            status: { $ne: "Archived" },
+          }));
+          if (!isInternalEmployee) {
+            socket.emit("live-share:error", { requestId, message: "This administrator can only view Internal employees." });
+            return;
+          }
         }
 
         await runForSocketBusiness(() => LiveViewAudit.findOneAndUpdate(
@@ -427,8 +463,8 @@ export function createSocketServer(httpServer: HttpServer) {
     );
 
     socket.on("disconnect", () => {
-      const employeeId = String(socket.data.authEmployeeId || "");
-      const callId = employeeVoiceCalls.get(voiceEmployeeKey(socket.data.businessId, employeeId));
+      const party = socketParty(socket);
+      const callId = employeeVoiceCalls.get(voicePartyKey(socket.data.businessId, party.type, party.id));
       if (!callId) return;
       const activeCall = voiceCalls.get(callId);
       if (!activeCall || (socket.id !== activeCall.callerSocketId && socket.id !== activeCall.targetSocketId)) return;

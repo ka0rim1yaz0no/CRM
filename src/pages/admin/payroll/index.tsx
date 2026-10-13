@@ -1,6 +1,7 @@
 import type { FormEvent } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { toPng } from "html-to-image";
 import {
     FiBriefcase,
     FiCheck,
@@ -13,11 +14,13 @@ import {
     FiDownload,
     FiEdit2,
     FiFileText,
+    FiHash,
     FiFilter,
     FiPlus,
     FiPrinter,
     FiRotateCcw,
     FiSearch,
+    FiSend,
     FiArchive,
     FiTarget,
     FiUsers,
@@ -39,6 +42,7 @@ import {
     runPayroll,
     updatePayrollOvertime,
     updateEmployeeBasicPay,
+    updatePayrollWorkedMinutes,
     type PayrollItemCategory,
     type PayrollDtrRow,
     type PayrollListItem,
@@ -49,6 +53,8 @@ import { getEmployees, updateEmployeeBankDetails, type Employee } from "../../..
 import { getSystemSettings, type SystemSettings } from "../../../api/systemSettings";
 import { DataTableSortHeader } from "../../../components/admin/DataTable";
 import { formatCurrency } from "../../../lib/currency";
+import { createDirectConversation, sendMessage, uploadMessageAttachment } from "../../../api/messages";
+import { getAuthUser } from "../../../api/authStorage";
 
 const payrollTabs = ["Employee Payroll", "Bank Accounts", "Payouts", "Deductions", "Tax Settings", "Archived"] as const;
 const payrollNavigation = [
@@ -585,6 +591,7 @@ function ArchivedPanel({
 
 export default function PayrollPage() {
     const queryClient = useQueryClient();
+    const authUser = getAuthUser();
     const [activeTab, setActiveTab] = useState<(typeof payrollTabs)[number]>("Employee Payroll");
     const [search, setSearch] = useState("");
     const [statusFilter, setStatusFilter] = useState("All statuses");
@@ -595,6 +602,7 @@ export default function PayrollPage() {
     const [page, setPage] = useState(1);
     const [dtrRecord, setDtrRecord] = useState<PayrollRecord | null>(null);
     const [payslipRecord, setPayslipRecord] = useState<PayrollRecord | null>(null);
+    const payslipImageRef = useRef<HTMLDivElement>(null);
     const [payslipCutoffPeriod, setPayslipCutoffPeriod] = useState("");
     const [isPayslipCutoffOpen, setIsPayslipCutoffOpen] = useState(false);
     const payslipCutoffPickerRef = useRef<HTMLDivElement | null>(null);
@@ -607,6 +615,10 @@ export default function PayrollPage() {
     const [bankForm, setBankForm] = useState(emptyBankForm);
     const [basicPayTarget, setBasicPayTarget] = useState<PayrollRecord | null>(null);
     const [basicPayInput, setBasicPayInput] = useState("");
+    const [payslipDeliveryStatus, setPayslipDeliveryStatus] = useState("");
+    const [workedMinutesTarget, setWorkedMinutesTarget] = useState<PayrollRecord | null>(null);
+    const [workedMinutesInput, setWorkedMinutesInput] = useState("");
+    const [workedMinutesError, setWorkedMinutesError] = useState("");
 
     const itemCategory = activeTab === "Employee Payroll" || activeTab === "Bank Accounts" || activeTab === "Archived" ? undefined : (activeTab as PayrollItemCategory);
 
@@ -712,6 +724,25 @@ export default function PayrollPage() {
             setBasicPayInput("");
         },
     });
+    const updateWorkedMinutesMutation = useMutation({
+        mutationFn: ({ id, workedMinutes }: { id: string; workedMinutes: number }) => updatePayrollWorkedMinutes(id, workedMinutes),
+        onSuccess: async () => {
+            setWorkedMinutesTarget(null);
+            setWorkedMinutesInput("");
+            setWorkedMinutesError("");
+            await Promise.all([
+                queryClient.invalidateQueries({ queryKey: ["payroll-dtr"] }),
+                queryClient.invalidateQueries({ queryKey: ["payroll-payslip-dtr"] }),
+                queryClient.invalidateQueries({ queryKey: ["payroll-records"] }),
+                queryClient.invalidateQueries({ queryKey: ["payroll-stats"] }),
+                queryClient.invalidateQueries({ queryKey: ["employee-attendance"] }),
+                queryClient.invalidateQueries({ queryKey: ["employees-attendance"] }),
+            ]);
+        },
+        onError: (error: { response?: { data?: { message?: string } }; message?: string }) => {
+            setWorkedMinutesError(error.response?.data?.message || error.message || "Unable to update worked minutes.");
+        },
+    });
     const archiveRecordMutation = useMutation({ mutationFn: archivePayrollRecord, onSuccess: () => { refreshPayroll(); closeDeletePrompt(); } });
     const restoreRecordMutation = useMutation({ mutationFn: restorePayrollRecord, onSuccess: refreshPayroll });
     const runPayrollMutation = useMutation({ mutationFn: runPayroll, onSuccess: refreshPayroll });
@@ -732,6 +763,35 @@ export default function PayrollPage() {
             setBankEditEmployee(null);
             setBankForm(emptyBankForm);
         },
+    });
+    const sendPayslipMutation = useMutation({
+        mutationFn: async () => {
+            if (!payslipPreviewRecord || !payslipDtr?.employee._id) throw new Error("The selected payslip is still loading.");
+            if (!payslipImageRef.current) throw new Error("The payslip preview is not ready yet.");
+            const conversation = await createDirectConversation([payslipDtr.employee._id], true);
+            const record = payslipPreviewRecord;
+            await document.fonts?.ready;
+            await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+            const dataUrl = await toPng(payslipImageRef.current, {
+                backgroundColor: "#ffffff",
+                cacheBust: true,
+                pixelRatio: 2,
+            });
+            const imageBlob = await (await fetch(dataUrl)).blob();
+            const safeEmployee = record.employeeName.replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "") || record.employeeId;
+            const safePeriod = record.payPeriod.replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "") || "pay-period";
+            const imageFile = new File([imageBlob], `Payslip-${safeEmployee}-${safePeriod}.png`, { type: "image/png" });
+            const attachment = await uploadMessageAttachment(conversation._id, imageFile);
+            await sendMessage(conversation._id, {
+                senderId: null,
+                senderName: authUser?.user.name || "Admin",
+                senderType: "admin",
+                body: `Payslip for ${record.payPeriod}`,
+                attachments: [attachment],
+            });
+        },
+        onSuccess: () => setPayslipDeliveryStatus("Payslip image sent in CRM Messages."),
+        onError: (error: { response?: { data?: { message?: string } }; message?: string }) => setPayslipDeliveryStatus(error.response?.data?.message || error.message || "Unable to send the payslip."),
     });
     const money = (value = 0) => formatCurrency(value, systemSettings?.currencyCode || "USD");
     const itemLabels = itemCategory ? payrollItemFieldLabels(itemCategory) : null;
@@ -891,6 +951,7 @@ export default function PayrollPage() {
     useEffect(() => {
         setPayslipCutoffPeriod(payslipRecord?.payPeriod || "");
         setIsPayslipCutoffOpen(false);
+        setPayslipDeliveryStatus("");
     }, [payslipRecord?._id, payslipRecord?.payPeriod]);
 
     useEffect(() => {
@@ -1180,8 +1241,18 @@ export default function PayrollPage() {
                                                             >
                                                                 {employee.status === "Paid" ? <FiRotateCcw className="size-3.5" /> : <FiCheck className="size-3.5" />}
                                                             </button>
-                                                            <button className="inline-flex size-7 items-center justify-center rounded-md !text-amber-600 transition hover:bg-amber-100 hover:!text-amber-700" type="button" onClick={() => openDeletePrompt({ type: "record", record: employee })} aria-label={`Archive ${employee.employeeName}`}>
-                                                                <FiArchive className="size-3.5" />
+                                                            <button
+                                                                className="inline-flex size-7 items-center justify-center rounded-md !text-fuchsia-600 transition hover:bg-fuchsia-50 hover:!text-fuchsia-700"
+                                                                type="button"
+                                                                onClick={() => {
+                                                                    setWorkedMinutesError("");
+                                                                    setWorkedMinutesTarget(employee);
+                                                                    setWorkedMinutesInput(String(Math.round((employee.workedMinutesOverride ?? (employee.workedHours || 0) * 60))));
+                                                                }}
+                                                                aria-label={`Edit worked minutes for ${employee.employeeName}`}
+                                                                title="Edit total worked minutes"
+                                                            >
+                                                                <FiHash className="size-3.5" />
                                                             </button>
                                                         </div>
                                                     </td>
@@ -1567,6 +1638,15 @@ export default function PayrollPage() {
                                         </div>
                                         {isPayslipDtrLoading && <span className="text-xs font-semibold text-violet-100/70">Updating...</span>}
                                         <button
+                                            className="flex h-10 items-center gap-2 rounded-lg bg-emerald-500 px-3 text-sm font-semibold text-white transition hover:bg-emerald-600 disabled:cursor-wait disabled:opacity-60"
+                                            type="button"
+                                            onClick={() => sendPayslipMutation.mutate()}
+                                            disabled={isPayslipDtrLoading || sendPayslipMutation.isPending}
+                                        >
+                                            <FiSend className="size-4" aria-hidden="true" />
+                                            {sendPayslipMutation.isPending ? "Sending..." : "Send to Messages"}
+                                        </button>
+                                        <button
                                             className="flex h-10 items-center gap-2 rounded-lg border border-white/10 bg-white/[0.06] px-3 text-sm font-semibold text-white/80 transition hover:bg-white/10 hover:text-white"
                                             type="button"
                                             onClick={printPayslip}
@@ -1585,6 +1665,10 @@ export default function PayrollPage() {
                                     </div>
                                 </div>
 
+                                {payslipDeliveryStatus && (
+                                    <p className="mt-3 rounded-lg border border-white/10 bg-white/[0.06] px-3 py-2 text-sm font-semibold text-white/80">{payslipDeliveryStatus}</p>
+                                )}
+
                                 <div className="mt-4 grid gap-3 sm:grid-cols-3">
                                     {[
                                         ["Gross Pay", money(payslipPreviewRecord.grossPay)],
@@ -1599,7 +1683,7 @@ export default function PayrollPage() {
                                 </div>
                             </div>
                             <div className="content-scroll min-h-0 flex-1 overflow-auto bg-slate-200 p-6">
-                                <div className="mx-auto w-full max-w-[49rem] overflow-hidden rounded-xl shadow-2xl shadow-black/25">
+                                <div ref={payslipImageRef} className="mx-auto w-full max-w-[49rem] overflow-hidden rounded-xl shadow-2xl shadow-black/25">
                                     <PayslipDocument record={payslipPreviewRecord} money={money} payrollRunDay={systemSettings?.payrollRunDay} />
                                 </div>
                             </div>
@@ -1766,6 +1850,55 @@ export default function PayrollPage() {
                                 </button>
                             </div>
                         </div>
+                    </div>
+                )}
+
+                {workedMinutesTarget && (
+                    <div className="modal-backdrop-enter fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4 backdrop-blur-sm" onMouseDown={(event) => { if (event.target === event.currentTarget && !updateWorkedMinutesMutation.isPending) setWorkedMinutesTarget(null); }}>
+                        <form
+                            className="modal-panel-enter w-full max-w-[30rem] overflow-hidden rounded-lg border border-white/10 bg-[#0d1018] shadow-2xl shadow-black/40"
+                            onSubmit={(event) => {
+                                event.preventDefault();
+                                const value = Number(workedMinutesInput);
+                                const maximum = Math.round((workedMinutesTarget.scheduledHours || 0) * 60);
+                                if (!Number.isInteger(value) || value < 0 || value > maximum) {
+                                    setWorkedMinutesError(`Enter a whole number from 0 to ${maximum} minutes.`);
+                                    return;
+                                }
+                                setWorkedMinutesError("");
+                                updateWorkedMinutesMutation.mutate({ id: workedMinutesTarget._id, workedMinutes: value });
+                            }}
+                        >
+                            <div className="flex items-start justify-between gap-3 border-b border-white/10 px-5 py-4">
+                                <div className="min-w-0">
+                                    <p className="text-xs font-semibold uppercase tracking-[0.14em] text-white/35">Cutoff Worked Minutes</p>
+                                    <h3 className="mt-1 truncate text-lg font-semibold text-white">{workedMinutesTarget.employeeName}</h3>
+                                    <p className="mt-1 text-sm text-white/45">{workedMinutesTarget.payPeriod}</p>
+                                </div>
+                                <button className="grid size-9 shrink-0 place-items-center rounded-lg border border-white/10 bg-white/[0.05] text-white/60 hover:bg-white/10 hover:text-white" type="button" disabled={updateWorkedMinutesMutation.isPending} onClick={() => setWorkedMinutesTarget(null)} aria-label="Close worked minutes editor"><FiX className="size-4" /></button>
+                            </div>
+                            <div className="p-5">
+                                <div className="grid grid-cols-2 gap-3">
+                                    <div className="rounded-lg border border-white/10 bg-white/[0.035] p-3">
+                                        <p className="text-[0.65rem] font-semibold uppercase tracking-[0.12em] text-white/35">Current Total</p>
+                                        <p className="mt-1 text-base font-semibold text-white">{workedMinutesTarget.workedHours ?? 0}h</p>
+                                        <p className="mt-0.5 text-xs text-white/45">{Math.round((workedMinutesTarget.workedMinutesOverride ?? (workedMinutesTarget.workedHours || 0) * 60))} minutes</p>
+                                    </div>
+                                    <div className="rounded-lg border border-white/10 bg-white/[0.035] p-3">
+                                        <p className="text-[0.65rem] font-semibold uppercase tracking-[0.12em] text-white/35">Shift Maximum</p>
+                                        <p className="mt-1 text-base font-semibold text-white">{Math.round((workedMinutesTarget.scheduledHours || 0) * 60)} min</p>
+                                    </div>
+                                </div>
+                                <label className="mt-4 block text-xs font-semibold uppercase tracking-[0.14em] text-white/45">Total worked minutes for this cutoff</label>
+                                <input className="mt-2 h-11 w-full rounded-lg border border-white/10 bg-black/20 px-3 text-sm font-semibold text-white outline-none focus:border-[#842cff] focus:ring-2 focus:ring-[#842cff]/20" type="number" min="0" max={Math.round((workedMinutesTarget.scheduledHours || 0) * 60)} step="1" required autoFocus value={workedMinutesInput} onChange={(event) => { setWorkedMinutesInput(event.target.value); setWorkedMinutesError(""); }} />
+                                <p className="mt-2 text-xs leading-5 text-white/45">Only minutes inside official shifts are counted. Early clock-ins do not increase paid work time. Saving recalculates deductions, gross/net pay, DTR, and payslip data across assigned businesses.</p>
+                                {workedMinutesError && <p className="mt-3 rounded-lg border border-rose-300/20 bg-rose-300/10 px-3 py-2 text-sm font-semibold text-rose-100">{workedMinutesError}</p>}
+                            </div>
+                            <div className="flex justify-end gap-2 border-t border-white/10 px-5 py-3">
+                                <button className="h-10 rounded-lg border border-white/10 bg-white/[0.05] px-4 text-sm font-semibold text-white/60 hover:bg-white/10 hover:text-white" type="button" disabled={updateWorkedMinutesMutation.isPending} onClick={() => setWorkedMinutesTarget(null)}>Cancel</button>
+                                <button className="h-10 rounded-lg bg-[#842cff] px-4 text-sm font-semibold text-white transition hover:bg-[#933cff] disabled:opacity-60" type="submit" disabled={updateWorkedMinutesMutation.isPending}>{updateWorkedMinutesMutation.isPending ? "Recalculating..." : "Save Worked Minutes"}</button>
+                            </div>
+                        </form>
                     </div>
                 )}
 

@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { useSearchParams } from "react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FiCheckCircle, FiEdit2, FiSearch, FiX } from "react-icons/fi";
 import { getAuthUser } from "../../../api/authStorage";
@@ -44,12 +45,14 @@ function statusClass(label: string) {
     return "border-white/10 bg-white/[0.05] text-white/55";
 }
 
-export default function AdminEvaluations() {
+export function EvaluationWorkspace({ employeeCode = "", embedded = false }: { employeeCode?: string; embedded?: boolean }) {
     const queryClient = useQueryClient();
     const authUser = getAuthUser();
     const adminName = authUser?.user.name || "Admin";
+    const [searchParams] = useSearchParams();
+    const employeeFilter = employeeCode.trim() || searchParams.get("employee")?.trim() || "";
     const [filter, setFilter] = useState<EvaluationFilter>("All");
-    const [search, setSearch] = useState("");
+    const [search, setSearch] = useState(employeeFilter);
     const [selectedRow, setSelectedRow] = useState<EvaluationRow | null>(null);
     const [form, setForm] = useState<EvaluationInput>({ ...emptyForm, reviewedBy: adminName });
     const [errorMessage, setErrorMessage] = useState("");
@@ -117,8 +120,8 @@ export default function AdminEvaluations() {
     };
     const loading = employeesQuery.isPending || evaluationsQuery.isPending;
 
-    return (
-        <AdminLayout>
+    const content = (
+        <>
             <section className="space-y-5">
                 <div className="theme-surface-bg rounded-lg border border-white/10 p-5">
                     <p className="text-xs font-medium uppercase tracking-[0.16em] text-white/35">People Operations</p>
@@ -198,6 +201,12 @@ export default function AdminEvaluations() {
                     </div>
                 </div>
             )}
-        </AdminLayout>
+        </>
     );
+
+    return embedded ? content : <AdminLayout>{content}</AdminLayout>;
+}
+
+export default function AdminEvaluations() {
+    return <EvaluationWorkspace />;
 }

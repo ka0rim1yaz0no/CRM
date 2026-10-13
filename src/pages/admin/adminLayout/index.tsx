@@ -1,7 +1,7 @@
 import type { ElementType, FormEvent, ReactNode } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link, NavLink, useLocation, useNavigate } from "react-router";
+import { Link, NavLink, Navigate, useLocation, useNavigate } from "react-router";
 import { getBusinesses } from "../../../api/businesses";
 import { getActiveBusinessId, setActiveBusinessId } from "../../../api/businessStorage";
 import { clearAuthUser, getAuthUser, setAuthUser } from "../../../api/authStorage";
@@ -23,7 +23,8 @@ import {
     FiBookOpen,
     FiChevronDown,
     FiCheckSquare,
-    FiClipboard,
+    FiChevronLeft,
+    FiChevronRight,
     FiImage,
     FiFileText,
     FiLogOut,
@@ -72,6 +73,17 @@ function readDismissedNotifications(storageKey: string) {
     }
 }
 
+function leaveNotificationKey(item: Awaited<ReturnType<typeof getLeaveRequests>>[number]) {
+    const employeeCode = typeof item.employee === "string" ? item.employee : item.employee.employeeCode || item.employee._id;
+    return `leave:${employeeCode}:${item.leaveType}:${item.startDate.slice(0, 10)}:${item.endDate.slice(0, 10)}:${item.createdAt}`;
+}
+
+function noticeNotificationKey(item: Awaited<ReturnType<typeof getRecentNotices>>[number]) {
+    const employeeCode = typeof item.employee === "string" ? item.employee : item.employee.employeeCode || item.employee._id;
+    const identity = item.sourceId || `${item.title}:${item.createdAt}`;
+    return `notice:${employeeCode}:${item.source || "notice"}:${identity}`;
+}
+
 const adminNavSections: AdminNavSection[] = [
     {
         title: "Overview",
@@ -94,7 +106,6 @@ const adminNavSections: AdminNavSection[] = [
         title: "Workspace",
         items: [
             { label: "HR", path: "/admin/hr", icon: FiFileText, feature: "hr" },
-            { label: "Evaluations", path: "/admin/evaluations", icon: FiClipboard, feature: "hr" },
             { label: "Knowledge Base", path: "/admin/knowledge-base", icon: FiBookOpen, feature: "knowledge-base" },
             { label: "Media", path: "/admin/media", icon: FiImage, feature: "media" },
             { label: "Messages", path: "/admin/messages", icon: FiMessageCircle, feature: "messages" },
@@ -112,6 +123,7 @@ const adminNavSections: AdminNavSection[] = [
 
 export default function AdminLayout({ children }: Props) {
     const [isScrolling, setIsScrolling] = useState(false);
+    const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(() => window.localStorage.getItem("crm:sidebar-collapsed") === "true");
     const [isNotificationsOpen, setIsNotificationsOpen] = useState(false);
     const [isBusinessOpen, setIsBusinessOpen] = useState(false);
     const [adminSearch, setAdminSearch] = useState("");
@@ -123,8 +135,14 @@ export default function AdminLayout({ children }: Props) {
     const notificationsRef = useRef<HTMLDivElement>(null);
     const businessRef = useRef<HTMLDivElement>(null);
     const adminSearchRef = useRef<HTMLFormElement>(null);
+    useEffect(() => {
+        const syncSidebar = () => setIsSidebarCollapsed(window.localStorage.getItem("crm:sidebar-collapsed") === "true");
+        window.addEventListener("crm:sidebar-toggle", syncSidebar);
+        return () => window.removeEventListener("crm:sidebar-toggle", syncSidebar);
+    }, []);
     const queryClient = useQueryClient();
     const authUser = getAuthUser();
+    const isTrackerOnlyAdmin = authUser?.userType === "admin" && authUser.access === "tracker";
     const isPocOperations = isPocOperationsUser(authUser);
     const { isEnabled } = useFeatureFlags();
     const { unreadMessageCount } = useMessageNotifications();
@@ -178,10 +196,17 @@ export default function AdminLayout({ children }: Props) {
         return evaluationEmployees.filter((employee) =>
             [employee.name, employee.employeeCode, employee.email, employee.role, employee.team]
                 .filter(Boolean)
-                .some((value) => String(value).toLowerCase().includes(search))
+                .some((value) => String(value).trim().toLowerCase() === search)
         ).slice(0, 5);
     }, [evaluationEmployees, normalizedAdminSearch]);
-    const matchingLeads = adminLeadSearchData?.leads || [];
+    const matchingLeads = useMemo(() => {
+        const search = normalizedAdminSearch.toLowerCase();
+        return (adminLeadSearchData?.leads || []).filter((lead) =>
+            [lead.businessName, lead.leadName, lead.email, lead.phone]
+                .filter(Boolean)
+                .some((value) => String(value).trim().toLowerCase() === search)
+        );
+    }, [adminLeadSearchData?.leads, normalizedAdminSearch]);
     const visibleNavSections = adminNavSections
         .map((section) => ({
             ...section,
@@ -189,12 +214,16 @@ export default function AdminLayout({ children }: Props) {
                 isEnabled(item.feature, "admin") && (!isPocOperations || isPocOperationsPath(item.path))
             ),
         }))
+        .map((section) => isTrackerOnlyAdmin
+            ? { ...section, items: section.items.filter((item) => item.label === "Tracker") }
+            : section)
         .filter((section) => section.items.length > 0);
     const visibleNavItems = visibleNavSections.flatMap((section) => section.items);
     const currentPageTitle =
         [...visibleNavItems]
             .sort((first, second) => second.path.length - first.path.length)
             .find((item) => pathname === item.path || pathname.startsWith(`${item.path}/`))?.label || "Admin";
+
     const businessNamesById = new Map(businesses.map((business) => [business.id, business.name]));
     const accessibleBusinesses = authUser?.userType === "admin"
         ? businesses
@@ -226,10 +255,23 @@ export default function AdminLayout({ children }: Props) {
             return next;
         });
     };
+    useEffect(() => {
+        const syncDismissedNotifications = (event: StorageEvent) => {
+            if (event.key === dismissalStorageKey) {
+                setDismissedNotifications(readDismissedNotifications(dismissalStorageKey));
+            }
+        };
+        window.addEventListener("storage", syncDismissedNotifications);
+        return () => window.removeEventListener("storage", syncDismissedNotifications);
+    }, [dismissalStorageKey]);
     const visibleUnreadMessageCount = unreadMessageCount;
-    const visiblePendingLeaveRequests = pendingLeaveRequests.filter((item) => !dismissedNotifications.has(`leave:${item._id}`));
+    const visiblePendingLeaveRequests = pendingLeaveRequests.filter((item) =>
+        !dismissedNotifications.has(leaveNotificationKey(item)) && !dismissedNotifications.has(`leave:${item._id}`)
+    );
     const visibleEvaluationReminders = evaluationReminders.filter((item) => !dismissedNotifications.has(`evaluation:${item.id}`));
-    const visibleNotices = notices.filter((item) => !dismissedNotifications.has(`notice:${item._id}`));
+    const visibleNotices = notices.filter((item) =>
+        !dismissedNotifications.has(noticeNotificationKey(item)) && !dismissedNotifications.has(`notice:${item._id}`)
+    );
     const visibleNotificationCount = visiblePendingLeaveRequests.length
         + visibleEvaluationReminders.length
         + visibleNotices.length;
@@ -264,8 +306,8 @@ export default function AdminLayout({ children }: Props) {
                 .filter(Boolean)
                 .some((value) => String(value).toLowerCase() === normalizedSearch)
         );
-        const employee = exactEmployee || (!exactLead ? matchingEmployees[0] : undefined);
-        const lead = exactLead || (!employee ? matchingLeads[0] : undefined);
+        const employee = exactEmployee;
+        const lead = exactLead;
 
         setIsAdminSearchOpen(false);
         setAdminSearch("");
@@ -314,6 +356,10 @@ export default function AdminLayout({ children }: Props) {
         window.location.reload();
     };
 
+    if (isTrackerOnlyAdmin && !pathname.startsWith("/admin/tracker")) {
+        return <Navigate to="/admin/tracker" replace />;
+    }
+
     if (isPocOperations) {
         return <MainLayout>{children}</MainLayout>;
     }
@@ -323,20 +369,29 @@ export default function AdminLayout({ children }: Props) {
             <div className="pointer-events-none fixed inset-0 bg-[radial-gradient(circle_at_8%_14%,color-mix(in_srgb,var(--primary)_20%,transparent),transparent_28%),radial-gradient(circle_at_98%_0%,color-mix(in_srgb,var(--secondary)_12%,transparent),transparent_25%),linear-gradient(135deg,rgba(255,255,255,0.035),transparent_26%)]" />
             <div className="pointer-events-none fixed inset-0 bg-[linear-gradient(90deg,rgba(255,255,255,0.025)_1px,transparent_1px),linear-gradient(180deg,rgba(255,255,255,0.018)_1px,transparent_1px)] bg-[size:4rem_4rem] opacity-20" />
 
-            <aside className="theme-shell-bg fixed inset-y-0 left-0 z-10 flex w-[13.5rem] flex-col border-r border-white/10 text-white shadow-2xl shadow-black/20 backdrop-blur-xl 2xl:w-[16rem]">
-                <div className="flex w-full items-center justify-center border-b border-white/10 px-4 py-4 2xl:px-6 2xl:py-5">
-                    <img className="theme-sidebar-logo theme-sidebar-logo-dark max-w-[9.75rem] 2xl:max-w-[12rem]" src="/images/logoaside.png" alt="Assistly" />
-                    <img className="theme-sidebar-logo theme-sidebar-logo-light hidden max-w-[9.75rem] 2xl:max-w-[12rem]" src="/images/logoaside-light.png" alt="Assistly" />
+            <aside className={["theme-shell-bg fixed inset-y-0 left-0 z-10 flex flex-col border-r border-white/10 text-white shadow-2xl shadow-black/20 backdrop-blur-xl transition-[width] duration-200", isSidebarCollapsed ? "w-[5rem]" : "w-[13.5rem] 2xl:w-[16rem]"].join(" ")}>
+                <div className={["flex w-full items-center border-b border-white/10 py-4 2xl:py-5", isSidebarCollapsed ? "justify-center px-2" : "justify-center px-4 2xl:px-6"].join(" ")}>
+                    {isSidebarCollapsed ? (
+                        <div className="h-10 w-10 overflow-hidden" aria-label="Assistly">
+                            <img className="theme-sidebar-logo theme-sidebar-logo-dark h-auto w-[9.75rem] max-w-none" src="/images/logoaside.png" alt="" />
+                            <img className="theme-sidebar-logo theme-sidebar-logo-light hidden h-auto w-[9.75rem] max-w-none" src="/images/logoaside-light.png" alt="" />
+                        </div>
+                    ) : (
+                        <>
+                            <img className="theme-sidebar-logo theme-sidebar-logo-dark max-w-[9.75rem] 2xl:max-w-[12rem]" src="/images/logoaside.png" alt="Assistly" />
+                            <img className="theme-sidebar-logo theme-sidebar-logo-light hidden max-w-[9.75rem] 2xl:max-w-[12rem]" src="/images/logoaside-light.png" alt="Assistly" />
+                        </>
+                    )}
                 </div>
 
-                <div className="flex min-h-0 flex-1 flex-col px-2.5 py-4 2xl:px-3 2xl:py-5">
+                <div className={["flex min-h-0 flex-1 flex-col py-4 2xl:py-5", isSidebarCollapsed ? "px-2" : "px-2.5 2xl:px-3"].join(" ")}>
                     <nav className="admin-sidebar-nav-command content-scroll min-h-0 flex-1 overflow-y-auto pr-1" aria-label="Admin navigation">
                         <div className="flex flex-col gap-5">
                             {visibleNavSections.map((section) => (
                                 <div key={section.title}>
                                     <div className="admin-sidebar-section-title mb-2 flex items-center gap-2 px-3 text-xs font-semibold uppercase tracking-[0.16em] text-white/35 2xl:px-4">
                                         {section.title === "Admin" && <FiShield className="size-4" aria-hidden="true" />}
-                                        <span>{section.title}</span>
+                                        {!isSidebarCollapsed && <span>{section.title}</span>}
                                     </div>
                                     <ul className="flex flex-col gap-1">
                                         {section.items.map(({ label, path, icon: Icon }) => (
@@ -345,7 +400,8 @@ export default function AdminLayout({ children }: Props) {
                                                     to={path}
                                                     className={({ isActive }) =>
                                                         [
-                                                            "admin-sidebar-link flex h-10 items-center gap-2.5 rounded-lg px-3 text-sm font-medium transition 2xl:h-11 2xl:gap-3 2xl:px-4",
+                                                            "admin-sidebar-link flex h-10 items-center rounded-lg text-sm font-medium transition 2xl:h-11",
+                                                            isSidebarCollapsed ? "justify-center px-2" : "gap-2.5 px-3 2xl:gap-3 2xl:px-4",
                                                             isActive
                                                                 ? "bg-white text-[#070910] shadow-lg shadow-white/10"
                                                                 : "text-white/70 hover:bg-white/10 hover:text-white",
@@ -355,8 +411,8 @@ export default function AdminLayout({ children }: Props) {
                                                     <span className="admin-sidebar-icon flex shrink-0 items-center justify-center">
                                                         <Icon className="size-5" aria-hidden="true" />
                                                     </span>
-                                                    <span className="min-w-0 truncate">{label}</span>
-                                                    {label === "Messages" && visibleUnreadMessageCount > 0 && (
+                                                    {!isSidebarCollapsed && <span className="min-w-0 truncate">{label}</span>}
+                                                    {!isSidebarCollapsed && label === "Messages" && visibleUnreadMessageCount > 0 && (
                                                         <span className="ml-auto inline-flex min-w-5 items-center justify-center rounded-full bg-[#842cff] px-1.5 py-0.5 text-[0.65rem] font-bold leading-none text-white">
                                                             {visibleUnreadMessageCount > 99 ? "99+" : visibleUnreadMessageCount}
                                                         </span>
@@ -371,9 +427,9 @@ export default function AdminLayout({ children }: Props) {
                     </nav>
 
                     <nav className="admin-sidebar-nav-legacy content-scroll min-h-0 flex-1 overflow-y-auto pr-1" aria-label="Admin navigation">
-                        <div className="mb-3 flex items-center gap-2 px-3 text-xs font-semibold uppercase tracking-[0.16em] text-white/35 2xl:px-4">
+                        <div className={isSidebarCollapsed ? "mb-3 flex justify-center px-2" : "mb-3 flex items-center gap-2 px-3 text-xs font-semibold uppercase tracking-[0.16em] text-white/35 2xl:px-4"}>
                             <FiShield className="size-4" aria-hidden="true" />
-                            Admin
+                            {!isSidebarCollapsed && "Admin"}
                         </div>
                         <ul className="flex flex-col gap-1">
                             {visibleNavItems.map(({ label, path, icon: Icon }) => (
@@ -382,7 +438,8 @@ export default function AdminLayout({ children }: Props) {
                                         to={path}
                                         className={({ isActive }) =>
                                             [
-                                                "flex h-10 items-center gap-2.5 rounded-lg px-3 text-sm font-medium transition 2xl:h-11 2xl:gap-3 2xl:px-4",
+                                                "flex h-10 items-center rounded-lg text-sm font-medium transition 2xl:h-11",
+                                                isSidebarCollapsed ? "justify-center px-2" : "gap-2.5 px-3 2xl:gap-3 2xl:px-4",
                                                 isActive
                                                     ? "bg-white text-[#070910] shadow-lg shadow-white/10"
                                                     : "text-white/70 hover:bg-white/10 hover:text-white",
@@ -390,8 +447,8 @@ export default function AdminLayout({ children }: Props) {
                                         }
                                     >
                                         <Icon className="size-5 shrink-0" aria-hidden="true" />
-                                        <span className="min-w-0 truncate">{label}</span>
-                                        {label === "Messages" && visibleUnreadMessageCount > 0 && (
+                                        {!isSidebarCollapsed && <span className="min-w-0 truncate">{label}</span>}
+                                        {!isSidebarCollapsed && label === "Messages" && visibleUnreadMessageCount > 0 && (
                                             <span className="ml-auto inline-flex min-w-5 items-center justify-center rounded-full bg-[#842cff] px-1.5 py-0.5 text-[0.65rem] font-bold leading-none text-white">
                                                 {visibleUnreadMessageCount > 99 ? "99+" : visibleUnreadMessageCount}
                                             </span>
@@ -422,25 +479,30 @@ export default function AdminLayout({ children }: Props) {
                         </NavLink>
                     </nav>
 
-                    <nav className="admin-sidebar-account-legacy mt-4 shrink-0 border-t border-white/10 pt-4" aria-label="Admin account navigation">
+                    <nav className={"admin-sidebar-account-legacy mt-4 shrink-0 border-t border-white/10 pt-4"} aria-label="Admin account navigation">
                         <NavLink
                             to="/login"
                             onClick={clearAuthUser}
-                            className="flex h-10 items-center gap-2.5 rounded-lg px-3 text-sm font-medium text-white/70 transition hover:bg-white/10 hover:text-white 2xl:h-11 2xl:gap-3 2xl:px-4"
+                            className={["flex h-10 items-center rounded-lg text-sm font-medium text-white/70 transition hover:bg-white/10 hover:text-white 2xl:h-11", isSidebarCollapsed ? "justify-center px-2" : "gap-2.5 px-3 2xl:gap-3 2xl:px-4"].join(" ")}
                         >
                             <FiLogOut className="size-5 shrink-0" aria-hidden="true" />
-                            <span>Logout</span>
+                            {!isSidebarCollapsed && <span>Logout</span>}
                         </NavLink>
                     </nav>
                 </div>
             </aside>
 
-            <main className="relative flex h-screen flex-col pl-[13.5rem] 2xl:pl-[16rem]">
+            <main className={["relative flex h-screen flex-col transition-[padding] duration-200", isSidebarCollapsed ? "pl-[5rem]" : "pl-[13.5rem] 2xl:pl-[16rem]"].join(" ")}>
                 <header className="theme-header-bg z-20 border-b border-white/10 px-4 py-3 backdrop-blur-xl 2xl:px-6 2xl:py-4">
                     <div className="flex min-h-11 items-center justify-between gap-3 2xl:min-h-12 2xl:gap-4">
-                        <div className="min-w-0">
-                            <p className="text-xs font-medium uppercase tracking-[0.18em] text-white/40">{isPocOperations ? "Operations Workspace" : "Admin Workspace"}</p>
-                            <h1 className="mt-1 truncate text-xl font-semibold text-white">{currentPageTitle}</h1>
+                        <div className="flex min-w-0 items-center gap-3">
+                            <button className="grid size-9 shrink-0 place-items-center rounded-lg border border-white/15 bg-white/[0.06] text-white/75 shadow-sm transition hover:bg-white/10 hover:text-white" type="button" onClick={() => { const next = !isSidebarCollapsed; setIsSidebarCollapsed(next); window.localStorage.setItem("crm:sidebar-collapsed", String(next)); window.dispatchEvent(new Event("crm:sidebar-toggle")); }} aria-label={isSidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"} title={isSidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}>
+                                {isSidebarCollapsed ? <FiChevronRight className="size-4" /> : <FiChevronLeft className="size-4" />}
+                            </button>
+                            <div className="min-w-0">
+                                <p className="text-xs font-medium uppercase tracking-[0.18em] text-white/40">{isPocOperations ? "Operations Workspace" : "Admin Workspace"}</p>
+                                <h1 className="mt-1 truncate text-xl font-semibold text-white">{currentPageTitle}</h1>
+                            </div>
                         </div>
 
                         <div className="flex min-w-0 flex-1 items-center justify-end gap-2 2xl:gap-3">
@@ -537,7 +599,7 @@ export default function AdminLayout({ children }: Props) {
                                                         className="block rounded-lg border border-amber-300/35 bg-amber-300/10 p-3 pr-11 text-left transition hover:bg-amber-300/15"
                                                         to={employeeId ? roleWorkspacePath(`/admin/employees/${employeeId}?tab=leave`, authUser) : roleWorkspacePath("/admin/hr", authUser)}
                                                         onClick={() => {
-                                                            dismissNotification(`leave:${leaveRequest._id}`);
+                                                            dismissNotification(leaveNotificationKey(leaveRequest));
                                                             setIsNotificationsOpen(false);
                                                         }}
                                                     >
@@ -559,7 +621,7 @@ export default function AdminLayout({ children }: Props) {
                                                         className="absolute right-2 top-2 flex size-7 items-center justify-center rounded-md text-white/45 transition hover:bg-white/10 hover:text-white"
                                                         type="button"
                                                         aria-label="Dismiss notification"
-                                                        onClick={() => dismissNotification(`leave:${leaveRequest._id}`)}
+                                                        onClick={() => dismissNotification(leaveNotificationKey(leaveRequest))}
                                                     >
                                                         <FiX className="size-4" aria-hidden="true" />
                                                     </button>
@@ -570,7 +632,7 @@ export default function AdminLayout({ children }: Props) {
                                                 <div key={reminder.id} className="relative mb-2">
                                                 <Link
                                                     className="block rounded-lg border border-cyan-300/35 bg-cyan-300/10 p-3 pr-11 text-left transition hover:bg-cyan-300/15"
-                                                    to={roleWorkspacePath("/admin/evaluations", authUser)}
+                                                    to={roleWorkspacePath(`/admin/employees/${encodeURIComponent(reminder.employeeId)}?tab=evaluations`, authUser)}
                                                     onClick={() => {
                                                         dismissNotification(`evaluation:${reminder.id}`);
                                                         setIsNotificationsOpen(false);
@@ -613,7 +675,7 @@ export default function AdminLayout({ children }: Props) {
                                                         className="block rounded-lg border border-white/10 bg-white/[0.025] p-3 pr-11 text-left transition hover:bg-white/[0.055]"
                                                         to={roleWorkspacePath(`/admin/employees/${employeeId}?tab=notices`, authUser)}
                                                         onClick={() => {
-                                                            dismissNotification(`notice:${notice._id}`);
+                                                            dismissNotification(noticeNotificationKey(notice));
                                                             setIsNotificationsOpen(false);
                                                         }}
                                                     >
@@ -641,7 +703,7 @@ export default function AdminLayout({ children }: Props) {
                                                         className="absolute right-2 top-2 flex size-7 items-center justify-center rounded-md text-white/45 transition hover:bg-white/10 hover:text-white"
                                                         type="button"
                                                         aria-label="Dismiss notification"
-                                                        onClick={() => dismissNotification(`notice:${notice._id}`)}
+                                                        onClick={() => dismissNotification(noticeNotificationKey(notice))}
                                                     >
                                                         <FiX className="size-4" aria-hidden="true" />
                                                     </button>

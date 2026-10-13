@@ -4,8 +4,10 @@ import {
   monthlyWorkingDaysForPayPeriod,
   periodRange,
   payrollRatesForCutoff,
+  payrollAttendanceWithWorkedMinutes,
   resolveCutoffForDate,
   scheduledPayDateForPeriod,
+  workedMinutesInsideShift,
 } from "./payrollController";
 
 function localDateKey(value: Date | null) {
@@ -85,4 +87,40 @@ test("deduction rate is monthly salary divided by full-cycle weekdays, eight hou
   const rates = payrollRatesForCutoff(30_000, "Oct 6, 2026 - Oct 20, 2026");
   const expected = 30_000 / rates.monthlyWorkingDays / 8 / 60;
   assert.ok(Math.abs(rates.minuteRate - expected) < 1e-10);
+});
+
+test("counts work only inside the official shift window", () => {
+  const shiftStart = 10_000;
+  const shiftEnd = shiftStart + 540;
+  assert.equal(workedMinutesInsideShift(shiftStart - 45, shiftEnd, shiftStart, shiftEnd), 540);
+  assert.equal(workedMinutesInsideShift(shiftStart - 45, shiftEnd - 30, shiftStart, shiftEnd), 510);
+  assert.equal(workedMinutesInsideShift(shiftStart + 15, shiftEnd + 60, shiftStart, shiftEnd), 525);
+});
+
+test("a cutoff worked-minute override recalculates total shortage without changing scheduled time", () => {
+  const adjusted = payrollAttendanceWithWorkedMinutes({
+    attendanceDays: 10,
+    absentDays: 0,
+    absentHours: 0,
+    lateDays: 0,
+    lateHours: 0,
+    workingDays: 10,
+    workedHours: 80,
+    overtimeHours: 0,
+    missingHours: 0,
+    scheduledHours: 80,
+    lateMinutes: 0,
+    excessLunchMinutes: 10,
+    excessBreakMinutes: 5,
+    absenceMinutes: 0,
+    earlyTimeOutMinutes: 0,
+    deductibleMinutes: 15,
+    incompleteShiftDays: 0,
+  }, 4_500);
+
+  assert.equal(adjusted.effectiveWorkedMinutes, 4_500);
+  assert.equal(adjusted.workedHours, 75);
+  assert.equal(adjusted.earlyTimeOutMinutes, 300);
+  assert.equal(adjusted.deductibleMinutes, 315);
+  assert.equal(adjusted.scheduledHours, 80);
 });

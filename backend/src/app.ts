@@ -36,6 +36,7 @@ import { tomTomQuotaRouter } from "./routes/tomTomQuotaRoutes";
 import { businessContextMiddleware, createBusiness, getPublicBusinesses, updateBusinessDisplayName } from "./config/tenancy";
 import { publicSurveyRouter } from "./routes/publicSurveyRoutes";
 import { employeeEvaluationRouter } from "./routes/employeeEvaluationRoutes";
+import { businessAccessMiddleware, configuredAdminOnly } from "./middleware/businessAccess";
 
 const appDirectory = path.dirname(fileURLToPath(import.meta.url));
 const backendRootDirectory = path.resolve(appDirectory, "..");
@@ -122,6 +123,7 @@ export function createApp() {
         "X-CRM-User-Type",
         "X-TomTom-Quota-Secret",
       ],
+      exposedHeaders: ["X-Business-Id"],
     })
   );
 
@@ -141,7 +143,7 @@ export function createApp() {
     response.json(await getPublicBusinesses());
   });
 
-  app.post("/api/businesses", async (request, response) => {
+  app.post("/api/businesses", configuredAdminOnly, async (request, response) => {
     const name = String(request.body.name || "").trim();
 
     if (!name) {
@@ -159,7 +161,7 @@ export function createApp() {
     response.status(201).json(business);
   });
 
-  app.patch("/api/businesses/:businessId", async (request, response) => {
+  app.patch("/api/businesses/:businessId", configuredAdminOnly, async (request, response) => {
     const name = String(request.body.name || "").trim();
 
     if (!name) {
@@ -183,6 +185,7 @@ export function createApp() {
   app.use("/api", businessContextMiddleware);
 
   app.use("/api/auth", authRouter);
+  app.use("/api", businessAccessMiddleware);
   app.use("/api/employees", employeeRouter);
   app.use("/api/roles", roleRouter);
   app.use("/api/branches", branchRouter);

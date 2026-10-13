@@ -1,5 +1,6 @@
 import type { Request, Response } from "express";
-import { Tool } from "../models/Tool";
+import { Tool, type ToolDocument } from "../models/Tool";
+import { runForEachBusiness } from "../config/tenancy";
 
 const defaultTools = [
   { name: "Google Workspace", link: "https://workspace.google.com", branches: ["Assistly HQ"] },
@@ -25,7 +26,36 @@ function getToolInput(request: Request) {
 
 export async function listTools(_request: Request, response: Response) {
   await ensureDefaultTools();
-  const tools = await Tool.find({ isArchived: false }).sort({ name: 1 });
+
+  const toolMap = new Map<string, ToolDocument & { _id?: unknown }>();
+
+  await runForEachBusiness(async () => {
+    try {
+      const businessTools = await Tool.find({ isArchived: false }).lean();
+      for (const tool of businessTools) {
+        const key = String(tool.name || "").trim().toLowerCase();
+        if (key && !toolMap.has(key)) {
+          toolMap.set(key, tool);
+        }
+      }
+    } catch {
+      // Continue to next business
+    }
+  });
+
+  if (toolMap.size === 0) {
+    const currentTools = await Tool.find({ isArchived: false }).lean();
+    for (const tool of currentTools) {
+      const key = String(tool.name || "").trim().toLowerCase();
+      if (key && !toolMap.has(key)) {
+        toolMap.set(key, tool);
+      }
+    }
+  }
+
+  const tools = Array.from(toolMap.values()).sort((a, b) =>
+    String(a.name || "").localeCompare(String(b.name || ""), undefined, { sensitivity: "base" })
+  );
   response.json(tools);
 }
 

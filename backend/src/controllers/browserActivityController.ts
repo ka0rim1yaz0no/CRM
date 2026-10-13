@@ -1,4 +1,5 @@
 import type { Request, Response } from "express";
+import { isTrackerOnlyAdminCode } from "../config/adminUsers";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { Employee, normalizeEmployeeAvailabilityStatus } from "../models/Employee";
@@ -393,7 +394,14 @@ export async function listBrowserActivityEvents(request: Request, response: Resp
   const limit = Math.min(Math.max(Number(request.query.limit || 200) || 200, 1), 1000);
   const filter: Record<string, unknown> = {};
 
-  if (employeeId) filter.employee = employeeId;
+  if (isTrackerOnlyAdminCode(String(request.header("x-crm-user-code") || "").trim())) {
+    const internalEmployeeIds = await Employee.find({ team: /^internal$/i, status: { $ne: "Archived" } }).distinct("_id");
+    filter.employee = employeeId && internalEmployeeIds.some((id) => String(id) === employeeId)
+      ? employeeId
+      : { $in: employeeId ? [] : internalEmployeeIds };
+  }
+
+  if (employeeId && !filter.employee) filter.employee = employeeId;
   if (allowedClassifications.has(classification)) filter.classification = classification;
   if (category) filter.category = category;
   if (start || end) {
@@ -416,7 +424,14 @@ export async function listBrowserActivityScreenshots(request: Request, response:
   const limit = Math.min(Math.max(Number(request.query.limit || 100) || 100, 1), 500);
   const filter: Record<string, unknown> = {};
 
-  if (employeeId) filter.employee = employeeId;
+  if (isTrackerOnlyAdminCode(String(request.header("x-crm-user-code") || "").trim())) {
+    const internalEmployeeIds = await Employee.find({ team: /^internal$/i, status: { $ne: "Archived" } }).distinct("_id");
+    filter.employee = employeeId && internalEmployeeIds.some((id) => String(id) === employeeId)
+      ? employeeId
+      : { $in: employeeId ? [] : internalEmployeeIds };
+  }
+
+  if (employeeId && !filter.employee) filter.employee = employeeId;
   if (allowedClassifications.has(classification)) filter.classification = classification;
   if (category) filter.category = category;
   if (start || end) {

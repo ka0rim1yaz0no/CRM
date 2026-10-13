@@ -51,7 +51,7 @@ export async function getCallDashboard(request: Request, response: Response) {
     // business assignment, so filtering devices by businessIds creates a false
     // "Call Bridge disconnected" status despite fresh heartbeats.
     getCallBridgeDeviceModel().find({ employeeCode: { $in: employeeCodes }, ...providerDeviceFilter })
-      .select("employeeCode state audioSessionActive nextivaProcessDetected lastSeenAt lastStateChangedAt")
+      .select("employeeCode state audioSessionActive nextivaProcessDetected lastSeenAt lastStateChangedAt lastIdleAt")
       .lean(),
     getCallBridgeScheduleModel().find({ employeeCode: { $in: employeeCodes } })
       .select("employeeCode callLeaseUntil lastCallEndedAt nextCallAllowedAt lastDialStartedAt dialIntentUntil lastCallStartedAt")

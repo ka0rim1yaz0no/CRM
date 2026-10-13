@@ -22,21 +22,30 @@ function toCredentialStatus(value: unknown): CredentialStatus {
 }
 
 function getCredentialInput(request: Request) {
+  const company = toText(request.body.company);
   return {
     accountName: toText(request.body.accountName),
     username: toText(request.body.username),
     password: toText(request.body.password),
     platform: toText(request.body.platform),
-    company: toText(request.body.company, "General"),
+    // Support specific company/business or shared across all branches
+    company: company && company !== "All companies" ? company : "All branches",
     team: toText(request.body.team, "All teams"),
     status: toCredentialStatus(request.body.status),
   };
 }
 
 export async function listCredentials(_request: Request, response: Response) {
-  const credentials = await withSharedCredentials(() =>
+  const sourceCredentials = await withSharedCredentials(() =>
     Credential.find({ status: { $ne: "Archived" } }).sort({ updatedAt: -1 }).lean()
   );
+  const credentialMap = new Map<string, (typeof sourceCredentials)[number]>();
+  for (const credential of sourceCredentials) {
+    const identity = `${toText(credential.platform).toLowerCase()}|${toText(credential.username).toLowerCase()}`;
+    if (!credentialMap.has(identity)) credentialMap.set(identity, credential);
+  }
+  const credentials = Array.from(credentialMap.values());
+
   response.json(
     credentials.map((credential) => ({
       ...credential,
@@ -59,17 +68,42 @@ export async function createCredential(request: Request, response: Response) {
     return;
   }
 
-  const credential = await withSharedCredentials(() => Credential.create(input));
+  const credential = await withSharedCredentials(async () => {
+    const duplicate = await Credential.findOne({
+      platform: { $regex: `^${input.platform.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, $options: "i" },
+      username: { $regex: `^${input.username.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, $options: "i" },
+      status: { $ne: "Archived" },
+    }).lean();
+    if (duplicate) return null;
+    return Credential.create(input);
+  });
+  if (!credential) {
+    response.status(409).json({ message: "This tool and username already exist in Credentials." });
+    return;
+  }
   response.status(201).json(credential);
 }
 
 export async function updateCredential(request: Request, response: Response) {
-  const credential = await withSharedCredentials(() =>
-    Credential.findByIdAndUpdate(request.params.id, getCredentialInput(request), {
+  const input = getCredentialInput(request);
+  const credential = await withSharedCredentials(async () => {
+    const duplicate = await Credential.findOne({
+      _id: { $ne: request.params.id },
+      platform: { $regex: `^${input.platform.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, $options: "i" },
+      username: { $regex: `^${input.username.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, $options: "i" },
+      status: { $ne: "Archived" },
+    }).lean();
+    if (duplicate) return "duplicate" as const;
+    return Credential.findByIdAndUpdate(request.params.id, input, {
       returnDocument: "after",
       runValidators: true,
-    })
-  );
+    });
+  });
+
+  if (credential === "duplicate") {
+    response.status(409).json({ message: "This tool and username already exist in Credentials." });
+    return;
+  }
 
   if (!credential) {
     response.status(404).json({ message: "Credential not found" });

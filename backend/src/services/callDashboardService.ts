@@ -9,6 +9,7 @@ export type CallDashboardDevice = {
   nextivaProcessDetected: boolean;
   lastSeenAt: Date;
   lastStateChangedAt: Date;
+  lastIdleAt?: Date | null;
 };
 
 export type CallDashboardSchedule = {
@@ -21,6 +22,9 @@ export type CallDashboardSchedule = {
 };
 
 const heartbeatFreshnessMs = 20_000;
+// Windows can leave a Nextiva audio session open after a call ends. A bridge
+// signal that never transitions must not hold the dashboard ON CALL forever.
+const maximumActiveCallSignalMs = 2 * 60 * 60 * 1000;
 
 function zonedDateParts(date: Date, timeZone: string) {
   const parts = new Intl.DateTimeFormat("en-US", {
@@ -125,17 +129,55 @@ export function callDashboardStatus(input: {
     .filter((device) => device.lastSeenAt.getTime() >= now.getTime() - heartbeatFreshnessMs)
     .sort((a, b) => b.lastSeenAt.getTime() - a.lastSeenAt.getTime());
   const latestDevice = [...devices].sort((a, b) => b.lastSeenAt.getTime() - a.lastSeenAt.getTime())[0];
-  const active = fresh.find((device) => device.state === "active");
-  const ready = fresh.find((device) => device.nextivaProcessDetected && device.state !== "unknown");
+  // A previous bridge installation can continue heartbeating from the same
+  // employee. Only the newest session is authoritative; otherwise an older
+  // device can keep ON CALL visible while the current device is idle.
+  const authoritativeDevice = fresh[0];
+  const activeSignalStartedAt = authoritativeDevice
+    ? latestDate(schedule?.lastCallStartedAt, authoritativeDevice.lastStateChangedAt)
+    : null;
+  const hasObservedIdleBaseline = Boolean(
+    authoritativeDevice?.lastIdleAt &&
+    authoritativeDevice.lastIdleAt <= authoritativeDevice.lastStateChangedAt
+  );
+  const hasDialIntent = Boolean(
+    schedule?.lastDialStartedAt &&
+    authoritativeDevice &&
+    schedule.lastDialStartedAt <= authoritativeDevice.lastStateChangedAt
+  );
+  const active = authoritativeDevice?.state === "active" &&
+    authoritativeDevice.audioSessionActive &&
+    (hasObservedIdleBaseline || hasDialIntent) &&
+    activeSignalStartedAt &&
+    now.getTime() - activeSignalStartedAt.getTime() <= maximumActiveCallSignalMs
+    ? authoritativeDevice
+    : undefined;
+  const ready = authoritativeDevice && (input.provider === "ringcentral"
+    ? authoritativeDevice.state !== "unknown"
+    : authoritativeDevice.nextivaProcessDetected && authoritativeDevice.state !== "unknown")
+    ? authoritativeDevice
+    : undefined;
   const lastOnlineAt = latestAttendanceTransition(sortedEvents, ["Time In", "Login", "Break In", "Lunch Break In", "Off the Phone In"]);
   const lastOfflineAt = latestAttendanceTransition(sortedEvents, ["Time Out", "Logout", "Break Out", "Lunch Break Out", "Off the Phone Out"]);
   const onlineAt = lastOnlineAt && (!lastOfflineAt || lastOnlineAt >= lastOfflineAt) ? lastOnlineAt : null;
   const offlineAt = lastOfflineAt && (!lastOnlineAt || lastOfflineAt >= lastOnlineAt) ? lastOfflineAt : null;
 
   if (active) {
+    const activeStartedAt = activeSignalStartedAt;
+    if (!activeStartedAt || activeStartedAt < shift.start) {
+      return {
+        status: "ONLINE" as const,
+        statusStartedAt: withinShift(latestDate(ready?.lastStateChangedAt, onlineAt)),
+        transitionUntil: null,
+        detail: ready ? "Ready to dial" : `${providerName} session needs a fresh call event`,
+      };
+    }
+
     return {
       status: "ON CALL" as const,
-      statusStartedAt: withinShift(schedule?.lastCallStartedAt || active.lastStateChangedAt),
+      // A stale schedule can outlive the current device session. The newest
+      // timestamp is the actual start of the currently active call.
+      statusStartedAt: activeStartedAt,
       transitionUntil: null,
       detail: `${providerName} call active`,
     };

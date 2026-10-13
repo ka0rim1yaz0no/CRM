@@ -2,7 +2,7 @@ import type { FormEvent, KeyboardEvent } from "react";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useLocation, useSearchParams } from "react-router";
-import { FiCheck, FiChevronLeft, FiChevronRight, FiCornerUpLeft, FiDownload, FiEdit2, FiFile, FiHash, FiMessageCircle, FiPaperclip, FiPhone, FiPlus, FiSearch, FiSend, FiSmile, FiTrash2, FiUsers, FiX } from "react-icons/fi";
+import { FiCheck, FiChevronLeft, FiChevronRight, FiCornerUpLeft, FiDownload, FiEdit2, FiFile, FiHash, FiMessageCircle, FiPaperclip, FiPhone, FiPlus, FiSearch, FiSend, FiSmile, FiTrash2, FiUserPlus, FiUsers, FiX } from "react-icons/fi";
 import MainLayout from "../layout";
 import AdminLayout from "../admin/adminLayout";
 import {
@@ -61,7 +61,12 @@ function getInitials(value: string) {
 const acceptedMessageFileTypes = "image/png,image/jpeg,image/webp,image/gif,video/mp4,video/webm,video/ogg,video/quicktime,audio/mpeg,audio/mp4,audio/wav,audio/ogg,audio/webm,application/pdf,text/plain,text/csv,.doc,.docx,.xls,.xlsx";
 const maxMessageAttachmentBytes = 50 * 1024 * 1024;
 const maxMessageAttachments = 6;
-const messageEmojiOptions = ["😀", "😂", "😊", "😍", "😅", "😎", "🤔", "😢", "😮", "😡", "👍", "👎", "👏", "🙏", "🎉", "❤️", "🔥", "✅", "⭐", "💬"];
+const messageEmojiOptions = [
+    "😀", "😃", "😄", "😁", "😂", "🤣", "😊", "😇", "🙂", "🙃", "😉", "😍", "🥰", "😘", "😎",
+    "🤔", "🤗", "😐", "😶", "🙄", "😏", "😢", "😭", "😥", "😓", "😮", "😲", "😱", "😡", "😤",
+    "👍", "👎", "👏", "🙌", "🙏", "🤝", "💪", "🎉", "🎊", "❤️", "🧡", "💛", "💚", "💙", "💜",
+    "🔥", "✨", "✅", "❌", "⭐", "💯", "💬", "💡", "🎯", "☕",
+];
 
 type DraftConversation = {
     type: "direct" | "team";
@@ -89,6 +94,7 @@ function MessageAttachmentView({ attachment, isMine }: { attachment: MessageAtta
         staleTime: Number.POSITIVE_INFINITY,
     });
     const [objectUrl, setObjectUrl] = useState("");
+    const [isImagePreviewOpen, setIsImagePreviewOpen] = useState(false);
 
     useEffect(() => {
         if (!blob) return;
@@ -99,9 +105,54 @@ function MessageAttachmentView({ attachment, isMine }: { attachment: MessageAtta
 
     if (attachment.kind === "image") {
         return objectUrl ? (
-            <a href={objectUrl} target="_blank" rel="noreferrer" className="block overflow-hidden rounded-xl">
-                <img className="max-h-80 w-full object-contain" src={objectUrl} alt={attachment.name} />
-            </a>
+            <>
+                <button
+                    type="button"
+                    className="block overflow-hidden rounded-lg border border-slate-200/70 bg-white"
+                    onClick={() => setIsImagePreviewOpen(true)}
+                    aria-label={`Preview ${attachment.name}`}
+                >
+                    <img className="max-h-80 w-full object-contain" src={objectUrl} alt={attachment.name} />
+                </button>
+                {isImagePreviewOpen && (
+                    <div
+                        className="fixed inset-0 z-[120] flex flex-col bg-slate-950/80 backdrop-blur-sm"
+                        role="dialog"
+                        aria-modal="true"
+                        aria-label={`Preview ${attachment.name}`}
+                        onMouseDown={(event) => {
+                            if (event.target === event.currentTarget) setIsImagePreviewOpen(false);
+                        }}
+                    >
+                        <div className="flex h-16 shrink-0 items-center justify-between gap-4 border-b border-white/10 bg-slate-950/90 px-4 sm:px-6">
+                            <p className="min-w-0 truncate text-sm font-semibold text-white">{attachment.name}</p>
+                            <div className="flex shrink-0 items-center gap-2">
+                                <a
+                                    className="grid size-10 place-items-center rounded-lg border border-white/15 bg-white/10 text-white transition hover:bg-white/15"
+                                    href={objectUrl}
+                                    download={attachment.name}
+                                    aria-label="Download image"
+                                    title="Download"
+                                >
+                                    <FiDownload className="size-4" aria-hidden="true" />
+                                </a>
+                                <button
+                                    className="grid size-10 place-items-center rounded-lg border border-white/15 bg-white/10 text-white transition hover:bg-white/15"
+                                    type="button"
+                                    onClick={() => setIsImagePreviewOpen(false)}
+                                    aria-label="Close image preview"
+                                    title="Close"
+                                >
+                                    <FiX className="size-5" aria-hidden="true" />
+                                </button>
+                            </div>
+                        </div>
+                        <div className="flex min-h-0 flex-1 items-center justify-center overflow-auto bg-slate-200 p-3 sm:p-6" onMouseDown={(event) => { if (event.target === event.currentTarget) setIsImagePreviewOpen(false); }}>
+                            <img className="max-h-full max-w-full rounded-lg bg-white object-contain shadow-2xl" src={objectUrl} alt={attachment.name} />
+                        </div>
+                    </div>
+                )}
+            </>
         ) : <div className="h-32 w-52 animate-pulse rounded-xl bg-slate-200/70" />;
     }
     if (attachment.kind === "video") {
@@ -164,6 +215,7 @@ export default function Messages() {
     const [teamEditor, setTeamEditor] = useState<TeamEditorState | null>(null);
     const [teamMemberSearch, setTeamMemberSearch] = useState("");
     const [teamEditorError, setTeamEditorError] = useState("");
+    const [isTeamMembersOpen, setIsTeamMembersOpen] = useState(false);
     const messagesScrollRef = useRef<HTMLDivElement>(null);
     const messageInputRef = useRef<HTMLTextAreaElement>(null);
     const shouldFollowMessagesRef = useRef(true);
@@ -193,6 +245,9 @@ export default function Messages() {
     const selectedConversation = draftConversation
         ? null
         : visibleConversations.find((conversation) => conversation._id === selectedConversationId) || visibleConversations[0] || null;
+    const selectedTeam = selectedConversation?.type === "team"
+        ? accessibleTeams.find((team) => team._id === selectedConversation.team?._id) || null
+        : null;
     const { data: messages = [] } = useQuery({
         queryKey: ["messages", selectedConversation?._id],
         queryFn: () => getMessages(selectedConversation?._id || ""),
@@ -899,12 +954,38 @@ export default function Messages() {
                                 <p className="mt-1 inline-flex rounded bg-slate-100 px-2 py-0.5 text-[0.65rem] font-semibold text-slate-500">{selectedSubtitle}</p>
                             </div>
                         </div>
-                        {selectedConversation && selectedConversation.type === "direct" && !isAdminRoute && (
+                        {selectedConversation && selectedConversation.type === "team" && (
+                            <div className="flex items-center gap-2">
+                                <button
+                                    className="flex h-9 items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-700 transition hover:border-[#0084ff]/30 hover:bg-[#f2f8ff] hover:text-[#0084ff]"
+                                    type="button"
+                                    onClick={() => setIsTeamMembersOpen(true)}
+                                    title="View team members"
+                                >
+                                    <FiUsers className="size-4" aria-hidden="true" />
+                                    {selectedConversation.participants.length} members
+                                </button>
+                                {isAdminRoute && selectedTeam && (
+                                    <button
+                                        className="flex h-9 items-center gap-2 rounded-lg bg-[#0084ff] px-3 text-xs font-semibold text-white transition hover:bg-[#0073df]"
+                                        type="button"
+                                        onClick={() => openTeamEditor(selectedTeam)}
+                                        title="Add or remove team members"
+                                    >
+                                        <FiUserPlus className="size-4" aria-hidden="true" />
+                                        Add members
+                                    </button>
+                                )}
+                            </div>
+                        )}
+                        {selectedConversation && selectedConversation.type === "direct" && (
                             <button
                                 className="flex h-9 items-center gap-2 rounded-full bg-[#e7f3ff] px-3 text-xs font-semibold text-[#0084ff] transition hover:bg-[#dceeff]"
                                 type="button"
                                 onClick={() => {
-                                    const target = selectedConversation.participants.find((participant) => participant._id !== currentUser._id);
+                                    const target = selectedConversation.includeAdmin && !isAdminRoute
+                                        ? { _id: "admin", name: "Admin", role: "Admin" }
+                                        : selectedConversation.participants.find((participant) => participant._id !== currentUser._id);
                                     if (target) startEmployeeVoiceCall({ _id: target._id, name: target.name, role: target.role });
                                 }}
                             >
@@ -1283,6 +1364,25 @@ export default function Messages() {
                             <button className="h-10 rounded-lg bg-[#0084ff] px-5 text-sm font-semibold text-white transition hover:bg-[#0073df] disabled:cursor-wait disabled:bg-slate-300" type="submit" disabled={saveEmployeeTeamMutation.isPending}>{saveEmployeeTeamMutation.isPending ? "Saving..." : teamEditor.team ? "Save members" : "Create team"}</button>
                         </div>
                     </form>
+                </div>
+            )}
+
+            {isTeamMembersOpen && selectedConversation?.type === "team" && (
+                <div className="fixed inset-0 z-[80] grid place-items-center bg-slate-950/55 p-4 backdrop-blur-sm" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setIsTeamMembersOpen(false); }}>
+                    <section className="w-full max-w-md overflow-hidden rounded-xl border border-slate-200 bg-white shadow-2xl" aria-label="Team members">
+                        <header className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
+                            <div><h3 className="text-lg font-semibold text-slate-950">{selectedTitle}</h3><p className="mt-1 text-sm text-slate-500">{selectedConversation.participants.length} conversation members</p></div>
+                            <button className="grid size-9 place-items-center rounded-lg text-slate-500 hover:bg-slate-100 hover:text-slate-950" type="button" onClick={() => setIsTeamMembersOpen(false)} aria-label="Close member list"><FiX className="size-5" /></button>
+                        </header>
+                        <div className="content-scroll max-h-96 overflow-y-auto p-3">
+                            {selectedConversation.participants.map((participant) => (
+                                <div key={participant._id} className="flex items-center gap-3 rounded-lg px-3 py-2.5 hover:bg-slate-50">
+                                    <span className="grid size-9 shrink-0 place-items-center rounded-lg bg-[#e7f3ff] text-xs font-bold text-[#0084ff]">{getInitials(participant.name)}</span>
+                                    <span className="min-w-0"><span className="block truncate text-sm font-semibold text-slate-950">{participant.name}</span><span className="block truncate text-xs text-slate-500">{participant.role} · {participant.employeeCode}</span></span>
+                                </div>
+                            ))}
+                        </div>
+                    </section>
                 </div>
             )}
         </Layout>

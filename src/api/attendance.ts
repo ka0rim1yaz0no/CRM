@@ -56,6 +56,14 @@ export async function updateEmployeeAttendance(employeeId: string, attendanceId:
     return response.data;
 }
 
+export async function updateEmployeeWorkedMinutes(employeeId: string, timeInRecordId: string, workedMinutes: number) {
+    const response = await api.patch<{ workedMinutes: number; timeOut: string; affectedBusinesses: number }>(
+        `/employees/${employeeId}/attendance/worked-minutes`,
+        { timeInRecordId, workedMinutes }
+    );
+    return response.data;
+}
+
 export async function archiveEmployeeAttendance(employeeId: string, attendanceId: string) {
     const response = await api.patch<AttendanceRecord>(`/employees/${employeeId}/attendance/${attendanceId}/archive`);
     return response.data;

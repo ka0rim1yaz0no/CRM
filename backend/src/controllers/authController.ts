@@ -45,6 +45,7 @@ export async function loginWithEmployeeCode(request: Request, response: Response
     response.json({
       user: { id: "admin", name: configuredAdmin.name, role: "Admin", employeeCode },
       userType: "admin",
+      access: configuredAdmin.access,
       business: responseBusiness(request, publicBusinesses),
       allowedBusinesses: publicBusinesses,
     });

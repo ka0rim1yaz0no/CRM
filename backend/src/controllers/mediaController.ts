@@ -1,6 +1,7 @@
 import type { Request, Response } from "express";
 import { mkdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { Employee } from "../models/Employee";
 import { MediaAsset, type MediaAssetType } from "../models/MediaAsset";
 
 const mediaUploadRoot = path.resolve(process.cwd(), "uploads", "media");
@@ -56,7 +57,7 @@ export async function listMediaAssets(_request: Request, response: Response) {
         url: toText(asset.url),
         mimeType,
         assetType: toAssetType(asset.assetType, mimeType),
-        branch: toText(asset.branch, "All branches"),
+        role: toText(asset.role, "All roles"),
         size: toSize(asset.size),
         isArchived: Boolean(asset.isArchived),
       };
@@ -67,12 +68,20 @@ export async function listMediaAssets(_request: Request, response: Response) {
 export async function uploadMediaAsset(request: Request, response: Response) {
   const dataUrl = String(request.body.dataUrl || "");
   const originalName = String(request.body.fileName || "media").replace(/[^a-zA-Z0-9._-]/g, "-");
-  const branch = toText(request.body.branch);
+  const role = toText(request.body.role);
   const match = dataUrl.match(/^data:(image\/(?:png|jpe?g|webp|gif)|video\/(?:mp4|webm|ogg|quicktime));base64,(.+)$/);
 
-  if (!branch) {
-    response.status(400).json({ message: "branch is required" });
+  if (!role) {
+    response.status(400).json({ message: "role is required" });
     return;
+  }
+
+  if (role !== "All roles") {
+    const roleExists = await Employee.exists({ role, status: { $ne: "Archived" } });
+    if (!roleExists) {
+      response.status(400).json({ message: "Select a role used by an active employee in this business." });
+      return;
+    }
   }
 
   if (!match) {
@@ -106,7 +115,7 @@ export async function uploadMediaAsset(request: Request, response: Response) {
     url: mediaFileUrl(fileName),
     mimeType,
     assetType,
-    branch,
+    role,
     size: bytes.length,
     ...(bytes.length <= maxStoredMediaBytes ? { data: bytes } : {}),
   });

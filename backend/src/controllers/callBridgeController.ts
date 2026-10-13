@@ -10,7 +10,6 @@ import {
   isSupportedAutoCallClientVersion,
   legacyAutoCallClientVersion,
 } from "../config/callProvider";
-import { getBusinessAccessForEmployeeCode } from "../models/BusinessUserAccess";
 import {
   getCallBridgeAttemptModel,
   getCallBridgeDeviceModel,
@@ -33,10 +32,11 @@ import {
   isLeadEligibleForAutoCall,
 } from "../services/leadAutoCallEligibility";
 import { emitCallDashboardUpdated } from "../socket";
+import { resolveCallBridgeBusinessIds, syncCallBridgeBusinessIds } from "../services/callBridgeBusinessService";
 
 const pairingLifetimeMs = 10 * 60 * 1000;
 const heartbeatFreshnessMs = 20 * 1000;
-const callLeaseMs = 90 * 1000;
+const callLeaseMs = 45 * 1000;
 const postCallDelayMs = 30 * 1000;
 const dialIntentMs = 30 * 1000;
 const activeCallIdleConfirmationMs = 8 * 1000;
@@ -157,8 +157,14 @@ async function devicesForEmployee(employeeCode: string) {
   return getCallBridgeDeviceModel().find({ employeeCode, ...providerFilter }).sort({ lastSeenAt: -1 }).lean();
 }
 
+async function emitEmployeeCallDashboardUpdated(employeeCode: string, fallbackBusinessIds: string[] = []) {
+  const businessIds = await syncCallBridgeBusinessIds(employeeCode, fallbackBusinessIds);
+  emitCallDashboardUpdated(businessIds);
+  return businessIds;
+}
+
 function aggregateBridgeStatus(
-  devices: Array<Pick<CallBridgeDeviceDocument, "state" | "lastSeenAt" | "nextivaProcessDetected" | "deviceName" | "bridgeVersion">>,
+  devices: Array<Pick<CallBridgeDeviceDocument, "state" | "audioSessionActive" | "lastSeenAt" | "lastStateChangedAt" | "lastIdleAt" | "nextivaProcessDetected" | "deviceName" | "bridgeVersion">>,
   schedule: { callLeaseUntil?: Date | null; nextCallAllowedAt?: Date | null; lastCallEndedAt?: Date | null } | null,
   now = new Date()
 ) {
@@ -166,9 +172,14 @@ function aggregateBridgeStatus(
   const providerName = provider === "ringcentral" ? "RingCentral" : "Nextiva";
   const freshAfter = new Date(now.getTime() - heartbeatFreshnessMs);
   const freshDevices = devices.filter((device) => new Date(device.lastSeenAt) >= freshAfter);
-  const activeDevice = freshDevices.find((device) => device.state === "active");
   const connectedDevice = freshDevices[0];
-  const nextivaProcessDetected = freshDevices.some((device) => device.nextivaProcessDetected);
+  const activeDevice = connectedDevice?.state === "active" &&
+    connectedDevice.audioSessionActive &&
+    connectedDevice.lastIdleAt &&
+    connectedDevice.lastIdleAt <= connectedDevice.lastStateChangedAt
+    ? connectedDevice
+    : undefined;
+  const nextivaProcessDetected = Boolean(connectedDevice?.nextivaProcessDetected);
   const callLeaseUntil = schedule?.callLeaseUntil ? new Date(schedule.callLeaseUntil) : null;
   const nextCallAllowedAt = schedule?.nextCallAllowedAt ? new Date(schedule.nextCallAllowedAt) : null;
   const leaseActive = Boolean(callLeaseUntil && callLeaseUntil > now);
@@ -226,9 +237,9 @@ export async function createCallBridgePairing(request: Request, response: Respon
   }
 
   const pairingCode = randomPairingCode();
-  const businessAccessIds = await getBusinessAccessForEmployeeCode(employee.employeeCode);
-  const businessIds = Array.from(
-    new Set([request.business?.id, ...businessAccessIds].filter((value): value is string => Boolean(value)))
+  const businessIds = await resolveCallBridgeBusinessIds(
+    employee.employeeCode,
+    [request.business?.id || ""]
   );
   const expiresAt = new Date(Date.now() + pairingLifetimeMs);
   const Pairing = getCallBridgePairingModel();
@@ -346,6 +357,7 @@ export async function claimCallBridgePairing(request: Request, response: Respons
     { upsert: true, setDefaultsOnInsert: true }
   );
 
+  await emitEmployeeCallDashboardUpdated(pairing.employeeCode, pairing.businessIds);
   response.status(201).json({
     token,
     employeeCode: pairing.employeeCode,
@@ -391,7 +403,7 @@ export async function activateCallBridgeForEmployee(request: Request, response: 
     }
 
     const businessId = request.business?.id || "";
-    const businessAccessIds = await getBusinessAccessForEmployeeCode(employeeCode);
+    const businessAccessIds = await resolveCallBridgeBusinessIds(employeeCode, [businessId]);
     if (businessAccessIds.length > 0 && !businessAccessIds.includes(businessId)) {
       response.status(403).json({ message: "This employee cannot use RingCentral for the selected business." });
       return;
@@ -436,7 +448,7 @@ export async function activateCallBridgeForEmployee(request: Request, response: 
   }
 
   const businessId = request.business?.id || "";
-  const businessAccessIds = await getBusinessAccessForEmployeeCode(employeeCode);
+  const businessAccessIds = await resolveCallBridgeBusinessIds(employeeCode, [businessId]);
 
   if (businessAccessIds.length > 0 && !businessAccessIds.includes(businessId)) {
     response.status(403).json({ message: "This employee cannot use Call Bridge for the selected business." });
@@ -545,13 +557,16 @@ export async function activateCallBridgeForEmployee(request: Request, response: 
     ]);
   }
 
+  const previousBusinessIds = [...device.businessIds];
+  const membershipChanged = previousBusinessIds.slice().sort().join("|") !== businessAccessIds.slice().sort().join("|");
   device.browserSessionId = browserSessionId;
   device.browserSessionStartedAt = browserSessionStartedAt;
   device.browserSessionLastSeenAt = now;
+  device.businessIds = businessAccessIds;
   await device.save();
 
-  if (employeeChanged) {
-    emitCallDashboardUpdated(device.businessIds);
+  if (employeeChanged || membershipChanged) {
+    emitCallDashboardUpdated(Array.from(new Set([...previousBusinessIds, ...businessAccessIds])));
   }
 
   response.json({
@@ -580,11 +595,27 @@ export async function updateCallBridgeHeartbeat(request: Request, response: Resp
   }
 
   const now = new Date();
+  const previousBusinessIds = [...device.businessIds];
+  const currentBusinessIds = await resolveCallBridgeBusinessIds(device.employeeCode, device.businessIds);
+  const membershipChanged = previousBusinessIds.slice().sort().join("|") !== currentBusinessIds.slice().sort().join("|");
   const previousState = device.state;
   const previousNextivaProcessDetected = device.nextivaProcessDetected;
   const previousAudioSessionActive = device.audioSessionActive;
   const requestedState = bridgeState(request.body.state);
-  let nextState = requestedState;
+  const requestedAudioSessionActive = Boolean(request.body.audioSessionActive);
+  const hasIdleBaseline = Boolean(device.lastIdleAt);
+  let nextState = requestedState === "active" && !requestedAudioSessionActive
+    ? "idle"
+    : requestedState;
+
+  // A persistent Windows audio session can look active as soon as the bridge
+  // starts. A real manual or automatic call must first have an observed idle
+  // heartbeat on this device.
+  if (nextState === "active" && !hasIdleBaseline) {
+    nextState = "unknown";
+  }
+
+  let confirmedCallEndedAt: Date | null = null;
 
   if (requestedState === "active") {
     device.inactiveSince = null;
@@ -597,6 +628,7 @@ export async function updateCallBridgeHeartbeat(request: Request, response: Resp
     } else if (now.getTime() - inactiveSince.getTime() < activeCallIdleConfirmationMs) {
       nextState = "active";
     } else {
+      confirmedCallEndedAt = inactiveSince;
       device.inactiveSince = null;
     }
   } else {
@@ -605,10 +637,14 @@ export async function updateCallBridgeHeartbeat(request: Request, response: Resp
 
   device.state = nextState;
   device.nextivaProcessDetected = Boolean(request.body.nextivaProcessDetected);
-  device.audioSessionActive = Boolean(request.body.audioSessionActive);
+  device.audioSessionActive = requestedAudioSessionActive && nextState === "active";
+  if (nextState === "idle") {
+    device.lastIdleAt = now;
+  }
   device.bridgeVersion = cleanString(request.body.bridgeVersion, 40);
   device.deviceName = cleanString(request.body.deviceName, 160) || device.deviceName;
   device.lastSeenAt = now;
+  device.businessIds = currentBusinessIds;
 
   if (previousState !== nextState || previousNextivaProcessDetected !== device.nextivaProcessDetected) {
     device.lastStateChangedAt = now;
@@ -630,14 +666,15 @@ export async function updateCallBridgeHeartbeat(request: Request, response: Resp
       },
       { upsert: true, setDefaultsOnInsert: true }
     );
-  } else if (heartbeatControlsCallState && previousState === "active") {
+  } else if (heartbeatControlsCallState && previousState === "active" && nextState !== "active") {
+    const callEndedAt = confirmedCallEndedAt || now;
     await getCallBridgeScheduleModel().findOneAndUpdate(
       { employeeCode: device.employeeCode },
       {
         $set: {
           ...clearedCallReservationFields(),
-          lastCallEndedAt: now,
-          nextCallAllowedAt: new Date(now.getTime() + postCallDelayMs),
+          lastCallEndedAt: callEndedAt,
+          nextCallAllowedAt: new Date(callEndedAt.getTime() + postCallDelayMs),
           lastCallStartedAt: null,
         },
         $setOnInsert: { employeeCode: device.employeeCode },
@@ -646,8 +683,8 @@ export async function updateCallBridgeHeartbeat(request: Request, response: Resp
     );
   }
 
-  if (previousState !== nextState || previousNextivaProcessDetected !== device.nextivaProcessDetected || previousAudioSessionActive !== device.audioSessionActive) {
-    emitCallDashboardUpdated(device.businessIds);
+  if (previousState !== nextState || previousNextivaProcessDetected !== device.nextivaProcessDetected || previousAudioSessionActive !== device.audioSessionActive || membershipChanged) {
+    emitCallDashboardUpdated(Array.from(new Set([...previousBusinessIds, ...currentBusinessIds])));
   }
 
   response.json({ ok: true, serverTime: now });
@@ -665,10 +702,15 @@ export async function getCallBridgeStatus(request: Request, response: Response) 
     devicesForEmployee(employeeCode),
     getCallBridgeScheduleModel().findOne({ employeeCode }).lean(),
   ]);
+  const currentBusinessIds = await syncCallBridgeBusinessIds(
+    employeeCode,
+    devices.flatMap((device) => device.businessIds)
+  );
 
   if (isAutoCallDisabledForEmployee(employeeCode)) {
     response.json({
       employeeCode,
+      businessIds: currentBusinessIds,
       provider: getCallProvider(),
       connected: false,
       ready: false,
@@ -689,6 +731,7 @@ export async function getCallBridgeStatus(request: Request, response: Response) 
     const monitor = getRingCentralMonitorStatus(employeeCode);
     response.json({
       employeeCode,
+      businessIds: currentBusinessIds,
       provider: "ringcentral",
       connected: false,
       ready: false,
@@ -713,6 +756,7 @@ export async function getCallBridgeStatus(request: Request, response: Response) 
 
   response.json({
     employeeCode,
+    businessIds: currentBusinessIds,
     ...aggregateBridgeStatus(devices, schedule),
   });
 }
@@ -813,7 +857,7 @@ export async function reserveCallBridgeCall(request: Request, response: Response
     ? { bridgeVersion: ringCentralProviderVersion }
     : { bridgeVersion: { $ne: ringCentralProviderVersion } };
   const [freshDevices, employee, reservedLead] = await Promise.all([
-    Device.find({ employeeCode, lastSeenAt: { $gte: freshAfter }, ...providerFilter }).lean(),
+    Device.find({ employeeCode, lastSeenAt: { $gte: freshAfter }, ...providerFilter }).sort({ lastSeenAt: -1 }).lean(),
     Employee.findOne({ employeeCode, status: { $ne: "Archived" } })
       .select("name employeeCode aliases role availabilityStatus")
       .lean(),
@@ -862,7 +906,10 @@ export async function reserveCallBridgeCall(request: Request, response: Response
   if (
     freshDevices.length === 0 ||
     !freshDevices.some((device) => device.nextivaProcessDetected) ||
-    freshDevices.some((device) => device.state === "active")
+    (freshDevices[0]?.state === "active" &&
+      freshDevices[0]?.audioSessionActive &&
+      freshDevices[0]?.lastIdleAt &&
+      freshDevices[0].lastIdleAt <= freshDevices[0].lastStateChangedAt)
   ) {
     const schedule = await getCallBridgeScheduleModel().findOne({ employeeCode }).lean();
     response.status(409).json({
@@ -967,7 +1014,7 @@ export async function reserveCallBridgeCall(request: Request, response: Response
     callLeaseUntil: leaseUntil,
     reservationToken,
   });
-  emitCallDashboardUpdated(freshDevices.flatMap((device) => device.businessIds));
+  await emitEmployeeCallDashboardUpdated(employeeCode, freshDevices.flatMap((device) => device.businessIds));
 }
 
 export async function markCallBridgeDialStarted(request: Request, response: Response) {
@@ -1105,7 +1152,7 @@ export async function markCallBridgeDialStarted(request: Request, response: Resp
 
   const devices = await devicesForEmployee(employeeCode);
   response.json({ startedAt: now, dialIntentUntil: schedule.dialIntentUntil });
-  emitCallDashboardUpdated(devices.flatMap((device) => device.businessIds));
+  await emitEmployeeCallDashboardUpdated(employeeCode, devices.flatMap((device) => device.businessIds));
 }
 
 export async function releaseCallBridgeCall(request: Request, response: Response) {
@@ -1137,10 +1184,15 @@ export async function releaseCallBridgeCall(request: Request, response: Response
   const providerFilter = getCallProvider() === "ringcentral"
     ? { bridgeVersion: ringCentralProviderVersion }
     : { bridgeVersion: { $ne: ringCentralProviderVersion } };
-  const freshDevices = await Device.find({ employeeCode, lastSeenAt: { $gte: freshAfter }, ...providerFilter }).lean();
+  const freshDevices = await Device.find({ employeeCode, lastSeenAt: { $gte: freshAfter }, ...providerFilter })
+    .sort({ lastSeenAt: -1 })
+    .lean();
   const schedule = await getCallBridgeScheduleModel().findOne({ employeeCode }).lean();
 
-  if (freshDevices.some((device) => device.state === "active")) {
+  if (freshDevices[0]?.state === "active" &&
+    freshDevices[0]?.audioSessionActive &&
+    freshDevices[0]?.lastIdleAt &&
+    freshDevices[0].lastIdleAt <= freshDevices[0].lastStateChangedAt) {
     response.status(409).json({
       employeeCode,
       ...aggregateBridgeStatus(freshDevices, schedule, now),
@@ -1197,7 +1249,7 @@ export async function releaseCallBridgeCall(request: Request, response: Response
     employeeCode,
     ...aggregateBridgeStatus(freshDevices, releasedSchedule, now),
   });
-  emitCallDashboardUpdated(freshDevices.flatMap((device) => device.businessIds));
+  await emitEmployeeCallDashboardUpdated(employeeCode, freshDevices.flatMap((device) => device.businessIds));
 }
 
 export async function revokeCallBridgeDevices(request: Request, response: Response) {
@@ -1215,7 +1267,8 @@ export async function revokeCallBridgeDevices(request: Request, response: Respon
   ]);
 
   response.json({ message: "Call Bridge devices disconnected.", devicesRemoved: result.deletedCount || 0 });
-  if (request.business?.id) emitCallDashboardUpdated([request.business.id]);
+  const businessIds = await resolveCallBridgeBusinessIds(employeeCode, [request.business?.id || ""]);
+  emitCallDashboardUpdated(businessIds);
 }
 
 export async function downloadCallBridgePackage(_request: Request, response: Response) {

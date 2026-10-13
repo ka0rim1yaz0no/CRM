@@ -16,6 +16,7 @@ import {
   updatePayrollOvertime,
   updatePayrollRecord,
   updateEmployeeBasicPay,
+  updatePayrollWorkedMinutes,
 } from "../controllers/payrollController";
 
 export const payrollRouter = Router();
@@ -26,6 +27,7 @@ payrollRouter.get("/records", listPayrollRecords);
 payrollRouter.post("/records", createPayrollRecord);
 payrollRouter.put("/records/:id", updatePayrollRecord);
 payrollRouter.patch("/records/:id/overtime", updatePayrollOvertime);
+payrollRouter.patch("/records/:id/worked-minutes", updatePayrollWorkedMinutes);
 payrollRouter.patch("/employees/:employeeId/basic-pay", updateEmployeeBasicPay);
 payrollRouter.patch("/records/:id/paid", markPayrollRecordPaid);
 payrollRouter.patch("/records/:id/unpaid", markPayrollRecordUnpaid);

@@ -6,6 +6,7 @@ export type AttendanceSlotSettings = {
     attendanceTimeZone?: string | null;
     officialShiftStartTime?: string | null;
     officialShiftEndTime?: string | null;
+    lateGraceMinutes?: number | null;
 };
 
 export type AttendanceSlotRecord = {
@@ -59,6 +60,25 @@ export function isAttendanceTimeOutUndertime(
     }
 
     return parts.minutes < shiftEndMinutes;
+}
+
+export function isAttendanceTimeInLate(
+    record?: AttendanceSlotRecord | null,
+    settings?: AttendanceSlotSettings | null
+) {
+    if (!record || !isAttendanceTimeInSource(record.source)) return false;
+    const parts = zonedDateParts(record.timeIn, attendanceSlotTimeZone(settings));
+    if (!parts) return false;
+
+    const shiftStartMinutes = minutesFromAttendanceTime(attendanceSlotShiftStart(settings));
+    const shiftEndMinutes = minutesFromAttendanceTime(attendanceSlotShiftEnd(settings));
+    const isOvernightShift = shiftEndMinutes <= shiftStartMinutes;
+    const normalizedMinutes = isOvernightShift && parts.minutes < shiftEndMinutes
+        ? parts.minutes + 1440
+        : parts.minutes;
+    const graceMinutes = Math.max(0, Number(settings?.lateGraceMinutes || 0));
+
+    return normalizedMinutes >= shiftStartMinutes + graceMinutes + 1;
 }
 
 function zonedDateParts(value?: Date | string | null, timeZone = ATTENDANCE_TIME_ZONE) {

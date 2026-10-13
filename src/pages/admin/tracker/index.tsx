@@ -29,6 +29,7 @@ import {
 } from "../../../api/browserActivity";
 import type { BrowserActivityClassification, BrowserActivityEvent, BrowserActivityEventType } from "../../../api/browserActivity";
 import { getEmployeeSummaries } from "../../../api/employees";
+import { getAuthUser } from "../../../api/authStorage";
 import { getSystemSettings } from "../../../api/systemSettings";
 import { backendOrigin } from "../../../lib/backendUrl";
 import { parsePhDateTimeInput, formatPhDateTime } from "../../../lib/dateTime";
@@ -296,6 +297,8 @@ export default function AdminTracker() {
     const liveStreamRef = useRef<MediaStream | null>(null);
     const startIso = startDateTime ? parsePhDateTimeInput(startDateTime)?.toISOString() : undefined;
     const endIso = endDateTime ? parsePhDateTimeInput(endDateTime)?.toISOString() : undefined;
+    const authUser = getAuthUser();
+    const isTrackerOnlyAdmin = authUser?.userType === "admin" && authUser.user.employeeCode === "2132123000";
     const activityParams = {
         employeeId: employeeFilter === "ALL" ? undefined : employeeFilter,
         classification: classificationFilter === "ALL" ? undefined : classificationFilter,
@@ -306,6 +309,9 @@ export default function AdminTracker() {
     };
 
     const { data: employees = [] } = useQuery({ queryKey: ["employee-summaries"], queryFn: getEmployeeSummaries });
+    const employeesForTracker = isTrackerOnlyAdmin
+        ? employees.filter((employee) => String(employee.team || "").trim().toLowerCase() === "internal")
+        : employees;
     const { data: systemSettings } = useQuery({ queryKey: ["system-settings"], queryFn: getSystemSettings });
     const clearDataEnabled = systemSettings?.trackerClearDataEnabled !== false;
     const eventsQuery = useQuery({
@@ -578,7 +584,7 @@ export default function AdminTracker() {
     };
 
     const requestLiveView = () => {
-        const selectedEmployee = employees.find((employee) => employee._id === liveEmployeeId);
+        const selectedEmployee = employeesForTracker.find((employee) => employee._id === liveEmployeeId);
 
         if (!selectedEmployee) {
             setLiveSession({
@@ -753,7 +759,7 @@ export default function AdminTracker() {
                                 aria-label="Filter by employee"
                             >
                                 <option className="bg-white text-slate-900" value="ALL">All employees</option>
-                                {employees.map((employee) => (
+                                {employeesForTracker.map((employee) => (
                                     <option key={employee._id} className="bg-white text-slate-900" value={employee._id}>{employee.name}</option>
                                 ))}
                             </select>
@@ -1010,7 +1016,7 @@ export default function AdminTracker() {
                                                 aria-label="Select employee for live view"
                                             >
                                                 <option className="bg-white text-slate-900" value="">Select employee</option>
-                                                {employees
+                                                {employeesForTracker
                                                     .filter((employee) => employee.status !== "Archived")
                                                     .map((employee) => (
                                                         <option key={employee._id} className="bg-white text-slate-900" value={employee._id}>

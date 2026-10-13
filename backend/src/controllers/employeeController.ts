@@ -10,6 +10,10 @@ import {
 import { getBusinessById, getConfiguredBusinesses, getCurrentBusinessId, runWithBusiness } from "../config/tenancy";
 import { reassignLeadsFromAgent } from "./leadController";
 import { emitCallDashboardUpdated } from "../socket";
+import { syncCallBridgeBusinessIds } from "../services/callBridgeBusinessService";
+import { isTrackerOnlyAdminCode } from "../config/adminUsers";
+import { syncEmployeeCurrentPayrollAcrossBusinesses } from "./payrollController";
+import { syncEmployeeAttendanceAcrossBusinesses } from "../services/employeeAttendanceSyncService";
 
 function toSalary(value: unknown) {
   const salary = Number(value);
@@ -19,7 +23,12 @@ function toSalary(value: unknown) {
 function toProfileImage(value: unknown) {
   const image = String(value || "").trim();
   if (!image) return "";
-  return /^data:image\/(?:png|jpe?g|webp|gif);base64,/i.test(image) ? image : "";
+  const maxDataUrlLength = Math.ceil((2 * 1024 * 1024 * 4) / 3) + 128;
+  return image.length <= maxDataUrlLength && /^data:image\/(?:png|jpe?g|webp|gif);base64,/i.test(image) ? image : "";
+}
+
+function profileImageIsInvalid(value: unknown) {
+  return Boolean(String(value || "").trim()) && !toProfileImage(value);
 }
 
 function toText(value: unknown, fallback = "") {
@@ -54,27 +63,33 @@ function sameNormalizedName(first: unknown, second: unknown) {
   return toText(first).toLowerCase().replace(/\s+/g, " ") === toText(second).toLowerCase().replace(/\s+/g, " ");
 }
 
-async function syncEmployeeNameReferences(employeeId: string, previousName: string, nextName: string) {
+async function syncEmployeeNameReferences(employeeCode: string, businessAccessIds: unknown, previousName: string, nextName: string) {
   if (!previousName || !nextName || sameNormalizedName(previousName, nextName)) {
     return;
   }
 
-  await Promise.all([
-    Lead.updateMany(
-      { $or: [{ assignedAgent: employeeId }, { assignedAgentName: previousName }] },
-      { $set: { assignedAgentName: nextName } }
-    ),
-    Lead.updateMany(
-      { "comments.authorName": previousName },
-      { $set: { "comments.$[comment].authorName": nextName } },
-      { arrayFilters: [{ "comment.authorName": previousName }] }
-    ),
-    Lead.updateMany(
-      { "activity.actorName": previousName, "activity.actorType": "employee" },
-      { $set: { "activity.$[activity].actorName": nextName } },
-      { arrayFilters: [{ "activity.actorName": previousName, "activity.actorType": "employee" }] }
-    ),
-  ]);
+  for (const businessId of validBusinessAccessIds(businessAccessIds)) {
+    await runWithBusiness(businessId, async () => {
+      const employee = await Employee.findOne({ employeeCode }).select("_id").lean();
+      if (!employee) return;
+      await Promise.all([
+        Lead.updateMany(
+          { $or: [{ assignedAgent: employee._id }, { assignedAgentName: previousName }] },
+          { $set: { assignedAgentName: nextName } }
+        ),
+        Lead.updateMany(
+          { "comments.authorName": previousName },
+          { $set: { "comments.$[comment].authorName": nextName } },
+          { arrayFilters: [{ "comment.authorName": previousName }] }
+        ),
+        Lead.updateMany(
+          { "activity.actorName": previousName, "activity.actorType": "employee" },
+          { $set: { "activity.$[activity].actorName": nextName } },
+          { arrayFilters: [{ "activity.actorName": previousName, "activity.actorType": "employee" }] }
+        ),
+      ]);
+    });
+  }
 }
 
 function toEmployeeStatus(value: unknown): EmployeeStatus {
@@ -132,6 +147,30 @@ function withNormalizedAvailability<T extends { availabilityStatus?: unknown }>(
   };
 }
 
+function actorType(request: Request) {
+  return String(request.header("x-crm-user-type") || "").trim().toLowerCase();
+}
+
+function actorCode(request: Request) {
+  return String(request.header("x-crm-user-code") || "").trim();
+}
+
+function employeeCanAccessRecord(request: Request, employeeCode: string) {
+  return actorType(request) !== "employee" || actorCode(request) === String(employeeCode || "").trim();
+}
+
+function respondIfEmployeeCannotAccess(request: Request, response: Response, employeeCode: string) {
+  if (employeeCanAccessRecord(request, employeeCode)) return false;
+  response.status(403).json({ message: "You can only access your own employee profile." });
+  return true;
+}
+
+function respondIfNotAdmin(request: Request, response: Response) {
+  if (actorType(request) === "admin") return false;
+  response.status(403).json({ message: "Administrator access is required." });
+  return true;
+}
+
 const employeeSummaryFields = [
   "name",
   "dateHired",
@@ -153,7 +192,8 @@ async function syncEmployeeBusinessAccess(
   employeeCode: string,
   businessAccessIds: string[],
   employeePayloadForTargets: ReturnType<typeof employeePayload>,
-  previousEmployeeCode = ""
+  previousEmployeeCode = "",
+  sourceProfileImage = ""
 ) {
   const normalizedEmployeeCode = toText(employeeCode);
   const normalizedPreviousEmployeeCode = toText(previousEmployeeCode);
@@ -164,8 +204,12 @@ async function syncEmployeeBusinessAccess(
   }
 
   const configuredBusinessIds = getConfiguredBusinesses().map((business) => business.id);
-  const safeTargetPayload = { ...employeePayloadForTargets } as Record<string, unknown>;
-  delete safeTargetPayload.profileImage;
+  const safeTargetPayload = {
+    ...employeePayloadForTargets,
+    profileImage: Object.prototype.hasOwnProperty.call(employeePayloadForTargets, "profileImage")
+      ? toProfileImage((employeePayloadForTargets as Record<string, unknown>).profileImage)
+      : toProfileImage(sourceProfileImage),
+  } as Record<string, unknown>;
 
   if (normalizedPreviousEmployeeCode && normalizedPreviousEmployeeCode !== normalizedEmployeeCode) {
     await deleteBusinessAccessForEmployeeCode(normalizedPreviousEmployeeCode);
@@ -181,6 +225,7 @@ async function syncEmployeeBusinessAccess(
   }
 
   await setBusinessAccessForEmployeeCode(normalizedEmployeeCode, allowedBusinessIds);
+  await syncCallBridgeBusinessIds(normalizedEmployeeCode, allowedBusinessIds);
 
   const allowedBusinessIdSet = new Set(allowedBusinessIds);
 
@@ -200,7 +245,6 @@ async function syncEmployeeBusinessAccess(
       if (existingEmployee) {
         existingEmployee.set({
           ...safeTargetPayload,
-          profileImage: existingEmployee.profileImage || "",
           businessAccessIds: allowedBusinessIds,
         });
         existingEmployee.businessAccessIds = allowedBusinessIds;
@@ -210,10 +254,33 @@ async function syncEmployeeBusinessAccess(
 
       await Employee.create({
         ...safeTargetPayload,
-        profileImage: "",
         businessAccessIds: allowedBusinessIds,
       });
     });
+  }
+}
+
+async function verifyEmployeeBusinessAccess(employeeCode: string, businessAccessIds: unknown) {
+  const allowedBusinessIds = validBusinessAccessIds(businessAccessIds);
+  const allowedBusinessIdSet = new Set(allowedBusinessIds);
+  const failures: string[] = [];
+
+  for (const business of getConfiguredBusinesses()) {
+    await runWithBusiness(business.id, async () => {
+      const employee = await Employee.findOne({ employeeCode }).select("status businessAccessIds").lean();
+      if (allowedBusinessIdSet.has(business.id)) {
+        const storedAccessIds = normalizeBusinessAccessIds(employee?.businessAccessIds);
+        if (!employee || employee.status === "Archived" || allowedBusinessIds.some((id) => !storedAccessIds.includes(id))) {
+          failures.push(business.id);
+        }
+        return;
+      }
+      if (employee && employee.status !== "Archived") failures.push(business.id);
+    });
+  }
+
+  if (failures.length) {
+    throw new Error(`Employee synchronization verification failed for: ${failures.join(", ")}`);
   }
 }
 
@@ -248,9 +315,16 @@ async function syncSharedEmployeeFields(
 }
 
 export async function listEmployees(request: Request, response: Response) {
-  const isSummary = String(request.query.summary || "").toLowerCase() === "true";
+  const isSummary = actorType(request) === "employee" || String(request.query.summary || "").toLowerCase() === "true";
   const includeArchived = String(request.query.includeArchived || "").toLowerCase() === "true";
-  const employeeQuery = (includeArchived ? Employee.find() : Employee.find({ status: { $ne: "Archived" as EmployeeStatus } })).sort({ createdAt: -1 });
+  const actorCode = String(request.header("x-crm-user-code") || "").trim();
+  const employeeFilter: Record<string, unknown> = includeArchived ? {} : { status: { $ne: "Archived" as EmployeeStatus } };
+
+  if (isTrackerOnlyAdminCode(actorCode)) {
+    employeeFilter.team = /^internal$/i;
+  }
+
+  const employeeQuery = Employee.find(employeeFilter).sort({ createdAt: -1 });
 
   if (isSummary) {
     employeeQuery.select(employeeSummaryFields);
@@ -287,20 +361,58 @@ export async function getEmployee(request: Request, response: Response) {
     return;
   }
 
+  if (!isSummary && respondIfEmployeeCannotAccess(request, response, employee.employeeCode)) return;
+
   response.json(withNormalizedAvailability(employee.toObject()));
 }
 
 export async function createEmployee(request: Request, response: Response) {
+  if (respondIfNotAdmin(request, response)) return;
+  if (profileImageIsInvalid(request.body.profileImage)) {
+    response.status(400).json({ message: "Profile picture must be a JPG, PNG, WebP, or GIF no larger than 2 MB." });
+    return;
+  }
   const payload = employeePayload(request.body);
-  const employee = await Employee.create(payload);
-  await syncEmployeeBusinessAccess(employee.employeeCode, employee.businessAccessIds, payload);
+  const existingByCode = await Employee.findOne({ employeeCode: payload.employeeCode });
+  if (existingByCode && (!sameNormalizedName(existingByCode.name, payload.name) || toText(existingByCode.email).toLowerCase() !== toText(payload.email).toLowerCase())) {
+    response.status(409).json({ message: "That employee code already belongs to another employee." });
+    return;
+  }
+  const existingByEmail = payload.email
+    ? await Employee.findOne({ email: payload.email, employeeCode: { $ne: payload.employeeCode } }).select("_id").lean()
+    : null;
+  if (existingByEmail) {
+    response.status(409).json({ message: "That email address already belongs to another employee." });
+    return;
+  }
+
+  await syncEmployeeBusinessAccess(
+    payload.employeeCode,
+    payload.businessAccessIds,
+    payload,
+    "",
+    toProfileImage((payload as Record<string, unknown>).profileImage)
+  );
+  await verifyEmployeeBusinessAccess(payload.employeeCode, payload.businessAccessIds);
+  await syncEmployeeAttendanceAcrossBusinesses(payload.employeeCode);
+  await syncEmployeeCurrentPayrollAcrossBusinesses(payload.employeeCode, payload.businessAccessIds);
+  const employee = await Employee.findOne({ employeeCode: payload.employeeCode });
+  if (!employee) {
+    response.status(500).json({ message: "Employee synchronization completed without creating the active-business record." });
+    return;
+  }
   emitCallDashboardUpdated(validBusinessAccessIds(employee.businessAccessIds));
 
-  response.status(201).json(withNormalizedAvailability(employee.toObject()));
+  response.status(existingByCode ? 200 : 201).json(withNormalizedAvailability(employee.toObject()));
 }
 
 export async function updateEmployee(request: Request, response: Response) {
+  if (respondIfNotAdmin(request, response)) return;
   const shouldUpdateProfileImage = Object.prototype.hasOwnProperty.call(request.body, "profileImage");
+  if (shouldUpdateProfileImage && profileImageIsInvalid(request.body.profileImage)) {
+    response.status(400).json({ message: "Profile picture must be a JPG, PNG, WebP, or GIF no larger than 2 MB." });
+    return;
+  }
   const existingEmployee = await Employee.findById(request.params.id);
 
   if (!existingEmployee) {
@@ -332,8 +444,11 @@ export async function updateEmployee(request: Request, response: Response) {
     await reassignLeadsFromAgent(String(employee._id));
   }
 
-  await syncEmployeeNameReferences(String(employee._id), previousName, employee.name);
-  await syncEmployeeBusinessAccess(employee.employeeCode, employee.businessAccessIds, payload, previousEmployeeCode);
+  await syncEmployeeBusinessAccess(employee.employeeCode, employee.businessAccessIds, payload, previousEmployeeCode, employee.profileImage);
+  await verifyEmployeeBusinessAccess(employee.employeeCode, employee.businessAccessIds);
+  await syncEmployeeAttendanceAcrossBusinesses(employee.employeeCode);
+  await syncEmployeeCurrentPayrollAcrossBusinesses(employee.employeeCode, employee.businessAccessIds);
+  await syncEmployeeNameReferences(employee.employeeCode, employee.businessAccessIds, previousName, employee.name);
   emitCallDashboardUpdated([
     ...previousBusinessAccessIds,
     ...validBusinessAccessIds(employee.businessAccessIds),
@@ -343,6 +458,18 @@ export async function updateEmployee(request: Request, response: Response) {
 }
 
 export async function updateEmployeeProfile(request: Request, response: Response) {
+  const existingEmployee = await Employee.findById(request.params.id).select("employeeCode").lean();
+  if (!existingEmployee) {
+    response.status(404).json({ message: "Employee not found" });
+    return;
+  }
+  if (respondIfEmployeeCannotAccess(request, response, existingEmployee.employeeCode)) return;
+
+  const profileImageWasProvided = Object.prototype.hasOwnProperty.call(request.body, "profileImage");
+  if (profileImageWasProvided && profileImageIsInvalid(request.body.profileImage)) {
+    response.status(400).json({ message: "Profile picture must be a JPG, PNG, WebP, or GIF no larger than 2 MB." });
+    return;
+  }
   const profilePayload = {
     personalPhone: toText(request.body.personalPhone),
     personalEmail: toText(request.body.personalEmail),
@@ -354,6 +481,7 @@ export async function updateEmployeeProfile(request: Request, response: Response
     bankName: toText(request.body.bankName),
     bankAccountName: toText(request.body.bankAccountName),
     bankAccountNumber: toText(request.body.bankAccountNumber),
+    ...(profileImageWasProvided ? { profileImage: toProfileImage(request.body.profileImage) } : {}),
   };
 
   const employee = await Employee.findByIdAndUpdate(
@@ -376,6 +504,13 @@ export async function updateEmployeeProfile(request: Request, response: Response
 }
 
 export async function updateEmployeeBankDetails(request: Request, response: Response) {
+  const existingEmployee = await Employee.findById(request.params.id).select("employeeCode").lean();
+  if (!existingEmployee) {
+    response.status(404).json({ message: "Employee not found" });
+    return;
+  }
+  if (respondIfEmployeeCannotAccess(request, response, existingEmployee.employeeCode)) return;
+
   const bankPayload = {
     bankName: toText(request.body.bankName),
     bankAccountName: toText(request.body.bankAccountName),
@@ -399,6 +534,7 @@ export async function updateEmployeeBankDetails(request: Request, response: Resp
 }
 
 export async function archiveEmployee(request: Request, response: Response) {
+  if (respondIfNotAdmin(request, response)) return;
   const employee = await Employee.findByIdAndUpdate(
     request.params.id,
     { status: "Archived" },
@@ -410,13 +546,23 @@ export async function archiveEmployee(request: Request, response: Response) {
     return;
   }
 
-  await reassignLeadsFromAgent(String(employee._id));
-  emitCallDashboardUpdated(validBusinessAccessIds(employee.businessAccessIds));
+  const businessIds = validBusinessAccessIds(employee.businessAccessIds);
+  for (const businessId of businessIds) {
+    await runWithBusiness(businessId, async () => {
+      const businessEmployee = await Employee.findOne({ employeeCode: employee.employeeCode });
+      if (!businessEmployee) return;
+      await reassignLeadsFromAgent(String(businessEmployee._id));
+      businessEmployee.status = "Archived";
+      await businessEmployee.save();
+    });
+  }
+  emitCallDashboardUpdated(businessIds);
 
   response.json(withNormalizedAvailability(employee.toObject()));
 }
 
 export async function deleteEmployee(request: Request, response: Response) {
+  if (respondIfNotAdmin(request, response)) return;
   const employee = await Employee.findByIdAndDelete(request.params.id);
 
   if (!employee) {
@@ -424,8 +570,17 @@ export async function deleteEmployee(request: Request, response: Response) {
     return;
   }
 
-  await reassignLeadsFromAgent(String(employee._id));
-  emitCallDashboardUpdated(validBusinessAccessIds(employee.businessAccessIds));
+  const businessIds = validBusinessAccessIds(employee.businessAccessIds);
+  for (const businessId of getConfiguredBusinesses().map((business) => business.id)) {
+    await runWithBusiness(businessId, async () => {
+      const businessEmployee = await Employee.findOne({ employeeCode: employee.employeeCode });
+      if (!businessEmployee) return;
+      await reassignLeadsFromAgent(String(businessEmployee._id));
+      await businessEmployee.deleteOne();
+    });
+  }
+  await deleteBusinessAccessForEmployeeCode(employee.employeeCode);
+  emitCallDashboardUpdated(businessIds);
 
   response.json(withNormalizedAvailability(employee.toObject()));
 }

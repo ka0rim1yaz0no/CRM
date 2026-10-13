@@ -32,6 +32,7 @@ export type CallBridgeDeviceDocument = {
   lastSeenAt: Date;
   lastStateChangedAt: Date;
   inactiveSince?: Date | null;
+  lastIdleAt?: Date | null;
 };
 
 export type CallBridgeScheduleDocument = {
@@ -139,6 +140,7 @@ const deviceSchema = new Schema<CallBridgeDeviceDocument>(
     lastSeenAt: { type: Date, required: true, default: Date.now, index: true },
     lastStateChangedAt: { type: Date, required: true, default: Date.now },
     inactiveSince: { type: Date, default: null },
+    lastIdleAt: { type: Date, default: null },
   },
   { timestamps: true }
 );
