@@ -772,11 +772,37 @@ export default function PayrollPage() {
             const record = payslipPreviewRecord;
             await document.fonts?.ready;
             await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
-            const dataUrl = await toPng(payslipImageRef.current, {
-                backgroundColor: "#ffffff",
-                cacheBust: true,
-                pixelRatio: 2,
+            const payslipElement = payslipImageRef.current.querySelector<HTMLElement>(".payslip-print");
+            if (!payslipElement) throw new Error("The payslip image could not be prepared.");
+
+            const captureElement = payslipElement.cloneNode(true) as HTMLElement;
+            const captureWidth = Math.ceil(payslipElement.getBoundingClientRect().width);
+            Object.assign(captureElement.style, {
+                position: "fixed",
+                left: "-100000px",
+                top: "0",
+                width: `${captureWidth}px`,
+                maxWidth: "none",
+                margin: "0",
+                padding: "0",
+                boxSizing: "border-box",
+                background: "#ffffff",
             });
+            document.body.appendChild(captureElement);
+
+            let dataUrl = "";
+            try {
+                await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+                dataUrl = await toPng(captureElement, {
+                    backgroundColor: "#ffffff",
+                    cacheBust: true,
+                    pixelRatio: 2,
+                    width: captureElement.scrollWidth,
+                    height: captureElement.scrollHeight,
+                });
+            } finally {
+                captureElement.remove();
+            }
             const imageBlob = await (await fetch(dataUrl)).blob();
             const safeEmployee = record.employeeName.replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "") || record.employeeId;
             const safePeriod = record.payPeriod.replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "") || "pay-period";
