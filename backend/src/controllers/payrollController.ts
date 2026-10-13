@@ -407,6 +407,10 @@ export function excessClickedSessionMinutes<TRecord extends { source: string; ti
   return excess;
 }
 
+export function visiblePayrollDtrRows<TRow extends { status: string }>(rows: TRow[]) {
+  return rows.filter((row) => row.status !== "Scheduled");
+}
+
 function allowedSessionMinutes(start: string | null | undefined, end: string | null | undefined, fallback: number) {
   if (!start || !end) return fallback;
   const duration = (minutesFromTime(end) - minutesFromTime(start) + 1440) % 1440;
@@ -1021,7 +1025,7 @@ export async function getPayrollDtr(request: Request, response: Response) {
       deductions,
       netPay: Math.max(grossPay - deductions, 0),
     },
-    rows: dtr.rows,
+    rows: visiblePayrollDtrRows(dtr.rows),
   });
 }
 

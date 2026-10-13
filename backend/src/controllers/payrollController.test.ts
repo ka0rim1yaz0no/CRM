@@ -8,6 +8,7 @@ import {
   payrollAttendanceWithWorkedMinutes,
   resolveCutoffForDate,
   scheduledPayDateForPeriod,
+  visiblePayrollDtrRows,
   workedMinutesInsideShift,
 } from "./payrollController";
 
@@ -40,6 +41,19 @@ test("calculates each clicked break independently instead of using fixed clock t
     attendance("Break Out", 30),
     attendance("Break In", 50),
   ], "Break Out", "Break In", 15), 10);
+});
+
+test("keeps future scheduled dates out of attendance detail rows", () => {
+  const rows = visiblePayrollDtrRows([
+    { status: "Present", date: "Oct 12" },
+    { status: "In Progress", date: "Oct 13" },
+    { status: "Scheduled", date: "Oct 14" },
+  ]);
+
+  assert.deepEqual(rows, [
+    { status: "Present", date: "Oct 12" },
+    { status: "In Progress", date: "Oct 13" },
+  ]);
 });
 
 function localDateKey(value: Date | null) {
