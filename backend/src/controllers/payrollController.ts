@@ -389,12 +389,11 @@ function elapsedMinutes(start?: Date | null, end?: Date | null) {
   return Math.max(0, Math.round((end.getTime() - start.getTime()) / 60000));
 }
 
-function excessSessionMinutes<TRecord extends { source: string; timeIn: Date }>(
+export function excessClickedSessionMinutes<TRecord extends { source: string; timeIn: Date }>(
   records: TRecord[],
   outSource: string,
   inSource: string,
-  allowanceMinutes: number,
-  shiftEnd?: Date | null
+  allowanceMinutes: number
 ) {
   let open: Date | null = null;
   let excess = 0;
@@ -405,8 +404,13 @@ function excessSessionMinutes<TRecord extends { source: string; timeIn: Date }>(
       open = null;
     }
   }
-  if (open && shiftEnd && shiftEnd > open) excess += Math.max(0, elapsedMinutes(open, shiftEnd) - allowanceMinutes);
   return excess;
+}
+
+function allowedSessionMinutes(start: string | null | undefined, end: string | null | undefined, fallback: number) {
+  if (!start || !end) return fallback;
+  const duration = (minutesFromTime(end) - minutesFromTime(start) + 1440) % 1440;
+  return duration > 0 ? duration : fallback;
 }
 
 function formatDtrDate(value: string) {
@@ -607,7 +611,12 @@ function lastRecord<TRecord extends { source: string; timeIn: Date }>(records: T
 async function attendancePayrollDtr(employeeId: Types.ObjectId, payPeriod: string) {
   const settings = await getSystemSettings();
   const { start, end } = periodRange(payPeriod);
-  const officialLunchHours = 1;
+  const allowedLunchMinutes = allowedSessionMinutes(settings.officialLunchBreakStartTime, settings.officialLunchBreakEndTime, 60);
+  const allowedBreakMinutes = Math.min(
+    allowedSessionMinutes(settings.officialFirstBreakStartTime, settings.officialFirstBreakEndTime, 15),
+    allowedSessionMinutes(settings.officialSecondBreakStartTime, settings.officialSecondBreakEndTime, 15)
+  );
+  const officialLunchHours = allowedLunchMinutes / 60;
   const scheduledGrossHours = hoursFromTimeRange(settings.officialShiftStartTime || "23:00", settings.officialShiftEndTime || "08:00") || 9;
   const scheduledDailyHours = Math.max(1, scheduledGrossHours - officialLunchHours);
   const workingDays = countWorkingDays(start, end);
@@ -667,8 +676,8 @@ async function attendancePayrollDtr(employeeId: Types.ObjectId, payPeriod: strin
               : "Scheduled";
     const lateHours = timeIn && !isWeekendSlot ? calculatedLateHours : 0;
     const lateMinutes = Math.round(lateHours * 60);
-    const excessLunchMinutes = isWeekendSlot ? 0 : excessSessionMinutes(dayRecords, "Lunch Break Out", "Lunch Break In", 60, timeOut?.timeIn);
-    const excessBreakMinutes = isWeekendSlot ? 0 : excessSessionMinutes(dayRecords, "Break Out", "Break In", 15, timeOut?.timeIn);
+    const excessLunchMinutes = isWeekendSlot ? 0 : excessClickedSessionMinutes(dayRecords, "Lunch Break Out", "Lunch Break In", allowedLunchMinutes);
+    const excessBreakMinutes = isWeekendSlot ? 0 : excessClickedSessionMinutes(dayRecords, "Break Out", "Break In", allowedBreakMinutes);
     const absenceMinutes = status === "Absent" ? Math.round(scheduledDailyHours * 60) : 0;
     const earlyTimeOutMinutes = !isWeekendSlot && timeIn && timeOut && completedShift
       ? earlyTimeOutMinutesForSlot(timeOut.timeIn, slotKey, settings)

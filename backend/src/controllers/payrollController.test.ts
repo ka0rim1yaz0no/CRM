@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  excessClickedSessionMinutes,
   monthlyWorkingDaysForPayPeriod,
   periodRange,
   payrollRatesForCutoff,
@@ -9,6 +10,37 @@ import {
   scheduledPayDateForPeriod,
   workedMinutesInsideShift,
 } from "./payrollController";
+
+function attendance(source: string, minute: number) {
+  return { source, timeIn: new Date(Date.UTC(2026, 9, 9, 0, minute)) };
+}
+
+test("deducts lunch and break only after their clicked duration exceeds the allowance", () => {
+  assert.equal(excessClickedSessionMinutes([
+    attendance("Lunch Break Out", 0),
+    attendance("Lunch Break In", 60),
+  ], "Lunch Break Out", "Lunch Break In", 60), 0);
+
+  assert.equal(excessClickedSessionMinutes([
+    attendance("Break Out", 0),
+    attendance("Break In", 17),
+  ], "Break Out", "Break In", 15), 2);
+});
+
+test("does not deduct an unfinished lunch or break without an employee click in", () => {
+  assert.equal(excessClickedSessionMinutes([
+    attendance("Break Out", 0),
+  ], "Break Out", "Break In", 15), 0);
+});
+
+test("calculates each clicked break independently instead of using fixed clock times", () => {
+  assert.equal(excessClickedSessionMinutes([
+    attendance("Break Out", 0),
+    attendance("Break In", 20),
+    attendance("Break Out", 30),
+    attendance("Break In", 50),
+  ], "Break Out", "Break In", 15), 10);
+});
 
 function localDateKey(value: Date | null) {
   if (!value) return "";
