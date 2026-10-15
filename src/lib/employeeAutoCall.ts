@@ -85,7 +85,7 @@ export function getEmployeeCommentMarker(comments: EmployeeCommentMarkerInput[] 
 export function isLeadEligibleForAutoCall(
     lead: AutoCallEligibilityLead,
     now = new Date(),
-    employeeNames: string[] = []
+    _employeeNames: string[] = []
 ) {
     if (lead.status !== "NEW" && lead.status !== "Follow up") {
         return false;
@@ -97,15 +97,7 @@ export function isLeadEligibleForAutoCall(
         return false;
     }
 
-    const normalizedEmployeeNames = new Set(
-        employeeNames.map((name) => String(name || "").trim().toLowerCase()).filter(Boolean)
-    );
-    const matchingComments = (lead.comments || []).filter((comment) =>
-        comment.authorType === "employee" && (
-            normalizedEmployeeNames.size === 0 ||
-            normalizedEmployeeNames.has(String(comment.authorName || "").trim().toLowerCase())
-        )
-    );
+    const matchingComments = (lead.comments || []).filter((comment) => comment.authorType === "employee");
     const commentTimes = matchingComments
         .map((comment) => new Date(comment.createdAt || "").getTime())
         .filter(Number.isFinite);

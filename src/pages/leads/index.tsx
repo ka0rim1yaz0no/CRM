@@ -1491,7 +1491,7 @@ export default function Leads() {
         if (selectedLeadShadowAttempt.phase === "classifying") return "Processing automatically";
         if (selectedLeadShadowAttempt.phase === "answered") return "Answered - processing";
         if (selectedLeadShadowAttempt.phase === "ringing") return "Ringing";
-        return "Waiting for RingCentral";
+        return "Waiting for call confirmation";
     }, [selectedLeadShadowAttempt]);
 
     const selectedLeadCallLogs = useMemo(() => {

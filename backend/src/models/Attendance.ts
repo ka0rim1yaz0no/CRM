@@ -1,5 +1,6 @@
 import { Schema, Types } from "mongoose";
 import { tenantModel } from "../config/tenancy";
+import { attendanceV2Enabled } from "../config/rolloutFlags";
 
 export type AttendanceSource =
   | "Login"
@@ -20,6 +21,8 @@ export type AttendanceDocument = {
   source: AttendanceSource;
   attendanceStatus: AttendanceStatus;
   isArchived: boolean;
+  eventId?: string;
+  syncPending?: boolean;
 };
 
 const attendanceSchema = new Schema<AttendanceDocument>(
@@ -44,10 +47,14 @@ const attendanceSchema = new Schema<AttendanceDocument>(
     },
     attendanceStatus: { type: String, enum: ["On time", "Late", "Undertime", ""], default: "" },
     isArchived: { type: Boolean, default: false },
+    eventId: { type: String, default: undefined },
+    syncPending: { type: Boolean, default: undefined },
   },
   { timestamps: true }
 );
 
 attendanceSchema.index({ employee: 1, isArchived: 1, timeIn: -1 });
-
+if (attendanceV2Enabled()) {
+  attendanceSchema.index({ employee: 1, eventId: 1 }, { unique: true, partialFilterExpression: { eventId: { $type: "string" } } });
+}
 export const Attendance = tenantModel<AttendanceDocument>("Attendance", attendanceSchema);

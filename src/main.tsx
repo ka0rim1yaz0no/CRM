@@ -4,6 +4,7 @@ import './index.css'
 import App from './App.tsx'
 import { ToastProvider } from './components/ToastProvider.tsx'
 import { ThemeProvider } from './components/ThemeProvider.tsx'
+import { UpdatePrompt } from './components/UpdatePrompt.tsx'
 
 const queryClient = new QueryClient({
     defaultOptions: {
@@ -28,6 +29,7 @@ createRoot(document.getElementById('root')!).render(
         <ToastProvider>
             <ThemeProvider>
                 <App />
+                <UpdatePrompt />
             </ThemeProvider>
         </ToastProvider>
     </QueryClientProvider>

@@ -2,24 +2,31 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { mergeAttendanceSnapshots } from "./employeeAttendanceSyncService";
 
-test("merges attendance history from multiple businesses without duplicates", () => {
-  const timeIn = new Date("2026-10-07T15:00:00.000Z");
-  const timeOut = new Date("2026-10-08T00:00:00.000Z");
+function record(source: "Time In" | "Break Out", milliseconds: number) {
+  return {
+    source,
+    timeIn: new Date(Date.UTC(2026, 9, 9, 14, 52, 0, milliseconds)),
+    attendanceStatus: "" as const,
+    isArchived: false,
+  };
+}
+
+test("deduplicates the same attendance action copied within five seconds", () => {
   const merged = mergeAttendanceSnapshots([
-    [{ timeIn, source: "Time In", attendanceStatus: "On time", isArchived: false }],
-    [
-      { timeIn, source: "Time In", attendanceStatus: "On time", isArchived: false },
-      { timeIn: timeOut, source: "Time Out", attendanceStatus: "", isArchived: false },
-    ],
+    [record("Time In", 0)],
+    [record("Time In", 472)],
   ]);
 
-  assert.deepEqual(merged.map((record) => record.source), ["Time In", "Time Out"]);
+  assert.equal(merged.length, 1);
+  assert.equal(merged[0].timeIn.toISOString(), "2026-10-09T14:52:00.000Z");
 });
 
-test("does not restore archived attendance records", () => {
+test("keeps distinct attendance actions and actions outside the duplicate window", () => {
   const merged = mergeAttendanceSnapshots([[
-    { timeIn: new Date("2026-10-07T15:00:00.000Z"), source: "Time In", attendanceStatus: "On time", isArchived: true },
+    record("Time In", 0),
+    record("Break Out", 472),
+    record("Time In", 6_000),
   ]]);
 
-  assert.equal(merged.length, 0);
+  assert.equal(merged.length, 3);
 });

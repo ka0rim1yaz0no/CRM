@@ -1,7 +1,5 @@
 import type { ReactNode } from "react";
 import { useEffect, useRef, useState } from "react";
-import { reportEmployeeActivity } from "../../api/attendance";
-import { getAuthUser } from "../../api/authStorage";
 import EmployeeAutoCaller from "../../components/EmployeeAutoCaller";
 import EmployeeLiveShare from "../../components/EmployeeLiveShare";
 import Navbar from "./navbar";
@@ -26,19 +24,6 @@ export default function MainLayout({ children }: Props) {
         const syncSidebar = () => setIsSidebarCollapsed(window.localStorage.getItem("crm:sidebar-collapsed") === "true");
         window.addEventListener("crm:sidebar-toggle", syncSidebar);
         return () => window.removeEventListener("crm:sidebar-toggle", syncSidebar);
-    }, []);
-
-    useEffect(() => {
-        const authUser = getAuthUser();
-        const employeeId = authUser?.userType === "employee" ? authUser.user._id : "";
-
-        if (!employeeId) {
-            return;
-        }
-
-        void reportEmployeeActivity(employeeId, "active", {
-            reason: "automatic-off-phone-disabled",
-        }).catch(() => undefined);
     }, []);
 
     return (

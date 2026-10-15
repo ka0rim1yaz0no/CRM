@@ -4,6 +4,8 @@ import { Attendance, type AttendanceSource } from "../models/Attendance";
 import { Employee, employeeAvailabilityStatuses, normalizeEmployeeAvailabilityStatus, type EmployeeAvailabilityStatus } from "../models/Employee";
 import { EmployeeTransaction } from "../models/EmployeeTransaction";
 import { Lead, type LeadStatus } from "../models/Lead";
+import { timeAccountingV2Enabled } from "../config/rolloutFlags";
+import { accountTime, type TimeBucket } from "../services/timeAccounting";
 
 type AvailabilityStatus = EmployeeAvailabilityStatus;
 
@@ -537,6 +539,25 @@ export async function readAgentProductivityReport(request: Request, response: Re
   rows.forEach((row) => {
     const events = (eventsByEmployee.get(row.employeeId) || []).sort((first, second) => first.occurredAt.getTime() - second.occurredAt.getTime());
     const inRangeEvents = events.filter((event) => event.occurredAt.getTime() >= start.getTime() && event.occurredAt.getTime() <= effectiveEnd.getTime());
+    if (timeAccountingV2Enabled()) {
+      const bucketForStatus = (status: AvailabilityStatus): TimeBucket => {
+        if (status === "BREAK") return "break";
+        if (status === "LUNCH") return "lunch";
+        if (status === "OFF THE PHONE") return "offPhone";
+        return status === "ONLINE" ? "online" : "offline";
+      };
+      const accounted = accountTime(events.map((event) => ({ at: event.occurredAt, bucket: bucketForStatus(event.status) })),
+        start, effectiveEnd, effectiveEnd);
+      row.activeMinutes = accounted.milliseconds.online / 60_000;
+      row.breakMinutes = accounted.milliseconds.break / 60_000;
+      row.lunchMinutes = accounted.milliseconds.lunch / 60_000;
+      row.idleMinutes = accounted.milliseconds.offPhone / 60_000;
+      row.offlineMinutes = accounted.milliseconds.offline / 60_000;
+      row.lastStatusAt = inRangeEvents.at(-1)?.occurredAt || null;
+      row.idleSessions = inRangeEvents.filter((event) => event.status === "OFF THE PHONE").length;
+      row.uniqueLeads = row.leadIds.size;
+      return;
+    }
     let cursor = start.getTime();
     let currentStatus: AvailabilityStatus | null = null;
 

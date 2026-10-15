@@ -8,12 +8,21 @@ import {
   requiredAutoCallClientVersion,
 } from "./callProvider";
 
-test("accepts the current and controlled legacy auto-call browser clients", () => {
-  assert.equal(isSupportedAutoCallClientVersion(requiredAutoCallClientVersion), true);
-  assert.equal(isSupportedAutoCallClientVersion(legacyAutoCallClientVersion), true);
-  assert.equal(isSupportedAutoCallClientVersion("2026-10-02-single-launch-v2"), false);
-  assert.equal(isSupportedAutoCallClientVersion("2026-10-02-single-launch-v1"), false);
-  assert.equal(isSupportedAutoCallClientVersion(undefined), false);
+test("accepts only the current auto-call browser client", () => {
+  const previous = process.env.CRM_CALL_TIMING_V2;
+  try {
+    process.env.CRM_CALL_TIMING_V2 = "true";
+    assert.equal(isSupportedAutoCallClientVersion(requiredAutoCallClientVersion), true);
+    assert.equal(isSupportedAutoCallClientVersion("2026-10-14-comment-lock-v5"), false);
+    process.env.CRM_CALL_TIMING_V2 = "false";
+    assert.equal(isSupportedAutoCallClientVersion("2026-10-14-comment-lock-v5"), true);
+    assert.equal(isSupportedAutoCallClientVersion(requiredAutoCallClientVersion), false);
+    assert.equal(isSupportedAutoCallClientVersion(legacyAutoCallClientVersion), false);
+    assert.equal(isSupportedAutoCallClientVersion(undefined), false);
+  } finally {
+    if (previous === undefined) delete process.env.CRM_CALL_TIMING_V2;
+    else process.env.CRM_CALL_TIMING_V2 = previous;
+  }
 });
 
 test("parses temporary auto-call employee restrictions", () => {

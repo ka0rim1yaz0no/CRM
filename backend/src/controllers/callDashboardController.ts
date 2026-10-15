@@ -6,8 +6,106 @@ import { Employee } from "../models/Employee";
 import { getCallBridgeDeviceModel, getCallBridgeScheduleModel } from "../models/CallBridge";
 import { getSystemSettings } from "./systemSettingsController";
 import { callDashboardStatus, currentAttendanceShift, offPhoneTimeInShift } from "../services/callDashboardService";
+import { callDashboardV2Enabled, timeAccountingV2Enabled } from "../config/rolloutFlags";
+import { accountTime, bucketForAttendanceSource } from "../services/timeAccounting";
+import { verifyAdminDashboardSession } from "../config/adminDashboardSession";
+import { CallBridgeObservation } from "../models/CallBridgeObservation";
+import { groupDashboardSnapshots, type DashboardSnapshot } from "../services/callDashboardAggregation";
+
+async function getCallDashboardForBusiness(request: Request, response: Response) {
+  const admin = verifyAdminDashboardSession(request.header("x-crm-admin-session"));
+  if (!admin) {
+    response.status(403).json({ message: "A valid administrator session is required." });
+    return;
+  }
+  const selectedBusiness = request.business;
+  if (!selectedBusiness) {
+    response.status(400).json({ message: "Select a business to view its call dashboard." });
+    return;
+  }
+  const now = new Date();
+  const settings = await getSystemSettings();
+  const shift = currentAttendanceShift(now, settings.attendanceTimeZone || "Asia/Manila",
+    settings.officialShiftStartTime || "23:00", settings.officialShiftEndTime || "08:00");
+  const employees = await Employee.find({ status: { $ne: "Archived" }, role: /sales/i })
+    .select("name employeeCode role team").lean();
+  const ids = employees.map((employee) => employee._id);
+  const attendance = ids.length ? await Attendance.find({ employee: { $in: ids }, isArchived: { $ne: true },
+    timeIn: { $gte: new Date(shift.start.getTime() - 24 * 60 * 60_000), $lte: now } })
+    .select("employee source timeIn eventId").sort({ timeIn: 1 }).lean() : [];
+  const recordsById = new Map<string, typeof attendance>();
+  for (const event of attendance) {
+    const key = String(event.employee);
+    const list = recordsById.get(key) || [];
+    list.push(event);
+    recordsById.set(key, list);
+  }
+  const snapshots: DashboardSnapshot[] = employees.filter((employee) => employee.employeeCode).map((employee) => ({
+    employee: { _id: String(employee._id), name: employee.name, employeeCode: employee.employeeCode,
+      role: employee.role, team: employee.team },
+    business: { id: selectedBusiness.id, name: selectedBusiness.name },
+    events: (recordsById.get(String(employee._id)) || []).map((event) => ({
+      source: event.source, timeIn: event.timeIn, eventId: event.eventId,
+    })),
+  }));
+  const grouped = groupDashboardSnapshots(snapshots, selectedBusiness.id);
+  const codes = [...grouped.keys()];
+  const [devices, schedules, observations] = await Promise.all([
+    getCallBridgeDeviceModel().find({ employeeCode: { $in: codes }, bridgeVersion: { $ne: "ringcentral-api-v1" } })
+      .select("employeeCode bridgeVersion state audioSessionActive nextivaProcessDetected lastSeenAt lastStateChangedAt lastIdleAt").lean(),
+    getCallBridgeScheduleModel().find({ employeeCode: { $in: codes } })
+      .select("employeeCode callLeaseUntil lastCallEndedAt nextCallAllowedAt lastDialStartedAt dialIntentUntil lastCallStartedAt").lean(),
+    CallBridgeObservation.find({ employeeCode: { $in: codes }, endedAt: { $gte: shift.start, $lte: now } })
+      .select("employeeCode durationMs").lean(),
+  ]);
+  const rows = [...grouped.values()].map((group) => {
+    const code = group.employee.employeeCode;
+    const events = group.events.sort((a, b) => a.timeIn.getTime() - b.timeIn.getTime());
+    const accounted = accountTime(events.flatMap((event) => {
+      const bucket = bucketForAttendanceSource(event.source);
+      return bucket ? [{ at: event.timeIn, bucket }] : [];
+    }), shift.start, shift.end, now);
+    const businessBreakdown = group.businesses.map((business) => ({ ...business,
+      timeBucketsMs: accountTime((group.eventsByBusiness.get(business.id) || []).flatMap((event) => {
+        const bucket = bucketForAttendanceSource(event.source);
+        return bucket ? [{ at: event.timeIn, bucket }] : [];
+      }), shift.start, shift.end, now).milliseconds }));
+    const availabilityStatus = accounted.state === "break" ? "BREAK" : accounted.state === "lunch" ? "LUNCH"
+      : accounted.state === "offPhone" ? "OFF THE PHONE" : accounted.state === "online" ? "ONLINE" : "OFFLINE";
+    const employeeDevices = devices.filter((device) => device.employeeCode === code);
+    const schedule = schedules.find((item) => item.employeeCode === code);
+    const status = callDashboardStatus({ availabilityStatus, devices: employeeDevices, schedule,
+      attendance: events, offPhoneStartedAt: accounted.state === "offPhone" ? accounted.stateSince : null,
+      now, shift, provider: "nextiva" });
+    const latestDevice = [...employeeDevices].sort((a, b) => b.lastSeenAt.getTime() - a.lastSeenAt.getTime())[0];
+    const heartbeatAgeMs = latestDevice ? Math.max(0, now.getTime() - latestDevice.lastSeenAt.getTime()) : null;
+    const employeeCalls = observations.filter((observation) => observation.employeeCode === code);
+    return {
+      employeeId: String(group.employee._id), employeeCode: code, name: group.employee.name || code,
+      businessId: group.businesses[0]?.id || "", businessName: group.businesses[0]?.name || "",
+      businesses: group.businesses, businessBreakdown, role: group.employee.role, team: group.employee.team,
+      ...status, timeBucketsMs: accounted.milliseconds,
+      offPhoneCompletedMs: accounted.milliseconds.offPhone, offPhoneActiveStartedAt: null,
+      offPhoneTotalMs: accounted.milliseconds.offPhone,
+      breakRemainingMs: accounted.remainingBreakMs, lunchRemainingMs: accounted.remainingLunchMs,
+      allowanceOverdue: accounted.overdue, heartbeatAgeMs,
+      callsCount: employeeCalls.length,
+      talkTimeMs: employeeCalls.reduce((sum, observation) => sum + observation.durationMs, 0),
+      bridgeHealth: !latestDevice ? "offline" : heartbeatAgeMs !== null && heartbeatAgeMs <= 20_000
+        ? latestDevice.nextivaProcessDetected ? "fresh" : "nextiva-closed" : "stale",
+    };
+  }).sort((a, b) => a.name.localeCompare(b.name));
+  response.set("Cache-Control", "no-store");
+  response.json({ generatedAt: now, serverTime: now,
+    business: { id: selectedBusiness.id, name: selectedBusiness.name }, shift, employees: rows,
+    totals: { employees: rows.length, onlineMs: rows.reduce((sum, row) => sum + row.timeBucketsMs.online, 0),
+      breakMs: rows.reduce((sum, row) => sum + row.timeBucketsMs.break, 0),
+      lunchMs: rows.reduce((sum, row) => sum + row.timeBucketsMs.lunch, 0),
+      offPhoneMs: rows.reduce((sum, row) => sum + row.timeBucketsMs.offPhone, 0) } });
+}
 
 export async function getCallDashboard(request: Request, response: Response) {
+  if (callDashboardV2Enabled()) return getCallDashboardForBusiness(request, response);
   const actorCode = String(request.header("x-crm-user-code") || "").trim();
   const actorType = String(request.header("x-crm-user-type") || "").trim().toLowerCase();
   if (actorType !== "admin" || !isConfiguredAdminCode(actorCode)) {
@@ -51,7 +149,7 @@ export async function getCallDashboard(request: Request, response: Response) {
     // business assignment, so filtering devices by businessIds creates a false
     // "Call Bridge disconnected" status despite fresh heartbeats.
     getCallBridgeDeviceModel().find({ employeeCode: { $in: employeeCodes }, ...providerDeviceFilter })
-      .select("employeeCode state audioSessionActive nextivaProcessDetected lastSeenAt lastStateChangedAt lastIdleAt")
+      .select("employeeCode bridgeVersion state audioSessionActive nextivaProcessDetected lastSeenAt lastStateChangedAt lastIdleAt")
       .lean(),
     getCallBridgeScheduleModel().find({ employeeCode: { $in: employeeCodes } })
       .select("employeeCode callLeaseUntil lastCallEndedAt nextCallAllowedAt lastDialStartedAt dialIntentUntil lastCallStartedAt")
@@ -90,8 +188,18 @@ export async function getCallDashboard(request: Request, response: Response) {
     const employeeDevices = devices.filter((device) => device.employeeCode === employee.employeeCode);
     const schedule = schedules.find((item) => item.employeeCode === employee.employeeCode);
     const offPhone = offPhoneTimeInShift(employeeAttendance, shift.start, shift.end, now);
+    const accounted = timeAccountingV2Enabled() ? accountTime(
+      employeeAttendance.flatMap((event) => {
+        const bucket = bucketForAttendanceSource(event.source);
+        return bucket ? [{ at: event.timeIn, bucket }] : [];
+      }), shift.start, shift.end, now
+    ) : null;
+    const accountedAvailability = accounted?.state === "break" ? "BREAK"
+      : accounted?.state === "lunch" ? "LUNCH"
+      : accounted?.state === "offPhone" ? "OFF THE PHONE"
+      : accounted?.state === "online" ? "ONLINE" : "OFFLINE";
     const status = callDashboardStatus({
-      availabilityStatus: employee.availabilityStatus,
+      availabilityStatus: callDashboardV2Enabled() && accounted ? accountedAvailability : employee.availabilityStatus,
       devices: employeeDevices,
       schedule,
       attendance: statusAttendance,
@@ -117,6 +225,9 @@ export async function getCallDashboard(request: Request, response: Response) {
       offPhoneCompletedMs: offPhone.completedMs,
       offPhoneActiveStartedAt: offPhone.activeStartedAt,
       offPhoneTotalMs: offPhone.totalMs,
+      ...(accounted ? { timeBucketsMs: accounted.milliseconds, accountingState: accounted.state,
+        breakRemainingMs: accounted.remainingBreakMs, lunchRemainingMs: accounted.remainingLunchMs,
+        allowanceOverdue: accounted.overdue } : {}),
     };
   }).sort((first, second) => first.name.localeCompare(second.name));
 

@@ -45,6 +45,7 @@ export type EmployeeDocument = {
   status: EmployeeStatus;
   availabilityStatus: EmployeeAvailabilityStatus;
   availabilityStatusReason: string;
+  availabilityRevision: number;
   businessAccessIds: string[];
 };
 
@@ -86,6 +87,7 @@ const employeeSchema = new Schema<EmployeeDocument>(
       set: normalizeEmployeeAvailabilityStatus,
     },
     availabilityStatusReason: { type: String, trim: true, default: "" },
+    availabilityRevision: { type: Number, min: 0, default: 0 },
   },
   { timestamps: true }
 );

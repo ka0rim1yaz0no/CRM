@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { isLeadEligibleForAutoCall } from "./leadAutoCallEligibility";
+import { autoCallPhoneCandidates, isLeadEligibleForAutoCall, shouldBlockCommentedPhone } from "./leadAutoCallEligibility";
 
 const now = new Date("2026-10-01T02:00:00.000Z");
 
@@ -8,7 +8,7 @@ test("new leads without employee comments are callable", () => {
   assert.equal(isLeadEligibleForAutoCall({ status: "NEW", comments: [] }, now), true);
 });
 
-test("a current employee comment blocks a lead for a full 24 hours", () => {
+test("an employee comment blocks a lead for a full 24 hours", () => {
   assert.equal(
     isLeadEligibleForAutoCall({
       status: "Follow up",
@@ -78,14 +78,14 @@ test("call age does not change eligibility when the lead has no employee comment
   );
 });
 
-test("a previous assignee comment does not block the current employee", () => {
+test("a previous assignee comment blocks the current employee", () => {
   assert.equal(
     isLeadEligibleForAutoCall({
       status: "Follow up",
       comments: [{ authorType: "employee", authorName: "Previous Agent", createdAt: "2026-10-01T01:59:00.000Z" }],
       followUpAt: null,
     }, now, ["Current Agent", "26001015"]),
-    true
+    false
   );
 });
 
@@ -168,4 +168,35 @@ test("a due follow-up is blocked after the employee comments at the scheduled ti
 test("completed or archived leads are never callable", () => {
   assert.equal(isLeadEligibleForAutoCall({ status: "Completed", comments: [] }, now), false);
   assert.equal(isLeadEligibleForAutoCall({ status: "Archived", comments: [] }, now), false);
+});
+
+test("equivalent formatted phone numbers share an auto-call identity", () => {
+  const international = autoCallPhoneCandidates("+1 (555) 123-4567");
+  const local = autoCallPhoneCandidates("555-123-4567");
+  assert.equal(international.some((candidate) => local.includes(candidate)), true);
+});
+
+test("an old comment on a duplicate phone expires after the cooldown", () => {
+  assert.equal(
+    shouldBlockCommentedPhone([{ createdAt: "2026-09-01T00:00:00.000Z" }], null, now),
+    false
+  );
+});
+
+test("a recent comment blocks every duplicate record for the same phone", () => {
+  assert.equal(
+    shouldBlockCommentedPhone([{ createdAt: "2026-10-01T01:59:30.000Z" }], null, now),
+    true
+  );
+});
+
+test("an invalid historical comment timestamp fails closed", () => {
+  assert.equal(shouldBlockCommentedPhone([{ createdAt: null }], null, now), true);
+});
+
+test("only a later due follow-up unlocks a commented duplicate phone", () => {
+  const comments = [{ createdAt: "2026-10-01T01:00:00.000Z" }];
+  assert.equal(shouldBlockCommentedPhone(comments, "2026-10-01T01:59:00.000Z", now), false);
+  assert.equal(shouldBlockCommentedPhone(comments, "2026-10-01T02:01:00.000Z", now), true);
+  assert.equal(shouldBlockCommentedPhone(comments, "2026-10-01T00:59:00.000Z", now), true);
 });

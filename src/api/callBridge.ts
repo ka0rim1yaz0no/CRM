@@ -6,7 +6,7 @@ export type CallBridgeState = "offline" | "unknown" | "idle" | "calling" | "acti
 
 export type CallBridgeStatus = {
     employeeCode: string;
-    provider: "nextiva" | "ringcentral";
+    provider: "nextiva";
     connected: boolean;
     ready: boolean;
     state: CallBridgeState;
@@ -18,6 +18,8 @@ export type CallBridgeStatus = {
     callLeaseUntil: string | null;
     nextCallAllowedAt: string | null;
     lastCallEndedAt: string | null;
+    serverTime?: string;
+    clientReceivedAt?: number;
 };
 
 export type CallBridgePairing = {
@@ -45,8 +47,10 @@ export type CallBridgeReservation =
         state: "calling";
         callLeaseUntil: string;
         reservationToken: string;
+        attemptId?: string;
+        serverTime?: string;
     }
-    | ({ allowed: false } & CallBridgeStatus);
+    | ({ allowed: false; code?: "LEAD_ALREADY_COMMENTED" | "LEAD_NOT_ASSIGNED" | "LEAD_NOT_FOUND" | "LEAD_NOT_CALLABLE" } & CallBridgeStatus);
 
 export type CallBridgeAttempt = {
     id: string;
@@ -84,7 +88,10 @@ export type LatestCallBridgeAttempt = {
     attempt: CallBridgeAttempt | null;
 };
 
-export const autoCallClientVersion = "2026-10-02-first-lead-lock-v4";
+export const callTimingV2Enabled = import.meta.env.VITE_CRM_CALL_TIMING_V2 === "true" ||
+    (import.meta.env.DEV && import.meta.env.VITE_CRM_CALL_TIMING_V2 !== "false");
+export const autoCallClientVersion = callTimingV2Enabled
+    ? "2026-10-15-call-timing-v6" : "2026-10-14-comment-lock-v5";
 
 const autoCallClientHeaders = {
     "X-CRM-Auto-Call-Version": autoCallClientVersion,
@@ -189,17 +196,6 @@ export async function activateCallBridgeForEmployee(
     employeeCode: string,
     options: { timeoutMs?: number } = {}
 ) {
-    const status = await getCallBridgeStatus(employeeCode, options);
-
-    if (status.provider === "ringcentral") {
-        const response = await api.post<CallBridgeActivation>(
-            "/call-bridge/activate",
-            { employeeCode },
-            { timeout: options.timeoutMs }
-        );
-        return response.data;
-    }
-
     const browserDeviceKey = getStoredBrowserDeviceKey();
 
     if (!browserDeviceKey) {
@@ -231,7 +227,7 @@ export async function getCallBridgeStatus(employeeCode: string, options: { timeo
         params: { employeeCode },
         timeout: options.timeoutMs,
     });
-    return response.data;
+    return { ...response.data, clientReceivedAt: Date.now() };
 }
 
 export async function getLatestCallBridgeAttempt(employeeCode: string, leadId: string) {
@@ -241,17 +237,17 @@ export async function getLatestCallBridgeAttempt(employeeCode: string, leadId: s
     return response.data;
 }
 
-export async function reserveCallBridgeCall(employeeCode: string, options: { timeoutMs?: number; leadId?: string } = {}) {
+export async function reserveCallBridgeCall(employeeCode: string, options: { timeoutMs?: number; leadId?: string; attemptId?: string } = {}) {
     const response = await api.post<CallBridgeReservation>(
         "/call-bridge/reserve",
-        { employeeCode, leadId: options.leadId },
+        { employeeCode, leadId: options.leadId, ...(callTimingV2Enabled ? { attemptId: options.attemptId } : {}) },
         { timeout: options.timeoutMs, headers: autoCallClientHeaders }
     );
     return response.data;
 }
 
 export async function markCallBridgeDialStarted(employeeCode: string, options: { timeoutMs?: number; leadId: string; reservationToken: string }) {
-    const response = await api.post<{ startedAt: string; dialIntentUntil: string }>(
+    const response = await api.post<{ startedAt: string; dialIntentUntil: string; alreadyStarted?: boolean }>(
         "/call-bridge/dial-start",
         { employeeCode, leadId: options.leadId, reservationToken: options.reservationToken },
         { timeout: options.timeoutMs, headers: autoCallClientHeaders }

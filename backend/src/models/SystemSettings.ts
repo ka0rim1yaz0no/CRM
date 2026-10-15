@@ -52,7 +52,7 @@ export type SystemSettingsDocument = {
 const systemSettingsSchema = new Schema<SystemSettingsDocument>(
   {
     key: { type: String, required: true, unique: true, default: "system" },
-    currencyCode: { type: String, enum: ["USD", "PHP", "EUR", "GBP", "JPY"], default: "USD" },
+    currencyCode: { type: String, enum: ["USD", "PHP", "EUR", "GBP", "JPY"], default: "PHP" },
     payrollBillingCycle: { type: String, enum: ["Monthly", "Semi-monthly", "Weekly"], default: "Semi-monthly" },
     payrollRunDay: { type: Number, min: 1, max: 30, default: 15 },
     payrollFirstCutoffStartDay: { type: Number, min: 1, max: 31, default: 6 },

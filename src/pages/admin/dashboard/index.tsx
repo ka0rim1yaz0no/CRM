@@ -8000,7 +8000,7 @@ export default function AdminDashboard() {
                     <KpiCard label="Productivity Today" value={formatNumber(summary?.activityToday)} helper={`${formatNumber(summary?.commentsToday)} employee comments logged`} icon={FiTrendingUp} accent="purple" />
                 </div>
 
-                <CallDashboardPanel businessName={activeBusinessName} />
+                <CallDashboardPanel businessId={activeBusinessId} businessName={activeBusinessName} />
 
                 {isError && (
                     <section className="rounded-lg border border-red-200 bg-red-50 p-4 text-red-700">

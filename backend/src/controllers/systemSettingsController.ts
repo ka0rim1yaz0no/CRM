@@ -24,7 +24,7 @@ export const themeKeys: ThemeKey[] = [
 
 const defaultSystemSettings = {
   key: "system" as const,
-  currencyCode: "USD" as CurrencyCode,
+  currencyCode: "PHP" as CurrencyCode,
   payrollBillingCycle: "Semi-monthly" as PayrollBillingCycle,
   payrollRunDay: 15,
   payrollFirstCutoffStartDay: 6,
@@ -166,7 +166,7 @@ export async function readSystemSettings(_request: Request, response: Response) 
 
 export async function updateSystemSettings(request: Request, response: Response) {
   const existingSettings = await getSystemSettings();
-  const currencyCode = String(request.body.currencyCode || existingSettings.currencyCode || "USD").trim().toUpperCase();
+  const currencyCode = String(request.body.currencyCode || existingSettings.currencyCode || "PHP").trim().toUpperCase();
   const requestedPayrollBillingCycle = String(request.body.payrollBillingCycle || existingSettings.payrollBillingCycle || "Semi-monthly").trim();
   const payrollBillingCycle = requestedPayrollBillingCycle === "Monthly" ? "Semi-monthly" : requestedPayrollBillingCycle;
   const payrollRunDay = Number(request.body.payrollRunDay ?? existingSettings.payrollRunDay ?? 15);

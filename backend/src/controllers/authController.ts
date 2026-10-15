@@ -5,6 +5,9 @@ import { getBusinessById, getCurrentBusinessId, getPublicBusinesses, type Public
 import { syncEmployeeAvailabilityAcrossBusinesses } from "../services/employeeAvailabilityService";
 import { syncActiveAttendanceForBusinessSwitch } from "../services/employeeAttendanceSyncService";
 import { findConfiguredAdmin } from "../config/adminUsers";
+import { attendanceV2Enabled, callDashboardV2Enabled } from "../config/rolloutFlags";
+import { createAdminDashboardSession } from "../config/adminDashboardSession";
+import { syncRecentAttendanceEventsForBusinessSwitch } from "../services/attendanceEventSyncService";
 
 function responseBusiness(request: Request, publicBusinesses: PublicBusinessConfig[]) {
   if (!request.business) {
@@ -46,6 +49,8 @@ export async function loginWithEmployeeCode(request: Request, response: Response
       user: { id: "admin", name: configuredAdmin.name, role: "Admin", employeeCode },
       userType: "admin",
       access: configuredAdmin.access,
+      ...(callDashboardV2Enabled() || attendanceV2Enabled()
+        ? { sessionToken: createAdminDashboardSession(employeeCode) } : {}),
       business: responseBusiness(request, publicBusinesses),
       allowedBusinesses: publicBusinesses,
     });
@@ -154,11 +159,15 @@ export async function switchEmployeeBusiness(request: Request, response: Respons
     currentEmployee.availabilityStatusReason
   );
   try {
-    await syncActiveAttendanceForBusinessSwitch(
-      currentEmployee.employeeCode,
-      currentBusiness.id,
-      targetBusiness.id
-    );
+    if (attendanceV2Enabled()) {
+      await syncRecentAttendanceEventsForBusinessSwitch(currentEmployee.employeeCode, currentBusiness.id);
+    } else {
+      await syncActiveAttendanceForBusinessSwitch(
+        currentEmployee.employeeCode,
+        currentBusiness.id,
+        targetBusiness.id
+      );
+    }
   } catch (error) {
     console.error(`Unable to carry attendance while switching ${currentEmployee.employeeCode} from ${currentBusiness.id} to ${targetBusiness.id}:`, error);
   }

@@ -12,7 +12,7 @@ import { isLeadAutoAssignmentEnabled } from "./systemSettingsController";
 import { formatPhDate } from "../utils/dateTime";
 import { emitLeadChanged } from "../socket";
 import { getCurrentBusinessId, runForEachBusiness } from "../config/tenancy";
-import { AUTO_CALL_COMMENT_COOLDOWN_MS, isLeadEligibleForAutoCall } from "../services/leadAutoCallEligibility";
+import { AUTO_CALL_COMMENT_COOLDOWN_MS, autoCallPhoneCandidates, isLeadEligibleForAutoCall, shouldBlockCommentedPhone } from "../services/leadAutoCallEligibility";
 import { getCallProvider } from "../config/callProvider";
 import { getCallBridgeAttemptModel } from "../models/CallBridge";
 import { getRingCentralMonitorStatus } from "../services/ringCentralCallMonitor";
@@ -1969,30 +1969,19 @@ function createContactedTodayFilter() {
 }
 
 function createAutoCallEligibleFilter(now = new Date(), employeeNames: string[] = []) {
-  const normalizedEmployeeNames = Array.from(
-    new Set(employeeNames.map((name) => normalizeLeadValue(name)).filter(Boolean))
-  );
+  void employeeNames;
   const identityConditions: Record<string, unknown>[] = [{ $eq: ["$$comment.authorType", "employee"] }];
 
-  if (normalizedEmployeeNames.length > 0) {
-    identityConditions.push({
-      $in: [
-        { $toLower: { $trim: { input: { $ifNull: ["$$comment.authorName", ""] } } } },
-        normalizedEmployeeNames,
-      ],
-    });
-  }
-
-  const matchingCommentCount = (dateCondition: Record<string, unknown>) => ({
+  const matchingCommentCount = (dateCondition?: Record<string, unknown>) => ({
     $size: {
       $filter: {
         input: { $ifNull: ["$comments", []] },
         as: "comment",
-        cond: { $and: [...identityConditions, dateCondition] },
+        cond: dateCondition ? { $and: [...identityConditions, dateCondition] } : { $and: identityConditions },
       },
     },
   });
-  const recentCommentCount = matchingCommentCount({
+  const recentEmployeeCommentCount = matchingCommentCount({
     $gt: ["$$comment.createdAt", new Date(now.getTime() - AUTO_CALL_COMMENT_COOLDOWN_MS)],
   });
   const commentSinceFollowUpCount = matchingCommentCount({
@@ -2009,7 +1998,7 @@ function createAutoCallEligibleFilter(now = new Date(), employeeNames: string[] 
         },
         {
           $or: [
-            { $eq: [recentCommentCount, 0] },
+            { $eq: [recentEmployeeCommentCount, 0] },
             {
               $and: [
                 { $eq: ["$status", "Follow up"] },
@@ -2023,6 +2012,37 @@ function createAutoCallEligibleFilter(now = new Date(), employeeNames: string[] 
       ],
     },
   };
+}
+
+async function excludeCommentedPhoneCandidates<T extends { phone?: string; followUpAt?: Date | string | null }>(
+  candidates: T[],
+  now = new Date()
+) {
+  const phoneFilters = candidates
+    .flatMap((lead) => flexiblePhoneRegexes(String(lead.phone || "")))
+    .filter((regex, index, all) => all.findIndex((item) => item.source === regex.source && item.flags === regex.flags) === index)
+    .map((phone) => ({ phone }));
+
+  if (phoneFilters.length === 0) return candidates;
+
+  const commentedLeads = await Lead.find({
+    $or: phoneFilters,
+    comments: { $elemMatch: { authorType: "employee" } },
+  }).select("phone comments.authorType comments.createdAt").lean();
+  const commentsByPhone = new Map<string, Array<{ createdAt?: Date | string | null }>>();
+
+  for (const commentedLead of commentedLeads) {
+    const employeeComments = (commentedLead.comments || []).filter((comment) => comment.authorType === "employee");
+    for (const phoneKey of autoCallPhoneCandidates(commentedLead.phone)) {
+      commentsByPhone.set(phoneKey, [...(commentsByPhone.get(phoneKey) || []), ...employeeComments]);
+    }
+  }
+
+  return candidates.filter((lead) => {
+    const matchingComments = autoCallPhoneCandidates(lead.phone)
+      .flatMap((phoneKey) => commentsByPhone.get(phoneKey) || []);
+    return !shouldBlockCommentedPhone(matchingComments, lead.followUpAt, now);
+  });
 }
 
 function createHiddenFromEmployeeQueueTodayFilter() {
@@ -2660,8 +2680,11 @@ export async function listMyLeads(request: Request, response: Response) {
       .slice("activity", 20)
       .sort({ createdAt: -1, _id: 1 })
       .lean();
+    const queueCandidates = autoCallEligible
+      ? await excludeCommentedPhoneCandidates(candidates, new Date())
+      : candidates;
     const sortedCandidates = sortLeadsForAgentWorkQueue(
-      dedupeLeads(candidates as unknown as PopulatedLead[]),
+      dedupeLeads(queueCandidates as unknown as PopulatedLead[]),
       employeeNames,
     );
     const effectiveTotal = sortedCandidates.length;

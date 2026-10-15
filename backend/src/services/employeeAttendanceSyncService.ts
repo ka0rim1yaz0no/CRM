@@ -8,29 +8,36 @@ type AttendanceSnapshot = {
   source: AttendanceSource;
   attendanceStatus: AttendanceStatus;
   isArchived: boolean;
+  eventId?: string;
 };
+
+const duplicateWindowMs = 5_000;
 
 function attendanceRecordKey(record: Pick<AttendanceSnapshot, "timeIn" | "source">) {
   return `${new Date(record.timeIn).toISOString()}|${record.source}`;
 }
 
 export function mergeAttendanceSnapshots(recordGroups: AttendanceSnapshot[][]) {
-  const recordsByKey = new Map<string, AttendanceSnapshot>();
+  const mergedRecords: AttendanceSnapshot[] = [];
+  const sortedRecords = recordGroups
+    .flat()
+    .filter((record) => !record.isArchived)
+    .sort((left, right) => left.timeIn.getTime() - right.timeIn.getTime());
 
-  recordGroups.flat().forEach((record) => {
-    if (record.isArchived) return;
-    const key = attendanceRecordKey(record);
-    if (recordsByKey.has(key)) return;
-    recordsByKey.set(key, {
+  sortedRecords.forEach((record) => {
+    const isDuplicate = mergedRecords.some((candidate) =>
+      candidate.source === record.source &&
+      Math.abs(candidate.timeIn.getTime() - record.timeIn.getTime()) <= duplicateWindowMs
+    );
+    if (isDuplicate) return;
+    mergedRecords.push({
       ...record,
       timeIn: new Date(record.timeIn),
       isArchived: false,
     });
   });
 
-  return Array.from(recordsByKey.values()).sort(
-    (left, right) => left.timeIn.getTime() - right.timeIn.getTime()
-  );
+  return mergedRecords;
 }
 
 async function readAttendanceHistory(employeeCode: string, businessId: string) {
@@ -87,7 +94,29 @@ async function writeAttendanceHistory(employeeCode: string, businessId: string, 
       }))
     );
 
-    return result.upsertedCount;
+    const canonicalKeys = new Set(records.map(attendanceRecordKey));
+    const currentRecords = await Attendance.find({
+      employee: employee._id,
+      isArchived: { $ne: true },
+    }).select("_id timeIn source").sort({ timeIn: 1, _id: 1 }).lean();
+    const retainedKeys = new Set<string>();
+    const duplicateIds = currentRecords.flatMap((record) => {
+      const key = attendanceRecordKey(record as AttendanceSnapshot);
+      if (canonicalKeys.has(key) && !retainedKeys.has(key)) {
+        retainedKeys.add(key);
+        return [];
+      }
+      return [record._id];
+    });
+
+    if (duplicateIds.length > 0) {
+      await Attendance.updateMany(
+        { _id: { $in: duplicateIds } },
+        { $set: { isArchived: true } }
+      );
+    }
+
+    return result.upsertedCount + duplicateIds.length;
   });
 }
 
@@ -138,18 +167,45 @@ export async function syncEmployeesAttendanceAcrossBusinesses(employeeCodes: str
   let copiedCount = 0;
 
   for (let index = 0; index < pendingCodes.length; index += Math.max(1, concurrency)) {
-    const counts = await Promise.all(
+    const results = await Promise.allSettled(
       pendingCodes.slice(index, index + Math.max(1, concurrency)).map(syncEmployeeAttendanceAcrossBusinesses)
     );
-    copiedCount += counts.reduce((total, count) => total + count, 0);
+    copiedCount += results.reduce(
+      (total, result) => total + (result.status === "fulfilled" ? result.value : 0),
+      0
+    );
+    results.forEach((result, offset) => {
+      if (result.status === "rejected") {
+        console.error("Attendance reconciliation failed", {
+          employeeCode: pendingCodes[index + offset],
+          error: result.reason,
+        });
+      }
+    });
   }
 
   return copiedCount;
 }
 
+export async function reconcileAllEmployeeAttendance() {
+  const employeeCodes = new Set<string>();
+  for (const business of getConfiguredBusinesses()) {
+    const businessCodes = await runWithBusiness(business.id, () =>
+      Employee.find({ status: { $ne: "Archived" } }).distinct("employeeCode")
+    );
+    businessCodes.forEach((employeeCode) => {
+      const normalizedCode = String(employeeCode || "").trim();
+      if (normalizedCode) employeeCodes.add(normalizedCode);
+    });
+  }
+
+  const repairedRecords = await syncEmployeesAttendanceAcrossBusinesses(Array.from(employeeCodes));
+  return { employees: employeeCodes.size, repairedRecords };
+}
+
 export async function updateAttendanceAcrossBusinesses(
   employeeCode: string,
-  previous: Pick<AttendanceSnapshot, "timeIn" | "source">,
+  previous: Pick<AttendanceSnapshot, "timeIn" | "source" | "eventId">,
   updated: AttendanceSnapshot,
 ) {
   const normalizedEmployeeCode = String(employeeCode || "").trim();
@@ -167,8 +223,7 @@ export async function updateAttendanceAcrossBusinesses(
 
       const matchingRecord = await Attendance.findOne({
         employee: employee._id,
-        timeIn: previous.timeIn,
-        source: previous.source,
+        ...(previous.eventId ? { eventId: previous.eventId } : { timeIn: previous.timeIn, source: previous.source }),
       });
 
       if (matchingRecord) {
@@ -187,6 +242,7 @@ export async function updateAttendanceAcrossBusinesses(
           {
             $setOnInsert: {
               employee: employee._id,
+              ...(previous.eventId ? { eventId: previous.eventId } : {}),
               timeIn: updated.timeIn,
               source: updated.source,
               attendanceStatus: updated.attendanceStatus,

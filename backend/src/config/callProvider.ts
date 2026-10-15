@@ -1,17 +1,18 @@
+import { callTimingV2Enabled } from "./rolloutFlags";
+
+// Historical RingCentral attempt records remain readable; live calls use Nextiva.
 export type CallProvider = "nextiva" | "ringcentral";
 export const autoCallDisabledReason = "Auto-call is temporarily disabled by an administrator.";
-export const requiredAutoCallClientVersion = "2026-10-02-first-lead-lock-v4";
+export const requiredAutoCallClientVersion = "2026-10-15-call-timing-v6";
 export const legacyAutoCallClientVersion = "2026-10-02-provider-audit-v3";
-const compatibleAutoCallClientVersions = new Set([requiredAutoCallClientVersion, legacyAutoCallClientVersion]);
+const previousAutoCallClientVersion = "2026-10-14-comment-lock-v5";
 
 export function isSupportedAutoCallClientVersion(value: unknown) {
-  return compatibleAutoCallClientVersions.has(String(value || "").trim());
+  return String(value || "").trim() ===
+    (callTimingV2Enabled() ? requiredAutoCallClientVersion : previousAutoCallClientVersion);
 }
-
 export function getCallProvider(): CallProvider {
-  return String(process.env.CALL_PROVIDER || "ringcentral").trim().toLowerCase() === "nextiva"
-    ? "nextiva"
-    : "ringcentral";
+  return "nextiva";
 }
 
 export function parseAutoCallDisabledEmployeeCodes(rawValue: string) {
@@ -33,19 +34,4 @@ export function isAutoCallDisabledForEmployee(employeeCode: unknown) {
     normalizedCode &&
     (disabledEmployeeCodes.has("*") || disabledEmployeeCodes.has(normalizedCode))
   );
-}
-
-export function getRingCentralConfig() {
-  const server = String(process.env.RINGCENTRAL_SERVER_URL || "https://platform.ringcentral.com").trim();
-  const clientId = String(process.env.RINGCENTRAL_CLIENT_ID || "").trim();
-  const clientSecret = String(process.env.RINGCENTRAL_CLIENT_SECRET || "").trim();
-  const jwt = String(process.env.RINGCENTRAL_JWT || "").trim();
-
-  return {
-    server,
-    clientId,
-    clientSecret,
-    jwt,
-    configured: Boolean(server && clientId && clientSecret && jwt),
-  };
 }

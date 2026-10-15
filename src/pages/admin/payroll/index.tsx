@@ -409,7 +409,7 @@ function PayslipDocument({
                     <div>
                         <p className="text-[0.62rem] font-semibold uppercase tracking-[0.24em] text-[#ddd6fe]">Assistly Payroll</p>
                         <h1 className="mt-2 text-2xl font-bold tracking-tight text-[#ffffff]">Payslip</h1>
-                        <p className="mt-2 max-w-[18rem] text-[0.68rem] leading-5 text-[#e5e7eb]">P2 33 Purok 5 Bakakeng Norte, Baguio City Philippines</p>
+                        <p className="mt-2 max-w-[28rem] text-[0.68rem] leading-5 text-[#e5e7eb]">3rd FL Our Lady of Lourdes Bldg. 7 Harrison Rd, Carantes St, Claudio, Baguio, Benguet</p>
                     </div>
                     <div className="min-w-[11rem] rounded-lg border border-white/15 bg-white/10 p-4 text-right">
                         <p className="text-[0.62rem] font-semibold uppercase tracking-[0.18em] text-[#cbd5e1]">Net Pay</p>
@@ -799,7 +799,7 @@ export default function PayrollPage() {
         onSuccess: () => setPayslipDeliveryStatus("Payslip image sent in CRM Messages."),
         onError: (error: { response?: { data?: { message?: string } }; message?: string }) => setPayslipDeliveryStatus(error.response?.data?.message || error.message || "Unable to send the payslip."),
     });
-    const money = (value = 0) => formatCurrency(value, systemSettings?.currencyCode || "USD");
+    const money = (value = 0) => formatCurrency(value, systemSettings?.currencyCode || "PHP");
     const itemLabels = itemCategory ? payrollItemFieldLabels(itemCategory) : null;
 
     const totalPages = Math.max(Math.ceil(employees.length / pageSize), 1);

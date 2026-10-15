@@ -473,6 +473,8 @@ import {
     isAttendanceTimeOutUndertime,
 } from "../../lib/attendanceSlots";
 import { buildOffPhoneAttendanceSessions, formatAttendanceDuration } from "../../lib/attendanceRecords";
+const timeAccountingV2 = import.meta.env.VITE_CRM_TIME_ACCOUNTING_V2 === "true" ||
+    (import.meta.env.DEV && import.meta.env.VITE_CRM_TIME_ACCOUNTING_V2 !== "false");
 import { formatDateInTimeZone, formatTimeInTimeZone } from "../../lib/dateTime";
 import MainLayout from "../layout";
 
@@ -591,8 +593,6 @@ export default function AttendancePage() {
     });
 
     const currentEmployee = employeeProfile || employee;
-    const employeeAvailabilityStatus = normalizeEmployeeAvailabilityStatus(currentEmployee?.availabilityStatus);
-
     const attendanceSettings = useMemo(() => ({ ...systemSettings, attendanceTimeZone: ATTENDANCE_TIME_ZONE }), [systemSettings]);
     const attendanceTimeZone = attendanceSlotTimeZone(attendanceSettings);
     const recordsBySlot = useMemo(() => groupAttendanceRecordsBySlot(attendance, attendanceSettings), [attendance, attendanceSettings]);
@@ -640,10 +640,10 @@ export default function AttendancePage() {
                     : latestActionSource === "Logout" || latestActionSource === "Time Out"
                         ? "OFFLINE"
                         : "ONLINE";
+    // Attendance buttons follow the employee's manual record sequence. A stale
+    // replicated availability value must never disable or change an action.
     const currentStatus: EmployeeAvailabilityStatus = hasOpenAttendanceSlot
-        ? employeeAvailabilityStatus === "OFF THE PHONE"
-            ? "OFF THE PHONE"
-            : latestActionStatus
+        ? latestActionStatus
         : "OFFLINE";
     const isOnBreak = currentStatus === "BREAK" || latestActionSource === "Break Out";
     const isOnLunchBreak = currentStatus === "LUNCH" || latestActionSource === "Lunch Break Out";
@@ -724,12 +724,16 @@ export default function AttendancePage() {
         refreshAttendanceState();
         setMessage(attendanceRequestError(error, fallback));
     };
+    const savedAttendanceMessage = (record: AttendanceRecord, status: string) =>
+        record.syncPending
+            ? `${status} saved here. Sync to another business is pending and will retry.`
+            : `Status changed to ${status}.`;
 
     const timeInMutation = useMutation({
         mutationFn: () => timeInEmployee(employeeId),
         onSuccess: (record) => {
             updateAttendanceCache(record, "ONLINE");
-            setMessage("Status changed to ONLINE.");
+            setMessage(savedAttendanceMessage(record, "ONLINE"));
         },
         onError: (error) => handleAttendanceError(error, "Unable to change status to ONLINE. Please try again."),
     });
@@ -740,7 +744,7 @@ export default function AttendancePage() {
             updateAttendanceCache(record, "OFFLINE");
             queryClient.invalidateQueries({ queryKey: attendanceQueryKey(employeeId) });
             setShowOfflineConfirm(false);
-            setMessage("Status changed to OFFLINE.");
+            setMessage(savedAttendanceMessage(record, "OFFLINE"));
         },
         onError: (error) => {
             setShowOfflineConfirm(false);
@@ -752,7 +756,7 @@ export default function AttendancePage() {
         mutationFn: () => breakOutEmployee(employeeId),
         onSuccess: (record) => {
             updateAttendanceCache(record, "BREAK");
-            setMessage("Status changed to Break.");
+            setMessage(savedAttendanceMessage(record, "Break"));
         },
         onError: (error) => handleAttendanceError(error, "Unable to change status to Break. Please try again."),
     });
@@ -761,7 +765,7 @@ export default function AttendancePage() {
         mutationFn: () => breakInEmployee(employeeId),
         onSuccess: (record) => {
             updateAttendanceCache(record, "ONLINE");
-            setMessage("Status changed to ONLINE.");
+            setMessage(savedAttendanceMessage(record, "ONLINE"));
         },
         onError: (error) => handleAttendanceError(error, "Unable to change status to ONLINE. Please try again."),
     });
@@ -770,7 +774,7 @@ export default function AttendancePage() {
         mutationFn: () => lunchBreakOutEmployee(employeeId),
         onSuccess: (record) => {
             updateAttendanceCache(record, "LUNCH");
-            setMessage("Status changed to LUNCH.");
+            setMessage(savedAttendanceMessage(record, "LUNCH"));
         },
         onError: (error) => handleAttendanceError(error, "Unable to change status to LUNCH. Please try again."),
     });
@@ -779,7 +783,7 @@ export default function AttendancePage() {
         mutationFn: () => lunchBreakInEmployee(employeeId),
         onSuccess: (record) => {
             updateAttendanceCache(record, "ONLINE");
-            setMessage("Status changed to ONLINE.");
+            setMessage(savedAttendanceMessage(record, "ONLINE"));
         },
         onError: (error) => handleAttendanceError(error, "Unable to change status to ONLINE. Please try again."),
     });
@@ -800,7 +804,9 @@ export default function AttendancePage() {
             }
             queryClient.invalidateQueries({ queryKey: attendanceQueryKey(employeeId) });
             setManualOffPhoneStartedAt(status === "OFF THE PHONE" ? Date.now() : null);
-            setMessage(`Status changed to ${statusLabels[availabilityStatus]}.`);
+            setMessage(result.attendanceRecords?.some((record) => record.syncPending)
+                ? `${statusLabels[availabilityStatus]} saved here. Sync to another business is pending and will retry.`
+                : `Status changed to ${statusLabels[availabilityStatus]}.`);
         },
         onError: (error) => handleAttendanceError(error, "Unable to change status. Please try again."),
     });
@@ -814,7 +820,9 @@ export default function AttendancePage() {
         lunchBreakInMutation.isPending ||
         activityStatusMutation.isPending;
 
-    const sourceLabel = (source?: AttendanceRecord["source"]) => {
+    const sourceLabel = (source?: AttendanceRecord["source"], history = false) => {
+        if (timeAccountingV2 && history && source === "Break In") return "Break ended";
+        if (timeAccountingV2 && history && source === "Lunch Break In") return "Lunch ended";
         if (source === "Login" || source === "Time In" || source === "Break In" || source === "Lunch Break In" || source === "Off the Phone In") return statusLabels.ONLINE;
         if (source === "Logout" || source === "Time Out") return statusLabels.OFFLINE;
         if (source === "Break Out") return statusLabels.BREAK;
@@ -1020,7 +1028,11 @@ export default function AttendancePage() {
                                             <span
                                                 className={[
                                                     "flex size-9 items-center justify-center rounded-lg text-white",
-                                                    record.source === "Off the Phone Out"
+                                                    timeAccountingV2 && record.source.startsWith("Lunch Break")
+                                                        ? "bg-violet-600"
+                                                        : timeAccountingV2 && record.source.startsWith("Break")
+                                                            ? "bg-orange-600"
+                                                    : record.source === "Off the Phone Out"
                                                         ? "bg-sky-600"
                                                         : record.source === "Login" || record.source === "Time In" || record.source === "Break In" || record.source === "Lunch Break In" || record.source === "Off the Phone In"
                                                         ? "bg-[#10ac84]"
@@ -1038,7 +1050,7 @@ export default function AttendancePage() {
                                                             : <FiLogIn />}
                                             </span>
                                             <div>
-                                                <p className="text-sm font-semibold text-slate-950">{sourceLabel(record.source)}</p>
+                                                <p className="text-sm font-semibold text-slate-950">{sourceLabel(record.source, true)}</p>
                                                 <p className="text-xs text-slate-600">{formatAttendanceDateTime(record.timeIn, attendanceTimeZone)}</p>
                                             </div>
                                         </div>

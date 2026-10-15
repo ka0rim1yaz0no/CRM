@@ -6,7 +6,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 Import-Module Microsoft.PowerShell.Security -ErrorAction Stop
-$BridgeVersion = "0.4.0"
+$BridgeVersion = "0.4.1"
 $InstallDirectory = Join-Path $env:LOCALAPPDATA "Assistly\CallBridge"
 $ConfigPath = Join-Path $InstallDirectory "config.json"
 $LogPath = Join-Path $InstallDirectory "bridge.log"
@@ -117,13 +117,15 @@ namespace Assistly.CallBridge
 
         public static int[] ActiveAudioProcessIds()
         {
-            var processIds = new HashSet<int>();
-            AddActiveProcessIds(processIds, EDataFlow.Capture, ERole.Multimedia);
-            AddActiveProcessIds(processIds, EDataFlow.Capture, ERole.Communications);
-            AddActiveProcessIds(processIds, EDataFlow.Render, ERole.Multimedia);
-            AddActiveProcessIds(processIds, EDataFlow.Render, ERole.Communications);
-            var result = new int[processIds.Count];
-            processIds.CopyTo(result);
+            var captureProcessIds = new HashSet<int>();
+            var renderProcessIds = new HashSet<int>();
+            AddActiveProcessIds(captureProcessIds, EDataFlow.Capture, ERole.Multimedia);
+            AddActiveProcessIds(captureProcessIds, EDataFlow.Capture, ERole.Communications);
+            AddActiveProcessIds(renderProcessIds, EDataFlow.Render, ERole.Multimedia);
+            AddActiveProcessIds(renderProcessIds, EDataFlow.Render, ERole.Communications);
+            captureProcessIds.IntersectWith(renderProcessIds);
+            var result = new int[captureProcessIds.Count];
+            captureProcessIds.CopyTo(result);
             return result;
         }
 

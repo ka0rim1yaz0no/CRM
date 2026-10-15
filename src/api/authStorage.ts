@@ -6,7 +6,7 @@ export type AuthBusiness = {
 };
 
 export type AuthUser =
-    | { userType: "admin"; user: { id: string; name: string; role: string; employeeCode: string }; access?: "full" | "tracker"; business?: AuthBusiness; allowedBusinesses?: AuthBusiness[] }
+    | { userType: "admin"; user: { id: string; name: string; role: string; employeeCode: string }; access?: "full" | "tracker"; sessionToken?: string | null; business?: AuthBusiness; allowedBusinesses?: AuthBusiness[] }
     | { userType: "employee"; user: Employee; business?: AuthBusiness; allowedBusinesses?: AuthBusiness[] };
 
 export function getAuthUser() {

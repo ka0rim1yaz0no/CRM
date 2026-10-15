@@ -9,6 +9,9 @@ import { recordEmployeeTransaction } from "./employeeTransactionController";
 import { recalculateEmployeePayrollAfterAttendanceEdit } from "./payrollController";
 import { emitCallDashboardUpdated, emitEmployeeAvailabilityUpdated } from "../socket";
 import { getSystemSettings } from "./systemSettingsController";
+import { attendanceV2Enabled } from "../config/rolloutFlags";
+import { recordAttendanceEvent } from "../services/attendanceEventSyncService";
+import { verifyAdminDashboardSession } from "../config/adminDashboardSession";
 
 const activityTrackedStatuses = new Set(["ONLINE", "OFF THE PHONE"]);
 const attendanceSources: AttendanceSource[] = [
@@ -73,7 +76,7 @@ function zonedDateTimeToUtc(year: number, month: number, day: number, hour: numb
   return new Date(utcTime);
 }
 
-function attendanceSlotKey(value: Date, timeZone: string, shiftStart: string, shiftEnd: string) {
+export function attendanceSlotKey(value: Date, timeZone: string, shiftStart: string, shiftEnd: string) {
   const parts = zonedParts(value, timeZone);
   const shiftStartMinutes = minutesFromTime(shiftStart);
   const shiftEndMinutes = minutesFromTime(shiftEnd);
@@ -210,23 +213,64 @@ function sendAttendanceConflict(response: Response, message: string) {
   response.status(409).json({ message });
 }
 
-export async function recordEmployeeTimeIn(employeeId: Types.ObjectId | string) {
-  const now = new Date();
-  return Attendance.create({
-    employee: employeeId,
-    timeIn: now,
-    source: "Time In",
-    attendanceStatus: await getTimeInStatus(now),
-  });
+async function existingAttendanceEvent(request: Request, response: Response,
+  employeeId: Types.ObjectId, source: AttendanceSource) {
+  if (!attendanceV2Enabled()) return false;
+  const eventId = String(request.body.eventId || "").trim();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(eventId)) {
+    response.status(400).json({ message: "A valid attendance event ID is required." });
+    return true;
+  }
+  const existing = await Attendance.findOne({ employee: employeeId, eventId });
+  if (!existing) return false;
+  if (existing.source !== source) {
+    response.status(409).json({ message: "Attendance event ID belongs to another action." });
+  } else {
+    if (existing.syncPending) {
+      const employee = await Employee.findById(employeeId).select("employeeCode").lean();
+      if (employee?.employeeCode) {
+        const retried = await recordAttendanceEvent({ employeeCode: employee.employeeCode,
+          eventId, source: existing.source, timeIn: existing.timeIn,
+          attendanceStatus: existing.attendanceStatus });
+        response.json(retried);
+        return true;
+      }
+    }
+    response.json(existing);
+  }
+  return true;
 }
 
-export async function recordEmployeeTimeOut(employeeId: Types.ObjectId | string, occurredAt = new Date()) {
-  return Attendance.create({
-    employee: employeeId,
-    timeIn: occurredAt,
-    source: "Time Out",
-    attendanceStatus: await getTimeOutStatus(occurredAt),
-  });
+function rejectOtherEmployeesAction(request: Request, response: Response, employeeCode: string) {
+  if (!attendanceV2Enabled()) return false;
+  const ownAction = String(request.header("x-crm-user-type") || "").trim().toLowerCase() === "employee" &&
+    String(request.header("x-crm-user-code") || "").trim() === employeeCode;
+  if (ownAction) return false;
+  response.status(403).json({ message: "Only the employee can use their attendance buttons." });
+  return true;
+}
+
+function rejectUnsignedAdminAttendanceAction(request: Request, response: Response) {
+  if (!attendanceV2Enabled() || verifyAdminDashboardSession(request.header("x-crm-admin-session"))) return false;
+  response.status(403).json({ message: "A valid administrator session is required." });
+  return true;
+}
+
+async function createAttendanceRecord(employeeId: Types.ObjectId | string, source: AttendanceSource,
+  timeIn: Date, attendanceStatus: AttendanceStatus = "", eventId?: string) {
+  if (!attendanceV2Enabled()) return Attendance.create({ employee: employeeId, timeIn, source, attendanceStatus });
+  const employee = await Employee.findById(employeeId).select("employeeCode").lean();
+  if (!employee?.employeeCode) throw new Error("Cannot record attendance without an employee code");
+  return recordAttendanceEvent({ employeeCode: employee.employeeCode, source, timeIn, attendanceStatus, eventId });
+}
+
+export async function recordEmployeeTimeIn(employeeId: Types.ObjectId | string, eventId?: string) {
+  const now = new Date();
+  return createAttendanceRecord(employeeId, "Time In", now, await getTimeInStatus(now), eventId);
+}
+
+export async function recordEmployeeTimeOut(employeeId: Types.ObjectId | string, occurredAt = new Date(), eventId?: string) {
+  return createAttendanceRecord(employeeId, "Time Out", occurredAt, await getTimeOutStatus(occurredAt), eventId);
 }
 
 export function shouldAutomaticallyCloseAttendanceSlot({
@@ -251,52 +295,28 @@ export async function closeExpiredAttendanceSlots(_now = new Date()) {
   return [] as string[];
 }
 
-export async function recordEmployeeBreakOut(employeeId: Types.ObjectId | string) {
-  return Attendance.create({
-    employee: employeeId,
-    timeIn: new Date(),
-    source: "Break Out",
-  });
+export async function recordEmployeeBreakOut(employeeId: Types.ObjectId | string, eventId?: string) {
+  return createAttendanceRecord(employeeId, "Break Out", new Date(), "", eventId);
 }
 
-export async function recordEmployeeBreakIn(employeeId: Types.ObjectId | string) {
-  return Attendance.create({
-    employee: employeeId,
-    timeIn: new Date(),
-    source: "Break In",
-  });
+export async function recordEmployeeBreakIn(employeeId: Types.ObjectId | string, eventId?: string) {
+  return createAttendanceRecord(employeeId, "Break In", new Date(), "", eventId);
 }
 
-export async function recordEmployeeLunchBreakOut(employeeId: Types.ObjectId | string) {
-  return Attendance.create({
-    employee: employeeId,
-    timeIn: new Date(),
-    source: "Lunch Break Out",
-  });
+export async function recordEmployeeLunchBreakOut(employeeId: Types.ObjectId | string, eventId?: string) {
+  return createAttendanceRecord(employeeId, "Lunch Break Out", new Date(), "", eventId);
 }
 
-export async function recordEmployeeLunchBreakIn(employeeId: Types.ObjectId | string) {
-  return Attendance.create({
-    employee: employeeId,
-    timeIn: new Date(),
-    source: "Lunch Break In",
-  });
+export async function recordEmployeeLunchBreakIn(employeeId: Types.ObjectId | string, eventId?: string) {
+  return createAttendanceRecord(employeeId, "Lunch Break In", new Date(), "", eventId);
 }
 
 export async function recordEmployeeOffPhoneOut(employeeId: Types.ObjectId | string, occurredAt = new Date()) {
-  return Attendance.create({
-    employee: employeeId,
-    timeIn: occurredAt,
-    source: "Off the Phone Out",
-  });
+  return createAttendanceRecord(employeeId, "Off the Phone Out", occurredAt);
 }
 
 export async function recordEmployeeOffPhoneIn(employeeId: Types.ObjectId | string, occurredAt = new Date()) {
-  return Attendance.create({
-    employee: employeeId,
-    timeIn: occurredAt,
-    source: "Off the Phone In",
-  });
+  return createAttendanceRecord(employeeId, "Off the Phone In", occurredAt);
 }
 
 export async function timeInEmployee(request: Request, response: Response) {
@@ -314,15 +334,19 @@ export async function timeInEmployee(request: Request, response: Response) {
     return;
   }
 
+  if (rejectOtherEmployeesAction(request, response, employee.employeeCode)) return;
+  if (await existingAttendanceEvent(request, response, employee._id, "Time In")) return;
+
   const activeSlot = await getActiveAttendanceSlot(employee._id);
   if (activeSlot.timeIn && !activeSlot.timeOut) {
     sendAttendanceConflict(response, "Employee is already timed in.");
     return;
   }
 
+  const earlyAttendance = attendanceV2Enabled() ? await recordEmployeeTimeIn(employee._id, request.body.eventId) : null;
   const updatedEmployee = await Employee.findOneAndUpdate(
     { _id: employee._id },
-    { availabilityStatus: "ONLINE" },
+    { availabilityStatus: "ONLINE", availabilityStatusReason: "manual-time-in" },
     { returnDocument: "after", runValidators: true }
   );
 
@@ -331,10 +355,14 @@ export async function timeInEmployee(request: Request, response: Response) {
     return;
   }
 
-  const businessEmployees = await syncEmployeeAvailabilityAcrossBusinesses(employee.employeeCode, updatedEmployee.availabilityStatus);
+  const businessEmployees = await syncEmployeeAvailabilityAcrossBusinesses(
+    employee.employeeCode,
+    updatedEmployee.availabilityStatus,
+    updatedEmployee.availabilityStatusReason
+  );
 
-  const attendance = await recordEmployeeTimeIn(employee._id);
-  await syncEmployeeAttendanceAcrossBusinesses(employee.employeeCode);
+  const attendance = earlyAttendance || await recordEmployeeTimeIn(employee._id, request.body.eventId);
+  if (!attendanceV2Enabled()) await syncEmployeeAttendanceAcrossBusinesses(employee.employeeCode);
   emitEmployeeAvailabilityUpdated({
     employeeId: String(updatedEmployee._id),
     availabilityStatus: updatedEmployee.availabilityStatus,
@@ -364,6 +392,9 @@ export async function breakOutEmployee(request: Request, response: Response) {
     response.status(404).json({ message: "Employee not found" });
     return;
   }
+
+  if (rejectOtherEmployeesAction(request, response, employee.employeeCode)) return;
+  if (await existingAttendanceEvent(request, response, employee._id, "Break Out")) return;
 
   const activeSlot = await getActiveAttendanceSlot(employee._id);
   const breakOutCount = countAttendanceSource(activeSlot.records, "Break Out");
@@ -396,9 +427,10 @@ export async function breakOutEmployee(request: Request, response: Response) {
     return;
   }
 
+  const earlyAttendance = attendanceV2Enabled() ? await recordEmployeeBreakOut(employee._id, request.body.eventId) : null;
   const updatedEmployee = await Employee.findOneAndUpdate(
     { _id: employee._id },
-    { availabilityStatus: "BREAK" },
+    { availabilityStatus: "BREAK", availabilityStatusReason: "manual-break-out" },
     { returnDocument: "after", runValidators: true }
   );
 
@@ -407,10 +439,14 @@ export async function breakOutEmployee(request: Request, response: Response) {
     return;
   }
 
-  const businessEmployees = await syncEmployeeAvailabilityAcrossBusinesses(employee.employeeCode, updatedEmployee.availabilityStatus);
+  const businessEmployees = await syncEmployeeAvailabilityAcrossBusinesses(
+    employee.employeeCode,
+    updatedEmployee.availabilityStatus,
+    updatedEmployee.availabilityStatusReason
+  );
 
-  const attendance = await recordEmployeeBreakOut(employee._id);
-  await syncEmployeeAttendanceAcrossBusinesses(employee.employeeCode);
+  const attendance = earlyAttendance || await recordEmployeeBreakOut(employee._id, request.body.eventId);
+  if (!attendanceV2Enabled()) await syncEmployeeAttendanceAcrossBusinesses(employee.employeeCode);
   emitEmployeeAvailabilityUpdated({
     employeeId: String(updatedEmployee._id),
     availabilityStatus: updatedEmployee.availabilityStatus,
@@ -441,6 +477,9 @@ export async function breakInEmployee(request: Request, response: Response) {
     return;
   }
 
+  if (rejectOtherEmployeesAction(request, response, employee.employeeCode)) return;
+  if (await existingAttendanceEvent(request, response, employee._id, "Break In")) return;
+
   const activeSlot = await getActiveAttendanceSlot(employee._id);
   const breakOutCount = countAttendanceSource(activeSlot.records, "Break Out");
   const breakInCount = countAttendanceSource(activeSlot.records, "Break In");
@@ -451,9 +490,10 @@ export async function breakInEmployee(request: Request, response: Response) {
     return;
   }
 
+  const earlyAttendance = attendanceV2Enabled() ? await recordEmployeeBreakIn(employee._id, request.body.eventId) : null;
   const updatedEmployee = await Employee.findOneAndUpdate(
     { _id: employee._id },
-    { availabilityStatus: "ONLINE" },
+    { availabilityStatus: "ONLINE", availabilityStatusReason: "manual-break-in" },
     { returnDocument: "after", runValidators: true }
   );
 
@@ -462,10 +502,14 @@ export async function breakInEmployee(request: Request, response: Response) {
     return;
   }
 
-  const businessEmployees = await syncEmployeeAvailabilityAcrossBusinesses(employee.employeeCode, updatedEmployee.availabilityStatus);
+  const businessEmployees = await syncEmployeeAvailabilityAcrossBusinesses(
+    employee.employeeCode,
+    updatedEmployee.availabilityStatus,
+    updatedEmployee.availabilityStatusReason
+  );
 
-  const attendance = await recordEmployeeBreakIn(employee._id);
-  await syncEmployeeAttendanceAcrossBusinesses(employee.employeeCode);
+  const attendance = earlyAttendance || await recordEmployeeBreakIn(employee._id, request.body.eventId);
+  if (!attendanceV2Enabled()) await syncEmployeeAttendanceAcrossBusinesses(employee.employeeCode);
   emitEmployeeAvailabilityUpdated({
     employeeId: String(updatedEmployee._id),
     availabilityStatus: updatedEmployee.availabilityStatus,
@@ -496,6 +540,9 @@ export async function lunchBreakOutEmployee(request: Request, response: Response
     return;
   }
 
+  if (rejectOtherEmployeesAction(request, response, employee.employeeCode)) return;
+  if (await existingAttendanceEvent(request, response, employee._id, "Lunch Break Out")) return;
+
   const activeSlot = await getActiveAttendanceSlot(employee._id);
   const latestSource = latestAttendanceSource(activeSlot.records);
 
@@ -514,9 +561,10 @@ export async function lunchBreakOutEmployee(request: Request, response: Response
     return;
   }
 
+  const earlyAttendance = attendanceV2Enabled() ? await recordEmployeeLunchBreakOut(employee._id, request.body.eventId) : null;
   const updatedEmployee = await Employee.findOneAndUpdate(
     { _id: employee._id },
-    { availabilityStatus: "LUNCH" },
+    { availabilityStatus: "LUNCH", availabilityStatusReason: "manual-lunch-out" },
     { returnDocument: "after", runValidators: true }
   );
 
@@ -525,10 +573,14 @@ export async function lunchBreakOutEmployee(request: Request, response: Response
     return;
   }
 
-  const businessEmployees = await syncEmployeeAvailabilityAcrossBusinesses(employee.employeeCode, updatedEmployee.availabilityStatus);
+  const businessEmployees = await syncEmployeeAvailabilityAcrossBusinesses(
+    employee.employeeCode,
+    updatedEmployee.availabilityStatus,
+    updatedEmployee.availabilityStatusReason
+  );
 
-  const attendance = await recordEmployeeLunchBreakOut(employee._id);
-  await syncEmployeeAttendanceAcrossBusinesses(employee.employeeCode);
+  const attendance = earlyAttendance || await recordEmployeeLunchBreakOut(employee._id, request.body.eventId);
+  if (!attendanceV2Enabled()) await syncEmployeeAttendanceAcrossBusinesses(employee.employeeCode);
   emitEmployeeAvailabilityUpdated({
     employeeId: String(updatedEmployee._id),
     availabilityStatus: updatedEmployee.availabilityStatus,
@@ -559,6 +611,9 @@ export async function lunchBreakInEmployee(request: Request, response: Response)
     return;
   }
 
+  if (rejectOtherEmployeesAction(request, response, employee.employeeCode)) return;
+  if (await existingAttendanceEvent(request, response, employee._id, "Lunch Break In")) return;
+
   const activeSlot = await getActiveAttendanceSlot(employee._id);
   const latestSource = latestAttendanceSource(activeSlot.records);
   const hasLunchOut = activeSlot.records.some((record) => record.source === "Lunch Break Out");
@@ -569,9 +624,10 @@ export async function lunchBreakInEmployee(request: Request, response: Response)
     return;
   }
 
+  const earlyAttendance = attendanceV2Enabled() ? await recordEmployeeLunchBreakIn(employee._id, request.body.eventId) : null;
   const updatedEmployee = await Employee.findOneAndUpdate(
     { _id: employee._id },
-    { availabilityStatus: "ONLINE" },
+    { availabilityStatus: "ONLINE", availabilityStatusReason: "manual-lunch-in" },
     { returnDocument: "after", runValidators: true }
   );
 
@@ -580,10 +636,14 @@ export async function lunchBreakInEmployee(request: Request, response: Response)
     return;
   }
 
-  const businessEmployees = await syncEmployeeAvailabilityAcrossBusinesses(employee.employeeCode, updatedEmployee.availabilityStatus);
+  const businessEmployees = await syncEmployeeAvailabilityAcrossBusinesses(
+    employee.employeeCode,
+    updatedEmployee.availabilityStatus,
+    updatedEmployee.availabilityStatusReason
+  );
 
-  const attendance = await recordEmployeeLunchBreakIn(employee._id);
-  await syncEmployeeAttendanceAcrossBusinesses(employee.employeeCode);
+  const attendance = earlyAttendance || await recordEmployeeLunchBreakIn(employee._id, request.body.eventId);
+  if (!attendanceV2Enabled()) await syncEmployeeAttendanceAcrossBusinesses(employee.employeeCode);
   emitEmployeeAvailabilityUpdated({
     employeeId: String(updatedEmployee._id),
     availabilityStatus: updatedEmployee.availabilityStatus,
@@ -627,6 +687,8 @@ export async function timeOutEmployee(request: Request, response: Response) {
     return;
   }
 
+  if (await existingAttendanceEvent(request, response, employee._id, "Time Out")) return;
+
   const activeSlot = await getActiveAttendanceSlot(employee._id, true);
   const latestSource = latestAttendanceSource(activeSlot.records);
 
@@ -640,6 +702,7 @@ export async function timeOutEmployee(request: Request, response: Response) {
     return;
   }
 
+  const earlyAttendance = attendanceV2Enabled() ? await recordEmployeeTimeOut(employee._id, new Date(), request.body.eventId) : null;
   const updatedEmployee = await Employee.findOneAndUpdate(
     { _id: employee._id },
     { availabilityStatus: "OFFLINE", availabilityStatusReason: "manual-time-out" },
@@ -660,12 +723,12 @@ export async function timeOutEmployee(request: Request, response: Response) {
   const offPhoneOutCount = countAttendanceSource(activeSlot.records, "Off the Phone Out");
   const offPhoneInCount = countAttendanceSource(activeSlot.records, "Off the Phone In");
 
-  if (offPhoneInCount < offPhoneOutCount) {
+  if (!attendanceV2Enabled() && offPhoneInCount < offPhoneOutCount) {
     await recordEmployeeOffPhoneIn(employee._id);
   }
 
-  const attendance = await recordEmployeeTimeOut(employee._id, new Date());
-  await syncEmployeeAttendanceAcrossBusinesses(employee.employeeCode);
+  const attendance = earlyAttendance || await recordEmployeeTimeOut(employee._id, new Date(), request.body.eventId);
+  if (!attendanceV2Enabled()) await syncEmployeeAttendanceAcrossBusinesses(employee.employeeCode);
   emitEmployeeAvailabilityUpdated({
     employeeId: String(updatedEmployee._id),
     availabilityStatus: updatedEmployee.availabilityStatus,
@@ -697,7 +760,7 @@ export async function listEmployeeAttendance(request: Request, response: Respons
     ? await Employee.findById(employeeId).select("employeeCode").lean()
     : null;
   if (employee?.employeeCode) {
-    await syncEmployeeAttendanceAcrossBusinesses(employee.employeeCode);
+    if (!attendanceV2Enabled()) await syncEmployeeAttendanceAcrossBusinesses(employee.employeeCode);
   }
 
   const attendanceQuery = Attendance.find({
@@ -730,7 +793,7 @@ export async function listEmployeesAttendance(request: Request, response: Respon
     _id: { $in: employeeIds },
     status: { $ne: "Archived" },
   }).select("employeeCode").lean();
-  await syncEmployeesAttendanceAcrossBusinesses(employees.map((employee) => employee.employeeCode));
+  if (!attendanceV2Enabled()) await syncEmployeesAttendanceAcrossBusinesses(employees.map((employee) => employee.employeeCode));
 
   const includeAll = String(request.query.all || "") === "true";
   const requestedFrom = new Date(String(request.query.from || ""));
@@ -757,6 +820,7 @@ export async function listEmployeesAttendance(request: Request, response: Respon
 }
 
 export async function createEmployeeAttendance(request: Request, response: Response) {
+  if (rejectUnsignedAdminAttendanceAction(request, response)) return;
   const employeeId = String(request.params.employeeId || request.body.employeeId || "").trim();
   const source = attendanceSources.includes(request.body.source) ? request.body.source : "Time In";
   const timeIn = new Date(request.body.timeIn || Date.now());
@@ -772,13 +836,11 @@ export async function createEmployeeAttendance(request: Request, response: Respo
     return;
   }
 
-  const attendance = await Attendance.create({
-    employee: employee._id,
-    timeIn,
-    source,
-    attendanceStatus: await getAttendanceStatus(source, timeIn),
-  });
-  await syncEmployeeAttendanceAcrossBusinesses(employee.employeeCode);
+  if (await existingAttendanceEvent(request, response, employee._id, source)) return;
+
+  const attendance = await createAttendanceRecord(employee._id, source, timeIn,
+    await getAttendanceStatus(source, timeIn), request.body.eventId);
+  if (!attendanceV2Enabled()) await syncEmployeeAttendanceAcrossBusinesses(employee.employeeCode);
 
   await recordEmployeeTransaction({
     employee: employee._id,
@@ -793,6 +855,7 @@ export async function createEmployeeAttendance(request: Request, response: Respo
 }
 
 export async function updateEmployeeAttendance(request: Request, response: Response) {
+  if (rejectUnsignedAdminAttendanceAction(request, response)) return;
   const employeeId = String(request.params.employeeId || "").trim();
   const source = attendanceSources.includes(request.body.source) ? request.body.source : "Time In";
   const timeIn = new Date(request.body.timeIn || Date.now());
@@ -810,6 +873,8 @@ export async function updateEmployeeAttendance(request: Request, response: Respo
 
   const previousTime = attendance.timeIn;
   const previousSource = attendance.source;
+  const previousStatus = attendance.attendanceStatus;
+  const previousEventId = attendance.eventId;
   attendance.timeIn = timeIn;
   attendance.source = source;
   attendance.attendanceStatus = await getAttendanceStatus(source, timeIn);
@@ -823,7 +888,11 @@ export async function updateEmployeeAttendance(request: Request, response: Respo
     description: `${employee?.name || "Employee"}'s ${source} time was corrected by admin.`,
     metadata: {
       attendanceId: String(attendance._id),
+      actorCode: String(request.header("x-crm-user-code") || "").trim(),
+      previousSource,
       source,
+      previousStatus,
+      updatedStatus: attendance.attendanceStatus,
       previousTime: previousTime.toISOString(),
       updatedTime: timeIn.toISOString(),
     },
@@ -832,6 +901,7 @@ export async function updateEmployeeAttendance(request: Request, response: Respo
     ? await updateAttendanceAcrossBusinesses(employee.employeeCode, {
         timeIn: previousTime,
         source: previousSource,
+        eventId: previousEventId,
       }, {
         timeIn,
         source,
@@ -852,6 +922,7 @@ export async function updateEmployeeAttendance(request: Request, response: Respo
 }
 
 export async function updateEmployeeWorkedMinutes(request: Request, response: Response) {
+  if (rejectUnsignedAdminAttendanceAction(request, response)) return;
   if (String(request.header("x-crm-user-type") || "").trim().toLowerCase() !== "admin") {
     response.status(403).json({ message: "Only administrators can edit worked minutes." });
     return;
@@ -924,6 +995,7 @@ export async function updateEmployeeWorkedMinutes(request: Request, response: Re
     affectedEmployees = await updateAttendanceAcrossBusinesses(employee.employeeCode, {
       timeIn: previousTimeOut,
       source: previousSource,
+      eventId: existingTimeOut.eventId,
     }, {
       timeIn: updatedTimeOut,
       source: "Time Out",
@@ -950,6 +1022,7 @@ export async function updateEmployeeWorkedMinutes(request: Request, response: Re
 }
 
 export async function archiveEmployeeAttendance(request: Request, response: Response) {
+  if (rejectUnsignedAdminAttendanceAction(request, response)) return;
   const attendance = await Attendance.findOneAndUpdate(
     { _id: request.params.attendanceId, employee: request.params.employeeId },
     { isArchived: true },
@@ -966,6 +1039,7 @@ export async function archiveEmployeeAttendance(request: Request, response: Resp
     await updateAttendanceAcrossBusinesses(employee.employeeCode, {
       timeIn: attendance.timeIn,
       source: attendance.source,
+      eventId: attendance.eventId,
     }, {
       timeIn: attendance.timeIn,
       source: attendance.source,
@@ -973,6 +1047,16 @@ export async function archiveEmployeeAttendance(request: Request, response: Resp
       isArchived: true,
     });
   }
+
+  await recordEmployeeTransaction({
+    employee: attendance.employee,
+    category: "Attendance",
+    title: "Attendance archived",
+    description: "An administrator archived an attendance record.",
+    metadata: { attendanceId: String(attendance._id), eventId: attendance.eventId || "",
+      source: attendance.source, timeIn: attendance.timeIn.toISOString(),
+      actorCode: String(request.header("x-crm-user-code") || "").trim() },
+  });
 
   if (request.business?.id) emitCallDashboardUpdated([request.business.id]);
   response.json(attendance);
@@ -982,10 +1066,8 @@ export async function recordEmployeeActivity(request: Request, response: Respons
   const employeeId = String(request.params.employeeId || request.body.employeeId || "").trim();
   const state = request.body.state === "idle" ? "idle" : "active";
   const activityReason = String(request.body.reason || (state === "idle" ? "inactivity-timeout" : "browser-input")).trim().slice(0, 80);
-  const rawIdleStartedAt = new Date(String(request.body.idleStartedAt || ""));
-  const idleStartedAt = !Number.isNaN(rawIdleStartedAt.getTime()) && rawIdleStartedAt.getTime() <= Date.now()
-    ? rawIdleStartedAt
-    : null;
+  const actorEmployeeCode = String(request.header("x-crm-user-code") || "").trim();
+  const actorUserType = String(request.header("x-crm-user-type") || "").trim().toLowerCase();
 
   if (!employeeId) {
     response.status(400).json({ message: "employeeId is required" });
@@ -999,13 +1081,19 @@ export async function recordEmployeeActivity(request: Request, response: Respons
     return;
   }
 
-  const currentStatus = normalizeEmployeeAvailabilityStatus(employee.availabilityStatus);
-  if (!activityTrackedStatuses.has(currentStatus)) {
-    response.json({ availabilityStatus: currentStatus });
+  if (actorUserType !== "employee" || !actorEmployeeCode || actorEmployeeCode !== employee.employeeCode) {
+    response.status(403).json({ message: "You can only change your own attendance status." });
     return;
   }
 
-  if (state === "idle" && activityReason !== "manual-off-the-phone") {
+  const expectedManualReason = state === "idle" ? "manual-off-the-phone" : "manual-online";
+  if (activityReason !== expectedManualReason) {
+    response.status(400).json({ message: "Attendance status can only be changed from the attendance buttons." });
+    return;
+  }
+
+  const currentStatus = normalizeEmployeeAvailabilityStatus(employee.availabilityStatus);
+  if (!activityTrackedStatuses.has(currentStatus)) {
     response.json({ availabilityStatus: currentStatus });
     return;
   }
@@ -1026,9 +1114,7 @@ export async function recordEmployeeActivity(request: Request, response: Respons
     return;
   }
 
-  const offPhoneOccurredAt = activityReason === "manual-off-the-phone"
-    ? new Date()
-    : idleStartedAt || new Date(Date.now() - 10 * 60 * 1000);
+  const offPhoneOccurredAt = new Date();
   const activeSlot = await getActiveAttendanceSlot(employee._id);
 
   employee.availabilityStatus = nextStatus;
@@ -1044,18 +1130,8 @@ export async function recordEmployeeActivity(request: Request, response: Respons
     availabilityStatus: employee.availabilityStatus,
   }, businessEmployees);
 
-  const idleDescription = activityReason === "manual-off-the-phone"
-    ? `${employee.name} set status to off the phone.`
-    : activityReason === "tab-hidden"
-    ? `${employee.name} was idle after leaving the CRM tab for 10+ minutes.`
-    : activityReason === "window-blur"
-      ? `${employee.name} was idle after leaving the CRM window for 10+ minutes.`
-      : `${employee.name} was idle after no keyboard, mouse, touch, or scroll activity for 10+ minutes.`;
-  const activeDescription = activityReason === "manual-online"
-    ? `${employee.name} set status to online.`
-    : activityReason === "tab-return"
-    ? `${employee.name} returned to the CRM tab.`
-    : `${employee.name} became active again.`;
+  const idleDescription = `${employee.name} manually set status to off the phone.`;
+  const activeDescription = `${employee.name} manually set status to online.`;
   const attendanceRecords = [];
 
   if (activeSlot.timeIn && !activeSlot.timeOut) {
@@ -1071,7 +1147,7 @@ export async function recordEmployeeActivity(request: Request, response: Respons
       attendanceRecords.push(await recordEmployeeOffPhoneIn(employee._id));
     }
   }
-  if (attendanceRecords.length > 0) {
+  if (attendanceRecords.length > 0 && !attendanceV2Enabled()) {
     await syncEmployeeAttendanceAcrossBusinesses(employee.employeeCode);
   }
 
@@ -1084,7 +1160,6 @@ export async function recordEmployeeActivity(request: Request, response: Respons
     metadata: {
       reason: activityReason,
       reportedAt: new Date(),
-      ...(nextStatus === "OFF THE PHONE" && idleStartedAt ? { idleStartedAt } : {}),
     },
   });
 

@@ -1,9 +1,12 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { FiPhoneCall } from "react-icons/fi";
 import { getCallDashboard, type CallDashboardRow } from "../api/callDashboard";
 import { socket } from "../lib/socket";
 import { formatPhDate, formatPhTime } from "../lib/dateTime";
+
+const dashboardV2 = import.meta.env.VITE_CRM_CALL_DASHBOARD_V2 === "true" ||
+    (import.meta.env.DEV && import.meta.env.VITE_CRM_CALL_DASHBOARD_V2 !== "false");
 
 function duration(milliseconds: number) {
     const seconds = Math.max(0, Math.floor(milliseconds / 1000));
@@ -15,13 +18,22 @@ function duration(milliseconds: number) {
 function statusClasses(status: CallDashboardRow["status"]) {
     if (status === "ON CALL") return "border-emerald-200 bg-emerald-50 text-emerald-800";
     if (status === "ONLINE") return "border-green-200 bg-green-50 text-green-800";
+    if (status === "READY") return "border-green-200 bg-green-50 text-green-800";
     if (status === "CALL WAITING") return "border-sky-200 bg-sky-50 text-sky-800";
     if (status === "OFF THE PHONE") return "border-amber-200 bg-amber-50 text-amber-800";
-    if (status === "BREAK" || status === "LUNCH") return "border-orange-200 bg-orange-50 text-orange-800";
+    if (status === "BREAK") return "border-orange-200 bg-orange-50 text-orange-800";
+    if (status === "LUNCH") return "border-violet-200 bg-violet-50 text-violet-800";
     return "border-slate-200 bg-slate-100 text-slate-600";
 }
 
 function visibleStatus(row: CallDashboardRow, now: number, shiftStart: number, shiftEnd: number) {
+    if (dashboardV2) return {
+        status: row.status,
+        startedAt: row.statusStartedAt ? new Date(row.statusStartedAt).getTime() : 0,
+        detail: row.status === "CALL WAITING" && row.transitionUntil
+            ? `Next call in ${Math.max(0, Math.ceil((new Date(row.transitionUntil).getTime() - now) / 1_000))}s`
+            : row.detail,
+    };
     if (now < shiftStart || now >= shiftEnd) {
         return { status: row.status, startedAt: 0, detail: "Outside call shift" };
     }
@@ -40,12 +52,19 @@ function visibleStatus(row: CallDashboardRow, now: number, shiftStart: number, s
     };
 }
 
-export default function CallDashboardPanel({ businessName }: { businessName?: string }) {
+export default function CallDashboardPanel({ businessId, businessName }: { businessId: string; businessName?: string }) {
     const queryClient = useQueryClient();
+    const lastDeadlineRefresh = useRef(0);
     const [clock, setClock] = useState(Date.now);
     const { data, isLoading, isError } = useQuery({
-        queryKey: ["admin-call-dashboard"],
-        queryFn: async () => ({ ...(await getCallDashboard()), receivedAt: Date.now() }),
+        queryKey: ["admin-call-dashboard", businessId],
+        queryFn: async () => {
+            const snapshot = { ...(await getCallDashboard()), receivedAt: Date.now() };
+            const previous = queryClient.getQueryData<typeof snapshot>(["admin-call-dashboard", businessId]);
+            return previous && new Date(previous.generatedAt).getTime() > new Date(snapshot.generatedAt).getTime()
+                ? previous : snapshot;
+        },
+        enabled: Boolean(businessId),
         refetchInterval: 15_000,
         refetchOnWindowFocus: true,
     });
@@ -61,7 +80,7 @@ export default function CallDashboardPanel({ businessName }: { businessName?: st
         const update = () => {
             window.clearTimeout(refreshTimer);
             refreshTimer = window.setTimeout(() => {
-                void queryClient.invalidateQueries({ queryKey: ["admin-call-dashboard"] });
+                void queryClient.invalidateQueries({ queryKey: ["admin-call-dashboard", businessId] });
             }, 250);
         };
         socket.on("call-dashboard:updated", update);
@@ -73,18 +92,31 @@ export default function CallDashboardPanel({ businessName }: { businessName?: st
             socket.off("employee:availability-updated", update);
             socket.off("connect", update);
         };
-    }, [queryClient]);
+    }, [businessId, queryClient]);
 
     const serverOffset = data ? new Date(data.generatedAt).getTime() - data.receivedAt : 0;
     const serverNow = clock + serverOffset;
+    const nextDeadline = dashboardV2 ? data?.employees.reduce((earliest, row) => {
+        const deadline = row.transitionUntil ? new Date(row.transitionUntil).getTime() : 0;
+        return deadline > 0 && (earliest === 0 || deadline < earliest) ? deadline : earliest;
+    }, 0) || 0 : 0;
+    useEffect(() => {
+        if (nextDeadline && serverNow >= nextDeadline && lastDeadlineRefresh.current !== nextDeadline) {
+            lastDeadlineRefresh.current = nextDeadline;
+            void queryClient.invalidateQueries({ queryKey: ["admin-call-dashboard", businessId] });
+        }
+    }, [businessId, nextDeadline, serverNow, queryClient]);
     const shiftStart = data ? new Date(data.shift.start).getTime() : 0;
     const shiftEnd = data ? new Date(data.shift.end).getTime() : 0;
     const rows = data?.employees.map((row) => ({ row, visible: visibleStatus(row, serverNow, shiftStart, shiftEnd) })) || [];
     const counts = {
         onCall: rows.filter(({ visible }) => visible.status === "ON CALL").length,
         online: rows.filter(({ visible }) => visible.status === "ONLINE").length,
+        ready: rows.filter(({ visible }) => visible.status === "READY").length,
         waiting: rows.filter(({ visible }) => visible.status === "CALL WAITING").length,
-        away: rows.filter(({ visible }) => ["OFF THE PHONE", "BREAK", "LUNCH"].includes(visible.status)).length,
+        away: rows.filter(({ visible }) => visible.status === "OFF THE PHONE").length,
+        break: rows.filter(({ visible }) => visible.status === "BREAK").length,
+        lunch: rows.filter(({ visible }) => visible.status === "LUNCH").length,
         offline: rows.filter(({ visible }) => visible.status === "OFFLINE").length,
     };
     const displayRows = rows.map(({ row, visible }) => {
@@ -100,7 +132,7 @@ export default function CallDashboardPanel({ businessName }: { businessName?: st
             offPhoneTime: duration(offPhoneMs),
         };
     });
-
+    const snapshotStale = dashboardV2 && data && serverNow - new Date(data.generatedAt).getTime() > 45_000;
     return (
         <section className="overflow-hidden rounded-lg border border-slate-300 bg-white text-slate-950 shadow-lg shadow-slate-950/10" aria-labelledby="call-dashboard-title">
             <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 bg-slate-50 px-4 py-3">
@@ -117,10 +149,14 @@ export default function CallDashboardPanel({ businessName }: { businessName?: st
                     <span><span className="mr-1 inline-block size-2 rounded-full bg-emerald-500" />{counts.onCall} on call</span>
                     <span><span className="mr-1 inline-block size-2 rounded-full bg-green-500" />{counts.online} online</span>
                     <span><span className="mr-1 inline-block size-2 rounded-full bg-sky-500" />{counts.waiting} waiting</span>
-                    <span><span className="mr-1 inline-block size-2 rounded-full bg-amber-500" />{counts.away} away</span>
+                    {dashboardV2 && <span><span className="mr-1 inline-block size-2 rounded-full bg-lime-500" />{counts.ready} ready</span>}
+                    <span><span className="mr-1 inline-block size-2 rounded-full bg-amber-500" />{counts.away} off phone</span>
+                    {dashboardV2 && <><span><span className="mr-1 inline-block size-2 rounded-full bg-orange-500" />{counts.break} break</span>
+                    <span><span className="mr-1 inline-block size-2 rounded-full bg-violet-500" />{counts.lunch} lunch</span></>}
                     <span><span className="mr-1 inline-block size-2 rounded-full bg-slate-400" />{counts.offline} offline</span>
                 </div>}
             </div>
+            {snapshotStale && <p className="border-b border-amber-200 bg-amber-50 px-4 py-2 text-xs text-amber-900" role="status">Call data is stale. Reconnecting to the server.</p>}
             <div className="hidden md:block">
                 <table className="w-full table-fixed">
                     <colgroup><col className="w-[34%]" /><col className="w-[25%]" /><col className="w-[18%]" /><col className="w-[23%]" /></colgroup>
@@ -135,7 +171,7 @@ export default function CallDashboardPanel({ businessName }: { businessName?: st
                     <tbody className="divide-y divide-slate-100">
                         {isLoading && <tr><td colSpan={4} className="px-4 py-6 text-center text-sm text-slate-500">Loading live call status...</td></tr>}
                         {isError && !data && <tr><td colSpan={4} className="px-4 py-6 text-center text-sm text-red-700">Call status could not load.</td></tr>}
-                        {data?.employees.length === 0 && <tr><td colSpan={4} className="px-4 py-6 text-center text-sm text-slate-500">No sales employees are available for this business.</td></tr>}
+                        {data && rows.length === 0 && <tr><td colSpan={4} className="px-4 py-6 text-center text-sm text-slate-500">No sales employees in this business.</td></tr>}
                         {displayRows.map(({ row, visible, statusTime, statusTimeTitle, offPhoneTime }) => (
                             <tr key={row.employeeId} className="hover:bg-slate-50/80">
                                 <td className="px-4 py-2.5">
@@ -149,7 +185,6 @@ export default function CallDashboardPanel({ businessName }: { businessName?: st
                                 </td>
                                 <td className="px-4 py-2.5">
                                     <span className={`inline-flex whitespace-nowrap rounded-md border px-2 py-1 text-xs font-semibold ${statusClasses(visible.status)}`}>{visible.status}</span>
-                                    <p className="mt-0.5 truncate text-xs text-slate-500" title={visible.detail}>{visible.detail}</p>
                                 </td>
                                 <td className="px-4 py-2.5 text-right font-mono text-sm tabular-nums" title={statusTimeTitle}>{statusTime}</td>
                                 <td className="px-4 py-2.5 text-right font-mono text-sm tabular-nums">{offPhoneTime}</td>
@@ -161,7 +196,7 @@ export default function CallDashboardPanel({ businessName }: { businessName?: st
             <div className="divide-y divide-slate-200 md:hidden">
                 {isLoading && <p className="px-4 py-6 text-center text-sm text-slate-500">Loading live call status...</p>}
                 {isError && !data && <p className="px-4 py-6 text-center text-sm text-red-700">Call status could not load.</p>}
-                {data?.employees.length === 0 && <p className="px-4 py-6 text-center text-sm text-slate-500">No sales employees are available for this business.</p>}
+                {data && rows.length === 0 && <p className="px-4 py-6 text-center text-sm text-slate-500">No sales employees in this business.</p>}
                 {displayRows.map(({ row, visible, statusTime, statusTimeTitle, offPhoneTime }) => (
                     <article key={row.employeeId} className="p-4">
                         <div className="flex min-w-0 items-start justify-between gap-3">
@@ -178,7 +213,6 @@ export default function CallDashboardPanel({ businessName }: { businessName?: st
                                 {visible.status}
                             </span>
                         </div>
-                        <p className="mt-2 break-words text-xs text-slate-500">{visible.detail}</p>
                         <dl className="mt-3 grid grid-cols-2 gap-3 rounded-md border border-slate-200 bg-slate-50 p-3">
                             <div className="min-w-0">
                                 <dt className="text-[11px] font-semibold uppercase text-slate-500">Time</dt>

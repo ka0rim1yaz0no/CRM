@@ -1,9 +1,13 @@
+import { isTrustedBridgeActiveSignal } from "./callBridgeActiveSignal";
+import { callDashboardV2Enabled } from "../config/rolloutFlags";
+
 export type CallDashboardAttendanceEvent = {
   source: string;
   timeIn: Date;
 };
 
 export type CallDashboardDevice = {
+  bridgeVersion?: string;
   state: string;
   audioSessionActive: boolean;
   nextivaProcessDetected: boolean;
@@ -24,7 +28,7 @@ export type CallDashboardSchedule = {
 const heartbeatFreshnessMs = 20_000;
 // Windows can leave a Nextiva audio session open after a call ends. A bridge
 // signal that never transitions must not hold the dashboard ON CALL forever.
-const maximumActiveCallSignalMs = 2 * 60 * 60 * 1000;
+const maximumActiveCallSignalMs = 30 * 60 * 1000;
 
 function zonedDateParts(date: Date, timeZone: string) {
   const parts = new Intl.DateTimeFormat("en-US", {
@@ -133,8 +137,20 @@ export function callDashboardStatus(input: {
   // employee. Only the newest session is authoritative; otherwise an older
   // device can keep ON CALL visible while the current device is idle.
   const authoritativeDevice = fresh[0];
+  const conflictingActiveDevice = callDashboardV2Enabled() && fresh.slice(1).some((device) =>
+    device.state === "active" && device.audioSessionActive);
+  const scheduleStartBelongsToCurrentCall = Boolean(
+    callDashboardV2Enabled() && authoritativeDevice?.lastIdleAt && schedule?.lastCallStartedAt &&
+    schedule.lastCallStartedAt >= authoritativeDevice.lastIdleAt &&
+    schedule.lastCallStartedAt <= authoritativeDevice.lastStateChangedAt &&
+    (!schedule.lastCallEndedAt || schedule.lastCallStartedAt > schedule.lastCallEndedAt)
+  );
   const activeSignalStartedAt = authoritativeDevice
-    ? latestDate(schedule?.lastCallStartedAt, authoritativeDevice.lastStateChangedAt)
+    ? scheduleStartBelongsToCurrentCall
+      ? schedule!.lastCallStartedAt!
+      : callDashboardV2Enabled()
+        ? authoritativeDevice.lastStateChangedAt
+        : latestDate(schedule?.lastCallStartedAt, authoritativeDevice.lastStateChangedAt)
     : null;
   const hasObservedIdleBaseline = Boolean(
     authoritativeDevice?.lastIdleAt &&
@@ -145,14 +161,20 @@ export function callDashboardStatus(input: {
     authoritativeDevice &&
     schedule.lastDialStartedAt <= authoritativeDevice.lastStateChangedAt
   );
+  // Bridge 0.4.0 and older report any Nextiva audio as active. Do not let a
+  // ringtone or post-call notification create a new call after the backend has
+  // already recorded the real call ending. Version 0.4.1+ verifies two-way
+  // capture/render audio and can therefore represent manual calls safely.
+  const activeSignalIsTrustworthy = isTrustedBridgeActiveSignal(authoritativeDevice, schedule || null);
   const active = authoritativeDevice?.state === "active" &&
     authoritativeDevice.audioSessionActive &&
+    activeSignalIsTrustworthy &&
     (hasObservedIdleBaseline || hasDialIntent) &&
     activeSignalStartedAt &&
-    now.getTime() - activeSignalStartedAt.getTime() <= maximumActiveCallSignalMs
+    (callDashboardV2Enabled() || now.getTime() - activeSignalStartedAt.getTime() <= maximumActiveCallSignalMs)
     ? authoritativeDevice
     : undefined;
-  const ready = authoritativeDevice && (input.provider === "ringcentral"
+  const ready = authoritativeDevice && !conflictingActiveDevice && (!callDashboardV2Enabled() || authoritativeDevice.state === "idle") && (input.provider === "ringcentral"
     ? authoritativeDevice.state !== "unknown"
     : authoritativeDevice.nextivaProcessDetected && authoritativeDevice.state !== "unknown")
     ? authoritativeDevice
@@ -161,6 +183,15 @@ export function callDashboardStatus(input: {
   const lastOfflineAt = latestAttendanceTransition(sortedEvents, ["Time Out", "Logout", "Break Out", "Lunch Break Out", "Off the Phone Out"]);
   const onlineAt = lastOnlineAt && (!lastOfflineAt || lastOnlineAt >= lastOfflineAt) ? lastOnlineAt : null;
   const offlineAt = lastOfflineAt && (!lastOnlineAt || lastOfflineAt >= lastOnlineAt) ? lastOfflineAt : null;
+
+  if (callDashboardV2Enabled() && (availabilityStatus === "BREAK" || availabilityStatus === "LUNCH")) {
+    return {
+      status: availabilityStatus,
+      statusStartedAt: withinShift(offlineAt),
+      transitionUntil: null,
+      detail: availabilityStatus === "BREAK" ? "On break" : "At lunch",
+    };
+  }
 
   if (active) {
     const activeStartedAt = activeSignalStartedAt;
@@ -213,14 +244,15 @@ export function callDashboardStatus(input: {
   if (ready && schedule?.lastDialStartedAt && schedule.dialIntentUntil && schedule.dialIntentUntil > now) {
     return {
       status: "ONLINE" as const,
-      statusStartedAt: withinShift(schedule.lastDialStartedAt),
+      statusStartedAt: withinShift(callDashboardV2Enabled() ? onlineAt : schedule.lastDialStartedAt),
       transitionUntil: schedule.dialIntentUntil,
       detail: `Opening ${providerName} · call not confirmed`,
     };
   }
 
   const waitingUntil = schedule?.lastCallEndedAt && schedule.nextCallAllowedAt
-    ? new Date(Math.min(schedule.nextCallAllowedAt.getTime(), schedule.lastCallEndedAt.getTime() + 30_000))
+    ? callDashboardV2Enabled() ? schedule.nextCallAllowedAt
+      : new Date(Math.min(schedule.nextCallAllowedAt.getTime(), schedule.lastCallEndedAt.getTime() + 30_000))
     : null;
   if (ready && schedule?.lastCallEndedAt && schedule.lastCallEndedAt >= shift.start && waitingUntil && waitingUntil > now) {
     return {
@@ -232,12 +264,15 @@ export function callDashboardStatus(input: {
   }
 
   if (ready) {
+    const trustworthyReadyTransition = ready.state === "active" && !activeSignalIsTrustworthy
+      ? null
+      : ready.lastStateChangedAt;
     return {
-      status: "ONLINE" as const,
+      status: callDashboardV2Enabled() ? "READY" as const : "ONLINE" as const,
       statusStartedAt: withinShift(latestDate(
         schedule?.dialIntentUntil && schedule.dialIntentUntil <= now ? schedule.dialIntentUntil : null,
         waitingUntil && waitingUntil <= now ? waitingUntil : null,
-        ready.lastStateChangedAt,
+        trustworthyReadyTransition,
         onlineAt
       )),
       transitionUntil: null,
@@ -250,9 +285,9 @@ export function callDashboardStatus(input: {
     : null;
   return {
     status: "ONLINE" as const,
-    statusStartedAt: withinShift(latestDate(disconnectedAt, latestDevice && fresh.length ? latestDevice.lastStateChangedAt : null, offlineAt)),
+    statusStartedAt: withinShift(callDashboardV2Enabled() ? onlineAt : latestDate(disconnectedAt, latestDevice && fresh.length ? latestDevice.lastStateChangedAt : null, offlineAt)),
     transitionUntil: null,
-    detail: fresh.length
+    detail: conflictingActiveDevice ? "Conflicting Call Bridge sessions" : fresh.length
       ? `Online · ${providerName} unavailable`
       : input.provider === "ringcentral"
         ? "Online · RingCentral API disconnected"

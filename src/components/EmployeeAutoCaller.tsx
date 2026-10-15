@@ -3,6 +3,7 @@ import { useNavigate } from "react-router";
 import { getAuthUser } from "../api/authStorage";
 import {
     activateCallBridgeForEmployee,
+    callTimingV2Enabled,
     getCallBridgeStatus,
     markCallBridgeDialStarted,
     releaseCallBridgeCall,
@@ -25,7 +26,7 @@ import {
     startAutoCallPendingComment,
     isLeadEligibleForAutoCall,
 } from "../lib/employeeAutoCall";
-import { getRingCentralCallUrl, normalizePhoneForCall } from "../lib/phoneNumber";
+import { normalizePhoneForCall } from "../lib/phoneNumber";
 
 const AUTO_CALL_STORAGE_PREFIX = "crm:employee-auto-call";
 
@@ -58,16 +59,8 @@ async function waitForConfirmedCall(
     return false;
 }
 
-function launchPhoneCall(phone: string, provider: "nextiva" | "ringcentral") {
+function launchPhoneCall(phone: string) {
     const target = phone.trim();
-    if (provider === "ringcentral") {
-        const callUrl = getRingCentralCallUrl(target);
-        if (callUrl) {
-            window.location.assign(callUrl);
-        }
-        return;
-    }
-
     const link = document.createElement("a");
     link.href = `tel:${target}`;
     link.hidden = true;
@@ -164,6 +157,7 @@ export default function EmployeeAutoCaller() {
         let startTimeoutId: number | undefined;
         let redialTimeoutId: number | undefined;
         let redialDeadline = 0;
+        const blockedLeadIds = new Set<string>();
 
         const triggerAutoCall = async () => {
             if (isDisposed || isChecking.current || !isWithinAutoCallWindow()) {
@@ -182,6 +176,7 @@ export default function EmployeeAutoCaller() {
             let reservationToken = "";
             let callWasLaunched = false;
             let providerCallConfirmed = false;
+            let reservationNotBefore = 0;
 
             try {
                 const employee = await getEmployeeSummary(employeeId, { timeoutMs: AUTO_CALL_API_TIMEOUT_MS });
@@ -190,27 +185,37 @@ export default function EmployeeAutoCaller() {
                     return;
                 }
 
-                const now = Date.now();
-
-                const lastCallAt = Number(window.localStorage.getItem(lastCallStorageKey) || 0);
-
-                if (Number.isFinite(lastCallAt) && now - lastCallAt < AUTO_CALL_MIN_INTERVAL_MS) {
-                    return;
+                if (!callTimingV2Enabled) {
+                    const now = Date.now();
+                    const lastCallAt = Number(window.localStorage.getItem(lastCallStorageKey) || 0);
+                    if (Number.isFinite(lastCallAt) && now - lastCallAt < AUTO_CALL_MIN_INTERVAL_MS) return;
                 }
 
                 const bridgeStatus = await getCallBridgeStatus(employee.employeeCode, { timeoutMs: AUTO_CALL_API_TIMEOUT_MS });
 
                 if (!bridgeStatus.ready) {
                     const deadline = bridgeStatus.nextCallAllowedAt ? new Date(bridgeStatus.nextCallAllowedAt).getTime() : 0;
-                    if (deadline > Date.now() && deadline !== redialDeadline) {
+                    const serverOffsetMs = callTimingV2Enabled && bridgeStatus.serverTime
+                        ? new Date(bridgeStatus.serverTime).getTime() - (bridgeStatus.clientReceivedAt || Date.now()) : 0;
+                    const remainingCooldown = deadline - (Date.now() + serverOffsetMs);
+                    const canPrepareDuringCooldown =
+                        bridgeStatus.connected &&
+                        bridgeStatus.nextivaProcessDetected &&
+                        bridgeStatus.state === "idle" &&
+                        remainingCooldown > 0 &&
+                        remainingCooldown <= 10_000;
+
+                    if (canPrepareDuringCooldown) {
+                        reservationNotBefore = callTimingV2Enabled ? Date.now() + remainingCooldown : deadline;
+                    } else if (remainingCooldown > 0 && deadline !== redialDeadline) {
                         window.clearTimeout(redialTimeoutId);
                         redialDeadline = deadline;
                         redialTimeoutId = window.setTimeout(() => {
                             redialDeadline = 0;
                             void triggerAutoCall();
-                        }, deadline - Date.now() + 50);
+                        }, Math.max(0, remainingCooldown));
                     }
-                    return;
+                    if (!canPrepareDuringCooldown) return;
                 }
 
                 window.clearTimeout(redialTimeoutId);
@@ -234,6 +239,7 @@ export default function EmployeeAutoCaller() {
                         const stillAssigned = isLeadAssignedToEmployee(pendingLead, employeeId, employeeNames);
 
                         if (
+                            !blockedLeadIds.has(pendingLeadId) &&
                             commentUnchanged &&
                             stillAssigned &&
                             pendingPhone &&
@@ -258,6 +264,7 @@ export default function EmployeeAutoCaller() {
                     queueAutoCallLead = await getNextAutoCallLead({
                         employeeId,
                         employeeNames,
+                        excludedLeadIds: Array.from(blockedLeadIds),
                     }, { timeoutMs: AUTO_CALL_API_TIMEOUT_MS });
                 }
 
@@ -271,20 +278,29 @@ export default function EmployeeAutoCaller() {
                 let reservation: Awaited<ReturnType<typeof reserveCallBridgeCall>>;
 
                 try {
+                    if (reservationNotBefore > Date.now()) {
+                        await wait(reservationNotBefore - Date.now() + (callTimingV2Enabled ? 0 : 25));
+                    }
                     reservation = await reserveCallBridgeCall(employee.employeeCode, {
                         timeoutMs: AUTO_CALL_API_TIMEOUT_MS,
                         leadId: firstCallableLead._id,
+                        ...(callTimingV2Enabled ? { attemptId: crypto.randomUUID() } : {}),
                     });
                 } catch (error) {
                     const terminalErrorCode = getTerminalLeadReservationErrorCode(error);
 
                     if (terminalErrorCode) {
+                        blockedLeadIds.add(firstCallableLead._id);
                         clearAutoCallPendingComment(employee.employeeCode, firstCallableLead._id);
                     }
                     return;
                 }
 
                 if (!reservation.allowed) {
+                    if (reservation.code) {
+                        blockedLeadIds.add(firstCallableLead._id);
+                        clearAutoCallPendingComment(employee.employeeCode, firstCallableLead._id);
+                    }
                     return;
                 }
                 reservedEmployeeCode = employee.employeeCode;
@@ -303,25 +319,6 @@ export default function EmployeeAutoCaller() {
                     return;
                 }
 
-                const employeeBeforeCall = await getEmployeeSummary(employeeId, { timeoutMs: AUTO_CALL_API_TIMEOUT_MS });
-
-                if (
-                    !isSalesRole(employeeBeforeCall.role) ||
-                    normalizeEmployeeAvailabilityStatus(employeeBeforeCall.availabilityStatus) !== "ONLINE"
-                ) {
-                    return;
-                }
-
-                const leadBeforeCall = await getLead(firstCallableLead._id, { timeoutMs: AUTO_CALL_API_TIMEOUT_MS });
-                const expectedCommentMarker = pendingComment?.leadId === firstCallableLead._id
-                    ? pendingComment.baselineCommentMarker
-                    : getEmployeeCommentMarker(firstCallableLead.comments);
-
-                if (getEmployeeCommentMarker(leadBeforeCall.comments) !== expectedCommentMarker) {
-                    clearAutoCallPendingComment(employee.employeeCode, firstCallableLead._id);
-                    return;
-                }
-
                 if (!isDisposed) {
                     startAutoCallPendingComment(
                         employee.employeeCode,
@@ -330,35 +327,28 @@ export default function EmployeeAutoCaller() {
                     );
 
                     const launchedAt = Date.now();
-                    window.localStorage.setItem(lastCallStorageKey, String(launchedAt));
+                    if (!callTimingV2Enabled) window.localStorage.setItem(lastCallStorageKey, String(launchedAt));
                     navigate(`/leads?lead=${encodeURIComponent(firstCallableLead._id)}`, {
                         state: { autoCallLead: firstCallableLead },
                     });
                     await wait(150);
 
                     try {
-                        await markCallBridgeDialStarted(employee.employeeCode, {
+                        const dialStart = await markCallBridgeDialStarted(employee.employeeCode, {
                             timeoutMs: AUTO_CALL_API_TIMEOUT_MS,
                             leadId: firstCallableLead._id,
                             reservationToken,
                         });
+                        if (callTimingV2Enabled && dialStart.alreadyStarted) {
+                            reservedEmployeeCode = "";
+                            return;
+                        }
                     } catch {
                         clearAutoCallPendingComment(employee.employeeCode, firstCallableLead._id);
                         return;
                     }
 
-                    const pendingImmediatelyBeforeDial = getAutoCallPendingComment(employee.employeeCode);
-                    const leadImmediatelyBeforeDial = await getLead(firstCallableLead._id, { timeoutMs: AUTO_CALL_API_TIMEOUT_MS });
-
-                    if (
-                        pendingImmediatelyBeforeDial?.leadId !== firstCallableLead._id ||
-                        getEmployeeCommentMarker(leadImmediatelyBeforeDial.comments) !== expectedCommentMarker
-                    ) {
-                        clearAutoCallPendingComment(employee.employeeCode, firstCallableLead._id);
-                        return;
-                    }
-
-                    launchPhoneCall(normalizedPhone, bridgeStatus.provider);
+                    launchPhoneCall(normalizedPhone);
                     callWasLaunched = true;
 
                     const callConfirmed = await waitForConfirmedCall(

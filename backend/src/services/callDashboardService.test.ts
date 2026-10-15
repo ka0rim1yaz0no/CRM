@@ -14,6 +14,32 @@ test("selects the current overnight PH shift before and after midnight", () => {
   assert.equal(duringNight.end.toISOString(), "2026-09-16T00:00:00.000Z");
 });
 
+test("v2 uses the observed call start, break precedence, and a stale bridge state", () => {
+  const previous = process.env.CRM_CALL_DASHBOARD_V2;
+  process.env.CRM_CALL_DASHBOARD_V2 = "true";
+  try {
+    const shift = { start: at("2026-09-15T15:00:00Z"), end: at("2026-09-16T00:00:00Z") };
+    const now = at("2026-09-15T16:10:00Z");
+    const startedAt = at("2026-09-15T16:00:00Z");
+    const device = { bridgeVersion: "0.4.1", state: "active", audioSessionActive: true,
+      nextivaProcessDetected: true, lastSeenAt: at("2026-09-15T16:09:58Z"),
+      lastStateChangedAt: at("2026-09-15T16:05:00Z"), lastIdleAt: at("2026-09-15T15:59:00Z") };
+    const base = { availabilityStatus: "ONLINE", devices: [device], schedule: { lastCallStartedAt: startedAt },
+      attendance: [{ source: "Time In", timeIn: shift.start }], now, shift };
+    const active = callDashboardStatus(base);
+    assert.equal(active.status, "ON CALL");
+    assert.equal(active.statusStartedAt?.toISOString(), startedAt.toISOString());
+    assert.equal(callDashboardStatus({ ...base, availabilityStatus: "BREAK" }).status, "BREAK");
+    const disconnected = callDashboardStatus({ ...base, devices: [{ ...device, lastSeenAt: at("2026-09-15T16:09:00Z") }] });
+    assert.equal(disconnected.status, "ONLINE");
+    assert.equal(disconnected.statusStartedAt?.toISOString(), shift.start.toISOString());
+    assert.equal(callDashboardStatus({ ...base, devices: [] }).status, "ONLINE");
+  } finally {
+    if (previous === undefined) delete process.env.CRM_CALL_DASHBOARD_V2;
+    else process.env.CRM_CALL_DASHBOARD_V2 = previous;
+  }
+});
+
 test("adds completed and active off-phone sessions without crossing shift boundaries", () => {
   const start = at("2026-09-15T15:00:00Z");
   const end = at("2026-09-16T00:00:00Z");
@@ -43,6 +69,7 @@ test("closes an off-phone session at time out", () => {
 test("dial launch is provisional until Nextiva activity, and call status stays inside the shift", () => {
   const shift = { start: at("2026-09-15T15:00:00Z"), end: at("2026-09-16T00:00:00Z") };
   const device = {
+    bridgeVersion: "0.4.1",
     state: "idle",
     audioSessionActive: false,
     nextivaProcessDetected: true,
@@ -82,6 +109,27 @@ test("dial launch is provisional until Nextiva activity, and call status stays i
   const outside = callDashboardStatus({ ...base, now: at("2026-09-16T01:00:00Z"), devices: [{ ...device, state: "active", lastSeenAt: at("2026-09-16T00:59:55Z") }] });
   assert.equal(outside.status, "ONLINE");
   assert.equal(outside.statusStartedAt, null);
+});
+
+test("v2 keeps online time anchored to attendance while a dial is pending", () => {
+  const previous = process.env.CRM_CALL_DASHBOARD_V2;
+  process.env.CRM_CALL_DASHBOARD_V2 = "true";
+  try {
+    const shift = { start: at("2026-09-15T15:00:00Z"), end: at("2026-09-16T00:00:00Z") };
+    const status = callDashboardStatus({
+      availabilityStatus: "ONLINE", attendance: [{ source: "Time In", timeIn: shift.start }],
+      devices: [{ bridgeVersion: "0.4.1", state: "idle", audioSessionActive: false,
+        nextivaProcessDetected: true, lastSeenAt: at("2026-09-15T16:02:00Z"),
+        lastStateChangedAt: at("2026-09-15T16:00:00Z") }],
+      schedule: { lastDialStartedAt: at("2026-09-15T16:01:50Z"), dialIntentUntil: at("2026-09-15T16:02:20Z") },
+      now: at("2026-09-15T16:02:00Z"), shift,
+    });
+    assert.equal(status.status, "ONLINE");
+    assert.equal(status.statusStartedAt?.toISOString(), shift.start.toISOString());
+  } finally {
+    if (previous === undefined) delete process.env.CRM_CALL_DASHBOARD_V2;
+    else process.env.CRM_CALL_DASHBOARD_V2 = previous;
+  }
 });
 
 test("call waiting is only the 30 seconds after a call ends", () => {
@@ -300,6 +348,7 @@ test("expires an active audio signal that never reports the call ending", () => 
     availabilityStatus: "ONLINE",
     attendance: [{ source: "Time In", timeIn: shift.start }],
     devices: [{
+      bridgeVersion: "0.4.1",
       state: "active",
       audioSessionActive: true,
       nextivaProcessDetected: true,
@@ -308,6 +357,96 @@ test("expires an active audio signal that never reports the call ending", () => 
     }],
     schedule: { lastCallStartedAt: at("2026-09-15T15:15:00Z") },
     now,
+    shift,
+    provider: "nextiva",
+  });
+
+  assert.equal(result.status, "ONLINE");
+  assert.equal(result.detail, "Ready to dial");
+});
+
+test("expires a stuck active signal after thirty minutes", () => {
+  const shift = { start: at("2026-09-15T15:00:00Z"), end: at("2026-09-16T00:00:00Z") };
+  const startedAt = at("2026-09-15T16:00:00Z");
+  const result = callDashboardStatus({
+    availabilityStatus: "ONLINE",
+    attendance: [{ source: "Time In", timeIn: shift.start }],
+    devices: [{
+      bridgeVersion: "0.4.1",
+      state: "active",
+      audioSessionActive: true,
+      nextivaProcessDetected: true,
+      lastSeenAt: at("2026-09-15T16:30:01Z"),
+      lastStateChangedAt: startedAt,
+      lastIdleAt: at("2026-09-15T15:59:00Z"),
+    }],
+    schedule: { lastCallStartedAt: startedAt },
+    now: at("2026-09-15T16:30:01Z"),
+    shift,
+    provider: "nextiva",
+  });
+
+  assert.equal(result.status, "ONLINE");
+  assert.equal(result.detail, "Ready to dial");
+});
+
+test("v2 starts a manual call timer at the fresh bridge transition, not a stale schedule", () => {
+  const previous = process.env.CRM_CALL_DASHBOARD_V2;
+  process.env.CRM_CALL_DASHBOARD_V2 = "true";
+  try {
+    const startedAt = at("2026-10-13T16:31:55Z");
+    const result = callDashboardStatus({
+      availabilityStatus: "ONLINE",
+      attendance: [{ source: "Time In", timeIn: at("2026-10-13T15:00:00Z") }],
+      devices: [{ bridgeVersion: "0.4.1", state: "active", audioSessionActive: true,
+        nextivaProcessDetected: true, lastSeenAt: at("2026-10-13T16:32:00Z"),
+        lastStateChangedAt: startedAt, lastIdleAt: at("2026-10-13T16:31:40Z") }],
+      schedule: { lastCallStartedAt: at("2026-10-13T15:05:00Z") },
+      now: at("2026-10-13T16:32:01Z"),
+      shift: { start: at("2026-10-13T15:00:00Z"), end: at("2026-10-14T00:00:00Z") },
+      provider: "nextiva",
+    });
+    assert.equal(result.status, "ON CALL");
+    assert.equal(result.statusStartedAt?.toISOString(), startedAt.toISOString());
+
+    const laterReservation = callDashboardStatus({
+      availabilityStatus: "ONLINE",
+      attendance: [{ source: "Time In", timeIn: at("2026-10-13T15:00:00Z") }],
+      devices: [{ bridgeVersion: "0.4.1", state: "active", audioSessionActive: true,
+        nextivaProcessDetected: true, lastSeenAt: at("2026-10-13T16:32:00Z"),
+        lastStateChangedAt: startedAt, lastIdleAt: at("2026-10-13T16:31:40Z") }],
+      schedule: { lastCallStartedAt: at("2026-10-13T16:31:58Z") },
+      now: at("2026-10-13T16:32:01Z"),
+      shift: { start: at("2026-10-13T15:00:00Z"), end: at("2026-10-14T00:00:00Z") },
+      provider: "nextiva",
+    });
+    assert.equal(laterReservation.statusStartedAt?.toISOString(), startedAt.toISOString());
+  } finally {
+    if (previous === undefined) delete process.env.CRM_CALL_DASHBOARD_V2;
+    else process.env.CRM_CALL_DASHBOARD_V2 = previous;
+  }
+});
+
+test("rejects a legacy audio signal that starts after the confirmed call ended", () => {
+  const shift = { start: at("2026-10-13T15:00:00Z"), end: at("2026-10-14T00:00:00Z") };
+  const result = callDashboardStatus({
+    availabilityStatus: "ONLINE",
+    attendance: [{ source: "Time In", timeIn: shift.start }],
+    devices: [{
+      bridgeVersion: "0.4.0",
+      state: "active",
+      audioSessionActive: true,
+      nextivaProcessDetected: true,
+      lastSeenAt: at("2026-10-13T16:50:12Z"),
+      lastStateChangedAt: at("2026-10-13T16:31:55Z"),
+      lastIdleAt: at("2026-10-13T16:31:20Z"),
+    }],
+    schedule: {
+      lastDialStartedAt: at("2026-10-13T16:30:30Z"),
+      lastCallStartedAt: at("2026-10-13T16:30:35Z"),
+      lastCallEndedAt: at("2026-10-13T16:31:18Z"),
+    },
+    now: at("2026-10-13T16:50:14Z"),
     shift,
     provider: "nextiva",
   });

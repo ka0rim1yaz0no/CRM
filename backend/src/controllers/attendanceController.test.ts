@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { canEditWorkedMinutes, isTimeInLate, shouldAutomaticallyCloseAttendanceSlot, workedMinutesToTimeOut } from "./attendanceController";
+import { attendanceSlotKey, canEditWorkedMinutes, isTimeInLate, shouldAutomaticallyCloseAttendanceSlot, workedMinutesToTimeOut } from "./attendanceController";
 
 const now = new Date("2026-10-07T00:30:00.000Z");
 
@@ -9,6 +9,14 @@ test("treats the full configured start minute as on time", () => {
   assert.equal(isTimeInLate(new Date("2026-10-06T15:00:00.000Z"), shiftStart), false);
   assert.equal(isTimeInLate(new Date("2026-10-06T15:00:59.999Z"), shiftStart), false);
   assert.equal(isTimeInLate(new Date("2026-10-06T15:01:00.000Z"), shiftStart), true);
+});
+
+test("an overnight Manila shift keeps time-in and the next morning on one slot", () => {
+  const slot = (value: string) => attendanceSlotKey(new Date(value), "Asia/Manila", "23:00", "08:00");
+  assert.equal(slot("2026-10-14T15:00:00Z"), "2026-10-14");
+  assert.equal(slot("2026-10-14T23:59:00Z"), "2026-10-14");
+  assert.equal(slot("2026-10-15T00:00:00Z"), "2026-10-14");
+  assert.equal(slot("2026-10-15T00:01:00Z"), "2026-10-15");
 });
 
 test("converts edited worked minutes into a time-out while preserving the payroll lunch", () => {

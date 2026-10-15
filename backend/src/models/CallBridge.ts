@@ -38,6 +38,7 @@ export type CallBridgeDeviceDocument = {
 export type CallBridgeScheduleDocument = {
   employeeCode: string;
   callLeaseUntil: Date | null;
+  reservedAttemptId: string;
   reservedBusinessId: string;
   reservedLeadId: string;
   reservationTokenHash: string;
@@ -153,6 +154,7 @@ const scheduleSchema = new Schema<CallBridgeScheduleDocument>(
   {
     employeeCode: { type: String, required: true, trim: true, unique: true, index: true },
     callLeaseUntil: { type: Date, default: null },
+    reservedAttemptId: { type: String, trim: true, default: "" },
     reservedBusinessId: { type: String, trim: true, default: "" },
     reservedLeadId: { type: String, trim: true, default: "" },
     reservationTokenHash: { type: String, trim: true, default: "" },

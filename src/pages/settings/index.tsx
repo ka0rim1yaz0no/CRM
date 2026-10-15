@@ -5,6 +5,7 @@ import {
     callBridgeBackendUrl,
     callBridgeBusinessId,
     callBridgePackageUrl,
+    callTimingV2Enabled,
     createCallBridgePairing,
     getCallBridgeStatus,
     revokeCallBridgeDevices,
@@ -117,7 +118,7 @@ export default function Settings() {
     }, [pairing]);
 
     useEffect(() => {
-        const intervalId = window.setInterval(() => setAutoCallNow(new Date()), 5_000);
+        const intervalId = window.setInterval(() => setAutoCallNow(new Date()), callTimingV2Enabled ? 1_000 : 5_000);
         return () => window.clearInterval(intervalId);
     }, []);
 
@@ -180,8 +181,7 @@ export default function Settings() {
         setBridgeActionMessage("Copied.");
     };
 
-    const isRingCentral = bridgeStatus?.provider === "ringcentral";
-    const providerName = isRingCentral ? "RingCentral" : "Nextiva";
+    const providerName = "Nextiva";
     const bridgeStatusLabel = bridgeStatusLoading
         ? "Checking"
         : bridgeStatus?.state === "active"
@@ -206,7 +206,7 @@ export default function Settings() {
         if (!bridgeStatus?.connected) {
             return {
                 label: "Not connected",
-                detail: isRingCentral ? bridgeStatus?.reason || "RingCentral API is not connected." : "Pair this computer with Call Bridge.",
+                detail: "Pair this computer with Call Bridge.",
                 ready: false,
             };
         }
@@ -214,7 +214,7 @@ export default function Settings() {
         if (!bridgeStatus.nextivaProcessDetected) {
             return {
                 label: `${providerName} unavailable`,
-                detail: isRingCentral ? bridgeStatus.reason : "Open Nextiva on this computer.",
+                detail: "Open Nextiva on this computer.",
                 ready: false,
             };
         }
@@ -225,6 +225,15 @@ export default function Settings() {
 
         if (bridgeStatus.state === "calling") {
             return { label: "Starting call", detail: `A ${providerName} call is being opened.`, ready: false };
+        }
+
+        if (callTimingV2Enabled && bridgeStatus.nextCallAllowedAt && bridgeStatus.serverTime) {
+            const serverNow = autoCallNow.getTime() + new Date(bridgeStatus.serverTime).getTime() -
+                (bridgeStatus.clientReceivedAt || autoCallNow.getTime());
+            const secondsLeft = Math.max(0, Math.ceil((new Date(bridgeStatus.nextCallAllowedAt).getTime() - serverNow) / 1_000));
+            if (secondsLeft > 0) {
+                return { label: `Next call in ${secondsLeft}s`, detail: "Waiting for the server's call-end deadline.", ready: false };
+            }
         }
 
         if (availabilityStatus !== "ONLINE") {
@@ -360,15 +369,13 @@ export default function Settings() {
                         <div>
                             <p className="text-xs font-medium uppercase tracking-[0.16em] text-white/35">Calling</p>
                             <h2 className="mt-1 text-lg font-semibold text-white">
-                                {isRingCentral ? "RingCentral Call Control" : "Nextiva Call Bridge"}
+                                Nextiva Call Bridge
                             </h2>
                             <p className="mt-1 text-sm text-white/45">
-                                {bridgeStatus?.reason || (isRingCentral
-                                    ? "RingCentral call status is supplied securely by the CRM backend."
-                                    : "Pair once, then Call Bridge follows the latest sales login on this computer.")}
+                                {bridgeStatus?.reason || "Pair once, then Call Bridge follows the latest sales login on this computer."}
                             </p>
                         </div>
-                        {!isRingCentral && <div className="flex flex-wrap items-center gap-2">
+                        <div className="flex flex-wrap items-center gap-2">
                             <a
                                 className="inline-flex h-10 items-center gap-2 rounded-lg border border-white/10 bg-white/[0.05] px-3 text-sm font-semibold text-white/70 transition hover:bg-white/[0.08] hover:text-white"
                                 href={callBridgePackageUrl}
@@ -397,10 +404,10 @@ export default function Settings() {
                                     <FiXCircle className="size-4" aria-hidden="true" />
                                 </button>
                             )}
-                        </div>}
+                        </div>
                     </div>
 
-                    {!isRingCentral && pairing && (
+                    {pairing && (
                         <div ref={pairingDetailsRef} className="border-b border-white/10 px-5 py-5">
                             <div className="grid gap-3 md:grid-cols-3">
                                 {[
@@ -433,17 +440,17 @@ export default function Settings() {
                             <div className="flex items-center gap-2">
                                 {bridgeStatus?.connected ? <FiWifi className="size-4" aria-hidden="true" /> : <FiWifiOff className="size-4" aria-hidden="true" />}
                                 <p className="text-xs font-medium uppercase tracking-[0.14em] opacity-70">
-                                    {isRingCentral ? "API Status" : "Bridge Status"}
+                                    Bridge Status
                                 </p>
                             </div>
                             <p className="mt-2 text-sm font-semibold">{bridgeStatusLabel}</p>
                         </div>
                         <div className="rounded-lg border border-white/10 bg-white/[0.04] p-4">
                             <p className="text-xs font-medium uppercase tracking-[0.14em] text-white/35">
-                                {isRingCentral ? "Calling Endpoint" : "Computer"}
+                                Computer
                             </p>
                             <p className="mt-2 truncate text-sm font-semibold text-white">
-                                {bridgeStatus?.deviceName || (isRingCentral ? "Extension not mapped" : "Not paired")}
+                                {bridgeStatus?.deviceName || "Not paired"}
                             </p>
                         </div>
                         <div className={["rounded-lg border p-4", autoCallStatusTone].join(" ")}>
