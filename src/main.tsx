@@ -5,6 +5,9 @@ import App from './App.tsx'
 import { ToastProvider } from './components/ToastProvider.tsx'
 import { ThemeProvider } from './components/ThemeProvider.tsx'
 import { UpdatePrompt } from './components/UpdatePrompt.tsx'
+import { getStoredThemeKey, setAppTheme } from './lib/appTheme'
+
+setAppTheme(getStoredThemeKey())
 
 const queryClient = new QueryClient({
     defaultOptions: {

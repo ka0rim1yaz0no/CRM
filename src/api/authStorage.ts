@@ -29,12 +29,15 @@ export function setAuthUser(user: AuthUser) {
         const safeEmployee = { ...user.user };
         delete safeEmployee.profileImage;
         localStorage.setItem("authUser", JSON.stringify({ ...user, user: safeEmployee }));
+        window.dispatchEvent(new Event("crm:auth-changed"));
         return;
     }
 
     localStorage.setItem("authUser", JSON.stringify(user));
+    window.dispatchEvent(new Event("crm:auth-changed"));
 }
 
 export function clearAuthUser() {
     localStorage.removeItem("authUser");
+    window.dispatchEvent(new Event("crm:auth-changed"));
 }

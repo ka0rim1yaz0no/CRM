@@ -1,6 +1,7 @@
 import { useEffect, type ReactNode } from "react";
 import { getStoredThemeKey, hasAppThemeOverride, setAppTheme } from "../lib/appTheme";
 import { getActiveBusinessId } from "../api/businessStorage";
+import { getAuthUser } from "../api/authStorage";
 
 export function ThemeProvider({ children }: { children: ReactNode }) {
     useEffect(() => {
@@ -9,6 +10,8 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
         let generation = 0;
         const refresh = () => {
             const request = ++generation;
+            setAppTheme(getStoredThemeKey());
+            if (getAuthUser()?.userType === "admin") return;
             const business = getActiveBusinessId();
             void import("../api/systemSettings")
                 .then(({ getSystemSettings }) => getSystemSettings())
@@ -20,8 +23,16 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
                 .catch(() => undefined);
         };
         refresh();
+        const storageChanged = (event: StorageEvent) => {
+            if (!event.key || ["authUser", "crmThemeKey", "crmThemeUserOverride", "activeBusinessId"].includes(event.key)) refresh();
+        };
         window.addEventListener("crm:business-changed", refresh);
-        return () => { generation++; window.removeEventListener("crm:business-changed", refresh); };
+        window.addEventListener("crm:auth-changed", refresh);
+        window.addEventListener("storage", storageChanged);
+        return () => {
+            generation++; window.removeEventListener("crm:business-changed", refresh);
+            window.removeEventListener("crm:auth-changed", refresh); window.removeEventListener("storage", storageChanged);
+        };
     }, []);
 
     return children;

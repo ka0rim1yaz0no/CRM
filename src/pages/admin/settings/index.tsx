@@ -447,7 +447,8 @@ export default function AdminSettings() {
                 <div className="flex flex-wrap items-center justify-between gap-4 border-b border-white/10 px-5 py-4">
                     <div>
                         <p className="text-xs font-medium uppercase tracking-[0.16em] text-white/35">Admin Settings</p>
-                        <h2 className="mt-1 text-xl font-semibold text-white">{activeTab}</h2>
+                        <h2 className="mt-1 text-xl font-semibold text-white">{activeTab === "Themes" ? "Employee themes" : activeTab}</h2>
+                        {activeTab === "Themes" && <p className="mt-1 text-sm text-slate-600">Admin appearance: Light</p>}
                     </div>
 
                     {activeTab !== "Features" && activeTab !== "Themes" && activeTab !== "System" && (
@@ -551,7 +552,7 @@ export default function AdminSettings() {
                                         </tr>
                                     ) : activeTab === "Themes" ? (
                                         <tr>
-                                            <th className="w-[30%] px-5 py-4">Theme</th>
+                                            <th className="w-[30%] px-5 py-4">Employee Theme</th>
                                             <th className="w-[18%] px-5 py-4">Basis</th>
                                             <th className="w-[22%] px-5 py-4">Palette</th>
                                             <th className="w-[30%] px-5 py-4">Action</th>
@@ -821,7 +822,7 @@ export default function AdminSettings() {
                                                                     onClick={() => updateSystemSettingsMutation.mutate({ themeKey: theme.key as ThemeKey })}
                                                                 >
                                                                     {isActive && <FiCheck className="size-4" aria-hidden="true" />}
-                                                                    {isActive ? "Active theme" : "Use theme"}
+                                                                    {isActive ? "Employee default" : "Set employee default"}
                                                                 </button>
                                                             </td>
                                                         </tr>

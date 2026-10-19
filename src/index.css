@@ -1736,6 +1736,29 @@ textarea.bg-\[\#0d1018\] {
   color: #8b8a94 !important;
 }
 
+/* Admin light mode keeps legacy muted labels readable on tinted surfaces too. */
+:root[data-theme-role="admin"][data-theme="light-command"] :is(
+  .text-white\/50, .text-white\/45, .text-white\/40, .text-white\/38,
+  .text-white\/35, .text-white\/30, .text-white\/25
+) {
+  color: #475569 !important;
+}
+
+:root[data-theme-role="admin"][data-theme="light-command"] :is(input, textarea)::placeholder {
+  color: #64748b !important;
+  opacity: 1;
+}
+
+:root[data-theme-role="admin"][data-theme="light-command"] main button.canada-action-add {
+  color: #ffffff !important;
+}
+
+:root[data-theme-role="admin"][data-theme="light-command"] main button:is(.flat-action-reassign, .bg-\[\#2e86de\]) {
+  background-color: #1d4ed8 !important;
+  border-color: #1d4ed8 !important;
+  color: #ffffff !important;
+}
+
 .login-screen .login-code-input:-webkit-autofill,
 .login-screen .login-code-input:-webkit-autofill:hover,
 .login-screen .login-code-input:-webkit-autofill:focus {

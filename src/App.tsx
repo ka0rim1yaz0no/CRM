@@ -48,7 +48,7 @@ const Credentials = lazy(() => import('./pages/admin/credentials'))
 const HempIndustrySurvey = lazy(() => import('./pages/survey/HempIndustrySurvey'))
 
 function RouteLoading() {
-  return <div className="min-h-screen bg-[#070910] p-6 text-sm text-white/50">Loading workspace...</div>
+  return <div className="theme-app-bg min-h-screen p-6 text-sm text-white/50">Loading workspace...</div>
 }
 
 const outsideSalesAllowedPaths = ["/dashboard", "/leads", "/tasks"];
