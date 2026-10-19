@@ -32,12 +32,19 @@ test("activity comparisons use overnight shift days without fabricating stock sn
   const trend = activityTrend([{ _id: "fake", activity: [{ actorType: "employee", createdAt: "2026-10-16T00:00:00Z" }] }], "2026-10-15", "2026-10-16");
   assert.deepEqual(trend.map((row) => row.count), [1, 0]);
 });
-test("call dashboard component, API and endpoint remain byte-for-byte unchanged", () => {
+const sourceHash = (source: string) => crypto.createHash("sha256").update(source.replace(/\r\n/g, "\n")).digest("hex").toUpperCase();
+
+test("source guard ignores checkout line endings, but still detects code changes", () => {
+  assert.equal(sourceHash("fixture\r\n"), sourceHash("fixture\n"));
+  assert.notEqual(sourceHash("fixture\n"), sourceHash("changed\n"));
+});
+
+test("call dashboard component, API and endpoint source remain unchanged", () => {
   const root = new URL("../../../", import.meta.url);
   for (const [path, hash] of [
-    ["src/components/CallDashboardPanel.tsx", "9B054467C0F5C28CE38AC5ECA89201F2EFAC34419D9CAA1F0F407D462CD18E8F"],
-    ["src/api/callDashboard.ts", "D7A832A6D57D627A92251A8441C7020947C894BB417670FBBF90E35D509A8799"],
-    ["backend/src/controllers/callDashboardController.ts", "6E794040EB9CDE149CB2354F746298AC93A387B0873D8D0759631EDF7F2977CB"],
+    ["src/components/CallDashboardPanel.tsx", "D561D37D851A9F885FA5FEFD498404E8D335255F7CCD31C3CBD766482A1568C4"],
+    ["src/api/callDashboard.ts", "2BD61E9E093FBB952477144CCAFBB43F049FCAB87EE5A6C81282D58BB0C0D923"],
+    ["backend/src/controllers/callDashboardController.ts", "8FD7BE4E0DA788F2CA2ED69CA8F05BBC2DBE5C1A2A0B8A003344D2D60E717A5C"],
     ["backend/src/routes/callDashboardRoutes.ts", "18BAE4DB7FE451D0275ABCB3E7BFA53F4DC7C9D1901C39666BFD8B26C3C0BF19"],
-  ]) assert.equal(crypto.createHash("sha256").update(fs.readFileSync(new URL(path, root))).digest("hex").toUpperCase(), hash, path);
+  ]) assert.equal(sourceHash(fs.readFileSync(new URL(path, root), "utf8")), hash, path);
 });

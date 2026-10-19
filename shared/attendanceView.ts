@@ -11,9 +11,9 @@ export function shiftDateOffset(day: string, days: number) {
     return date.toISOString().slice(0, 10);
 }
 
-export function attendanceViewRange(view: ShiftView, now: Date, date?: string, historyPage = 1) {
+export function attendanceViewRange(view: ShiftView, now: Date, currentShiftDay: string, date?: string, historyPage = 1) {
     const today = manilaCalendarDate(now);
-    if (view === "today") return { from: today, to: today };
+    if (view === "today") return { from: currentShiftDay, to: currentShiftDay };
     if (view === "date") {
         if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number.isFinite(Date.parse(`${date}T00:00:00Z`))
             || new Date(`${date}T00:00:00Z`).toISOString().slice(0, 10) !== date || date > today) {

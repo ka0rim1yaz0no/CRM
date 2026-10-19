@@ -3,6 +3,7 @@ import { after, before, mock, test } from "node:test";
 import crypto from "node:crypto";
 import http from "node:http";
 import { manilaCalendarDate, shiftDateOffset } from "../../../shared/attendanceView";
+import { hubDayKey } from "./attendanceHubMath";
 import mongoose from "mongoose";
 import { MongoMemoryReplSet } from "mongodb-memory-server";
 
@@ -351,9 +352,10 @@ test("real API: shift views retain empty roster cards, page history, preserve ov
   assert.equal(current.total, 1);
   assert.equal(current.employees.length, 1);
   assert.equal(current.employees[0].employeeCode, actor.code);
-  assert.deepEqual(current.rows, []);
-  assert.equal(current.summary.daysWorked, 0);
-  assert.deepEqual(current.range, { from: today, to: today });
+  const shiftDay = hubDayKey(new Date(), { officialShiftStartTime: "23:00", officialShiftEndTime: "08:00", attendanceTimeZone: "Asia/Manila", lateGraceMinutes: 0 });
+  assert.equal(current.rows.length, Number(shiftDay === recentDay));
+  assert.equal(current.summary.daysWorked, Number(shiftDay === recentDay));
+  assert.deepEqual(current.range, { from: shiftDay, to: shiftDay });
   const specific = await (await query(`shiftView=date&shiftDate=${recentDay}`)).json();
   assert.equal(specific.rows.length, 1);
   assert.equal(specific.rows[0].dayKey, recentDay);
@@ -375,6 +377,52 @@ test("real API: shift views retain empty roster cards, page history, preserve ov
   assert.equal((await request("/attendance-hub/days?shiftView=today", createAttendanceHubSession(actor.code)!)).status, 403);
   assert.equal(JSON.stringify(await AttendanceLedger.findById(identity.key).lean()), before);
   assert.ok((await AttendanceLedger.findById(identity.key).lean())!.audit.length > 0);
+});
+
+test("real API: Today shows the same overnight shift in all three businesses, including after PH midnight", async () => {
+  mock.timers.enable({ apis: ["Date"], now: new Date("2026-10-19T18:00:00Z") });
+  try {
+    const businesses = ["test-a", "test-b", "test-c"];
+    const code = String(91000000 + counter++);
+    const ids: string[] = [];
+    for (const business of businesses) await runWithBusiness(business, async () => {
+      const employee = await Employee.create({ employeeCode: code, name: "Synthetic Midnight Employee", role: "Test", team: "Fixture",
+        dateHired: "2026-10-01", businessAccessIds: businesses });
+      ids.push(String(employee._id));
+    });
+    await setBusinessAccessForEmployeeCode(code, businesses);
+    const actor = { role: "employee" as const, code };
+    const identity = await runWithBusiness("test-a", () => resolveAttendanceIdentity(ids[0], actor));
+    await executeAttendanceCommand(identity, command(0, "Time In"), actor, new Date("2026-10-19T15:00:00Z"));
+    await executeAttendanceCommand(identity, command(1, "Break Out"), actor, new Date("2026-10-19T17:00:00Z"));
+    await deliverAttendanceLedger(identity.key);
+    const before = JSON.stringify(await AttendanceLedger.findById(identity.key).lean());
+    const token = createAdminDashboardSession(admin.code)!;
+    for (const business of businesses) {
+      const headers = { "X-Business-Id": business, "X-CRM-Admin-Session": token };
+      const query = `business=${business}&employee=${code}&shiftView=today`;
+      const response = await fetch(`${base}/attendance-hub/days?${query}`, { headers });
+      assert.equal(response.status, 200);
+      const data = await response.json();
+      assert.deepEqual(data.range, { from: "2026-10-19", to: "2026-10-19" });
+      assert.equal(data.history.today, "2026-10-20", "calendar-date input limits remain separate from the selected shift day");
+      assert.equal(data.rows.length, 1);
+      assert.equal(data.rows[0].dayKey, "2026-10-19");
+      assert.equal(data.rows[0].businessId, business);
+      assert.equal(data.rows[0].events.length, 2);
+      assert.equal(data.summary.daysWorked, 1);
+      assert.equal(data.summary.online, 2 * 3_600_000);
+      assert.equal(data.summary.break, 3_600_000);
+      assert.equal(data.rows[0].timeOut, null, "viewing Today must not invent a checkout");
+      const csv = await fetch(`${base}/attendance-hub/export?${query}`, { headers });
+      assert.equal(csv.status, 200);
+      assert.ok((await csv.text()).includes('"Attendance","2026-10-19","2026-10-19"'));
+      const nextDate = await fetch(`${base}/attendance-hub/days?business=${business}&employee=${code}&shiftView=date&shiftDate=2026-10-20`, { headers });
+      assert.equal(nextDate.status, 200);
+      assert.deepEqual((await nextDate.json()).rows, [], "an explicit next-shift date must not inherit the previous shift's punches");
+    }
+    assert.equal(JSON.stringify(await AttendanceLedger.findById(identity.key).lean()), before, "all list and export reads remain non-mutating");
+  } finally { mock.timers.reset(); }
 });
 
   test("real API: shift-view employee sorting survives pagination and keeps business-only roster members scoped", async () => {

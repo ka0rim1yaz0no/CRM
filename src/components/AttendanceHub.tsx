@@ -253,7 +253,7 @@ export default function AttendanceHub({ admin = false, actions, message, embedde
         const next = new URLSearchParams(params);
         ["preset", "from", "to", "page", "historyPage"].forEach((key) => next.delete(key));
         next.set("shiftView", view);
-        if (view === "date") next.set("shiftDate", date || data?.history?.today || manilaCalendarDate(new Date()));
+        if (view === "date") next.set("shiftDate", date || data?.range.to || data?.history?.today || manilaCalendarDate(new Date()));
         else next.delete("shiftDate");
         if (view === "all") { next.set("sort", "date"); next.set("direction", "desc"); }
         setParams(next);
@@ -359,7 +359,7 @@ export default function AttendanceHub({ admin = false, actions, message, embedde
                         <input type="checkbox" checked={visible.has(column)} onChange={() => setVisible((current) => {
                             const next = new Set(current); if (next.has(column)) next.delete(column); else next.add(column); return next;
                         })} /> {columnLabels[column]}</label>)}</div></details></div></div>
-                {admin && <p className="attendance-hub-record-range">{filters.shiftView === "today" ? "Today" : filters.shiftView === "date" ? "Shift date" : filters.shiftView === "all" ? "All Shifts · historical window" : "Linked date range"}: {data.range.from}{data.range.to !== data.range.from ? ` to ${data.range.to}` : ""} · Asia/Manila{isPlaceholderData ? " · Updating..." : ""}</p>}
+                {admin && <p className="attendance-hub-record-range">{filters.shiftView === "today" ? "Current shift" : filters.shiftView === "date" ? "Shift date" : filters.shiftView === "all" ? "All Shifts · historical window" : "Linked date range"}: {data.range.from}{data.range.to !== data.range.from ? ` to ${data.range.to}` : ""} · Asia/Manila{filters.shiftView === "today" && data.history?.today && data.history.today !== data.range.from ? ` · Calendar date: ${data.history.today}` : ""}{isPlaceholderData ? " · Updating..." : ""}</p>}
                 {!groups.length && <p className="attendance-hub-empty">No shift records match these filters.</p>}
                 {groups.map(({ employee, days }) => <div key={employee.scopeKey} className="attendance-hub-employee-group">
                     {admin && <button type="button" className="attendance-hub-group-toggle" aria-expanded={expanded.has(employee.scopeKey)} aria-controls={`attendance-days-${encodeURIComponent(employee.scopeKey)}`}

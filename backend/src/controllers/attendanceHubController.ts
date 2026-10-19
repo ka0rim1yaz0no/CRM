@@ -42,13 +42,13 @@ function dayShift(key: string, days: number) {
   return date.toISOString().slice(0, 10);
 }
 function rangeForQuery(query: Request["query"], now: Date) {
+  const today = hubDayKey(now, { officialShiftStartTime: defaultSystemSettings.officialShiftStartTime,
+    officialShiftEndTime: defaultSystemSettings.officialShiftEndTime, lateGraceMinutes: 0, attendanceTimeZone: hubTimeZone });
   const shiftView = scalar(query.shiftView);
   if (shiftView) {
     if (!["today", "date", "all"].includes(shiftView)) throw new Error("Invalid shift view.");
-    return { ...attendanceViewRange(shiftView as ShiftView, now, scalar(query.shiftDate), Number(query.historyPage || 1)), preset: "custom" };
+    return { ...attendanceViewRange(shiftView as ShiftView, now, today, scalar(query.shiftDate), Number(query.historyPage || 1)), preset: "custom" };
   }
-  const today = hubDayKey(now, { officialShiftStartTime: defaultSystemSettings.officialShiftStartTime,
-    officialShiftEndTime: defaultSystemSettings.officialShiftEndTime, lateGraceMinutes: 0, attendanceTimeZone: hubTimeZone });
   const preset = scalar(query.preset) || "last-7-days";
   const weekday = dayDate(today)?.getUTCDay() || 0;
   const weekStart = dayShift(today, -(weekday === 0 ? 6 : weekday - 1));
