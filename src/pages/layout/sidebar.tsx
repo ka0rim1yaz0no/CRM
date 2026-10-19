@@ -28,7 +28,6 @@ import {
   readAnnouncementSeenAt,
 } from "../../lib/announcementReadState";
 import { isPocOperationsUser } from "../../lib/roleAccess";
-import { MdPassword } from "react-icons/md";
 import "../../components/WorkspaceSidebar.css";
 
 const navItems = [
@@ -78,9 +77,7 @@ const navItems = [
 const outsideSalesNavPaths = new Set(["/dashboard", "/leads", "/tasks"]);
 
 const pocOperationsNavItems = [
-  { label: "Employees", path: "/poc/employees", icon: FiUsers, feature: "employees" },
   { label: "Tasks", path: "/poc/tasks", icon: FiCheckSquare, feature: "tasks" },
-  { label: "Credentials", path: "/poc/credentials", icon: MdPassword, feature: "credentials" },
 ];
 
 function isOutsideSalesEmployee(authUser: ReturnType<typeof getAuthUser>) {

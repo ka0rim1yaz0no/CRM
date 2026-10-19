@@ -42,7 +42,7 @@ walk(source("src/App.tsx"), (node) => {
 
 for (const [file, expectedCount] of [
   ["src/pages/admin/adminLayout/index.tsx", 15],
-  ["src/pages/layout/sidebar.tsx", 14],
+  ["src/pages/layout/sidebar.tsx", 12],
 ] as const) {
   test(`${file}: every sidebar destination exists and uses the same feature and role gate`, () => {
     const destinations: Array<{ path: string; feature: string }> = [];
@@ -54,6 +54,15 @@ for (const [file, expectedCount] of [
     });
     assert.equal(destinations.length, expectedCount, "include all normal and POC navigation items");
     assert.equal(new Set(destinations.map((item) => item.path)).size, destinations.length);
+    if (file === "src/pages/layout/sidebar.tsx") {
+      assert.ok(!destinations.some((item) => /\/(employees|credentials)(\/|$)/.test(item.path)),
+        "employee navigation must not expose Employees or Credentials in any business, including POC");
+      assert.ok(destinations.some((item) => item.path === "/poc/tasks"), "POC Tasks remains available");
+    } else {
+      for (const path of ["/admin/employees", "/admin/credentials"]) {
+        assert.ok(destinations.some((item) => item.path === path), `admin navigation keeps ${path}`);
+      }
+    }
     for (const item of destinations) {
       assert.deepEqual(routes.get(item.path), {
         feature: item.feature,
