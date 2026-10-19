@@ -1164,8 +1164,8 @@ export default function PayrollPage() {
                         </div>
 
                         <section className="mt-3 flex min-h-[24rem] flex-1 flex-col overflow-hidden rounded-lg border border-violet-200/80 bg-white/90 shadow-xl shadow-violet-200/35">
-                            <div className="content-scroll min-h-0 max-w-full flex-1 overflow-auto bg-[linear-gradient(to_bottom,#ffffff_0,#ffffff_3.25rem,transparent_3.25rem)] [scrollbar-gutter:stable]">
-                                <table className="w-full min-w-full table-fixed border-separate border-spacing-0 text-left">
+                            <div role="region" aria-label="Employee payroll records" tabIndex={0} className="content-scroll min-h-0 max-w-full flex-1 overflow-auto bg-[linear-gradient(to_bottom,#ffffff_0,#ffffff_3.25rem,transparent_3.25rem)] [scrollbar-gutter:stable]">
+                                <table className="w-full min-w-[64rem] table-fixed border-separate border-spacing-0 text-left">
                                     <thead className="sticky top-0 z-10 bg-white text-[0.74rem] font-medium !text-slate-600 shadow-[12px_0_0_#ffffff]">
                                         <tr>
                                             <th className="w-[4%] px-3 py-3">
@@ -1177,14 +1177,14 @@ export default function PayrollPage() {
                                                     onChange={toggleAllVisibleRecords}
                                                 />
                                             </th>
-                                            <th className="w-[24%] px-3 py-3"><DataTableSortHeader field="employeeName" sortBy={sortBy} sortDir={sortDir} onSort={changeSort}>Employee</DataTableSortHeader></th>
-                                            <th className="w-[12%] px-3 py-3"><DataTableSortHeader field="employeeId" sortBy={sortBy} sortDir={sortDir} onSort={changeSort}>Employee ID</DataTableSortHeader></th>
-                                            <th className="w-[10%] px-3 py-3">Basic Pay</th>
-                                            <th className="w-[6%] px-3 py-3">Days</th>
-                                            <th className="w-[7%] px-3 py-3">Hours</th>
-                                            <th className="w-[10%] px-3 py-3"><DataTableSortHeader field="netPay" sortBy={sortBy} sortDir={sortDir} onSort={changeSort}>Net Pay</DataTableSortHeader></th>
+                                            <th className="w-[22%] px-3 py-3"><DataTableSortHeader field="employeeName" sortBy={sortBy} sortDir={sortDir} onSort={changeSort}>Employee</DataTableSortHeader></th>
+                                            <th className="w-[11%] px-3 py-3"><DataTableSortHeader field="employeeId" sortBy={sortBy} sortDir={sortDir} onSort={changeSort}>Employee ID</DataTableSortHeader></th>
+                                            <th className="w-[11%] px-3 py-3">Basic Pay</th>
+                                            <th className="w-[5%] px-3 py-3">Days</th>
+                                            <th className="w-[6%] px-3 py-3">Hours</th>
+                                            <th className="w-[11%] px-3 py-3"><DataTableSortHeader field="netPay" sortBy={sortBy} sortDir={sortDir} onSort={changeSort}>Net Pay</DataTableSortHeader></th>
                                             <th className="w-[10%] px-3 py-3"><DataTableSortHeader field="status" sortBy={sortBy} sortDir={sortDir} onSort={changeSort}>Status</DataTableSortHeader></th>
-                                            <th className="w-[25%] px-3 py-3 text-center">Actions</th>
+                                            <th className="w-[20%] px-3 py-3 text-center">Actions</th>
                                         </tr>
                                     </thead>
                                     <tbody className="divide-y divide-slate-200">

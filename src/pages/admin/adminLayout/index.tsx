@@ -32,6 +32,7 @@ import {
     FiFileText,
     FiLogOut,
     FiMessageCircle,
+    FiMenu,
     FiMonitor,
     FiPieChart,
     FiSearch,
@@ -129,23 +130,52 @@ const adminNavSections: AdminNavSection[] = [
 
 export default function AdminLayout({ children }: Props) {
     const [isScrolling, setIsScrolling] = useState(false);
-    const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(() => window.localStorage.getItem("crm:sidebar-collapsed") === "true");
+    const [isDesktopSidebarCollapsed, setIsDesktopSidebarCollapsed] = useState(() => window.localStorage.getItem("crm:sidebar-collapsed") === "true");
+    const [isNarrowViewport, setIsNarrowViewport] = useState(() => window.matchMedia("(max-width: 767px)").matches);
+    const [mobileNavPath, setMobileNavPath] = useState<string | null>(null);
     const [isNotificationsOpen, setIsNotificationsOpen] = useState(false);
     const [isBusinessOpen, setIsBusinessOpen] = useState(false);
     const [adminSearch, setAdminSearch] = useState("");
     const [debouncedAdminSearch, setDebouncedAdminSearch] = useState("");
     const [isAdminSearchOpen, setIsAdminSearchOpen] = useState(false);
     const { pathname } = useLocation();
+    const isMobileNavOpen = isNarrowViewport && mobileNavPath === pathname;
+    const isSidebarCollapsed = !isNarrowViewport && isDesktopSidebarCollapsed;
     const navigate = useNavigate();
     const scrollTimer = useRef<number | undefined>(undefined);
     const notificationsRef = useRef<HTMLDivElement>(null);
     const businessRef = useRef<HTMLDivElement>(null);
     const adminSearchRef = useRef<HTMLFormElement>(null);
+    const sidebarRef = useRef<HTMLElement>(null);
+    const sidebarToggleRef = useRef<HTMLButtonElement>(null);
     useEffect(() => {
-        const syncSidebar = () => setIsSidebarCollapsed(window.localStorage.getItem("crm:sidebar-collapsed") === "true");
+        const syncSidebar = () => setIsDesktopSidebarCollapsed(window.localStorage.getItem("crm:sidebar-collapsed") === "true");
         window.addEventListener("crm:sidebar-toggle", syncSidebar);
         return () => window.removeEventListener("crm:sidebar-toggle", syncSidebar);
     }, []);
+    useEffect(() => {
+        const media = window.matchMedia("(max-width: 767px)");
+        const syncViewport = () => { setIsNarrowViewport(media.matches); setMobileNavPath(null); };
+        media.addEventListener("change", syncViewport);
+        return () => media.removeEventListener("change", syncViewport);
+    }, []);
+    useEffect(() => {
+        if (!isMobileNavOpen) return;
+        const focusable = () => Array.from(sidebarRef.current?.querySelectorAll<HTMLElement>("a[href], button:not(:disabled)") || [])
+            .filter((element) => element.getClientRects().length > 0);
+        focusable()[0]?.focus();
+        const handleKey = (event: KeyboardEvent) => {
+            if (event.key === "Escape") { setMobileNavPath(null); event.preventDefault(); }
+            if (event.key !== "Tab") return;
+            const elements = focusable();
+            const first = elements[0], last = elements.at(-1);
+            if (event.shiftKey && document.activeElement === first) { last?.focus(); event.preventDefault(); }
+            else if (!event.shiftKey && document.activeElement === last) { first?.focus(); event.preventDefault(); }
+        };
+        document.addEventListener("keydown", handleKey);
+        const toggle = sidebarToggleRef.current;
+        return () => { document.removeEventListener("keydown", handleKey); toggle?.focus(); };
+    }, [isMobileNavOpen]);
     const queryClient = useQueryClient();
     const authUser = getAuthUser();
     const isTrackerOnlyAdmin = authUser?.userType === "admin" && authUser.access === "tracker";
@@ -381,11 +411,12 @@ export default function AdminLayout({ children }: Props) {
     }
 
     return (
-        <div className="theme-app-bg h-screen overflow-hidden text-white" data-sidebar-collapsed={isSidebarCollapsed}>
+        <div className="admin-workspace theme-app-bg h-screen overflow-hidden text-white" data-sidebar-collapsed={isSidebarCollapsed} data-mobile-nav-open={isMobileNavOpen}>
             <div className="pointer-events-none fixed inset-0 bg-[radial-gradient(circle_at_8%_14%,color-mix(in_srgb,var(--primary)_20%,transparent),transparent_28%),radial-gradient(circle_at_98%_0%,color-mix(in_srgb,var(--secondary)_12%,transparent),transparent_25%),linear-gradient(135deg,rgba(255,255,255,0.035),transparent_26%)]" />
             <div className="pointer-events-none fixed inset-0 bg-[linear-gradient(90deg,rgba(255,255,255,0.025)_1px,transparent_1px),linear-gradient(180deg,rgba(255,255,255,0.018)_1px,transparent_1px)] bg-[size:4rem_4rem] opacity-20" />
 
-            <aside className={["workspace-sidebar theme-shell-bg fixed inset-y-0 left-0 z-10 flex flex-col border-r border-white/10 text-white shadow-2xl shadow-black/20 backdrop-blur-xl transition-[width] duration-200", isSidebarCollapsed ? "w-[5rem]" : "w-[13.5rem] 2xl:w-[16rem]"].join(" ")}>
+            {isMobileNavOpen && <button className="admin-nav-backdrop" aria-label="Close navigation" tabIndex={-1} onClick={() => setMobileNavPath(null)} />}
+            <aside ref={sidebarRef} id="admin-navigation-drawer" role={isNarrowViewport ? "dialog" : undefined} aria-modal={isMobileNavOpen || undefined} aria-label={isNarrowViewport ? "Admin navigation" : undefined} aria-hidden={isNarrowViewport && !isMobileNavOpen || undefined} inert={isNarrowViewport && !isMobileNavOpen} className={["workspace-sidebar theme-shell-bg fixed inset-y-0 left-0 z-10 flex flex-col border-r border-white/10 text-white shadow-2xl shadow-black/20 backdrop-blur-xl transition-[width] duration-200", isSidebarCollapsed ? "w-[5rem]" : "w-[13.5rem] 2xl:w-[16rem]"].join(" ")}>
                 <div className={["workspace-sidebar-brand flex w-full items-center border-b border-white/10 py-4 2xl:py-5", isSidebarCollapsed ? "justify-center px-2" : "justify-center px-4 2xl:px-6"].join(" ")}>
                     {isSidebarCollapsed ? (
                         <div className="h-10 w-10 overflow-hidden" aria-label="Assistly">
@@ -398,6 +429,7 @@ export default function AdminLayout({ children }: Props) {
                             <img className="theme-sidebar-logo theme-sidebar-logo-light hidden max-w-[9.75rem] 2xl:max-w-[12rem]" src="/images/logoaside-light.png" alt="Assistly" />
                         </>
                     )}
+                    {isNarrowViewport && <button className="admin-nav-close" aria-label="Close navigation" onClick={() => setMobileNavPath(null)}><FiX aria-hidden="true" /></button>}
                 </div>
 
                 <div className={["workspace-sidebar-body flex min-h-0 flex-1 flex-col py-4 2xl:py-5", isSidebarCollapsed ? "px-2" : "px-2.5 2xl:px-3"].join(" ")}>
@@ -416,6 +448,7 @@ export default function AdminLayout({ children }: Props) {
                                                     to={path}
                                                     title={label}
                                                     aria-label={label}
+                                                    onClick={() => setMobileNavPath(null)}
                                                     className={({ isActive }) =>
                                                         [
                                                             "admin-sidebar-link flex h-10 items-center rounded-lg text-sm font-medium transition 2xl:h-11",
@@ -510,12 +543,12 @@ export default function AdminLayout({ children }: Props) {
                 </div>
             </aside>
 
-            <main className={["relative flex h-screen flex-col transition-[padding] duration-200", isSidebarCollapsed ? "pl-[5rem]" : "pl-[13.5rem] 2xl:pl-[16rem]"].join(" ")}>
+            <main inert={isMobileNavOpen} className={["relative flex h-screen flex-col transition-[padding] duration-200", isSidebarCollapsed ? "pl-[5rem]" : "pl-[13.5rem] 2xl:pl-[16rem]"].join(" ")}>
                 <header className="theme-header-bg z-20 border-b border-white/10 px-4 py-3 backdrop-blur-xl 2xl:px-6 2xl:py-4">
                     <div className="flex min-h-11 items-center justify-between gap-3 2xl:min-h-12 2xl:gap-4">
-                        <div className="flex min-w-0 items-center gap-3">
-                            <button className="grid size-9 shrink-0 place-items-center rounded-lg border border-white/15 bg-white/[0.06] text-white/75 shadow-sm transition hover:bg-white/10 hover:text-white" type="button" onClick={() => { const next = !isSidebarCollapsed; setIsSidebarCollapsed(next); window.localStorage.setItem("crm:sidebar-collapsed", String(next)); window.dispatchEvent(new Event("crm:sidebar-toggle")); }} aria-label={isSidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"} title={isSidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}>
-                                {isSidebarCollapsed ? <FiChevronRight className="size-4" /> : <FiChevronLeft className="size-4" />}
+                        <div className="admin-header-title flex min-w-0 items-center gap-3">
+                            <button ref={sidebarToggleRef} className="grid size-9 shrink-0 place-items-center rounded-lg border border-white/15 bg-white/[0.06] text-white/75 shadow-sm transition hover:bg-white/10 hover:text-white" type="button" onClick={() => { if (isNarrowViewport) { setMobileNavPath(pathname); return; } const next = !isDesktopSidebarCollapsed; setIsDesktopSidebarCollapsed(next); window.localStorage.setItem("crm:sidebar-collapsed", String(next)); window.dispatchEvent(new Event("crm:sidebar-toggle")); }} aria-controls="admin-navigation-drawer" aria-expanded={isNarrowViewport ? isMobileNavOpen : !isSidebarCollapsed} aria-label={isNarrowViewport ? "Open navigation" : isSidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"} title={isNarrowViewport ? "Open navigation" : isSidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}>
+                                {isNarrowViewport ? <FiMenu className="size-4" /> : isSidebarCollapsed ? <FiChevronRight className="size-4" /> : <FiChevronLeft className="size-4" />}
                             </button>
                             <div className="min-w-0">
                                 <p className="text-xs font-medium uppercase tracking-[0.18em] text-white/40">{import.meta.env.DEV && import.meta.env.VITE_CRM_LOCAL_REVIEW === "true" ? "Local Review Copy" : isPocOperations ? "Operations Workspace" : "Admin Workspace"}</p>
@@ -523,7 +556,7 @@ export default function AdminLayout({ children }: Props) {
                             </div>
                         </div>
 
-                        <div className="flex min-w-0 flex-1 items-center justify-end gap-2 2xl:gap-3">
+                        <div className="admin-header-actions flex min-w-0 flex-1 items-center justify-end gap-2 2xl:gap-3">
                             <form ref={adminSearchRef} className="relative hidden w-full max-w-[18rem] lg:block 2xl:max-w-[22rem]" onSubmit={submitAdminSearch}>
                                 <label className="flex h-10 items-center gap-3 rounded-lg border border-white/10 bg-white/[0.06] px-3 text-white/50 transition focus-within:border-[#842cff] focus-within:bg-white/[0.08] focus-within:ring-2 focus-within:ring-[#842cff]/20 2xl:h-11">
                                     <FiSearch className="size-5 shrink-0" aria-hidden="true" />
@@ -595,7 +628,7 @@ export default function AdminLayout({ children }: Props) {
                                     {visibleNotificationCount > 0 && <span className="absolute right-2.5 top-2.5 size-2 rounded-full bg-[#842cff]" />}
                                 </button>
                                 {isNotificationsOpen && (
-                                    <div className="theme-panel-bg absolute right-0 top-[calc(100%+0.5rem)] z-40 w-80 overflow-hidden rounded-lg border border-white/10 shadow-2xl shadow-black/45">
+                                    <div className="admin-notifications-panel theme-panel-bg absolute right-0 top-[calc(100%+0.5rem)] z-40 w-80 overflow-hidden rounded-lg border border-white/10 shadow-2xl shadow-black/45">
                                         <div className="flex items-center justify-between gap-3 border-b border-white/10 px-4 py-3">
                                             <div>
                                                 <p className="text-xs font-medium uppercase tracking-[0.14em] text-white/35">Notifications</p>

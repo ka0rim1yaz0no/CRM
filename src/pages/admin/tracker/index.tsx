@@ -739,7 +739,7 @@ export default function AdminTracker() {
                 </section>
 
                 <section className="rounded-lg border border-slate-200 bg-white p-3 shadow-sm">
-                    <div className="grid gap-2 xl:grid-cols-[minmax(13rem,1.1fr)_12rem_10rem_11rem_11rem_11rem]">
+                    <div className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,11rem),1fr))] gap-2">
                         <label className="flex h-10 min-w-0 items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-2.5 text-slate-400 focus-within:border-violet-400 focus-within:bg-white focus-within:ring-2 focus-within:ring-violet-100">
                             <FiSearch className="size-4 shrink-0" aria-hidden="true" />
                             <input

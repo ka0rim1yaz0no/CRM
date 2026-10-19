@@ -1,4 +1,16 @@
 :root[data-theme] aside.workspace-sidebar.theme-shell-bg { background: var(--shell-bg) !important; }
+.admin-nav-backdrop { position: fixed; inset: 0; z-index: 40; border: 0; background: rgb(15 23 42 / 45%); }
+.admin-nav-close { display: grid; place-items: center; position: absolute; right: 8px; width: 36px; height: 36px; border: 1px solid #cbd5e1; border-radius: 6px; background: var(--surface-bg); color: #334155; }
+@media (max-width: 767px) {
+    .admin-workspace > main { padding-left: 0 !important; }
+    .admin-workspace > .workspace-sidebar { width: min(18rem, calc(100vw - 3rem)) !important; z-index: 50; visibility: hidden; transform: translateX(-100%); }
+    .admin-workspace[data-mobile-nav-open="true"] > .workspace-sidebar { visibility: visible; transform: translateX(0); }
+    .admin-workspace .admin-header-title { flex: 1; }
+    .admin-workspace .admin-header-title p { display: none; }
+    .admin-workspace .admin-header-title h1 { margin-top: 0; font-size: 18px; }
+    .admin-workspace .admin-header-actions { flex: 0 0 auto; }
+    .admin-workspace .admin-notifications-panel { position: fixed; top: 4.5rem; right: 1rem; width: min(20rem, calc(100vw - 2rem)); }
+}
 .workspace-sidebar .workspace-sidebar-brand {
     height: clamp(52px, 8dvh, 68px);
     flex-shrink: 0;

@@ -78,3 +78,47 @@ test("admin secondary labels, placeholders and purple actions retain readable co
   assert.ok(colorContrast("#ffffff", "#5f27cd") >= 4.5);
   assert.ok(colorContrast("#ffffff", "#1d4ed8") >= 4.5);
 });
+
+test("admin legacy solid actions and slate helper labels meet small-text contrast", () => {
+  const css = readFileSync(new URL("../../../src/index.css", import.meta.url), "utf8");
+  assert.match(css, /:root\[data-theme-role="admin"\]\[data-theme="light-command"\] :is\(\.text-slate-400, \.text-slate-500,[^)]*\)\s*\{\s*color: #475569 !important;/);
+  assert.match(css, /\.bg-red-600, \.bg-red-700, \.bg-slate-950\s*\)\.text-white\s*\{\s*color: #ffffff !important;/);
+  assert.match(css, /:is\(\.bg-emerald-500, \.bg-emerald-600\)\.text-white\s*\{\s*background-color: #047857 !important;/);
+  for (const background of ["#ffffff", "#f1f5f9", "#e2e8f0", "#f7f8fa"]) {
+    assert.ok(colorContrast("#475569", background) >= 4.5, background);
+  }
+  for (const background of ["#7f22fe", "#047857", "#b91c1c", "#dc2626", "#020617"]) {
+    assert.ok(colorContrast("#ffffff", background) >= 4.5, background);
+  }
+});
+
+test("employee payroll columns keep room for values and actions on narrow screens", () => {
+  const source = readFileSync(new URL("../../../src/pages/admin/payroll/index.tsx", import.meta.url), "utf8");
+  assert.ok(source.includes('role="region" aria-label="Employee payroll records" tabIndex={0}'));
+  const table = source.slice(source.indexOf('aria-label="Employee payroll records"')).split("</thead>")[0];
+  assert.ok(table.includes("min-w-[64rem] table-fixed"));
+  const widths = [...table.matchAll(/<th className="w-\[(\d+)%\]/g)].map((match) => Number(match[1]));
+  assert.equal(widths.length, 9);
+  assert.equal(widths.reduce((sum, width) => sum + width, 0), 100);
+  assert.ok(widths[8] * (64 * 15) / 100 - 24 >= 5 * 28 + 4 * 2);
+});
+
+test("mobile admin navigation cannot reserve page width or expose hidden focus targets", () => {
+  const css = readFileSync(new URL("../../../src/components/WorkspaceSidebar.css", import.meta.url), "utf8");
+  const layout = readFileSync(new URL("../../../src/pages/admin/adminLayout/index.tsx", import.meta.url), "utf8");
+  assert.match(css, /@media \(max-width: 767px\)/);
+  assert.match(css, /\.admin-workspace > main \{ padding-left: 0 !important;/);
+  assert.match(css, /width: min\(18rem, calc\(100vw - 3rem\)\)/);
+  assert.match(css, /\.admin-notifications-panel[^}]*width: min\(20rem, calc\(100vw - 2rem\)\)/);
+  assert.ok(layout.includes('inert={isNarrowViewport && !isMobileNavOpen}'));
+  assert.ok(layout.includes('inert={isMobileNavOpen}'));
+  assert.ok(layout.includes('event.key === "Escape"'));
+  assert.ok(layout.includes('aria-controls="admin-navigation-drawer"'));
+  assert.ok(layout.includes('!isNarrowViewport && isDesktopSidebarCollapsed'));
+});
+
+test("tracker filters wrap by available content width rather than viewport breakpoints", () => {
+  const source = readFileSync(new URL("../../../src/pages/admin/tracker/index.tsx", import.meta.url), "utf8");
+  assert.ok(source.includes("grid-cols-[repeat(auto-fit,minmax(min(100%,11rem),1fr))]"));
+  assert.ok(!source.includes("xl:grid-cols-[minmax(13rem,1.1fr)_12rem_10rem_11rem_11rem_11rem]"));
+});
