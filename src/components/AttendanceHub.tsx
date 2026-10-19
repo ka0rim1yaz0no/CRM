@@ -14,6 +14,7 @@ import AttendancePolicyEditor from "./AttendancePolicyEditor";
 import { getActiveBusinessId } from "../api/businessStorage";
 import { attendanceHubFilters, attendanceHubFilterChange } from "../lib/attendanceHubState";
 import { manilaCalendarDate, type ShiftView } from "../../shared/attendanceView";
+import { attendanceBreakAllowanceLabel, attendanceBreaksPerShift, attendanceIssueLabel } from "../lib/attendanceHubLabels";
 
 const presets = [
     ["today", "Today"], ["yesterday", "Yesterday"], ["this-week", "This week"], ["last-week", "Last week"],
@@ -23,7 +24,7 @@ const presets = [
 const columns = ["shift", "timeIn", "timeOut", "worked", "break", "lunch", "offPhone", "late", "underTime", "overtime", "issues", "notes"] as const;
 type Column = typeof columns[number];
 const columnLabels: Record<Column, string> = { shift: "Shift", timeIn: "Time In", timeOut: "Time Out", worked: "Worked",
-    break: "Break", lunch: "Lunch", offPhone: "Off phone", late: "Late", underTime: "Under", overtime: "OT", issues: "Status", notes: "Notes" };
+    break: "Breaks", lunch: "Lunch", offPhone: "Off phone", late: "Late", underTime: "Undertime", overtime: "OT", issues: "Status", notes: "Notes" };
 const numberFormat = new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 });
 const timeFormat = new Intl.DateTimeFormat("en-US", { timeZone: "Asia/Manila", hour: "numeric", minute: "2-digit" });
 const dateFormat = new Intl.DateTimeFormat("en-US", { timeZone: "Asia/Manila", month: "short", day: "numeric", year: "numeric" });
@@ -49,7 +50,7 @@ function kpis(summary: HubResponse["summary"], admin: boolean) {
     const items = [
         { label: "Days worked", value: summary.daysWorked, issue: "worked" },
         { label: "Online", value: duration(summary.online), issue: "online" },
-        { label: "Break", value: duration(summary.break), issue: "break" },
+        { label: "Breaks", value: duration(summary.break), issue: "break" },
         { label: "Lunch", value: duration(summary.lunch), issue: "lunch" },
         { label: "Off phone", value: duration(summary.offPhone), issue: "off-phone" },
         { label: "Late", value: `${summary.lateCount} / ${duration(summary.late)}`, issue: "late" },
@@ -138,7 +139,7 @@ function DayDrawer({ selected, onClose, admin }: { selected: { dayKey: string; e
                 <div className="attendance-hub-drawer-actions">{admin && <button type="button" onClick={() => setEditing(true)}>Edit attendance</button>}
                     <button type="button" onClick={() => window.print()}><FiPrinter /> Print</button></div>
                 <p><strong>{day.businessName}</strong> · {localTime(day.shiftStart)} - {localTime(day.shiftEnd)}</p>
-                <div className="attendance-hub-badges">{day.issues.map((issue) => <span key={issue} className={issueClass(issue)}>{issue}</span>)}
+                <div className="attendance-hub-badges">{day.issues.map((issue) => <span key={issue} className={issueClass(issue)}>{attendanceIssueLabel(issue)}</span>)}
                     {day.mismatch && <span className="attendance-hub-badge warning">CROSS-BUSINESS MISMATCH</span>}</div>
                 <h3>Timeline</h3>
                 <div className="attendance-hub-timeline" aria-label="Time allocation">
@@ -153,7 +154,7 @@ function DayDrawer({ selected, onClose, admin }: { selected: { dayKey: string; e
                 <dl className="attendance-hub-breakdown">
                     <div><dt>Worked</dt><dd>{duration(day.milliseconds.online)}</dd></div>
                     <div><dt>Late after {day.graceMinutes}m grace</dt><dd>{duration(day.milliseconds.late)}</dd></div>
-                    <div><dt>Break / over {day.breakMinutes}m</dt><dd>{duration(day.milliseconds.break)} / {duration(day.milliseconds.overBreak)}</dd></div>
+                    <div><dt>Breaks / over · {attendanceBreakAllowanceLabel(day.breakMinutes)}</dt><dd>{duration(day.milliseconds.break)} / {duration(day.milliseconds.overBreak)}</dd></div>
                     <div><dt>Lunch / over {day.lunchMinutes}m</dt><dd>{duration(day.milliseconds.lunch)} / {duration(day.milliseconds.overLunch)}</dd></div>
                     <div><dt>Off phone</dt><dd>{duration(day.milliseconds.offPhone)}</dd></div>
                     <div><dt>Under / overtime</dt><dd>{duration(day.milliseconds.underTime)} / {duration(day.milliseconds.overtime)}</dd></div>
@@ -177,10 +178,10 @@ function DayDrawer({ selected, onClose, admin }: { selected: { dayKey: string; e
 function DayRow({ day, visible, dense, open }: { day: HubDay; visible: Set<Column>; dense: boolean; open: (day: HubDay) => void }) {
     const value: Record<Column, ReactNode> = {
         shift: `${localTime(day.shiftStart)} - ${localTime(day.shiftEnd)}`, timeIn: localTime(day.timeIn), timeOut: localTime(day.timeOut),
-        worked: duration(day.milliseconds.online), break: `${duration(day.milliseconds.break)} / ${day.breakMinutes}m per break / +${duration(day.milliseconds.overBreak)}`,
+        worked: duration(day.milliseconds.online), break: <div><span>{duration(day.milliseconds.break)} used / +{duration(day.milliseconds.overBreak)} over</span><small>{attendanceBreakAllowanceLabel(day.breakMinutes)}</small></div>,
         lunch: `${duration(day.milliseconds.lunch)} / ${day.lunchMinutes}m per lunch / +${duration(day.milliseconds.overLunch)}`,
         offPhone: duration(day.milliseconds.offPhone), late: duration(day.milliseconds.late), underTime: duration(day.milliseconds.underTime),
-        overtime: duration(day.milliseconds.overtime), issues: <div className="attendance-hub-badges">{day.issues.map((issue) => <span key={issue} className={issueClass(issue)}>{issue}</span>)}
+        overtime: duration(day.milliseconds.overtime), issues: <div className="attendance-hub-badges">{day.issues.map((issue) => <span key={issue} className={issueClass(issue)}>{attendanceIssueLabel(issue)}</span>)}
             {day.mismatch && <span className="attendance-hub-badge warning">MISMATCH</span>}</div>,
         notes: <span className="attendance-hub-note-preview" title={day.note}>{day.note || "--"}</span>,
     };
@@ -190,7 +191,8 @@ function DayRow({ day, visible, dense, open }: { day: HubDay; visible: Set<Colum
         {columns.filter((column) => visible.has(column)).map((column) => <td key={column}>{value[column]}</td>)}
     </tr><tr className="attendance-hub-mobile-row"><td><button type="button" onClick={() => open(day)}><strong>{labelDay(day.dayKey)}</strong>
         <span>{day.status} · {duration(day.milliseconds.online)} worked</span>
-        <span>{day.issues.join(" · ") || "No issues"}</span>{day.note && <span>{day.note}</span>}</button></td></tr></>;
+        <span>Breaks: {duration(day.milliseconds.break)} used · {attendanceBreakAllowanceLabel(day.breakMinutes)}</span>
+        <span>{day.issues.map(attendanceIssueLabel).join(" · ") || "No issues"}</span>{day.note && <span>{day.note}</span>}</button></td></tr></>;
 }
 
 export default function AttendanceHub({ admin = false, actions, message, embedded = false }: { admin?: boolean; actions?: ReactNode; message?: string; embedded?: boolean }) {
@@ -299,7 +301,7 @@ export default function AttendanceHub({ admin = false, actions, message, embedde
             onClick={() => setNavOpen(!navOpen)}><FiMenu /></button><div><p className="attendance-hub-eyebrow">Attendance · Asia/Manila</p>
             <h1>Attendance</h1><p>{admin ? "Employees and shift-day records" : "Your shifts and time records"}</p></div>
             <div className="attendance-hub-header-actions"><details className="attendance-hub-help"><summary title="How this is calculated"><FiHelpCircle /> Calculations</summary>
-                <p>Overnight events belong to the shift start day. Online excludes break, lunch, and off-phone. Late starts after the configured grace period. Break allowance is {data?.thresholds.breakMinutes ?? 15} minutes per break; lunch is {data?.thresholds.lunchMinutes ?? 60} minutes per lunch. Under time is measured after a completed early Time Out. Open sessions are never closed automatically.</p></details>
+                <p>Overnight events belong to the shift start day. Online excludes break, lunch, and off-phone. Late starts after the configured grace period. Break allowance: {attendanceBreakAllowanceLabel(data?.thresholds.breakMinutes ?? 15)}; excess is measured separately for each break. Lunch is {data?.thresholds.lunchMinutes ?? 60} minutes per lunch. Undertime is measured after a completed early Time Out and the scheduled shift end. Open sessions are never closed automatically.</p></details>
                 <button type="button" title="Refresh" onClick={() => void refetch()}><FiRefreshCw /> Refresh</button>
                 <button type="button" title="Export CSV" disabled={!data || isFetching || Boolean(error) || exporting || debouncedEmployee !== filters.employee}
                     onClick={async () => { setExporting(true); setExportError(""); try { await downloadAttendanceHubCsv(queryFilters); } catch (failure) { setExportError(errorText(failure)); } finally { setExporting(false); } }}><FiDownload /> {exporting ? "Exporting..." : "CSV"}</button></div>
@@ -357,7 +359,7 @@ export default function AttendanceHub({ admin = false, actions, message, embedde
                         onClick={() => setExpanded((current) => { const next = new Set(current); if (next.has(employee.scopeKey)) next.delete(employee.scopeKey); else next.add(employee.scopeKey); return next; })}>
                         <strong>{employee.employeeName}</strong><span>{employee.employeeCode} · {employee.team} · {days.length} days · {duration(days.reduce((sum, day) => sum + day.milliseconds.online, 0))} worked · {days.reduce((sum, day) => sum + day.issues.length, 0)} issues</span><FiChevronDown /></button>}
                     <div id={`attendance-days-${encodeURIComponent(employee.scopeKey)}`} hidden={admin && !expanded.has(employee.scopeKey)}>{(!admin || expanded.has(employee.scopeKey)) && <div className="attendance-hub-table-scroll">
-                        {isPlaceholderData ? <p className="attendance-hub-empty" role="status">Loading selected shifts...</p> : (!days.length || (filters.shiftView !== "all" && days.every((day) => !day.events.length))) ? <p className="attendance-hub-empty">No shift record for this date {days.flatMap((day) => day.issues).map((issue) => <span className={issueClass(issue)} key={issue}>{issue}</span>)}</p> : <table><thead><tr><th scope="col">
+                        {isPlaceholderData ? <p className="attendance-hub-empty" role="status">Loading selected shifts...</p> : (!days.length || (filters.shiftView !== "all" && days.every((day) => !day.events.length))) ? <p className="attendance-hub-empty">No shift record for this date {days.flatMap((day) => day.issues).map((issue) => <span className={issueClass(issue)} key={issue}>{attendanceIssueLabel(issue)}</span>)}</p> : <table><thead><tr><th scope="col">
                         <button type="button" onClick={() => setSort("date")}>Date</button></th>
                         {columns.filter((column) => visible.has(column)).map((column) => <th scope="col" key={column} aria-sort={filters.sort === column ? filters.direction === "asc" ? "ascending" : "descending" : "none"}>
                             {column === "notes" ? columnLabels[column] : <button type="button" onClick={() => setSort(column)}>{columnLabels[column]}</button>}</th>)}</tr></thead><tbody>
@@ -379,7 +381,7 @@ export default function AttendanceHub({ admin = false, actions, message, embedde
                 <div className="attendance-hub-chart-label">{data.range.from} <span>{data.range.to}</span></div>
                 <div className="attendance-hub-mini-trends">{(["late", "break", "lunch"] as const).map((field) => {
                     const total = data.trend.reduce((sum, item) => sum + item[field], 0);
-                    const allowance = field === "break" ? data.trend.reduce((sum, item) => sum + item.people * data.thresholds.breakMinutes * 2 * 60_000, 0) :
+                    const allowance = field === "break" ? data.trend.reduce((sum, item) => sum + item.people * data.thresholds.breakMinutes * attendanceBreaksPerShift * 60_000, 0) :
                         field === "lunch" ? data.trend.reduce((sum, item) => sum + item.people * data.thresholds.lunchMinutes * 60_000, 0) : 0;
                     return <div key={field}><span>{field === "break" ? "Break / scheduled budget (2 per shift)" : field === "lunch" ? "Lunch / scheduled budget (1 per shift)" : "Late minutes"}</span>
                         <strong>{duration(total)}{field !== "late" ? ` / ${duration(allowance)}` : ""}</strong>

@@ -29,9 +29,35 @@ test("late, early-out and overtime are measured against the shift window", () =>
   const late = calculateHubDay(start, [event("Time In", 12), event("Time Out", 510)], settings, time(600));
   assert.equal(minutes(late.milliseconds.late), 12);
   assert.equal(minutes(late.milliseconds.underTime), 30);
+  assert.ok(late.issues.includes("UNDER TIME"));
   const overtime = calculateHubDay(start, [event("Time In", -10), event("Time Out", 570)], settings, time(600));
   assert.equal(minutes(overtime.milliseconds.online), 540);
   assert.equal(minutes(overtime.milliseconds.overtime), 30);
+});
+
+test("two separate breaks each receive their allowance without sharing unused minutes", () => {
+  const regular = calculateHubDay(start, [event("Time In", 0), event("Break Out", 120), event("Break In", 135),
+    event("Break Out", 420), event("Break In", 435), event("Time Out", 540)], settings, time(600));
+  assert.equal(minutes(regular.milliseconds.break), 30);
+  assert.equal(regular.milliseconds.overBreak, 0);
+  assert.ok(!regular.issues.includes("OVER BREAK"));
+  const excess = calculateHubDay(start, [event("Time In", 0), event("Break Out", 120), event("Break In", 140),
+    event("Break Out", 420), event("Break In", 430), event("Time Out", 510)], settings, time(600));
+  assert.equal(minutes(excess.milliseconds.break), 30);
+  assert.equal(minutes(excess.milliseconds.overBreak), 5);
+  assert.ok(excess.issues.includes("OVER BREAK"));
+  assert.ok(excess.issues.includes("UNDER TIME"));
+});
+
+test("a missing manual checkout stays open after shift end without an undertime verdict", () => {
+  const open = calculateHubDay(start, [event("Time In", 500)], settings, time(600));
+  assert.equal(open.timeOut, null);
+  assert.equal(open.milliseconds.underTime, 0);
+  assert.ok(open.issues.includes("OPEN SESSION"));
+  assert.ok(!open.issues.includes("UNDER TIME"));
+  const excused = calculateHubDay(start, [event("Time In", 0), event("Time Out", 510)], settings, time(600), true);
+  assert.equal(excused.milliseconds.underTime, 0);
+  assert.ok(!excused.issues.includes("UNDER TIME"));
 });
 
 test("open shift is not prematurely under time and unclosed break stays in break", () => {
