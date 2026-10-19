@@ -4,9 +4,12 @@ import { attendanceInputValue, buildAttendanceDraftChanges } from "../../../src/
 
 test("HR draft preserves unchanged milliseconds and legacy sources; blank checkout stays absent", () => {
   const original = { id: "legacy", source: "Login", at: "2026-10-15T14:53:12.345Z" };
+  assert.equal(attendanceInputValue(original.at), "2026-10-15T22:53:12");
   assert.deepEqual(buildAttendanceDraftChanges([{ value: attendanceInputValue(original.at), original, source: "Time In" },
     { value: "", source: "Time Out" }]), []);
   assert.deepEqual(buildAttendanceDraftChanges([{ value: "2026-10-15T22:54:12.345", original, source: "Time In" }]),
     [{ targetId: "legacy", source: "Login", at: "2026-10-15T14:54:12.345Z" }]);
   assert.deepEqual(buildAttendanceDraftChanges([{ value: "", original, source: "Time In" }]), [{ targetId: "legacy", remove: true }]);
+  assert.deepEqual(buildAttendanceDraftChanges([{ value: "2026-10-16T01:54:12", original, source: "Time In" }]),
+    [{ targetId: "legacy", source: "Login", at: "2026-10-15T17:54:12.000Z" }]);
 });

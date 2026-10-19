@@ -482,7 +482,7 @@ function AttendanceForm() {
                                         <input
                                             className="mt-2 h-12 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm font-semibold !text-slate-950 outline-none transition focus:border-violet-500 focus:ring-2 focus:ring-violet-200"
                                             type="datetime-local"
-                                            step="0.001"
+                                            step="1"
                                             disabled={saveAttendanceMutation.isPending}
                                             value={attendanceShiftForm[field]}
                                             onChange={(event) => { dirty.current = true; setIsDirty(true); setConfirmation(null); setAttendanceShiftForm((form) => ({ ...form, [field]: event.target.value })); }}

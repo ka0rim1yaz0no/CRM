@@ -57,6 +57,7 @@ import { useToast } from "../../../lib/toast";
 import { roleWorkspacePath } from "../../../lib/roleAccess";
 import { EvaluationWorkspace } from "../evaluations";
 import AttendanceCorrections from "../../../components/AttendanceCorrections";
+import AttendanceEditDialog from "../../../components/AttendanceEditDialog";
 import { attendanceIntegrityEnabled } from "../../../api/attendanceSession";
 import "../../../components/AttendanceHub.css";
 
@@ -3044,7 +3045,6 @@ export default function AdminEmployees() {
                                                                 className="flex size-8 shrink-0 items-center justify-center rounded-lg border border-slate-300 bg-white text-slate-600 transition hover:border-[#842cff]/40 hover:bg-violet-50 hover:text-[#5f27cd]"
                                                                 type="button"
                                                                 onClick={() => {
-                                                                    if (attendanceIntegrityEnabled) { navigate(`/admin/hr/attendance/${viewingEmployee._id}/${selectedAttendanceDay.dateKey}/edit`); return; }
                                                                     setAttendanceEditRecord(attendance);
                                                                     setAttendanceEditTime(attendanceDateTimeInput(attendance.timeIn));
                                                                 }}
@@ -3198,7 +3198,11 @@ export default function AdminEmployees() {
                 </div>
             )}
 
-            {attendanceEditRecord && (
+            {attendanceEditRecord && attendanceIntegrityEnabled && viewingEmployee && selectedAttendanceDay && <AttendanceEditDialog
+                key={`${getActiveBusinessId()}:${viewingEmployee._id}:${attendanceEditRecord._id}`}
+                employeeId={viewingEmployee._id} businessId={getActiveBusinessId()} dayKey={selectedAttendanceDay.dateKey}
+                eventId={attendanceEditRecord._id} onClose={() => { setAttendanceEditRecord(null); setAttendanceEditTime(""); }} />}
+            {attendanceEditRecord && !attendanceIntegrityEnabled && (
                 <div
                     className="modal-backdrop-enter fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4 backdrop-blur-sm"
                     onMouseDown={(event) => {

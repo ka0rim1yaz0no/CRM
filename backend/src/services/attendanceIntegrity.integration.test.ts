@@ -147,6 +147,33 @@ test("real API: a business-local attendance note preserves matching events and c
   assert.equal((await read()).rows[0].mismatch, true, "a differing excuse still changes attendance interpretation and must be reviewed");
 });
 
+test("real API: repeated note saves, reloads and clearing stay scoped to every configured business", async () => {
+  const code = String(91000000 + counter++);
+  const token = createAdminDashboardSession(admin.code)!;
+  const shiftDay = "2026-10-15";
+  const { AttendanceDayNote } = await import("../models/AttendanceDayNote");
+  for (const [index, business] of ["test-a", "test-b", "test-c"].entries()) {
+    await runWithBusiness(business, () => Employee.create({ employeeCode: code, name: "Synthetic note employee", role: "Test", dateHired: "2026-10-01" }));
+    const write = (reason: string, excused = false) => request(`/attendance-hub/day/${shiftDay}/note`, token, "POST", { employeeCode: code, businessId: business, reason, excused }, true);
+    for (const reason of [`Synthetic note ${index}`, `Updated synthetic note ${index}`]) {
+      const response = await write(reason);
+      assert.equal(response.status, 200, await response.clone().text());
+      const read = await request(`/attendance-hub/day/${shiftDay}?preset=custom&from=${shiftDay}&to=${shiftDay}&employeeCode=${code}&business=${business}`, token, "GET", undefined, true);
+      assert.equal(read.status, 200);
+      assert.equal((await read.json()).day.note, reason);
+    }
+    const saved = await runWithBusiness(business, () => AttendanceDayNote.findOne({ employeeCode: code, dayKey: shiftDay }).lean());
+    assert.equal(saved?.revisions.length, 2);
+    assert.ok(saved?.revisions.every((revision) => revision.by === admin.code));
+    assert.equal((await write("", true)).status, 400);
+    assert.equal((await write("x".repeat(1001))).status, 400);
+    assert.equal((await write("")).status, 200);
+    assert.equal((await runWithBusiness(business, () => AttendanceDayNote.findOne({ employeeCode: code, dayKey: shiftDay }).lean()))?.reason, "");
+  }
+  const denied = await request(`/attendance-hub/day/${shiftDay}/note`, createAttendanceHubSession(code)!, "POST", { employeeCode: code, businessId: "test-a", reason: "Denied", excused: false });
+  assert.equal(denied.status, 403);
+});
+
 test("real Mongo: one atomic batch preserves original evidence and replays after a lost response", async () => {
   const { identity } = await fixture();
   const input = { commandId: crypto.randomUUID(), expectedRevision: 0, operation: "correct" as const, reason: "Synthetic HR correction", changes: [

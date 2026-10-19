@@ -1,13 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Link, useSearchParams } from "react-router";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useSearchParams } from "react-router";
 import { FiAlertCircle, FiChevronDown, FiDownload, FiFilter, FiHelpCircle, FiMenu, FiPrinter, FiRefreshCw, FiX } from "react-icons/fi";
 import { getAuthUser } from "../api/authStorage";
 import { downloadAttendanceHubCsv, getAttendanceHubDay, getAttendanceHubDays, getAttendanceHubLive,
-    saveAttendanceHubNote, type HubDay, type HubFilters, type HubResponse } from "../api/attendanceHub";
+    type HubDay, type HubFilters, type HubResponse } from "../api/attendanceHub";
 import { socket } from "../lib/socket";
 import "./AttendanceHub.css";
 import AttendanceCorrections from "./AttendanceCorrections";
+import AttendanceEditDialog from "./AttendanceEditDialog";
+import AttendanceDayNoteForm from "./AttendanceDayNoteForm";
 import AttendancePolicyEditor from "./AttendancePolicyEditor";
 import { getActiveBusinessId } from "../api/businessStorage";
 import { attendanceHubFilters, attendanceHubFilterChange } from "../lib/attendanceHubState";
@@ -103,10 +105,10 @@ function LivePanel({ actions, message }: { actions: ReactNode; message?: string 
 }
 
 function DayDrawer({ selected, onClose, admin }: { selected: { dayKey: string; employeeCode: string; businessId?: string } | null; onClose: () => void; admin: boolean }) {
-    const client = useQueryClient();
+    const [editing, setEditing] = useState(false);
     const drawerRef = useRef<HTMLElement>(null);
     useEffect(() => {
-        if (!selected) return;
+        if (!selected || editing) return;
         const previous = document.activeElement as HTMLElement | null;
         const drawer = drawerRef.current;
         drawer?.querySelector<HTMLButtonElement>("button")?.focus();
@@ -120,17 +122,10 @@ function DayDrawer({ selected, onClose, admin }: { selected: { dayKey: string; e
         };
         document.addEventListener("keydown", keyboard);
         return () => { document.removeEventListener("keydown", keyboard); if (previous?.isConnected) previous.focus(); };
-    }, [selected, onClose]);
+    }, [selected, onClose, editing]);
     const { data: day, isPending, error } = useQuery({ queryKey: ["attendance-hub-day", selected?.businessId, selected?.dayKey, selected?.employeeCode],
         queryFn: () => getAttendanceHubDay(selected!.dayKey, selected!.employeeCode, selected?.businessId), enabled: Boolean(selected),
         refetchInterval: 30_000, refetchOnWindowFocus: true });
-    const [draft, setDraft] = useState<{ reason: string; excused: boolean } | null>(null);
-    const reason = draft?.reason ?? day?.note ?? "";
-    const excused = draft?.excused ?? Boolean(day?.excused);
-    const save = useMutation({ mutationFn: () => saveAttendanceHubNote(day!, reason.trim(), excused), onSuccess: () => {
-        void client.invalidateQueries({ queryKey: ["attendance-hub"] });
-        void client.invalidateQueries({ queryKey: ["attendance-hub-day"] });
-    } });
     if (!selected) return null;
     const timeline = day?.events ? [...day.events].sort((a, b) => a.at.localeCompare(b.at)) : [];
     return <div className="attendance-hub-drawer-layer" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
@@ -140,7 +135,7 @@ function DayDrawer({ selected, onClose, admin }: { selected: { dayKey: string; e
             {isPending && <p className="attendance-hub-empty">Loading shift...</p>}
             {error && <p className="attendance-hub-error">{errorText(error)}</p>}
             {day && <div className="attendance-hub-drawer-body">
-                <div className="attendance-hub-drawer-actions">{admin && <Link to={`/admin/hr/attendance/${encodeURIComponent(day.employeeId)}/${day.dayKey}/edit?business=${encodeURIComponent(day.businessId)}`}>Edit in HR</Link>}
+                <div className="attendance-hub-drawer-actions">{admin && <button type="button" onClick={() => setEditing(true)}>Edit attendance</button>}
                     <button type="button" onClick={() => window.print()}><FiPrinter /> Print</button></div>
                 <p><strong>{day.businessName}</strong> · {localTime(day.shiftStart)} - {localTime(day.shiftEnd)}</p>
                 <div className="attendance-hub-badges">{day.issues.map((issue) => <span key={issue} className={issueClass(issue)}>{issue}</span>)}
@@ -168,18 +163,14 @@ function DayDrawer({ selected, onClose, admin }: { selected: { dayKey: string; e
                     {business.businessName}: {business.status}, {duration(business.milliseconds.online)} worked</p>)}</>}
                 {day.leave && <p>Approved leave: {day.leave}</p>}
                 {admin && <AttendanceCorrections employeeId={day.employeeId} businessId={day.businessId} dayKey={day.dayKey} />}
-                {admin && <form className="attendance-hub-note" onSubmit={(event) => { event.preventDefault(); save.mutate(); }}>
-                    <h3>Admin note / excuse</h3><textarea aria-label="Reason" value={reason} onChange={(event) => setDraft({ reason: event.target.value, excused })} maxLength={1000} />
-                    <label><input type="checkbox" checked={excused} onChange={(event) => setDraft({ reason, excused: event.target.checked })} /> Excused</label>
-                    <button type="submit" disabled={save.isPending || (excused && !reason.trim())}>Save note</button>
-                    {save.isError && <p className="attendance-hub-error">{errorText(save.error)}</p>}
-                </form>}
+                {admin && <AttendanceDayNoteForm key={`${day.businessId}:${day.employeeCode}:${day.dayKey}`} day={day} />}
                 {day.noteRevisions.length > 0 && <><h3>Note history</h3>{day.noteRevisions.map((note, index) => <p key={`${note.at}-${index}`}>
                     {detailTime(note.at)} · {note.by} · {note.reason} {note.excused ? "(excused)" : ""}</p>)}</>}
                 {day.audit.length > 0 && <><h3>Admin edit audit</h3>{day.audit.map((entry) => <p key={entry._id}>
                     {detailTime(entry.occurredAt)} · {entry.description}</p>)}</>}
             </div>}
         </aside>
+        {editing && day && <AttendanceEditDialog employeeId={day.employeeId} businessId={day.businessId} dayKey={day.dayKey} onClose={() => setEditing(false)} />}
     </div>;
 }
 
@@ -400,6 +391,6 @@ export default function AttendanceHub({ admin = false, actions, message, embedde
                     {!data.reviewQueue.length && <p>No review items in this range.</p>}
                     {data.reviewQueue.length > 8 && <button type="button" onClick={() => setFilter("issue", "needs-review")}>View review queue</button>}</div></section>
         </>}
-        <DayDrawer key={selected ? `${selected.employeeCode}:${selected.dayKey}` : "closed"} selected={selected} onClose={closeDay} admin={admin} />
+        <DayDrawer key={selected ? `${selected.businessId}:${selected.employeeCode}:${selected.dayKey}` : "closed"} selected={selected} onClose={closeDay} admin={admin} />
     </Root>;
 }

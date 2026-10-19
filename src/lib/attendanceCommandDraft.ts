@@ -6,7 +6,7 @@ export function attendanceInputValue(value?: string) {
     const parts = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Manila", year: "numeric", month: "2-digit", day: "2-digit",
         hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" }).formatToParts(new Date(value));
     const part = (key: Intl.DateTimeFormatPartTypes) => parts.find((item) => item.type === key)?.value || "00";
-    return `${part("year")}-${part("month")}-${part("day")}T${part("hour")}:${part("minute")}:${part("second")}.${String(new Date(value).getUTCMilliseconds()).padStart(3, "0")}`;
+    return `${part("year")}-${part("month")}-${part("day")}T${part("hour")}:${part("minute")}:${part("second")}`;
 }
 export function buildAttendanceDraftChanges(fields: DraftField[]) {
     return fields.flatMap<DraftChange>((field) => {

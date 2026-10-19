@@ -182,6 +182,18 @@
 }
 .attendance-corrections { margin-block: 12px; padding-block: 12px; border-block: 1px solid var(--hub-border, #d5dce6); color: var(--hub-text, #172332); }
 .attendance-corrections form { display: grid; gap: 12px; margin-top: 12px; }
+.attendance-corrections fieldset { display: grid; gap: 12px; min-width: 0; }
+.attendance-edit-dialog { --hub-bg: #fff; --hub-text: #172332; --hub-border: #d7dde5; --hub-muted: #617080; --hub-soft: #f4f6f8;
+  margin: auto; width: min(640px, calc(100% - 24px)); max-height: calc(100dvh - 32px); padding: 0; border: 1px solid var(--hub-border);
+  border-radius: 8px; color: var(--hub-text); background: var(--hub-bg); overflow-y: auto; }
+.attendance-edit-dialog::backdrop { background: #0009; }
+.attendance-edit-dialog > header { position: sticky; top: 0; z-index: 1; display: flex; justify-content: space-between; align-items: start;
+  padding: 16px 20px; border-bottom: 1px solid var(--hub-border); background: var(--hub-bg); }
+.attendance-edit-dialog h2 { font-size: 18px; font-weight: 700; }
+.attendance-edit-dialog header p { color: var(--hub-muted); font-size: 12px; }
+.attendance-edit-dialog header button { display: grid; place-items: center; width: 34px; height: 34px; border: 1px solid var(--hub-border); border-radius: 4px; }
+.attendance-edit-dialog-body { padding: 16px 20px; font-size: 13px; }
+.attendance-edit-dialog .attendance-corrections { margin: 0; padding: 0; border: 0; }
 .attendance-corrections label { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .attendance-corrections input:not([type="checkbox"]), .attendance-corrections textarea { min-width: 0; max-width: 100%; border: 1px solid var(--hub-border, #b6c0d0); border-radius: 4px; padding: 8px; color: inherit; background: var(--hub-surface, transparent); }
 .attendance-corrections button { display: inline-flex; align-items: center; justify-content: center; gap: 6px; min-height: 34px; padding: 6px 10px; border: 1px solid var(--hub-border, #b6c0d0); border-radius: 4px; color: inherit; }
