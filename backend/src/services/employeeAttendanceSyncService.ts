@@ -1,7 +1,8 @@
-import { getConfiguredBusinesses, runWithBusiness } from "../config/tenancy";
+import { getConfiguredBusinesses, getCurrentBusinessId, runWithBusiness } from "../config/tenancy";
 import { Attendance, type AttendanceSource, type AttendanceStatus } from "../models/Attendance";
 import { Employee } from "../models/Employee";
 import { getBusinessAccessForEmployeeCode, normalizeBusinessAccessIds } from "../models/BusinessUserAccess";
+import { attendanceIntegrityEnabled } from "../config/rolloutFlags";
 
 type AttendanceSnapshot = {
   timeIn: Date;
@@ -12,10 +13,6 @@ type AttendanceSnapshot = {
 };
 
 const duplicateWindowMs = 5_000;
-
-function attendanceRecordKey(record: Pick<AttendanceSnapshot, "timeIn" | "source">) {
-  return `${new Date(record.timeIn).toISOString()}|${record.source}`;
-}
 
 export function mergeAttendanceSnapshots(recordGroups: AttendanceSnapshot[][]) {
   const mergedRecords: AttendanceSnapshot[] = [];
@@ -79,14 +76,12 @@ async function writeAttendanceHistory(employeeCode: string, businessId: string, 
             source: record.source,
           },
           update: {
-            $set: {
-              attendanceStatus: record.attendanceStatus || "",
-              isArchived: false,
-            },
             $setOnInsert: {
               employee: employee._id,
               timeIn: record.timeIn,
               source: record.source,
+              attendanceStatus: record.attendanceStatus || "",
+              isArchived: false,
             },
           },
           upsert: true,
@@ -94,29 +89,9 @@ async function writeAttendanceHistory(employeeCode: string, businessId: string, 
       }))
     );
 
-    const canonicalKeys = new Set(records.map(attendanceRecordKey));
-    const currentRecords = await Attendance.find({
-      employee: employee._id,
-      isArchived: { $ne: true },
-    }).select("_id timeIn source").sort({ timeIn: 1, _id: 1 }).lean();
-    const retainedKeys = new Set<string>();
-    const duplicateIds = currentRecords.flatMap((record) => {
-      const key = attendanceRecordKey(record as AttendanceSnapshot);
-      if (canonicalKeys.has(key) && !retainedKeys.has(key)) {
-        retainedKeys.add(key);
-        return [];
-      }
-      return [record._id];
-    });
-
-    if (duplicateIds.length > 0) {
-      await Attendance.updateMany(
-        { _id: { $in: duplicateIds } },
-        { $set: { isArchived: true } }
-      );
-    }
-
-    return result.upsertedCount + duplicateIds.length;
+    // A snapshot cannot prove a concurrently written event is a duplicate.
+    // Legacy reconciliation only inserts missing evidence and never archives or restores it.
+    return result.upsertedCount;
   });
 }
 
@@ -142,12 +117,17 @@ async function assignedBusinessIds(employeeCode: string) {
 
   return controlledBusinessIds.length > 0
     ? controlledBusinessIds
-    : Array.from(configuredBusinessIds);
+    : [getCurrentBusinessId()];
 }
 
 export async function syncEmployeeAttendanceAcrossBusinesses(employeeCode: string) {
   const normalizedEmployeeCode = String(employeeCode || "").trim();
   if (!normalizedEmployeeCode) return 0;
+  if (attendanceIntegrityEnabled()) {
+    const { refreshAttendanceLedgerMemberships, deliverAttendanceLedger } = await import("./attendanceLedgerOutbox");
+    for (const key of await refreshAttendanceLedgerMemberships(normalizedEmployeeCode)) await deliverAttendanceLedger(key);
+    return 0;
+  }
 
   const businessIds = await assignedBusinessIds(normalizedEmployeeCode);
   const mergedHistory = await mergedAttendanceHistory(normalizedEmployeeCode, businessIds);

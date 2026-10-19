@@ -79,6 +79,10 @@ export function EmployeeLiveShareProvider({ children }: { children: ReactNode })
     const [status, setStatus] = useState("");
     const [activeRequestId, setActiveRequestId] = useState("");
     const [pendingRequest, setPendingRequest] = useState<LiveShareRequest | null>(null);
+    if (!employee && (pendingRequest !== null || status !== "")) {
+        setPendingRequest(null);
+        setStatus("");
+    }
     const peerRef = useRef<RTCPeerConnection | null>(null);
     const streamRef = useRef<MediaStream | null>(null);
     const requestIdRef = useRef("");
@@ -293,9 +297,6 @@ export function EmployeeLiveShareProvider({ children }: { children: ReactNode })
 
     useEffect(() => {
         if (!employee?._id) {
-            cleanupLiveShare(true, "employee-left-crm");
-            setPendingRequest(null);
-            setStatus("");
             return;
         }
 

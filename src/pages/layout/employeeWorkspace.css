@@ -1,0 +1,53 @@
+.employee-workspace {
+  --employee-text: #e8edf5;
+  --employee-muted: #b8c4d9;
+  --employee-border: #526174;
+}
+:root:is([data-theme^="light-"], [data-theme^="mail-"]) .employee-workspace {
+  --employee-text: #172332;
+  --employee-muted: #526174;
+  --employee-border: #cbd5e1;
+}
+.employee-workspace > main, .employee-workspace > main > .content-scroll,
+.employee-dashboard, .employee-dashboard .grid > * { min-width: 0; }
+.employee-dashboard { color: var(--employee-text); letter-spacing: 0; }
+.employee-dashboard h1 { overflow-wrap: anywhere; }
+.employee-dashboard :is(.bg-white, .bg-slate-50, .bg-slate-50\/80) { background: var(--surface-bg); }
+.employee-dashboard .bg-slate-100 { background: var(--panel-bg); }
+.employee-dashboard :is(.text-slate-950, .text-slate-900, .text-slate-800, .text-slate-700) { color: var(--employee-text); }
+.employee-dashboard :is(.text-slate-600, .text-slate-500) { color: var(--employee-muted); }
+.employee-dashboard :is(.border-slate-200, .border-slate-300) { border-color: var(--employee-border); }
+.employee-dashboard :is(input, select) { color-scheme: inherit; max-width: 100%; min-width: 0; }
+.employee-dashboard .overflow-x-auto { max-width: 100%; scrollbar-width: thin; }
+.employee-dashboard .employee-call-counts > div:first-child { padding-top: 0; }
+.employee-dashboard tr[aria-hidden="true"] { display: none; }
+.employee-dashboard .employee-stat > div:first-child > span:first-child { width: 32px; height: 32px; }
+.employee-dashboard .employee-stat > p { margin-top: 8px; }
+.employee-dashboard .employee-stat > p.text-3xl { font-size: 26px; line-height: 30px; }
+.employee-dashboard :focus-visible { outline: 2px solid var(--primary-text); outline-offset: 3px; }
+.employee-dashboard .employee-dashboard-retry { display: inline-flex; gap: 6px; align-items: center; margin-left: 12px; text-decoration: underline; }
+.employee-workspace .workspace-mobile-menu { background: var(--panel-bg); color: var(--employee-text); border-color: var(--employee-border); }
+.employee-mobile-search-toggle { width: 36px; height: 36px; align-items: center; justify-content: center; border: 1px solid var(--employee-border); border-radius: 4px; background: var(--panel-bg); color: var(--employee-text); }
+@media (max-width: 760px) {
+  .employee-workspace > main > .content-scroll { padding: 16px; }
+  .employee-workspace > main > header { padding: 12px 16px; }
+  .employee-workspace > main > header > div { gap: 8px; }
+  .employee-workspace > main > header h1 { font-size: 18px; }
+  .employee-workspace > main > header .employee-navbar-search.is-open { display: block; position: absolute; top: calc(100% + 4px); left: 16px; right: 16px; width: auto; max-width: none; background: var(--surface-bg); border: 1px solid var(--employee-border); border-radius: 6px; }
+  .employee-workspace :is(.employee-attendance-menu, .profile-v2 > [data-mobile-navigation]) { display: none; }
+  .employee-dashboard .employee-call-counts label { width: 100%; }
+  .employee-dashboard .employee-call-counts label > div { display: grid; grid-template-columns: minmax(0, 1fr) 110px; }
+  .employee-dashboard .employee-call-counts input { width: 100%; }
+  .employee-dashboard .employee-call-counts .mt-5 { margin-top: 0; }
+  .employee-dashboard .employee-dashboard-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .employee-dashboard .employee-dashboard-stats article { padding: 12px; }
+  .employee-dashboard .employee-dashboard-stats article .text-3xl { font-size: 24px; }
+  .employee-dashboard .employee-dashboard-stats article > div:first-child > span:last-child { display: none; }
+}
+@media(max-width:767px) {
+  .employee-mobile-search-toggle { display: inline-flex; flex-shrink: 0; }
+  .employee-workspace > main > header .employee-navbar-search.is-open { display: block; position: absolute; top: calc(100% + 4px); left: 16px; right: 16px; width: auto; max-width: none; background: var(--surface-bg); border: 1px solid var(--employee-border); border-radius: 6px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .employee-workspace :is(aside, main) { transition: none; }
+}

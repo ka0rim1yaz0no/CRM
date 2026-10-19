@@ -1,0 +1,33 @@
+.employee-attendance-menu, .employee-attendance-nav-backdrop { display: none; }
+.employee-attendance-page { color: var(--employee-text); min-width: 0; }
+.employee-attendance-page > header, .employee-attendance-page > .grid > section {
+    background: var(--surface-bg); border-color: var(--employee-border); border-radius: 8px; min-width: 0;
+}
+.employee-attendance-page > .grid > section:first-child > .mt-5.rounded-lg { background: var(--panel-bg); border-color: var(--employee-border); }
+.employee-attendance-page :is(.text-slate-950,.text-slate-900,.text-slate-800,.text-slate-700) { color: var(--employee-text); }
+.employee-attendance-page :is(.text-slate-600,.text-slate-500) { color: var(--employee-muted); }
+.employee-attendance-page :is(.bg-white,.bg-white\/70,.bg-white\/60) { background: var(--panel-bg); }
+.employee-attendance-page :is(.bg-amber-50,.bg-rose-50,.bg-sky-50) .text-slate-950,
+.employee-attendance-page :is(.bg-amber-50,.bg-rose-50,.bg-sky-50) .text-slate-700 { color: #172332; }
+.employee-attendance-page .grid > section > .content-scroll { overflow-x: hidden; }
+.employee-attendance-page :is(p,h1,h2) { overflow-wrap: anywhere; }
+.employee-attendance-page .employee-attendance-event { background: var(--panel-bg); border-color: var(--employee-border); }
+.employee-attendance-page .employee-attendance-date { background: var(--surface-bg); color: var(--employee-muted); }
+.employee-attendance-allowances { display:flex; flex-wrap:wrap; gap:10px 24px; margin-top:20px; padding-block:10px; border-block:1px solid var(--employee-border); font-size:12px; }
+.employee-attendance-allowances div { display:flex; flex-wrap:wrap; gap:6px; }
+.employee-attendance-allowances dt { color:var(--employee-muted); }
+.employee-attendance-allowances dd { color:var(--employee-text); font-weight:600; }
+.employee-attendance-page :focus-visible { outline: 2px solid var(--primary-text); outline-offset: 3px; }
+:root:not([data-theme^="light-"]):not([data-theme^="mail-"]) .employee-attendance-page > header :is(h1,p),
+:root:not([data-theme^="light-"]):not([data-theme^="mail-"]) .employee-attendance-page > .grid > section:first-child > div:first-child p { color: #e8edf5; }
+:root:not([data-theme^="light-"]):not([data-theme^="mail-"]) .employee-attendance-menu { color: #e8edf5; }
+@media (max-width: 760px) {
+    .theme-app-bg:has(.employee-attendance-page) > aside { z-index: 60; width: min(16rem, 80vw) !important; transform: translateX(-100%); visibility: hidden; pointer-events: none; box-shadow: none; backdrop-filter: none; transition: transform .2s; }
+    .theme-app-bg.employee-attendance-nav-open > aside { transform: translateX(0); visibility: visible; pointer-events: auto; }
+    .theme-app-bg:has(.employee-attendance-page) > main { padding-left: 0 !important; }
+    .theme-app-bg:has(.employee-attendance-page) > main :is(button[aria-label="Collapse sidebar"],button[aria-label="Expand sidebar"]) { display: none; }
+    .employee-attendance-page { min-width: 0; }
+    .employee-attendance-menu { display: inline-flex; align-items: center; justify-content: center; width: 36px; height: 36px; border: 1px solid #9b8ab8; border-radius: 4px; background: var(--panel-bg); color: #172332; }
+    .employee-attendance-nav-backdrop { display: block; position: fixed; inset: 0; z-index: 50; background: #0008; }
+    .employee-attendance-page > header { padding: 16px; }
+}

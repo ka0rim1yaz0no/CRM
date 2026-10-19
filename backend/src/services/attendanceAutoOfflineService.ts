@@ -1,4 +1,5 @@
 export async function reconcileExpiredAttendanceSlots(_now = new Date()) {
+  void _now;
   // Attendance time-out is always employee-controlled. This legacy entry point
   // remains a no-op so an old deployment hook cannot close shifts automatically.
   return 0;

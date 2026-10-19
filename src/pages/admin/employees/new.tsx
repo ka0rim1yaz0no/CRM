@@ -12,7 +12,7 @@ import {
     type EmployeeStatus,
 } from "../../../api/employees";
 import { getRoles } from "../../../api/roles";
-import { useToast } from "../../../components/ToastProvider";
+import { useToast } from "../../../lib/toast";
 import { roleWorkspacePath } from "../../../lib/roleAccess";
 
 const fallbackRoles = ["Sales Agent", "Team Lead", "Manager", "Support Agent"];

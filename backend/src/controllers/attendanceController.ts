@@ -1,17 +1,19 @@
 import type { Request, Response } from "express";
 import { Types } from "mongoose";
 import { Attendance, type AttendanceSource, type AttendanceStatus } from "../models/Attendance";
-import { getConfiguredBusinesses, runWithBusiness } from "../config/tenancy";
-import { syncEmployeeAttendanceAcrossBusinesses, syncEmployeesAttendanceAcrossBusinesses, updateAttendanceAcrossBusinesses } from "../services/employeeAttendanceSyncService";
+import { runWithBusiness } from "../config/tenancy";
+import { syncEmployeeAttendanceAcrossBusinesses, updateAttendanceAcrossBusinesses } from "../services/employeeAttendanceSyncService";
 import { syncEmployeeAvailabilityAcrossBusinesses } from "../services/employeeAvailabilityService";
 import { Employee, normalizeEmployeeAvailabilityStatus } from "../models/Employee";
 import { recordEmployeeTransaction } from "./employeeTransactionController";
 import { recalculateEmployeePayrollAfterAttendanceEdit } from "./payrollController";
 import { emitCallDashboardUpdated, emitEmployeeAvailabilityUpdated } from "../socket";
 import { getSystemSettings } from "./systemSettingsController";
-import { attendanceV2Enabled } from "../config/rolloutFlags";
+import { attendanceActiveSessionEnabled, attendanceV2Enabled } from "../config/rolloutFlags";
 import { recordAttendanceEvent } from "../services/attendanceEventSyncService";
 import { verifyAdminDashboardSession } from "../config/adminDashboardSession";
+import { attendanceSlotKey, minutesFromTime, zonedDateTimeToUtc, zonedParts } from "../services/attendanceShift";
+export { attendanceSlotKey } from "../services/attendanceShift";
 
 const activityTrackedStatuses = new Set(["ONLINE", "OFF THE PHONE"]);
 const attendanceSources: AttendanceSource[] = [
@@ -36,58 +38,6 @@ export function workedMinutesToTimeOut(timeIn: Date, workedMinutes: number, lunc
 
 export function isTimeInLate(timeIn: Date, allowedStart: Date) {
   return timeIn.getTime() >= allowedStart.getTime() + 60_000;
-}
-
-function minutesFromTime(value = "23:00") {
-  const [hours, minutes] = value.split(":").map((part) => Number(part));
-  return hours * 60 + minutes;
-}
-
-function zonedParts(value: Date, timeZone = "Asia/Manila") {
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    hourCycle: "h23",
-  }).formatToParts(value);
-  const part = (type: Intl.DateTimeFormatPartTypes) => Number(parts.find((item) => item.type === type)?.value || 0);
-  return {
-    year: part("year"),
-    month: part("month"),
-    day: part("day"),
-    hour: part("hour"),
-    minute: part("minute"),
-  };
-}
-
-function zonedDateTimeToUtc(year: number, month: number, day: number, hour: number, minute: number, timeZone = "Asia/Manila") {
-  let utcTime = Date.UTC(year, month - 1, day, hour, minute);
-
-  for (let index = 0; index < 2; index += 1) {
-    const actual = zonedParts(new Date(utcTime), timeZone);
-    const desiredTime = Date.UTC(year, month - 1, day, hour, minute);
-    const actualTime = Date.UTC(actual.year, actual.month - 1, actual.day, actual.hour, actual.minute);
-    utcTime += desiredTime - actualTime;
-  }
-
-  return new Date(utcTime);
-}
-
-export function attendanceSlotKey(value: Date, timeZone: string, shiftStart: string, shiftEnd: string) {
-  const parts = zonedParts(value, timeZone);
-  const shiftStartMinutes = minutesFromTime(shiftStart);
-  const shiftEndMinutes = minutesFromTime(shiftEnd);
-  const actualMinutes = parts.hour * 60 + parts.minute;
-  const slotDate = new Date(Date.UTC(parts.year, parts.month - 1, parts.day));
-
-  if (shiftEndMinutes <= shiftStartMinutes && actualMinutes <= shiftEndMinutes) {
-    slotDate.setUTCDate(slotDate.getUTCDate() - 1);
-  }
-
-  return slotDate.toISOString().slice(0, 10);
 }
 
 async function getTimeInStatus(timeIn: Date) {
@@ -132,27 +82,9 @@ async function getAttendanceStatus(source: AttendanceSource, occurredAt: Date): 
   return "";
 }
 
-async function getTodayAttendanceRange() {
-  const settings = await getSystemSettings();
-  const timeZone = settings.attendanceTimeZone || "Asia/Manila";
-  const now = new Date();
-  const today = zonedParts(now, timeZone);
-  const start = zonedDateTimeToUtc(today.year, today.month, today.day, 0, 0, timeZone);
-  const end = zonedDateTimeToUtc(today.year, today.month, today.day + 1, 0, 0, timeZone);
 
-  return {
-    start,
-    end,
-  };
-}
 
-async function getTodayAttendance(employeeId: Types.ObjectId | string) {
-  const { start, end } = await getTodayAttendanceRange();
-  return Attendance.find({
-    employee: employeeId,
-    timeIn: { $gte: start, $lt: end },
-  }).sort({ timeIn: 1 });
-}
+
 
 async function getActiveAttendanceSlot(employeeId: Types.ObjectId | string, includePreviousShift = false) {
   const timeIn = await Attendance.findOne({
@@ -170,8 +102,8 @@ async function getActiveAttendanceSlot(employeeId: Types.ObjectId | string, incl
   const activeSlotKey = attendanceSlotKey(timeIn.timeIn, timeZone, shiftStart, shiftEnd);
   const currentSlotKey = attendanceSlotKey(new Date(), timeZone, shiftStart, shiftEnd);
 
-  // An unclosed prior shift must not block time-in, breaks, or lunch on a new shift.
-  if (activeSlotKey !== currentSlotKey && !includePreviousShift) {
+  // A reporting-date change cannot close an authoritative manual session.
+  if (!attendanceActiveSessionEnabled() && activeSlotKey !== currentSlotKey && !includePreviousShift) {
     return { timeIn: null, timeOut: null, records: [] as Awaited<ReturnType<typeof Attendance.find>>, recoveryTimeOut: null as Date | null };
   }
 
@@ -273,15 +205,13 @@ export async function recordEmployeeTimeOut(employeeId: Types.ObjectId | string,
   return createAttendanceRecord(employeeId, "Time Out", occurredAt, await getTimeOutStatus(occurredAt), eventId);
 }
 
-export function shouldAutomaticallyCloseAttendanceSlot({
-  recoveryTimeOut: _recoveryTimeOut,
-  now: _now,
-}: {
+export function shouldAutomaticallyCloseAttendanceSlot(options: {
   isInsideShift: boolean;
   hasCurrentOpenSlot: boolean;
   recoveryTimeOut: Date | null;
   now: Date;
 }) {
+  void options;
   // Attendance is employee-controlled. Shift boundaries never create a time-out
   // record or force availability offline.
   return false;
@@ -292,6 +222,7 @@ export function canEditWorkedMinutes(hasManualTimeOut: boolean) {
 }
 
 export async function closeExpiredAttendanceSlots(_now = new Date()) {
+  void _now;
   return [] as string[];
 }
 
@@ -760,7 +691,7 @@ export async function listEmployeeAttendance(request: Request, response: Respons
     ? await Employee.findById(employeeId).select("employeeCode").lean()
     : null;
   if (employee?.employeeCode) {
-    if (!attendanceV2Enabled()) await syncEmployeeAttendanceAcrossBusinesses(employee.employeeCode);
+    // Attendance history reads never reconcile or modify records.
   }
 
   const attendanceQuery = Attendance.find({
@@ -789,11 +720,7 @@ export async function listEmployeesAttendance(request: Request, response: Respon
     return;
   }
 
-  const employees = await Employee.find({
-    _id: { $in: employeeIds },
-    status: { $ne: "Archived" },
-  }).select("employeeCode").lean();
-  if (!attendanceV2Enabled()) await syncEmployeesAttendanceAcrossBusinesses(employees.map((employee) => employee.employeeCode));
+  // Cross-business history reads never reconcile or modify records.
 
   const includeAll = String(request.query.all || "") === "true";
   const requestedFrom = new Date(String(request.query.from || ""));

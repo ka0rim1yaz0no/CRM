@@ -1,5 +1,7 @@
 import type { Request, Response } from "express";
 import { SystemSettings, type CurrencyCode, type PayrollBillingCycle, type ThemeKey } from "../models/SystemSettings";
+import { AttendancePolicy } from "../models/AttendanceLedger";
+import { attendanceIntegrityEnabled } from "../config/rolloutFlags";
 
 export const currencies: CurrencyCode[] = ["USD", "PHP", "EUR", "GBP", "JPY"];
 export const payrollBillingCycles: PayrollBillingCycle[] = ["Monthly", "Semi-monthly", "Weekly"];
@@ -22,7 +24,7 @@ export const themeKeys: ThemeKey[] = [
   "mail-violet",
 ];
 
-const defaultSystemSettings = {
+export const defaultSystemSettings = {
   key: "system" as const,
   currencyCode: "PHP" as CurrencyCode,
   payrollBillingCycle: "Semi-monthly" as PayrollBillingCycle,
@@ -68,23 +70,15 @@ function isValidTimeZone(value: string) {
 }
 
 export async function getSystemSettings() {
-  const settings = await SystemSettings.findOneAndUpdate(
-    { key: "system" },
-    { $setOnInsert: defaultSystemSettings },
-    { returnDocument: "after", upsert: true, runValidators: true }
-  );
-  if (!settings) throw new Error("Unable to load system settings");
-
-  let shouldSaveSettings = false;
+  // Defaults and legacy normalization are projections. Only the explicit update endpoint persists settings.
+  const settings = await SystemSettings.findOne({ key: "system" }) || new SystemSettings(defaultSystemSettings);
 
   if (settings.payrollRunDay > 30) {
     settings.payrollRunDay = 30;
-    shouldSaveSettings = true;
   }
 
   if (settings.payrollBillingCycle === "Monthly") {
     settings.payrollBillingCycle = defaultSystemSettings.payrollBillingCycle;
-    shouldSaveSettings = true;
   }
 
   const missingPayrollCutoffRanges =
@@ -102,7 +96,7 @@ export async function getSystemSettings() {
     settings.payrollSecondCutoffStartDay = defaultSystemSettings.payrollSecondCutoffStartDay;
     settings.payrollSecondCutoffEndDay = defaultSystemSettings.payrollSecondCutoffEndDay;
     settings.payrollSecondCutoffPayDay = defaultSystemSettings.payrollSecondCutoffPayDay;
-    return settings.save();
+    return projectAttendancePolicy(settings);
   }
 
   const hasReversedDefaultCutoffs =
@@ -120,7 +114,7 @@ export async function getSystemSettings() {
     settings.payrollSecondCutoffStartDay = defaultSystemSettings.payrollSecondCutoffStartDay;
     settings.payrollSecondCutoffEndDay = defaultSystemSettings.payrollSecondCutoffEndDay;
     settings.payrollSecondCutoffPayDay = defaultSystemSettings.payrollSecondCutoffPayDay;
-    return settings.save();
+    return projectAttendancePolicy(settings);
   }
 
   const usesLegacyAttendanceDefaults =
@@ -135,7 +129,7 @@ export async function getSystemSettings() {
     settings.officialSecondBreakEndTime === "16:30";
 
   if (!usesLegacyAttendanceDefaults) {
-    return shouldSaveSettings ? settings.save() : settings;
+    return projectAttendancePolicy(settings);
   }
 
   settings.officialShiftStartTime = defaultSystemSettings.officialShiftStartTime;
@@ -147,7 +141,27 @@ export async function getSystemSettings() {
   settings.officialSecondBreakStartTime = defaultSystemSettings.officialSecondBreakStartTime;
   settings.officialSecondBreakEndTime = defaultSystemSettings.officialSecondBreakEndTime;
   settings.attendanceTimeZone = defaultSystemSettings.attendanceTimeZone;
-  return settings.save();
+  return projectAttendancePolicy(settings);
+}
+
+async function projectAttendancePolicy<T extends { lateGraceMinutes: number; officialShiftStartTime: string; officialShiftEndTime: string;
+  officialFirstBreakStartTime: string; officialFirstBreakEndTime: string; officialSecondBreakStartTime: string; officialSecondBreakEndTime: string;
+  officialLunchBreakStartTime: string; officialLunchBreakEndTime: string }>(settings: T) {
+  if (!attendanceIntegrityEnabled()) return settings;
+  const policy = await AttendancePolicy.findById("global-attendance").lean();
+  if (!policy) return settings;
+  const endAfter = (start: string, minutes: number) => {
+    const [hour, minute] = start.split(":").map(Number);
+    const end = (hour * 60 + minute + minutes) % 1440;
+    return `${String(Math.floor(end / 60)).padStart(2, "0")}:${String(end % 60).padStart(2, "0")}`;
+  };
+  settings.lateGraceMinutes = policy.graceMinutes;
+  settings.officialShiftStartTime = policy.shiftStart;
+  settings.officialShiftEndTime = policy.shiftEnd;
+  settings.officialFirstBreakEndTime = endAfter(settings.officialFirstBreakStartTime, policy.breakMinutes);
+  settings.officialSecondBreakEndTime = endAfter(settings.officialSecondBreakStartTime, policy.breakMinutes);
+  settings.officialLunchBreakEndTime = endAfter(settings.officialLunchBreakStartTime, policy.lunchMinutes);
+  return settings;
 }
 
 export async function getCurrencyCode() {

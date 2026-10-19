@@ -3,9 +3,11 @@ import { mkdir, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { Employee } from "../models/Employee";
 import { MediaAsset, type MediaAssetType } from "../models/MediaAsset";
+import { configuredUploadRoot, uploadRoot } from "../config/uploadPaths";
 
-const mediaUploadRoot = path.resolve(process.cwd(), "uploads", "media");
+const mediaUploadRoot = path.join(uploadRoot, "media");
 const maxStoredMediaBytes = 12 * 1024 * 1024;
+const maxMediaBytes = 50 * 1024 * 1024;
 
 function toText(value: unknown, fallback = "") {
   const text = String(value || "").trim();
@@ -36,6 +38,7 @@ function isSafeMediaFileName(value: string) {
 }
 
 function mediaUploadCandidates() {
+  if (configuredUploadRoot) return [mediaUploadRoot];
   return Array.from(
     new Set([
       mediaUploadRoot,
@@ -69,7 +72,7 @@ export async function uploadMediaAsset(request: Request, response: Response) {
   const dataUrl = String(request.body.dataUrl || "");
   const originalName = String(request.body.fileName || "media").replace(/[^a-zA-Z0-9._-]/g, "-");
   const role = toText(request.body.role);
-  const match = dataUrl.match(/^data:(image\/(?:png|jpe?g|webp|gif)|video\/(?:mp4|webm|ogg|quicktime));base64,(.+)$/);
+  const match = dataUrl.match(/^data:(image\/(?:png|jpe?g|webp|gif)|video\/(?:mp4|webm|ogg|quicktime));base64,([a-zA-Z0-9+/=]+)$/);
 
   if (!role) {
     response.status(400).json({ message: "role is required" });
@@ -106,6 +109,14 @@ export async function uploadMediaAsset(request: Request, response: Response) {
   const uploadDir = mediaUploadRoot;
   const fileName = `${Date.now()}-${Math.random().toString(16).slice(2)}-${originalName}.${extensionByMime[mimeType] || "bin"}`;
   const bytes = Buffer.from(base64, "base64");
+  if (!bytes.length || bytes.toString("base64").replace(/=+$/, "") !== base64.replace(/=+$/, "")) {
+    response.status(400).json({ message: "Media data is invalid or empty." });
+    return;
+  }
+  if (bytes.length > maxMediaBytes) {
+    response.status(413).json({ message: "Media files must be 50 MB or smaller." });
+    return;
+  }
 
   await mkdir(uploadDir, { recursive: true });
   await writeFile(path.join(uploadDir, fileName), bytes);
@@ -134,6 +145,14 @@ export async function serveMediaAssetFile(request: Request, response: Response) 
     return;
   }
 
+  const apiUrl = mediaFileUrl(fileName);
+  const legacyUrl = `/uploads/media/${fileName}`;
+  const asset = await MediaAsset.findOne({ url: { $in: [apiUrl, legacyUrl] }, isArchived: false }).select("_id mimeType").lean();
+  if (!asset) {
+    response.status(404).json({ message: "Media file not found in this business" });
+    return;
+  }
+
   for (const uploadDirectory of mediaUploadCandidates()) {
     const root = path.resolve(uploadDirectory);
     const filePath = path.resolve(root, fileName);
@@ -155,14 +174,12 @@ export async function serveMediaAssetFile(request: Request, response: Response) 
     }
   }
 
-  const apiUrl = mediaFileUrl(fileName);
-  const legacyUrl = `/uploads/media/${fileName}`;
-  const asset = await MediaAsset.findOne({ url: { $in: [apiUrl, legacyUrl] }, isArchived: false }).select("+data");
+  const stored = await MediaAsset.findById(asset._id).select("+data");
 
-  if (asset?.data && Buffer.isBuffer(asset.data)) {
-    response.type(asset.mimeType || "application/octet-stream");
+  if (stored?.data && Buffer.isBuffer(stored.data)) {
+    response.type(stored.mimeType || "application/octet-stream");
     response.setHeader("Cache-Control", "private, max-age=3600");
-    response.send(asset.data);
+    response.send(stored.data);
     return;
   }
 

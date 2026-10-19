@@ -1,5 +1,6 @@
 import { api } from "../lib/api";
 import type { ThemeKey } from "../lib/themes";
+import { getAuthUser } from "./authStorage";
 
 export type CurrencyCode = "USD" | "PHP" | "EUR" | "GBP" | "JPY";
 export type PayrollBillingCycle = "Monthly" | "Semi-monthly" | "Weekly";
@@ -57,13 +58,14 @@ export async function getSystemSettings() {
 }
 
 export async function updateSystemSettings(
-    settings: Partial<Pick<SystemSettings, "currencyCode" | "payrollBillingCycle" | "payrollRunDay" | "payrollFirstCutoffStartDay" | 
-    "payrollFirstCutoffEndDay" | "payrollFirstCutoffPayDay" | "payrollSecondCutoffStartDay" | "payrollSecondCutoffEndDay" | 
-    "payrollSecondCutoffPayDay" | "autoAssignLeadsEnabled" | "adminLeadMiniTabsEnabled" | "employeeLeadMiniTabsEnabled" | 
-    "trackerClearDataEnabled" | "officialShiftStartTime" | "officialShiftEndTime" | "officialFirstBreakStartTime" | 
-    "officialFirstBreakEndTime" | "officialLunchBreakStartTime" | "officialLunchBreakEndTime" | "officialSecondBreakStartTime" | 
+    settings: Partial<Pick<SystemSettings, "currencyCode" | "payrollBillingCycle" | "payrollRunDay" | "payrollFirstCutoffStartDay" |
+    "payrollFirstCutoffEndDay" | "payrollFirstCutoffPayDay" | "payrollSecondCutoffStartDay" | "payrollSecondCutoffEndDay" |
+    "payrollSecondCutoffPayDay" | "autoAssignLeadsEnabled" | "adminLeadMiniTabsEnabled" | "employeeLeadMiniTabsEnabled" |
+    "trackerClearDataEnabled" | "officialShiftStartTime" | "officialShiftEndTime" | "officialFirstBreakStartTime" |
+    "officialFirstBreakEndTime" | "officialLunchBreakStartTime" | "officialLunchBreakEndTime" | "officialSecondBreakStartTime" |
     "officialSecondBreakEndTime" | "attendanceTimeZone" | "lateGraceMinutes" | "themeKey">>
 ) {
-    const response = await api.put<SystemSettings>("/system-settings", settings);
+    const auth = getAuthUser();
+    const response = await api.put<SystemSettings>("/system-settings", settings, { headers: { "X-CRM-Admin-Session": auth?.userType === "admin" ? auth.sessionToken || "" : "" } });
     return response.data;
 }

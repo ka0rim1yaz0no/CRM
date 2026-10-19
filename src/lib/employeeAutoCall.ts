@@ -87,6 +87,7 @@ export function isLeadEligibleForAutoCall(
     now = new Date(),
     _employeeNames: string[] = []
 ) {
+    void _employeeNames;
     if (lead.status !== "NEW" && lead.status !== "Follow up") {
         return false;
     }

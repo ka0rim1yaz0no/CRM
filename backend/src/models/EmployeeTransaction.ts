@@ -25,6 +25,7 @@ const employeeTransactionSchema = new Schema<EmployeeTransactionDocument>(
   },
   { timestamps: true }
 );
+employeeTransactionSchema.index({ employee: 1, category: 1, occurredAt: -1 });
 
 export const EmployeeTransaction = tenantModel<EmployeeTransactionDocument>(
   "EmployeeTransaction",

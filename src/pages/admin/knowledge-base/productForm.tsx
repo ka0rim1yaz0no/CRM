@@ -1,5 +1,5 @@
 import type { FormEvent } from "react";
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate, useParams } from "react-router";
 import { FiArrowLeft, FiImage, FiPlus, FiSave, FiTrash2 } from "react-icons/fi";
@@ -14,7 +14,7 @@ import {
     type KnowledgeBaseEntry,
     type KnowledgeBaseInput,
 } from "../../../api/knowledgeBase";
-import { useToast } from "../../../components/ToastProvider";
+import { useToast } from "../../../lib/toast";
 import { getPlainTextFromRichText } from "../../../lib/richText";
 import { ClassicEditor, createKnowledgeBaseEditorConfig, normalizeKnowledgeBaseRichTextImages } from "./richTextEditor";
 import { backendOrigin } from "../../../lib/backendUrl";
@@ -109,22 +109,27 @@ export default function AdminProductForm() {
     });
     const editEntry = entries.find((entry) => entry._id === entryId);
 
-    useEffect(() => {
-        if (!isEditing) {
-            setInitialEditorData("");
-            setLoadedEntryId(null);
-            return;
-        }
+    const [previousProductDraft, setPreviousProductDraft] = useState<readonly unknown[] | null>(null);
+    const productDraftInputs = [editEntry, isEditing, loadedEntryId];
+    if (previousProductDraft === null || productDraftInputs.some((input, index) => !Object.is(input, previousProductDraft[index]))) {
+        setPreviousProductDraft(productDraftInputs);
+        (() => {
+            if (!isEditing) {
+                setInitialEditorData("");
+                setLoadedEntryId(null);
+                return;
+            }
 
-        if (!editEntry || loadedEntryId === editEntry._id) {
-            return;
-        }
+            if (!editEntry || loadedEntryId === editEntry._id) {
+                return;
+            }
 
-        const nextForm = entryToInput(editEntry);
-        setForm(nextForm);
-        setInitialEditorData(nextForm.description);
-        setLoadedEntryId(editEntry._id);
-    }, [editEntry, isEditing, loadedEntryId]);
+            const nextForm = entryToInput(editEntry);
+            setForm(nextForm);
+            setInitialEditorData(nextForm.description);
+            setLoadedEntryId(editEntry._id);
+        })();
+    }
 
     const createMutation = useMutation({
         mutationFn: createKnowledgeBaseEntry,
@@ -161,7 +166,7 @@ export default function AdminProductForm() {
             [field]: value,
         }));
     };
-    
+
     const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
         event.preventDefault();
 

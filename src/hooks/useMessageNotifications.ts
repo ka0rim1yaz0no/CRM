@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { getAuthUser } from "../api/authStorage";
 import { getConversations, getUnreadMessageNotifications, markMessageNotificationSeen, markMessagesSeen, type Conversation, type Message } from "../api/messages";
 import { connectAuthenticatedSocket, socket } from "../lib/socket";
+import { messageSound } from "../lib/messageSound";
 
 type MessageNotificationPayload = {
     message: Message;
@@ -10,62 +11,6 @@ type MessageNotificationPayload = {
 };
 
 const MESSAGE_NOTIFICATIONS_CHANGED_EVENT = "crm:message-notifications-changed";
-const soundedMessageIds = new Set<string>();
-let messageAudioContext: AudioContext | null = null;
-
-function getMessageAudioContext() {
-    messageAudioContext ??= new AudioContext();
-    return messageAudioContext;
-}
-
-function claimMessageSound(messageId: string) {
-    const key = `crm:message-sound:${messageId}`;
-    const now = Date.now();
-    const claimedAt = Number(localStorage.getItem(key) || 0);
-    if (now - claimedAt < 15_000) return false;
-    localStorage.setItem(key, String(now));
-    return true;
-}
-
-function playIncomingMessageSound(messageId: string) {
-    if (soundedMessageIds.has(messageId)) return;
-    try {
-        const context = getMessageAudioContext();
-        const playTone = (
-            frequency: number,
-            start: number,
-            duration = 0.24,
-            peakVolume = 0.16,
-            type: OscillatorType = "sine",
-        ) => {
-            const oscillator = context.createOscillator();
-            const gain = context.createGain();
-            oscillator.type = type;
-            oscillator.frequency.setValueAtTime(frequency, start);
-            gain.gain.setValueAtTime(0.0001, start);
-            gain.gain.exponentialRampToValueAtTime(peakVolume, start + 0.025);
-            gain.gain.exponentialRampToValueAtTime(0.0001, start + duration);
-            oscillator.connect(gain).connect(context.destination);
-            oscillator.start(start);
-            oscillator.stop(start + duration + 0.02);
-        };
-        const play = () => {
-            if (!claimMessageSound(messageId)) return;
-            soundedMessageIds.add(messageId);
-            if (soundedMessageIds.size > 200) soundedMessageIds.delete(soundedMessageIds.values().next().value || "");
-            const start = context.currentTime + 0.02;
-            playTone(784, start, 0.22, 0.15, "triangle");
-            playTone(1046.5, start + 0.14, 0.24, 0.17, "triangle");
-            playTone(1318.5, start + 0.29, 0.27, 0.18, "triangle");
-            playTone(1046.5, start + 0.5, 0.38, 0.16, "triangle");
-            playTone(523.25, start + 0.5, 0.4, 0.08, "sine");
-        };
-        if (context.state === "running") play();
-        else void context.resume().then(play).catch(() => undefined);
-    } catch {
-        // Browsers may block sound until the user has interacted with the CRM tab.
-    }
-}
 
 export type MessageNotification = {
     id: string;
@@ -83,6 +28,10 @@ function conversationIdentity(conversation: Conversation | null) {
     if (!conversation) return "";
     if (conversation.type === "team") return `team:${conversation.team?._id || conversation._id}`;
     return `${conversation.includeAdmin ? "admin" : "direct"}:${conversation.participants.map((participant) => participant.employeeCode).filter(Boolean).sort().join("|")}`;
+}
+
+function soundIdentity(message: Message, conversation: Conversation | null) {
+    return `${conversationIdentity(conversation)}:${message.createdAt}:${message.senderType}:${message.sender?.employeeCode || message.senderName || ""}`;
 }
 
 function getConversationTitle(conversation: Conversation | null, currentUserId: string) {
@@ -107,7 +56,6 @@ function readStoredNotifications(storageKey: string) {
     try {
         return JSON.parse(localStorage.getItem(storageKey) || "[]") as MessageNotification[];
     } catch {
-        localStorage.removeItem(storageKey);
         return [];
     }
 }
@@ -134,6 +82,7 @@ export function useMessageNotifications() {
     const legacyStorageKey = `messageNotifications:${currentUserId || "guest"}`;
     const [instanceId] = useState(() => crypto.randomUUID());
     const queryClient = useQueryClient();
+    const knownSounds = useRef({ identity: storageKey, initialized: false, keys: new Set<string>() });
     const [localNotifications, setNotifications] = useState<MessageNotification[]>(() => {
         const stored = readStoredNotifications(storageKey);
         return stored.length ? stored : readStoredNotifications(legacyStorageKey);
@@ -167,15 +116,10 @@ export function useMessageNotifications() {
 
     useEffect(() => {
         const unlockAudio = () => {
-            try {
-                const context = getMessageAudioContext();
-                if (context.state !== "running") void context.resume().catch(() => undefined);
-            } catch {
-                // Audio support is optional; unread badges continue to work.
-            }
+            void messageSound.unlock();
         };
-        window.addEventListener("pointerdown", unlockAudio, { once: true });
-        window.addEventListener("keydown", unlockAudio, { once: true });
+        window.addEventListener("pointerdown", unlockAudio);
+        window.addEventListener("keydown", unlockAudio);
         return () => {
             window.removeEventListener("pointerdown", unlockAudio);
             window.removeEventListener("keydown", unlockAudio);
@@ -214,8 +158,24 @@ export function useMessageNotifications() {
     }, [instanceId, storageKey]);
 
     useEffect(() => {
-        localStorage.setItem(storageKey, JSON.stringify(notifications.slice(0, 30)));
+        try { localStorage.setItem(storageKey, JSON.stringify(notifications.slice(0, 30))); } catch { /* Server unread state remains authoritative when storage is unavailable. */ }
     }, [notifications, storageKey]);
+
+    useEffect(() => {
+        if (!serverNotificationsLoaded) return;
+        if (knownSounds.current.identity !== storageKey) knownSounds.current = { identity: storageKey, initialized: false, keys: new Set() };
+        const known = knownSounds.current;
+        for (const { message, conversation } of serverNotifications) {
+            const key = soundIdentity(message, conversation);
+            if (known.initialized && !known.keys.has(key) && !message.deletedAt &&
+                !isOwnMessage(message, currentUserId, Boolean(isAdmin)) && isRelevantConversation(conversation, currentUserId, Boolean(isAdmin))) {
+                void messageSound.incoming(key);
+            }
+            known.keys.add(key);
+        }
+        known.initialized = true;
+        while (known.keys.size > 200) known.keys.delete(known.keys.values().next().value!);
+    }, [serverNotifications, serverNotificationsLoaded, storageKey, currentUserId, isAdmin]);
 
     useEffect(() => {
         if (!currentUserId) return;
@@ -230,13 +190,13 @@ export function useMessageNotifications() {
                 return;
             }
 
-            playIncomingMessageSound(message._id);
+            if (!message.deletedAt) void messageSound.incoming(soundIdentity(message, resolvedConversation));
 
             if (document.visibilityState !== "visible" && "Notification" in window && Notification.permission === "granted") {
-                new Notification(getConversationTitle(resolvedConversation, currentUserId), {
+                try { new Notification(getConversationTitle(resolvedConversation, currentUserId), {
                     body: message.body || "New attachment",
                     tag: `crm-message-${message._id}`,
-                });
+                }); } catch { /* A browser notification failure must not discard unread messages. */ }
             }
 
             const notification = toNotification(message, resolvedConversation);
@@ -255,9 +215,12 @@ export function useMessageNotifications() {
         };
 
         socket.on("message:notification", handleMessageNotification);
+        const refreshUnread = () => { void queryClient.invalidateQueries({ queryKey: ["message-notifications"] }); };
+        socket.on("connect", refreshUnread);
 
         return () => {
             socket.off("message:notification", handleMessageNotification);
+            socket.off("connect", refreshUnread);
         };
     }, [conversations, currentUserId, isAdmin, queryClient, toNotification]);
 

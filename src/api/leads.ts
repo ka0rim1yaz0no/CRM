@@ -310,6 +310,7 @@ export type AgentLeadProgress = {
 
 export type AgentLeadActivity = {
     id: string;
+    employeeId?: string;
     employeeName: string;
     action: string;
     detail: string;

@@ -11,8 +11,9 @@ import { Message, type MessageAttachment } from "../models/Message";
 import { Team } from "../models/Team";
 import { emitMessageEvents, emitMessageMutationEvent, emitMessagesRefresh } from "../socket";
 import { emitMirroredDirectMessage, syncDirectMessagesToBusiness } from "../services/directMessageSyncService";
+import { uploadRoot } from "../config/uploadPaths";
 
-const messageUploadRoot = path.resolve(process.cwd(), "uploads", "messages");
+const messageUploadRoot = path.join(uploadRoot, "messages");
 const maxAttachmentBytes = 50 * 1024 * 1024;
 const maxAttachmentsPerMessage = 6;
 const allowedMimeTypes = new Set([

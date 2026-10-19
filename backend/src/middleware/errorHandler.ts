@@ -2,6 +2,8 @@ import type { ErrorRequestHandler } from "express";
 import { toBusinessDatabaseAccessError } from "../utils/mongoErrors";
 
 export const errorHandler: ErrorRequestHandler = (error, _request, response, _next) => {
+  // Express identifies error middleware by its four-argument signature.
+  void _next;
   const businessDatabaseAccessError = toBusinessDatabaseAccessError(error);
 
   if (businessDatabaseAccessError) {

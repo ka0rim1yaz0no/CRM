@@ -5,8 +5,9 @@ import { getBusinessById, getCurrentBusinessId, getPublicBusinesses, type Public
 import { syncEmployeeAvailabilityAcrossBusinesses } from "../services/employeeAvailabilityService";
 import { syncActiveAttendanceForBusinessSwitch } from "../services/employeeAttendanceSyncService";
 import { findConfiguredAdmin } from "../config/adminUsers";
-import { attendanceV2Enabled, callDashboardV2Enabled } from "../config/rolloutFlags";
+import { attendanceIntegrityEnabled, attendanceV2Enabled } from "../config/rolloutFlags";
 import { createAdminDashboardSession } from "../config/adminDashboardSession";
+import { createAttendanceHubSession } from "../config/attendanceHubSession";
 import { syncRecentAttendanceEventsForBusinessSwitch } from "../services/attendanceEventSyncService";
 
 function responseBusiness(request: Request, publicBusinesses: PublicBusinessConfig[]) {
@@ -49,8 +50,7 @@ export async function loginWithEmployeeCode(request: Request, response: Response
       user: { id: "admin", name: configuredAdmin.name, role: "Admin", employeeCode },
       userType: "admin",
       access: configuredAdmin.access,
-      ...(callDashboardV2Enabled() || attendanceV2Enabled()
-        ? { sessionToken: createAdminDashboardSession(employeeCode) } : {}),
+      sessionToken: createAdminDashboardSession(employeeCode),
       business: responseBusiness(request, publicBusinesses),
       allowedBusinesses: publicBusinesses,
     });
@@ -80,6 +80,7 @@ export async function loginWithEmployeeCode(request: Request, response: Response
   response.json({
     user: employee,
     userType: "employee",
+    attendanceHubSession: createAttendanceHubSession(employee.employeeCode),
     business: responseBusiness(request, allowedBusinesses),
     allowedBusinesses,
   });
@@ -153,13 +154,15 @@ export async function switchEmployeeBusiness(request: Request, response: Respons
   }
 
   const currentAvailabilityStatus = normalizeEmployeeAvailabilityStatus(currentEmployee.availabilityStatus);
-  await syncEmployeeAvailabilityAcrossBusinesses(
+  if (!attendanceIntegrityEnabled()) await syncEmployeeAvailabilityAcrossBusinesses(
     currentEmployee.employeeCode,
     currentAvailabilityStatus,
     currentEmployee.availabilityStatusReason
   );
   try {
-    if (attendanceV2Enabled()) {
+    if (attendanceIntegrityEnabled()) {
+      // Business selection never changes attendance. Commands maintain the shared projection.
+    } else if (attendanceV2Enabled()) {
       await syncRecentAttendanceEventsForBusinessSwitch(currentEmployee.employeeCode, currentBusiness.id);
     } else {
       await syncActiveAttendanceForBusinessSwitch(
@@ -176,6 +179,7 @@ export async function switchEmployeeBusiness(request: Request, response: Respons
   response.json({
     user: targetEmployee,
     userType: "employee",
+    attendanceHubSession: createAttendanceHubSession(targetEmployee.employeeCode),
     business: allowedBusinesses.find((business) => business.id === targetBusiness.id) || { id: targetBusiness.id, name: targetBusiness.name },
     allowedBusinesses,
   });

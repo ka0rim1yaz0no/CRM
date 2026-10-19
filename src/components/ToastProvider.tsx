@@ -1,30 +1,7 @@
 import type { ReactNode } from "react";
-import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { FiAlertCircle, FiCheckCircle, FiInfo, FiX } from "react-icons/fi";
-
-type ToastTone = "success" | "error" | "info";
-
-export type ToastInput = {
-    title?: string;
-    message: string;
-    tone?: ToastTone;
-};
-
-type Toast = ToastInput & {
-    id: string;
-    tone: ToastTone;
-};
-
-type ToastContextValue = {
-    showToast: (toast: ToastInput) => void;
-};
-
-const ToastContext = createContext<ToastContextValue | null>(null);
-const toastListeners = new Set<(toast: ToastInput) => void>();
-
-export function emitToast(toast: ToastInput) {
-    toastListeners.forEach((listener) => listener(toast));
-}
+import { ToastContext, toastListeners, type Toast, type ToastInput } from "../lib/toast";
 
 export function ToastProvider({ children }: { children: ReactNode }) {
     const [toasts, setToasts] = useState<Toast[]>([]);
@@ -109,14 +86,4 @@ export function ToastProvider({ children }: { children: ReactNode }) {
             </div>
         </ToastContext.Provider>
     );
-}
-
-export function useToast() {
-    const context = useContext(ToastContext);
-
-    if (!context) {
-        return { showToast: emitToast };
-    }
-
-    return context;
 }

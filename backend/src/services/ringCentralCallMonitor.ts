@@ -108,6 +108,7 @@ export function startRingCentralCallMonitor() {
 }
 
 export function getRingCentralMonitorStatus(_employeeCode = "") {
+  void _employeeCode;
   return {
     configured: false,
     connected: false,

@@ -1,5 +1,6 @@
 import { reconcileAllEmployeeAttendance } from "./employeeAttendanceSyncService";
-import { attendanceV2Enabled } from "../config/rolloutFlags";
+import { attendanceIntegrityEnabled, attendanceV2Enabled } from "../config/rolloutFlags";
+import { retryAttendanceLedgers } from "./attendanceLedgerOutbox";
 import { retryAttendanceSyncOutbox } from "./attendanceEventSyncService";
 import { retryPendingEmployeeAvailability } from "./employeeAvailabilityService";
 
@@ -11,6 +12,7 @@ export async function runAttendanceReconciliation() {
   if (reconciliationRunning) return null;
   reconciliationRunning = true;
   try {
+    if (attendanceIntegrityEnabled()) { await retryAttendanceLedgers(); return { employees: 0, repairedRecords: 0 }; }
     if (attendanceV2Enabled()) {
       const [attendanceResult, availabilityResult] = await Promise.allSettled([
         retryAttendanceSyncOutbox(),

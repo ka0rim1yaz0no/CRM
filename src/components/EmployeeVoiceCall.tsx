@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { FiMic, FiMicOff, FiPhone, FiPhoneOff } from "react-icons/fi";
 import { useLocation } from "react-router";
 import { getAuthUser } from "../api/authStorage";
@@ -32,11 +32,11 @@ function configuredIceServers() {
 export default function EmployeeVoiceCall() {
     useLocation();
     const authUser = getAuthUser();
-    const currentUser = authUser?.userType === "employee"
+    const currentUser = useMemo(() => authUser?.userType === "employee"
         ? authUser.user
         : authUser?.userType === "admin"
             ? { ...authUser.user, _id: "admin", name: authUser.user.name || "Admin" }
-            : null;
+            : null, [authUser]);
     const [callState, setCallState] = useState<CallState>("idle");
     const [session, setSession] = useState<VoiceCallSession | null>(null);
     const [target, setTarget] = useState<VoiceCallTarget | null>(null);

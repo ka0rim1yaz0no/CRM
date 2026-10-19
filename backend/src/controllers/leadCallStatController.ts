@@ -1,13 +1,42 @@
 import { Lead } from "../models/Lead";
 import { Employee } from "../models/Employee";
-import { LeadCallStat } from "../models/leadCallStat";
+import { LeadCallStat, type LeadCallLogItem, type LeadCallStatDocument } from "../models/leadCallStat";
 import { getCallBridgeAttemptModel } from "../models/CallBridge";
 import { getCallProvider } from "../config/callProvider";
 import { Types } from "mongoose";
+import type { Request, Response } from "express";
+
+type CallRequest = Request<{ id: string }> & {
+    employee?: { _id?: Types.ObjectId | string };
+    user?: { employeeId?: string; employee?: { _id?: string }; _id?: string };
+};
+
+type EmployeeCallSummary = {
+    employeeId: string;
+    employeeName: string;
+    crmBusinessId: string;
+    crmBusinessName: string;
+    employeeRole: string;
+    employeeTeam: string;
+    totalCalls: number;
+    totalNotConnectedCalls: number;
+    totalVoicemails: number;
+    totalAttempts: number;
+    lastCallAt: Date | null;
+    leads: Array<{
+        leadId: string; leadName: string; businessName: string;
+        callCount: number; callNotConnectedCount: number; callVoicemailCount: number;
+        totalAttempts: number; lastCallAt: Date | null;
+    }>;
+};
+
+type SummaryAggregate = Omit<EmployeeCallSummary, "employeeId" | "crmBusinessId" | "crmBusinessName"> & {
+    _id: Types.ObjectId;
+};
 
 type LeadCallOutcome = "connected" | "not_connected" | "voicemail";
 
-function getRequestEmployeeId(req: any) {
+function getRequestEmployeeId(req: CallRequest) {
     return (
         req.employee?._id ||
         req.user?.employeeId ||
@@ -85,7 +114,7 @@ async function holdLeadAfterCallOutcome(
     );
 }
 
-function getLogOutcome(log: any): LeadCallOutcome {
+function getLogOutcome(log: Pick<LeadCallLogItem, "outcome">): LeadCallOutcome {
     if (log?.outcome === "not_connected" || log?.outcome === "voicemail") {
         return log.outcome;
     }
@@ -93,7 +122,7 @@ function getLogOutcome(log: any): LeadCallOutcome {
     return "connected";
 }
 
-function getLatestCallDate(callLogs: any[]) {
+function getLatestCallDate(callLogs: LeadCallLogItem[]) {
     return callLogs.reduce<Date | null>((latestDate, log) => {
         const calledAt = log?.calledAt ? new Date(log.calledAt) : null;
 
@@ -109,32 +138,22 @@ function getLatestCallDate(callLogs: any[]) {
     }, null);
 }
 
-function getDayRange(date = new Date()) {
-    const start = new Date(date);
-    start.setHours(0, 0, 0, 0);
-
-    const end = new Date(date);
-    end.setHours(23, 59, 59, 999);
-
-    return { start, end };
-}
-
-function normalizeCallStatForResponse(callStat: any) {
-    const callLogs = (callStat?.callLogs || []).map((log: any) => ({
+function normalizeCallStatForResponse(callStat: LeadCallStatDocument | null) {
+    const callLogs = (callStat?.callLogs || []).map((log) => ({
         ...log,
         outcome: getLogOutcome(log),
     }));
 
     const connectedLogs = callLogs.filter(
-        (log: any) => getLogOutcome(log) === "connected"
+        (log) => getLogOutcome(log) === "connected"
     );
 
     const notConnectedLogs = callLogs.filter(
-        (log: any) => getLogOutcome(log) === "not_connected"
+        (log) => getLogOutcome(log) === "not_connected"
     );
 
     const voicemailLogs = callLogs.filter(
-        (log: any) => getLogOutcome(log) === "voicemail"
+        (log) => getLogOutcome(log) === "voicemail"
     );
 
     return {
@@ -151,7 +170,7 @@ function normalizeCallStatForResponse(callStat: any) {
     };
 }
 
-async function createLeadCallLogUpdate(req: any, res: any, outcome: LeadCallOutcome) {
+async function createLeadCallLogUpdate(req: CallRequest, res: Response, outcome: LeadCallOutcome) {
     try {
         const leadId = req.params.id;
 
@@ -240,7 +259,12 @@ async function createLeadCallLogUpdate(req: any, res: any, outcome: LeadCallOutc
             } : {}),
         };
 
-        const update: any = {
+        const update: {
+            $setOnInsert: { lead: Types.ObjectId };
+            $set: { leadName: string; businessName: string; lastCallAt?: Date; lastNotConnectedAt?: Date; lastVoicemailAt?: Date };
+            $push: { callLogs: typeof callLog };
+            $inc?: { callCount?: number; callNotConnectedCount?: number; callVoicemailCount?: number };
+        } = {
             $setOnInsert: {
                 lead: lead._id,
             },
@@ -314,19 +338,19 @@ async function createLeadCallLogUpdate(req: any, res: any, outcome: LeadCallOutc
     }
 }
 
-export async function logConnectedCall(req: any, res: any) {
+export async function logConnectedCall(req: CallRequest, res: Response) {
     return createLeadCallLogUpdate(req, res, "connected");
 }
 
-export async function logNotConnectedCall(req: any, res: any) {
+export async function logNotConnectedCall(req: CallRequest, res: Response) {
     return createLeadCallLogUpdate(req, res, "not_connected");
 }
 
-export async function logVoicemailCall(req: any, res: any) {
+export async function logVoicemailCall(req: CallRequest, res: Response) {
     return createLeadCallLogUpdate(req, res, "voicemail");
 }
 
-export async function getLeadCallStat(req: any, res: any) {
+export async function getLeadCallStat(req: CallRequest, res: Response) {
     try {
         const leadId = req.params.id;
 
@@ -375,7 +399,7 @@ export async function getLeadCallStat(req: any, res: any) {
     }
 }
 
-export async function getLeadCallStats(req: any, res: any) {
+export async function getLeadCallStats(req: CallRequest, res: Response) {
     try {
         const callStats = await LeadCallStat.find({})
             .sort({
@@ -398,7 +422,7 @@ function optionalCallSummaryDate(value: unknown) {
     return date && !Number.isNaN(date.getTime()) ? date : null;
 }
 
-async function sendLeadCallSummary(req: any, res: any, employeeOnly: boolean) {
+async function sendLeadCallSummary(req: CallRequest, res: Response, employeeOnly: boolean) {
     try {
         const employeeId = employeeOnly ? getRequestEmployeeId(req) : null;
 
@@ -432,7 +456,7 @@ async function sendLeadCallSummary(req: any, res: any, employeeOnly: boolean) {
         }
 
         const [rows, employees] = await Promise.all([
-            LeadCallStat.aggregate([
+            LeadCallStat.aggregate<SummaryAggregate>([
                 { $unwind: "$callLogs" },
                 ...(Object.keys(logMatch).length ? [{ $match: logMatch }] : []),
                 {
@@ -493,7 +517,7 @@ async function sendLeadCallSummary(req: any, res: any, employeeOnly: boolean) {
             Employee.find(employeeFilter).select("name role team").lean(),
         ]);
 
-        const summaryRows = rows.map((row: any) => ({
+        const summaryRows = rows.map((row) => ({
             employeeId: String(row._id || ""),
             employeeName: row.employeeName || "Employee",
             crmBusinessId: String(req.business?.id || ""),
@@ -507,10 +531,10 @@ async function sendLeadCallSummary(req: any, res: any, employeeOnly: boolean) {
             lastCallAt: row.lastCallAt || null,
             leads: row.leads || [],
         }));
-        const summaryRowsByEmployeeId = new Map<string, any>(
-            summaryRows.map((row: any) => [row.employeeId, row])
+        const summaryRowsByEmployeeId = new Map<string, EmployeeCallSummary>(
+            summaryRows.map((row) => [row.employeeId, row])
         );
-        const rowsByEmployeeId = new Map<string, any>();
+        const rowsByEmployeeId = new Map<string, EmployeeCallSummary>();
 
         for (const employee of employees) {
             const currentEmployeeId = String(employee._id);
@@ -548,15 +572,15 @@ async function sendLeadCallSummary(req: any, res: any, employeeOnly: boolean) {
     }
 }
 
-export async function getLeadCallSummary(req: any, res: any) {
+export async function getLeadCallSummary(req: CallRequest, res: Response) {
     return sendLeadCallSummary(req, res, false);
 }
 
-export async function getMyLeadCallSummary(req: any, res: any) {
+export async function getMyLeadCallSummary(req: CallRequest, res: Response) {
     return sendLeadCallSummary(req, res, true);
 }
 
-export async function getMyLeadCallStats(req: any, res: any) {
+export async function getMyLeadCallStats(req: CallRequest, res: Response) {
     try {
         const currentEmployeeId = getRequestEmployeeId(req);
 
@@ -579,19 +603,19 @@ export async function getMyLeadCallStats(req: any, res: any) {
         const filteredCallStats = callStats
             .map((item) => {
                 const callLogs = (item.callLogs || []).filter(
-                    (log: any) => String(log.employee) === String(employeeObjectId)
+                    (log) => String(log.employee) === String(employeeObjectId)
                 );
 
                 const connectedLogs = callLogs.filter(
-                    (log: any) => getLogOutcome(log) === "connected"
+                    (log) => getLogOutcome(log) === "connected"
                 );
 
                 const notConnectedLogs = callLogs.filter(
-                    (log: any) => getLogOutcome(log) === "not_connected"
+                    (log) => getLogOutcome(log) === "not_connected"
                 );
 
                 const voicemailLogs = callLogs.filter(
-                    (log: any) => getLogOutcome(log) === "voicemail"
+                    (log) => getLogOutcome(log) === "voicemail"
                 );
 
                 return normalizeCallStatForResponse({

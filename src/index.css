@@ -282,13 +282,22 @@
 
 .admin-sidebar-nav-command,
 .admin-sidebar-account-command {
-  display: none;
+  display: block;
 }
 
 .admin-sidebar-nav-legacy,
 .admin-sidebar-account-legacy {
-  display: block;
+  display: none;
 }
+
+.admin-sidebar-link { min-height: 46px; position: relative; }
+.admin-sidebar-icon { width: 32px; height: 32px; border-radius: 6px; background: color-mix(in srgb,var(--primary) 10%,var(--shell-bg)); }
+.admin-sidebar-section-title { letter-spacing: 0; font-size: 10px; }
+.admin-sidebar-profile { background: var(--panel-bg); }
+.theme-app-bg[data-sidebar-collapsed="true"] .admin-sidebar-profile { border: 0; background: transparent !important; padding: 0; justify-content: center; }
+.theme-app-bg[data-sidebar-collapsed="true"] .admin-sidebar-profile > div { display: none; }
+.theme-app-bg[data-sidebar-collapsed="true"] .admin-sidebar-logout { padding-inline: 0; justify-content: center; }
+.theme-app-bg[data-sidebar-collapsed="true"] .admin-sidebar-logout > span { display: none; }
 
 :root[data-theme^="light-"],
 :root[data-theme^="mail-"] {
@@ -1460,7 +1469,7 @@ textarea.bg-\[\#0d1018\] {
     0 2px 6px rgba(15, 23, 42, 0.08) !important;
 }
 
-:root[data-theme="light-command"] .admin-dashboard-page .dashboard-kpi-card {
+:root[data-theme="light-command"] .admin-dashboard-page:not(.dv2-page) .dashboard-kpi-card {
   padding: 1.25rem !important;
 }
 
@@ -1500,7 +1509,7 @@ textarea.bg-\[\#0d1018\] {
   font-size: 22px !important;
 }
 
-:root[data-theme="light-command"] .admin-dashboard-page h2 {
+:root[data-theme="light-command"] .admin-dashboard-page:not(.dv2-page) h2 {
   font-size: 1.95rem !important;
   line-height: 2.25rem !important;
   font-weight: 750 !important;
@@ -1514,17 +1523,17 @@ textarea.bg-\[\#0d1018\] {
   letter-spacing: 0 !important;
 }
 
-:root[data-theme="light-command"] .admin-dashboard-page .dashboard-kpi-card .text-2xl {
+:root[data-theme="light-command"] .admin-dashboard-page:not(.dv2-page) .dashboard-kpi-card .text-2xl {
   font-size: 2rem !important;
   line-height: 2.25rem !important;
   font-weight: 750 !important;
 }
 
-:root[data-theme="light-command"] .admin-dashboard-page .dashboard-kpi-card .text-xs {
+:root[data-theme="light-command"] .admin-dashboard-page:not(.dv2-page) .dashboard-kpi-card .text-xs {
   font-size: 0.82rem !important;
 }
 
-:root[data-theme="light-command"] .admin-dashboard-page .dashboard-kpi-card .text-sm,
+:root[data-theme="light-command"] .admin-dashboard-page:not(.dv2-page) .dashboard-kpi-card .text-sm,
 :root[data-theme="light-command"] .admin-dashboard-page table {
   font-size: 0.95rem !important;
 }
@@ -1709,6 +1718,10 @@ textarea.bg-\[\#0d1018\] {
 .login-screen .login-code-input::placeholder {
   color: #8b8a94 !important;
 }
+
+:root[data-theme] main.login-screen form { color: #f4f4f5; color-scheme: dark; }
+:root[data-theme] main.login-screen form :is(h1,button,select,option) { color: #ffffff !important; }
+:root[data-theme] main.login-screen form select { background-color: #111018 !important; border-color: #71687e !important; }
 
 :root[data-theme^="light-"] main.login-screen input.login-code-input:not([type="checkbox"]):not([type="radio"]),
 :root[data-theme^="mail-"] main.login-screen input.login-code-input:not([type="checkbox"]):not([type="radio"]) {

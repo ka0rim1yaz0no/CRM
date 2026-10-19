@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSearchParams } from "react-router";
 import { FiBell, FiBriefcase, FiCalendar, FiCamera, FiCheck, FiCheckCircle, FiChevronDown, FiChevronLeft, FiChevronRight, FiClock, FiEdit2, FiMail, FiMapPin, FiPhone, FiRefreshCw, FiSave, FiShield, FiTrendingUp, FiX } from "react-icons/fi";
@@ -17,6 +17,12 @@ import {
 import { acknowledgeEmployeeNotice, getEmployeeNotices, markEmployeeNoticeRead, markEmployeeNoticesRead, replyToEmployeeNotice } from "../../api/notices";
 import { formatPhDate, formatPhDateTime } from "../../lib/dateTime";
 import MainLayout from "../layout";
+import { profileUpgradeEnabled } from "../../lib/workspaceRollout";
+import { profileCompleteness, profileActivityDay, tenureLabel } from "../../lib/profilePresentation";
+import { BankAccountInput, ProfileContactActions, ProfileFieldGroup, ProfileMobileNavigation } from "../../components/ProfileEnhancements";
+import AvailabilityBadge from "../../components/AvailabilityBadge";
+import MetricValue from "../../components/MetricValue";
+import "./profileUpgrade.css";
 
 const emptyProfileForm: EmployeeProfileInput = {
     personalPhone: "",
@@ -217,12 +223,12 @@ const emptyLeaveForm: LeaveRequestInput = {
 };
 
 type CustomDropdownProps = {
+    buttonRef: React.RefObject<HTMLButtonElement | null>;
     label: string;
     value?: string;
     placeholder?: string;
     disabled?: boolean;
     onOpen: () => void;
-    buttonRef: React.RefObject<HTMLButtonElement | null>;
 };
 
 function CustomDropdown({
@@ -255,7 +261,7 @@ function CustomDropdown({
 
 export default function Profile() {
     const queryClient = useQueryClient();
-    const [searchParams] = useSearchParams();
+    const [searchParams, setSearchParams] = useSearchParams();
     const [authUser, setAuthUser] = useState(() => getAuthUser());
     const employee = authUser?.userType === "employee" ? authUser.user : null;
     const employeeId = employee?._id || "";
@@ -271,17 +277,29 @@ export default function Profile() {
     const [noticeReplies, setNoticeReplies] = useState<Record<string, string>>({});
     const [leaveReplies, setLeaveReplies] = useState<Record<string, string>>({});
     const [openDropdown, setOpenDropdown] = useState<"contactRelationship" | null>(null);
+    const [dropdownStyle, setDropdownStyle] = useState<React.CSSProperties>({});
     const statusButtonRel = useRef<HTMLButtonElement>(null);
     const dropdownMenuRef = useRef<HTMLDivElement>(null);
     const profileImageInputRef = useRef<HTMLInputElement>(null);
+    const profileDetailsRef = useRef<HTMLElement>(null);
+    const selectProfileTab = (tab: "overview" | "notices" | "leave") => {
+        setActiveProfileTab(tab);
+        setSearchParams((previous) => { const next = new URLSearchParams(previous); next.set("tab", tab); if (tab !== "notices") next.delete("notice"); return next; });
+    };
     const requestedProfileTab = searchParams.get("tab");
     const highlightedNoticeId = searchParams.get("notice") || "";
-    const { data: employeeProfile } = useQuery({
+    const { data: employeeProfile, isPending: profileLoading, isError: profileLoadError } = useQuery({
         queryKey: ["employee-profile", employeeId],
         queryFn: () => getEmployee(employeeId),
         enabled: Boolean(employeeId),
     });
     const currentEmployee = employeeProfile || employee;
+    useEffect(() => {
+        if (!isProfileEditing || JSON.stringify(profileForm) === JSON.stringify(profileFormFromEmployee(currentEmployee))) return;
+        const warn = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = ""; };
+        window.addEventListener("beforeunload", warn);
+        return () => window.removeEventListener("beforeunload", warn);
+    }, [isProfileEditing, profileForm, currentEmployee]);
     const recentActivityQuery = useInfiniteQuery({
         queryKey: ["employee-recent-activity", employeeId],
         queryFn: ({ pageParam }) => getEmployeeRecentActivity(employeeId, pageParam, 10),
@@ -312,13 +330,13 @@ export default function Profile() {
         .slice(0, 2)
         .toUpperCase();
     const noticesQueryKey = ["employee-notices", employeeId];
-    const { data: notices = [], isLoading: noticesLoading } = useQuery({
+    const { data: notices = EMPTY_QUERY_ROWS, isLoading: noticesLoading, isError: noticesError } = useQuery({
         queryKey: noticesQueryKey,
         queryFn: () => getEmployeeNotices(employeeId),
         enabled: Boolean(employeeId),
     });
     const leaveRequestsQueryKey = ["employee-leave-requests", employeeId];
-    const { data: leaveRequests = [], isLoading: leaveRequestsLoading } = useQuery({
+    const { data: leaveRequests = EMPTY_QUERY_ROWS, isLoading: leaveRequestsLoading, isError: leaveRequestsError } = useQuery({
         queryKey: leaveRequestsQueryKey,
         queryFn: () => getEmployeeLeaveRequests(employeeId),
         enabled: Boolean(employeeId),
@@ -396,19 +414,31 @@ export default function Profile() {
         },
     });
 
-    useEffect(() => {
-        if (!currentEmployee || isProfileEditing) {
-            return;
-        }
+    const [previousProfileDraft, setPreviousProfileDraft] = useState<readonly unknown[] | null>(null);
+    const profileDraftInputs = [currentEmployee, isProfileEditing];
+    if (previousProfileDraft === null || profileDraftInputs.some((input, index) => !Object.is(input, previousProfileDraft[index]))) {
+        setPreviousProfileDraft(profileDraftInputs);
+        (() => {
+            if (!currentEmployee || isProfileEditing) {
+                return;
+            }
 
-        setProfileForm(profileFormFromEmployee(currentEmployee));
-    }, [currentEmployee, isProfileEditing]);
+            setProfileForm(profileFormFromEmployee(currentEmployee));
+        })();
+    }
 
-    useEffect(() => {
-        if (requestedProfileTab === "notices" || requestedProfileTab === "leave" || requestedProfileTab === "overview") {
-            setActiveProfileTab(requestedProfileTab);
-        }
-    }, [requestedProfileTab]);
+    const [previousProfileRoute, setPreviousProfileRoute] = useState<readonly unknown[] | null>(null);
+    const profileRouteInputs = [requestedProfileTab];
+    if (previousProfileRoute === null || profileRouteInputs.some((input, index) => !Object.is(input, previousProfileRoute[index]))) {
+        setPreviousProfileRoute(profileRouteInputs);
+        (() => {
+            if (requestedProfileTab === "notices" || requestedProfileTab === "leave" || requestedProfileTab === "overview") {
+                setActiveProfileTab(requestedProfileTab);
+            } else {
+                setActiveProfileTab("overview");
+            }
+        })();
+    }
 
     useEffect(() => {
         if (activeProfileTab !== "notices" || !highlightedNoticeId) {
@@ -564,7 +594,6 @@ export default function Profile() {
             options: contactRelationship,
             searchable: false,
             search: "",
-            buttonRef: statusButtonRel,
             onSearch: () => undefined,
             onChange: (status: string) => {
                 setProfileForm((employee) => ({ ...employee, contactRelationship: status as ContactRelationships }));
@@ -582,7 +611,7 @@ export default function Profile() {
 
         const handleOutsideClick = (event: globalThis.MouseEvent) => {
             const target = event.target as Node | null;
-            const activeButton = activeDropdown?.buttonRef.current;
+            const activeButton = { contactRelationship: statusButtonRel }[openDropdown].current;
             if (!target || activeButton?.contains(target) || dropdownMenuRef.current?.contains(target)) {
                 return;
             }
@@ -591,7 +620,7 @@ export default function Profile() {
 
         document.addEventListener("mousedown", handleOutsideClick);
         return () => document.removeEventListener("mousedown", handleOutsideClick);
-    }, [activeDropdown, openDropdown]);
+    }, [openDropdown]);
 
 
     const getDropdownStyle = (button: HTMLButtonElement | null) => {
@@ -610,17 +639,19 @@ export default function Profile() {
             width: rect.width,
         };
     };
-    
+
     return (
         <MainLayout>
-            <section className="min-h-[calc(100vh-8.5rem)] space-y-5">
-                <div className="theme-surface-bg overflow-hidden rounded-lg border border-white/10">
-                    <div className="h-36 border-b border-white/10 bg-[radial-gradient(circle_at_18%_10%,rgba(132,44,255,0.36),transparent_28%),linear-gradient(135deg,rgba(255,255,255,0.08),transparent_45%)]" />
+            <section className={`min-h-[calc(100vh-8.5rem)] space-y-5 ${profileUpgradeEnabled ? "profile-v2" : ""}`} aria-busy={profileUpgradeEnabled && profileLoading}>
+                {profileUpgradeEnabled && <ProfileMobileNavigation />}
+                {profileUpgradeEnabled && profileLoadError && <p role="alert">Profile could not refresh. Previously loaded information remains visible.</p>}
+                <div className="profile-hero theme-surface-bg overflow-hidden rounded-lg border border-white/10">
+                    <div className="profile-banner h-36 border-b border-white/10 bg-[radial-gradient(circle_at_18%_10%,rgba(132,44,255,0.36),transparent_28%),linear-gradient(135deg,rgba(255,255,255,0.08),transparent_45%)]" />
                     <div className="px-5 pb-5">
                         <div className="-mt-14 flex flex-wrap items-end justify-between gap-4">
                             <div className="flex min-w-0 items-end gap-4">
                                 <div className="relative">
-                                    <div className="grid size-28 place-items-center overflow-hidden rounded-lg border-4 border-[#090b13] bg-[linear-gradient(135deg,#842cff,#4a0ebd)] text-3xl font-semibold text-white shadow-2xl shadow-black/30">
+                                    <div className="profile-avatar grid size-28 place-items-center overflow-hidden rounded-lg border-4 border-[#090b13] bg-[linear-gradient(135deg,#842cff,#4a0ebd)] text-3xl font-semibold text-white shadow-2xl shadow-black/30">
                                         {profileImageValue ? (
                                             <img className="size-full object-cover" src={profileImageValue} alt={name} />
                                         ) : (
@@ -632,9 +663,9 @@ export default function Profile() {
                                             <button
                                                 className="absolute -bottom-2 -right-2 grid size-10 place-items-center rounded-full border-2 border-[#090b13] bg-white text-black shadow-lg transition hover:bg-white/90 disabled:cursor-not-allowed disabled:opacity-60"
                                                 type="button"
-                                                title="Change profile picture"
+                                                title={isProfileEditing ? "Save or cancel personal details before changing your picture" : "Change profile picture"}
                                                 aria-label="Change profile picture"
-                                                disabled={updateProfileMutation.isPending}
+                                                disabled={updateProfileMutation.isPending || isProfileEditing || profileLoading || profileLoadError}
                                                 onClick={() => profileImageInputRef.current?.click()}
                                             >
                                                 <FiCamera className="size-4" aria-hidden="true" />
@@ -656,6 +687,8 @@ export default function Profile() {
                                 <div className="min-w-0 pb-1">
                                     <p className="text-xs font-medium uppercase tracking-[0.16em] text-white/35">Agent Profile</p>
                                     <h2 className="mt-1 truncate text-2xl font-semibold text-white">{name}</h2>
+                                    {profileUpgradeEnabled && tenureLabel(currentEmployee?.dateHired) && <p className="profile-tenure">{tenureLabel(currentEmployee?.dateHired)} with the team</p>}
+                                    {profileUpgradeEnabled && currentEmployee?.availabilityStatus && <AvailabilityBadge status={currentEmployee.availabilityStatus} />}
                                     <div className="mt-2 flex flex-wrap gap-2">
                                         {[role, team, employmentStatus, `${unreadNoticeCount} unread notice${unreadNoticeCount === 1 ? "" : "s"}`].map((label) => (
                                             <span key={label} className="rounded-md border border-white/10 bg-white/[0.06] px-3 py-1 text-xs font-semibold text-white/65">
@@ -670,7 +703,7 @@ export default function Profile() {
                     </div>
                 </div>
 
-                <div className="theme-surface-bg flex flex-wrap gap-2 rounded-lg border border-white/10 p-2">
+                <div className="profile-tabs theme-surface-bg flex flex-wrap gap-2 rounded-lg border border-white/10 p-2" role={profileUpgradeEnabled ? "tablist" : undefined} aria-label={profileUpgradeEnabled ? "Profile sections" : undefined}>
                     {[
                         ["overview", "Overview"],
                         ["leave", `Leave${pendingLeaveCount > 0 ? ` (${pendingLeaveCount})` : ""}`],
@@ -678,6 +711,11 @@ export default function Profile() {
                     ].map(([tab, label]) => (
                         <button
                             key={tab}
+                            id={profileUpgradeEnabled ? `profile-tab-${tab}` : undefined}
+                            role={profileUpgradeEnabled ? "tab" : undefined}
+                            aria-selected={profileUpgradeEnabled ? activeProfileTab === tab : undefined}
+                            aria-controls={profileUpgradeEnabled ? `profile-panel-${tab}` : undefined}
+                            tabIndex={profileUpgradeEnabled ? activeProfileTab === tab ? 0 : -1 : undefined}
                             className={[
                                 "h-10 rounded-lg px-4 text-sm font-semibold transition",
                                 activeProfileTab === tab
@@ -685,22 +723,30 @@ export default function Profile() {
                                     : "text-white/60 hover:bg-white/[0.06] hover:text-white",
                             ].join(" ")}
                             type="button"
-                            onClick={() => setActiveProfileTab(tab as "overview" | "leave" | "notices")}
+                            onClick={() => selectProfileTab(tab as "overview" | "leave" | "notices")}
+                            onKeyDown={(event) => {
+                                if (!profileUpgradeEnabled || !["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+                                event.preventDefault(); const tabs = ["overview", "leave", "notices"] as const; const index = tabs.indexOf(activeProfileTab);
+                                const next = event.key === "Home" ? 0 : event.key === "End" ? 2 : (index + (event.key === "ArrowRight" ? 1 : 2)) % 3;
+                                selectProfileTab(tabs[next]); document.getElementById(`profile-tab-${tabs[next]}`)?.focus();
+                            }}
                         >
+                            {profileUpgradeEnabled && (tab === "overview" ? <FiBriefcase aria-hidden="true" /> : tab === "leave" ? <FiCalendar aria-hidden="true" /> : <FiBell aria-hidden="true" />)}
                             {label}
                         </button>
                     ))}
                 </div>
 
+                <div role={profileUpgradeEnabled ? "tabpanel" : undefined} id={profileUpgradeEnabled ? `profile-panel-${activeProfileTab}` : undefined} aria-labelledby={profileUpgradeEnabled ? `profile-tab-${activeProfileTab}` : undefined}>
                 {activeProfileTab === "overview" ? (
-                    <div className="grid gap-5 xl:grid-cols-[22rem_1fr]">
+                    <div className="profile-overview grid gap-5 xl:grid-cols-[22rem_1fr]">
                         <aside className="space-y-5">
                             <section className="theme-surface-bg rounded-lg border border-white/10 p-5">
                                 <p className="text-xs font-medium uppercase tracking-[0.16em] text-white/35">Contact</p>
                                 <div className="mt-4 space-y-3">
                                     {[
-                                        [FiMail, "Email", email],
-                                        [FiPhone, "Phone", phone],
+                                        [FiMail, "Email", profileUpgradeEnabled && email === "Not provided" ? currentEmployee?.personalEmail || email : email],
+                                        [FiPhone, "Phone", profileUpgradeEnabled && phone === "Not provided" ? currentEmployee?.personalPhone || phone : phone],
                                         [FiMapPin, "Address", currentEmployee?.personalAddress || "Not provided"],
                                     ].map(([Icon, label, value]) => {
                                         const ContactIcon = Icon as typeof FiMail;
@@ -709,7 +755,8 @@ export default function Profile() {
                                                 <ContactIcon className="mt-0.5 size-4 shrink-0 text-[#b994ff]" aria-hidden="true" />
                                                 <div className="min-w-0">
                                                     <p className="text-xs font-medium uppercase tracking-[0.12em] text-white/35">{label as string}</p>
-                                                    <p className="mt-1 break-words text-sm font-semibold text-white/75">{value as string}</p>
+                                                    <p className="mt-1 break-words text-sm font-semibold text-white/75">{profileUpgradeEnabled && value === "Not provided" ? "" : value as string}</p>
+                                                    {profileUpgradeEnabled && <ProfileContactActions value={value as string} label={label as string} edit={() => { setIsProfileEditing(true); window.requestAnimationFrame(() => { document.getElementById("profile-personal-details")?.scrollIntoView({ block: "start" }); document.getElementById(label === "Email" ? "personal-email" : label === "Phone" ? "personal-phone" : "personal-address")?.focus(); }); }} />}
                                                 </div>
                                             </div>
                                         );
@@ -729,7 +776,7 @@ export default function Profile() {
                                         ["Position", role],
                                         ["Status", employmentStatus],
                                     ].map(([label, value]) => (
-                                        <div key={label} className="flex items-center justify-between gap-4 rounded-lg border border-white/10 bg-white/[0.04] px-3 py-2">
+                                        <div key={label} className="profile-summary-row flex items-center justify-between gap-4 rounded-lg border border-white/10 bg-white/[0.04] px-3 py-2">
                                             <span className="text-xs font-medium uppercase tracking-[0.12em] text-white/35">{label}</span>
                                             <span className="truncate text-right text-sm font-semibold text-white/75">{value}</span>
                                         </div>
@@ -739,20 +786,21 @@ export default function Profile() {
                         </aside>
 
                         <div className="space-y-5">
-                            <div className="grid gap-3 md:grid-cols-3">
+                            <div className="profile-stats grid gap-3 md:grid-cols-3" aria-busy={recentActivityQuery.isPending}>
                                 {profileStats.map(([label, value, detail]) => (
                                     <article key={label} className="theme-surface-bg rounded-lg border border-white/10 p-4">
                                         <p className="text-xs font-medium uppercase tracking-[0.14em] text-white/35">{label}</p>
+                                        {profileUpgradeEnabled && <FiTrendingUp className="profile-stat-icon" aria-hidden="true" />}
                                         <div className="mt-3 flex items-end justify-between gap-3">
-                                            <p className="text-2xl font-semibold text-white">{value}</p>
+                                            <p className="text-2xl font-semibold text-white">{profileUpgradeEnabled ? recentActivityQuery.isPending ? <span className="profile-stat-loading" aria-label="Loading metric">...</span> : value === "-" ? <span className="text-sm">No data yet</span> : <MetricValue value={Number(value)} /> : value}</p>
                                             <span className="text-right text-xs font-semibold text-white/35">{detail}</span>
                                         </div>
                                     </article>
                                 ))}
                             </div>
 
-                            <section className="theme-surface-bg rounded-lg border border-white/10 p-5">
-                                <div className="flex flex-wrap items-center justify-between gap-3">
+                            <section ref={profileDetailsRef} id="profile-personal-details" className="profile-form theme-surface-bg rounded-lg border border-white/10 p-5">
+                                <div className={`flex flex-wrap items-center justify-between gap-3 ${profileUpgradeEnabled && isProfileEditing ? "profile-save-bar" : ""}`}>
                                     <div>
                                         <p className="text-xs font-medium uppercase tracking-[0.16em] text-white/35">Personal Details</p>
                                         <p className="mt-1 text-sm text-white/45">Only personal contact fields can be edited.</p>
@@ -762,7 +810,7 @@ export default function Profile() {
                                             <button
                                                 className="inline-flex h-9 items-center gap-2 rounded-lg bg-white px-3 text-xs font-semibold text-black transition hover:bg-white/90 disabled:cursor-not-allowed disabled:opacity-50"
                                                 type="button"
-                                                disabled={!employeeId}
+                                                disabled={!employeeId || profileLoading || profileLoadError}
                                                 onClick={() => {
                                                     setProfileSuccessMessage("");
                                                     setIsProfileEditing(true);
@@ -791,7 +839,11 @@ export default function Profile() {
                                                     className="inline-flex h-9 items-center gap-2 rounded-lg bg-white px-3 text-xs font-semibold text-black transition hover:bg-white/90 disabled:cursor-not-allowed disabled:opacity-50"
                                                     type="button"
                                                     disabled={!employeeId || updateProfileMutation.isPending}
-                                                    onClick={() => updateProfileMutation.mutate(profileForm)}
+                                                    onClick={() => {
+                                                        const invalid = profileDetailsRef.current?.querySelector<HTMLInputElement>("input:invalid");
+                                                        if (invalid) { invalid.reportValidity(); invalid.focus(); return; }
+                                                        updateProfileMutation.mutate(profileForm);
+                                                    }}
                                                 >
                                                     <FiSave className="size-4" aria-hidden="true" />
                                                     {updateProfileMutation.isPending ? "Saving..." : "Save"}
@@ -800,32 +852,38 @@ export default function Profile() {
                                         )}
                                     </div>
                                 </div>
+                                {profileUpgradeEnabled && <div className="profile-completeness"><span>Personal details {profileCompleteness(profileForm).percent}%</span><progress aria-label="Personal detail completeness" max="100" value={profileCompleteness(profileForm).percent} /><span>{profileCompleteness(profileForm).filled}/{profileCompleteness(profileForm).total}</span></div>}
+                                {profileUpgradeEnabled && isProfileEditing && <p className="profile-unsaved" role="status">{JSON.stringify(profileForm) === JSON.stringify(profileFormFromEmployee(currentEmployee)) ? "Editing personal details" : "Unsaved changes"}</p>}
 
                                 {profileSuccessMessage && (
-                                    <div className="mt-4 flex items-center gap-2 rounded-lg border border-emerald-300/25 bg-emerald-300/10 px-3 py-2 text-sm font-semibold text-emerald-200">
+                                    <div role={profileUpgradeEnabled ? "status" : undefined} className="mt-4 flex items-center gap-2 rounded-lg border border-emerald-300/25 bg-emerald-300/10 px-3 py-2 text-sm font-semibold text-emerald-200">
                                         <FiCheckCircle className="size-4 shrink-0" aria-hidden="true" />
                                         <span>{profileSuccessMessage}</span>
                                     </div>
                                 )}
                                 {profileErrorMessage && (
-                                    <div className="mt-4 rounded-lg border border-rose-300/25 bg-rose-300/10 px-3 py-2 text-sm font-semibold text-rose-200">
+                                    <div role={profileUpgradeEnabled ? "alert" : undefined} className="mt-4 rounded-lg border border-rose-300/25 bg-rose-300/10 px-3 py-2 text-sm font-semibold text-rose-200">
                                         {profileErrorMessage}
                                     </div>
                                 )}
 
                                 <div className="mt-5 grid gap-4 md:grid-cols-2">
+                                    <ProfileFieldGroup enabled={profileUpgradeEnabled} title="Contact">
                                     <label className="space-y-2">
                                         <span className="text-xs font-medium uppercase tracking-[0.12em] text-white/35">Personal Phone</span>
-                                        <input className={inputClass} disabled={isProfileFormDisabled} value={profileForm.personalPhone || ""} onChange={(event) => updateProfileForm("personalPhone", event.target.value)} />
+                                        <input id="personal-phone" className={inputClass} disabled={isProfileFormDisabled} value={profileForm.personalPhone || ""} onChange={(event) => updateProfileForm("personalPhone", event.target.value)} />
                                     </label>
                                     <label className="space-y-2">
                                         <span className="text-xs font-medium uppercase tracking-[0.12em] text-white/35">Personal Email</span>
-                                        <input className={inputClass} disabled={isProfileFormDisabled} type="email" value={profileForm.personalEmail || ""} onChange={(event) => updateProfileForm("personalEmail", event.target.value)} />
+                                        <input id="personal-email" className={inputClass} disabled={isProfileFormDisabled} type="email" value={profileForm.personalEmail || ""} onChange={(event) => updateProfileForm("personalEmail", event.target.value)} />
                                     </label>
+                                    </ProfileFieldGroup>
+                                    <ProfileFieldGroup enabled={profileUpgradeEnabled} title="Emergency">
                                     <label className="space-y-2 col-span-2">
                                         <span className="text-xs font-medium uppercase tracking-[0.12em] text-white/35">Emergency Contact</span>
                                         <input
                                             className={inputClass}
+                                            aria-label="Emergency contact name"
                                             disabled={isProfileFormDisabled}
                                             value={profileForm.emergencyContact || ""}
                                             onChange={(event) => updateProfileForm("emergencyContact", event.target.value)}
@@ -836,29 +894,36 @@ export default function Profile() {
                                             placeholder="Relationship"
                                             value={profileForm.contactRelationship}
                                             disabled={isProfileFormDisabled}
-                                            onOpen={() => setOpenDropdown((current) => (current === "contactRelationship" ? null : "contactRelationship"))}
+                                            onOpen={() => {
+                                                setDropdownStyle(getDropdownStyle(statusButtonRel.current) ?? {});
+                                                setOpenDropdown((current) => (current === "contactRelationship" ? null : "contactRelationship"));
+                                            }}
                                             buttonRef={statusButtonRel}
                                         />
                                         <input
                                             className={inputClass}
+                                            aria-label="Emergency contact phone"
                                             disabled={isProfileFormDisabled}
                                             value={profileForm.emergencyContactNumber || ""}
                                             onChange={(event) => updateProfileForm("emergencyContactNumber", event.target.value)}
                                             placeholder="Phone"
                                         />
                                     </label>
-
+                                    </ProfileFieldGroup>
+                                    <ProfileFieldGroup enabled={profileUpgradeEnabled} title="Address and notes">
                                     <label className="space-y-2 md:col-span-2">
                                         <span className="text-xs font-medium uppercase tracking-[0.12em] text-white/35">Personal Address</span>
-                                        <textarea className={textareaClass} disabled={isProfileFormDisabled} value={profileForm.personalAddress || ""} onChange={(event) => updateProfileForm("personalAddress", event.target.value)} />
+                                        <textarea id="personal-address" className={textareaClass} disabled={isProfileFormDisabled} value={profileForm.personalAddress || ""} onChange={(event) => updateProfileForm("personalAddress", event.target.value)} />
                                     </label>
                                     <label className="space-y-2 md:col-span-2">
                                         <span className="text-xs font-medium uppercase tracking-[0.12em] text-white/35">Personal Notes</span>
                                         <textarea className={textareaClass} disabled={isProfileFormDisabled} value={profileForm.personalNotes || ""} onChange={(event) => updateProfileForm("personalNotes", event.target.value)} />
                                     </label>
-                                    <div className="border-t border-white/10 pt-4 md:col-span-2">
+                                    </ProfileFieldGroup>
+                                    {!profileUpgradeEnabled && <div className="border-t border-white/10 pt-4 md:col-span-2">
                                         <p className="text-xs font-medium uppercase tracking-[0.12em] text-white/35">Bank Details</p>
-                                    </div>
+                                    </div>}
+                                    <ProfileFieldGroup enabled={profileUpgradeEnabled} title="Bank details">
                                     <label className="space-y-2">
                                         <span className="text-xs font-medium uppercase tracking-[0.12em] text-white/35">Bank Name</span>
                                         <input className={inputClass} disabled={isProfileFormDisabled} value={profileForm.bankName || ""} onChange={(event) => updateProfileForm("bankName", event.target.value)} autoComplete="organization" />
@@ -869,14 +934,15 @@ export default function Profile() {
                                     </label>
                                     <label className="space-y-2">
                                         <span className="text-xs font-medium uppercase tracking-[0.12em] text-white/35">Account Number</span>
-                                        <input className={inputClass} disabled={isProfileFormDisabled} value={profileForm.bankAccountNumber || ""} onChange={(event) => updateProfileForm("bankAccountNumber", event.target.value)} inputMode="numeric" autoComplete="off" />
+                                        {profileUpgradeEnabled ? <BankAccountInput className={inputClass} disabled={isProfileFormDisabled} value={profileForm.bankAccountNumber || ""} onChange={(value) => updateProfileForm("bankAccountNumber", value)} /> : <input className={inputClass} disabled={isProfileFormDisabled} value={profileForm.bankAccountNumber || ""} onChange={(event) => updateProfileForm("bankAccountNumber", event.target.value)} inputMode="numeric" autoComplete="off" />}
                                     </label>
+                                    </ProfileFieldGroup>
                                 </div>
                                 {isProfileEditing && activeDropdown && (
                                     <div
                                         ref={dropdownMenuRef}
                                         className="theme-panel-bg fixed z-[60] overflow-hidden rounded-lg border border-white/10 shadow-2xl shadow-black/40"
-                                        style={getDropdownStyle(activeDropdown.buttonRef.current)}
+                                        style={dropdownStyle}
                                         onMouseDown={(event) => event.stopPropagation()}
                                     >
                                         <div className="max-h-44 overflow-y-auto py-1">
@@ -911,12 +977,13 @@ export default function Profile() {
                                         ["Status", employmentStatus],
                                         ["Company", currentEmployee?.company || "Not provided"],
                                         ["Date Hired", currentEmployee?.dateHired ? formatPhDate(currentEmployee.dateHired) : "Not provided"],
-                                    ].map(([label, value]) => (
+                                    ].filter(([label]) => !profileUpgradeEnabled || ["Company", "Date Hired"].includes(label)).map(([label, value]) => (
                                         <div key={label} className="flex items-center justify-between gap-4 border-b border-white/10 pb-3 last:border-b-0 md:even:border-b-0">
                                             <span className="text-sm text-white/45">{label}</span>
                                             <span className="text-right text-sm font-semibold text-white">{value}</span>
                                         </div>
                                     ))}
+                                    {profileUpgradeEnabled && <><div><span className="text-sm text-white/45">Tenure</span><p className="text-sm font-semibold text-white">{tenureLabel(currentEmployee?.dateHired) || "Date hired not available"}</p></div><details className="profile-identity-details profile-work-details"><summary>Identity details</summary><div>{[["Employee Code", employeeCode], ["Department", team], ["Position", role], ["Status", employmentStatus]].map(([label, value]) => <p key={label}><span className="text-sm text-white/45">{label}</span><br /><strong>{value}</strong></p>)}</div></details></>}
                                 </div>
                             </section>
 
@@ -941,23 +1008,25 @@ export default function Profile() {
                                     {recentActivityQuery.isPending && Array.from({ length: 3 }, (_, index) => (
                                         <div key={index} className="h-[4.4rem] animate-pulse rounded-lg border border-white/10 bg-white/[0.04]" />
                                     ))}
-                                    {!recentActivityQuery.isPending && recentActivities.length === 0 && (
+                                    {!recentActivityQuery.isPending && recentActivities.length === 0 && (!profileUpgradeEnabled || !recentActivityQuery.isError) && (
                                         <div className="rounded-lg border border-dashed border-white/10 px-4 py-7 text-center">
                                             <p className="text-sm font-semibold text-white/65">No recent activity</p>
                                             <p className="mt-1 text-xs text-white/35">Attendance, notices, and leave updates will appear here.</p>
                                         </div>
                                     )}
-                                    {recentActivities.map((activity) => (
-                                        <article key={activity._id} className="flex min-h-[4.4rem] items-center gap-3 rounded-lg border border-white/10 bg-white/[0.04] p-3">
+                                    {profileUpgradeEnabled && recentActivityQuery.isError && <p role="alert">Recent activity could not load. Use refresh to try again.</p>}
+                                    {recentActivities.map((activity, index) => (
+                                        <Fragment key={activity._id}>{profileUpgradeEnabled && (index === 0 || profileActivityDay(activity.occurredAt) !== profileActivityDay(recentActivities[index - 1].occurredAt)) && <h3 className="profile-activity-day">{profileActivityDay(activity.occurredAt)}</h3>}
+                                        <article className="profile-activity-row flex min-h-[4.4rem] items-center gap-3 rounded-lg border border-white/10 bg-white/[0.04] p-3">
                                             <div className="flex size-9 shrink-0 items-center justify-center rounded-lg border border-[#842cff]/25 bg-[#842cff]/10 text-[#c9a7ff]">
-                                                <FiClock className="size-4" aria-hidden="true" />
+                                                {profileUpgradeEnabled && activity.category === "Notice" ? <FiBell className="size-4" aria-hidden="true" /> : profileUpgradeEnabled && activity.category === "Lead" ? <FiTrendingUp className="size-4" aria-hidden="true" /> : <FiClock className="size-4" aria-hidden="true" />}
                                             </div>
                                             <div className="min-w-0 flex-1">
                                                 <p className="truncate text-sm font-semibold text-white">{activity.title}</p>
                                                 <p className="mt-1 line-clamp-1 text-xs text-white/40">{activity.description}</p>
                                             </div>
                                             <span className="shrink-0 text-right text-xs text-white/35">{formatPhDateTime(activity.occurredAt)}</span>
-                                        </article>
+                                        </article></Fragment>
                                     ))}
                                     {recentActivityQuery.hasNextPage && (
                                         <button
@@ -979,7 +1048,8 @@ export default function Profile() {
                                 </div>
                                 <div className="mt-4 grid gap-3 md:grid-cols-2">
                                     {["Employee code login enabled", "Work details managed by admin"].map((item) => (
-                                        <div key={item} className="rounded-lg border border-white/10 bg-white/[0.04] p-3 text-sm font-semibold text-white/70">
+                                        <div key={item} className="profile-security-row rounded-lg border border-white/10 bg-white/[0.04] p-3 text-sm font-semibold text-white/70">
+                                            {profileUpgradeEnabled && <FiShield aria-hidden="true" />}
                                             {item}
                                         </div>
                                     ))}
@@ -1044,7 +1114,7 @@ export default function Profile() {
                                             <span key={day}>{day}</span>
                                         ))}
                                     </div>
-                                    <div className="mt-2 grid grid-cols-7 gap-1">
+                                    <div className="profile-calendar mt-2 grid grid-cols-7 gap-1">
                                         {leaveCalendarDays.map((day) => {
                                             const isSelected = selectedLeaveDateSet.has(day.dateKey);
 
@@ -1061,7 +1131,17 @@ export default function Profile() {
                                                     ].join(" ")}
                                                     type="button"
                                                     aria-pressed={isSelected}
+                                                    aria-label={profileUpgradeEnabled ? day.dateKey : undefined}
+                                                    aria-current={profileUpgradeEnabled && day.dateKey === getCurrentPhDateInput() ? "date" : undefined}
+                                                    data-weekend={profileUpgradeEnabled && [0, 6].includes(new Date(`${day.dateKey}T00:00:00Z`).getUTCDay())}
                                                     onClick={() => toggleLeaveDate(day.dateKey)}
+                                                    onKeyDown={(event) => {
+                                                        if (!profileUpgradeEnabled || !["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown"].includes(event.key)) return;
+                                                        event.preventDefault();
+                                                        const amount = ({ ArrowLeft: -1, ArrowRight: 1, ArrowUp: -7, ArrowDown: 7 } as Record<string, number>)[event.key];
+                                                        const index = leaveCalendarDays.findIndex((item) => item.dateKey === day.dateKey); const next = leaveCalendarDays[index + amount];
+                                                        if (next) event.currentTarget.parentElement?.querySelector<HTMLButtonElement>(`button[aria-label="${next.dateKey}"]`)?.focus();
+                                                    }}
                                                 >
                                                     {day.day}
                                                 </button>
@@ -1142,10 +1222,11 @@ export default function Profile() {
                             </div>
 
                             <div className="mt-5 max-h-[calc(100vh-19rem)] min-h-72 space-y-3 overflow-y-auto pr-2">
+                                {profileUpgradeEnabled && leaveRequestsError && <p role="alert">Leave requests could not load. Please refresh this page.</p>}
                                 {leaveRequestsLoading && (
                                     <div className="rounded-lg border border-white/10 bg-white/[0.04] p-4 text-sm text-white/55">Loading leave requests...</div>
                                 )}
-                                {!leaveRequestsLoading && leaveRequests.length === 0 && (
+                                {!leaveRequestsLoading && leaveRequests.length === 0 && (!profileUpgradeEnabled || !leaveRequestsError) && (
                                     <div className="rounded-lg border border-white/10 bg-white/[0.04] p-4">
                                         <p className="text-sm font-semibold text-white">No leave requests yet</p>
                                         <p className="mt-1 text-sm text-white/45">Submitted leave forms will appear here.</p>
@@ -1159,8 +1240,9 @@ export default function Profile() {
                                     return (
                                         <article
                                             key={leaveRequest._id}
+                                            data-status={profileUpgradeEnabled ? leaveRequest.status : undefined}
                                             className={[
-                                                "rounded-lg border border-white/10 bg-white/[0.04] p-4",
+                                                "profile-leave-request rounded-lg border border-white/10 bg-white/[0.04] p-4",
                                                 editingLeaveRequestId === leaveRequest._id ? "ring-2 ring-[#842cff]/50" : "",
                                             ].join(" ")}
                                         >
@@ -1272,7 +1354,8 @@ export default function Profile() {
                             {noticesLoading && (
                                 <div className="rounded-lg border border-white/10 bg-white/[0.04] p-4 text-sm text-white/55">Loading notices...</div>
                             )}
-                            {!noticesLoading && notices.length === 0 && (
+                            {profileUpgradeEnabled && noticesError && <p role="alert">Notices could not load. Please refresh this page.</p>}
+                            {!noticesLoading && notices.length === 0 && (!profileUpgradeEnabled || !noticesError) && (
                                 <div className="rounded-lg border border-white/10 bg-white/[0.04] p-4">
                                     <p className="text-sm font-semibold text-white">No notices issued</p>
                                     <p className="mt-1 text-sm text-white/45">Admin notices will appear here.</p>
@@ -1285,8 +1368,10 @@ export default function Profile() {
                                     <article
                                         key={notice._id}
                                         id={`notice-${notice._id}`}
+                                        data-severity={profileUpgradeEnabled ? notice.severity : undefined}
+                                        data-unread={profileUpgradeEnabled && !notice.isRead}
                                         className={[
-                                            "rounded-lg border bg-white/[0.04] p-4 transition",
+                                            "profile-notice rounded-lg border bg-white/[0.04] p-4 transition",
                                             isHighlightedNotice
                                                 ? "border-[#842cff] ring-2 ring-[#842cff]/35"
                                                 : "border-white/10",
@@ -1366,7 +1451,10 @@ export default function Profile() {
                         </div>
                     </section>
                 )}
+                </div>
             </section>
         </MainLayout>
     );
 }
+
+const EMPTY_QUERY_ROWS: [] = [];

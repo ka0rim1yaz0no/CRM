@@ -19,11 +19,9 @@ type BusinessInput = {
   db?: unknown;
 };
 
-declare global {
-  namespace Express {
-    interface Request {
-      business?: BusinessConfig;
-    }
+declare module "express-serve-static-core" {
+  interface Request {
+    business?: BusinessConfig;
   }
 }
 

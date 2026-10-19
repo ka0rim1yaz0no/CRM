@@ -12,7 +12,10 @@ import { getEmployeeNotices, markEmployeeNoticeRead, markEmployeeNoticesRead } f
 import { useClickOutside } from "../../hooks/useClickOutside";
 import { formatPhDateTime } from "../../lib/dateTime";
 import { refreshSocketBusinessContext } from "../../lib/socket";
-import { emitToast } from "../../components/ToastProvider";
+import { emitToast } from "../../lib/toast";
+import { canSelectSearchResult } from "../../../shared/workspaceSearch";
+import WorkspaceMobileNavigation from "../../components/WorkspaceMobileNavigation";
+import { employeeBusinessDestination } from "../../../shared/workspaceNavigation";
 
 const pageTitles: Record<string, string> = {
     "/dashboard": "Dashboard",
@@ -20,6 +23,10 @@ const pageTitles: Record<string, string> = {
     "/teams": "Teams",
     "/calendar": "Calendar",
     "/profile": "Profile",
+    "/attendance": "Attendance",
+    "/tasks": "Tasks",
+    "/knowledge-base": "Knowledge Base",
+    "/announcements": "Announcements",
     "/settings": "Settings",
     "/messages": "Messages",
     "/poc/employees": "Employees",
@@ -46,7 +53,7 @@ function employeeNoticeKey(notice: Awaited<ReturnType<typeof getEmployeeNotices>
 }
 
 export default function Navbar() {
-    const { pathname } = useLocation();
+    const { pathname, search: routeSearch } = useLocation();
     const navigate = useNavigate();
     const title = pageTitles[pathname] ??
         (pathname.startsWith("/poc/employees/") ? "Employees" : pathname.startsWith("/poc/tasks/") ? "Tasks" : "Workspace");
@@ -58,6 +65,7 @@ export default function Navbar() {
     const [leadSearch, setLeadSearch] = useState("");
     const [debouncedLeadSearch, setDebouncedLeadSearch] = useState("");
     const [isLeadSearchOpen, setIsLeadSearchOpen] = useState(false);
+    const [isMobileSearchOpen, setIsMobileSearchOpen] = useState(false);
     const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(() => window.localStorage.getItem("crm:sidebar-collapsed") === "true");
     const leadSearchRef = useRef<HTMLFormElement>(null);
     const notificationsRef = useRef<HTMLDivElement>(null);
@@ -69,13 +77,13 @@ export default function Navbar() {
         return () => window.removeEventListener("crm:sidebar-toggle", syncSidebar);
     }, []);
     const employeeId = authUser?.userType === "employee" ? authUser.user._id : "";
-    const employeeLeadNames = useMemo(() => {
+    const employeeLeadNames = (() => {
         if (authUser?.userType !== "employee") {
             return [];
         }
 
         return Array.from(new Set([authUser.user.name, authUser.user.employeeCode, ...(authUser.user.aliases || [])].filter(Boolean)));
-    }, [authUser]);
+    })();
     const normalizedLeadSearch = debouncedLeadSearch.trim();
     const { data: leadSearchData, isFetching: isLeadSearchFetching } = useQuery({
         queryKey: ["employee-navbar-lead-search", employeeId, employeeLeadNames.join("|"), normalizedLeadSearch],
@@ -149,11 +157,13 @@ export default function Navbar() {
         mutationFn: (noticeId: string) => markEmployeeNoticeRead(employeeId, noticeId),
         onMutate: (noticeId) => queryClient.setQueryData<typeof notices>(["employee-notices", employeeId], (current = []) => current.map((notice) => notice._id === noticeId ? { ...notice, isRead: true } : notice)),
         onSuccess: () => queryClient.invalidateQueries({ queryKey: ["employee-notices", employeeId] }),
+        onError: () => { void queryClient.invalidateQueries({ queryKey: ["employee-notices", employeeId] }); emitToast({ tone: "error", message: "Notice could not be marked read. Please try again." }); },
     });
     const markAllNoticesReadMutation = useMutation({
         mutationFn: () => markEmployeeNoticesRead(employeeId),
         onMutate: () => queryClient.setQueryData<typeof notices>(["employee-notices", employeeId], (current = []) => current.map((notice) => ({ ...notice, isRead: true }))),
         onSuccess: () => queryClient.invalidateQueries({ queryKey: ["employee-notices", employeeId] }),
+        onError: () => { void queryClient.invalidateQueries({ queryKey: ["employee-notices", employeeId] }); emitToast({ tone: "error", message: "Notices could not be marked read. Please try again." }); },
     });
     const dismissNotice = (notice: (typeof notices)[number]) => {
         const key = noticeKey(notice);
@@ -186,7 +196,7 @@ export default function Navbar() {
             setAuthUser(nextAuthUser);
             queryClient.clear();
             refreshSocketBusinessContext();
-            window.location.assign("/dashboard");
+            window.location.assign(employeeBusinessDestination(pathname, routeSearch));
         },
         onError: (error) => {
             emitToast({
@@ -224,12 +234,14 @@ export default function Navbar() {
         }
 
         setIsLeadSearchOpen(false);
+        setIsMobileSearchOpen(false);
         navigate(`/leads?${params.toString()}`);
     };
 
     const handleLeadSearchSubmit = (event: FormEvent<HTMLFormElement>) => {
         event.preventDefault();
-        openLeadSearchResult(leadSearchResults[0]);
+        // Enter opens the filtered list; a suggestion click opens one lead.
+        openLeadSearchResult();
     };
 
     useEffect(() => {
@@ -240,9 +252,14 @@ export default function Navbar() {
         return () => window.clearTimeout(timeoutId);
     }, [leadSearch]);
 
-    useEffect(() => {
-        setIsLeadSearchOpen(false);
-    }, [pathname]);
+    const [previousNavbarRoute, setPreviousNavbarRoute] = useState<readonly unknown[] | null>(null);
+    const navbarRouteInputs = [pathname];
+    if (previousNavbarRoute === null || navbarRouteInputs.some((input, index) => !Object.is(input, previousNavbarRoute[index]))) {
+        setPreviousNavbarRoute(navbarRouteInputs);
+        (() => {
+            setIsLeadSearchOpen(false);
+        })();
+    }
 
     useEffect(() => {
         const syncDismissedNotices = (event: StorageEvent) => {
@@ -259,9 +276,10 @@ export default function Navbar() {
     useClickOutside(businessRef, () => setIsBusinessOpen(false), isBusinessOpen);
 
     return (
-        <header className="theme-header-bg z-20 border-b border-white/10 px-6 py-4 backdrop-blur-xl">
+        <header className="theme-header-bg relative z-20 border-b border-white/10 px-6 py-4 backdrop-blur-xl">
             <div className="flex min-h-12 items-center justify-between gap-4">
                 <div className="flex min-w-0 items-center gap-3">
+                    <WorkspaceMobileNavigation />
                     <button className="grid size-9 shrink-0 place-items-center rounded-lg border border-white/15 bg-white/[0.06] text-white/75 shadow-sm transition hover:bg-white/10 hover:text-white" type="button" onClick={() => { const next = !isSidebarCollapsed; setIsSidebarCollapsed(next); window.localStorage.setItem("crm:sidebar-collapsed", String(next)); window.dispatchEvent(new Event("crm:sidebar-toggle")); }} aria-label={isSidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"} title={isSidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}>
                         {isSidebarCollapsed ? <FiChevronRight className="size-4" /> : <FiChevronLeft className="size-4" />}
                     </button>
@@ -272,7 +290,8 @@ export default function Navbar() {
                 </div>
 
                 <div className="flex min-w-0 flex-1 items-center justify-end gap-3">
-                    <form ref={leadSearchRef} className="relative hidden w-full max-w-[22rem] md:block" onSubmit={handleLeadSearchSubmit}>
+                    <button type="button" className="employee-mobile-search-toggle md:hidden" aria-label="Search leads" aria-expanded={isMobileSearchOpen} aria-controls="employee-navbar-search" onClick={() => { setIsMobileSearchOpen(!isMobileSearchOpen); if (!isMobileSearchOpen) window.requestAnimationFrame(() => leadSearchRef.current?.querySelector("input")?.focus()); }}><FiSearch aria-hidden="true" /></button>
+                    <form id="employee-navbar-search" ref={leadSearchRef} className={`employee-navbar-search relative w-full max-w-[22rem] md:block ${isMobileSearchOpen ? "is-open" : "hidden"}`} onSubmit={handleLeadSearchSubmit} onKeyDown={(event) => { if (event.key === "Escape") { setIsMobileSearchOpen(false); setIsLeadSearchOpen(false); } }}>
                         <label className="flex h-11 w-full items-center gap-3 rounded-lg border border-white/10 bg-white/[0.06] px-3 text-white/50 transition focus-within:border-[var(--primary)] focus-within:bg-white/[0.08] focus-within:ring-2 focus-within:ring-[color-mix(in_srgb,var(--primary)_20%,transparent)]">
                             <FiSearch className="size-5 shrink-0" aria-hidden="true" />
                             <input
@@ -285,6 +304,7 @@ export default function Navbar() {
                                 }}
                                 onFocus={() => setIsLeadSearchOpen(true)}
                                 placeholder="Search your leads"
+                                aria-label="Search your leads"
                             />
                         </label>
                         {authUser?.userType === "employee" && isLeadSearchOpen && leadSearch.trim().length >= 2 && (
@@ -296,10 +316,10 @@ export default function Navbar() {
                                     {isLeadSearchFetching && (
                                         <p className="rounded-md px-3 py-3 text-sm text-white/45">Searching leads...</p>
                                     )}
-                                    {!isLeadSearchFetching && leadSearchResults.length === 0 && (
+                                    {canSelectSearchResult(leadSearch, normalizedLeadSearch, isLeadSearchFetching) && leadSearchResults.length === 0 && (
                                         <p className="rounded-md px-3 py-3 text-sm text-white/45">No matching assigned leads.</p>
                                     )}
-                                    {!isLeadSearchFetching && leadSearchResults.map((lead) => (
+                                    {canSelectSearchResult(leadSearch, normalizedLeadSearch, isLeadSearchFetching) && leadSearchResults.map((lead) => (
                                         <button
                                             key={lead._id}
                                             className="block w-full rounded-md px-3 py-2.5 text-left transition hover:bg-white/[0.06]"

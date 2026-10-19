@@ -1,10 +1,11 @@
 import type { Request, Response } from "express";
+import { dashboardReadWindow } from "../services/dashboardReadWindow";
 import { Types } from "mongoose";
 import { Employee, normalizeEmployeeAvailabilityStatus } from "../models/Employee";
 import { Lead } from "../models/Lead";
 import { LeadCallStat } from "../models/leadCallStat";
 import { scoreLeadsByPotential } from "../services/leadScoringService";
-import { geocodeLocation, reverseGeocodeLocality, searchAllGooglePlaces, searchGooglePlaces, searchGooglePlacesPages, type GooglePlaceLead, type GooglePlacesLocationBias } from "../services/googlePlacesService";
+import { geocodeLocation, reverseGeocodeLocality, searchGooglePlaces, searchGooglePlacesPages, type GooglePlaceLead, type GooglePlacesLocationBias } from "../services/googlePlacesService";
 import { getTomTomUsage, searchTomTomPlaceQueries, type TomTomPlaceLead } from "../services/tomTomSearchService";
 import { isSpecificTomTomSearchQuery } from "../services/tomTomRelevance";
 import { getPlaceSearchAuditModel } from "../models/PlaceSearchUsage";
@@ -1079,26 +1080,9 @@ function getDuplicateLeadMessage(
   return `Duplicate lead already exists: ${fieldText}. Existing lead: ${existingName}${phoneText}`;
 }
 
-async function findDuplicateLeadByPhone(lead: { phone?: string }) {
-  const phoneRegexes = flexiblePhoneRegexes(String(lead.phone || ""));
 
-  if (phoneRegexes.length === 0) {
-    return null;
-  }
 
-  return Lead.findOne({
-    $or: phoneRegexes.map((phoneRegex) => ({ phone: phoneRegex })),
-    status: { $ne: "Archived" },
-  })
-    .populate(populateLead)
-    .sort({ createdAt: -1 });
-}
 
-function getImportPhoneDedupKey(lead: { phone?: string }, fallbackKey: string) {
-  const phone = normalizePhoneDigits(lead.phone || "");
-
-  return phone.length >= 7 ? `phone:${phone}` : `row:${fallbackKey}`;
-}
 
 function getLeadDedupKey(lead: {
   googlePlaceId?: string;
@@ -1844,13 +1828,7 @@ function parseLeadQueueTime(value?: Date | string | null) {
   return Number.isNaN(time) ? null : time;
 }
 
-function hasScheduledFollowUp(lead: { status?: string; followUpAt?: Date | string | null }) {
-  if (lead.status === "Qualified") {
-    return false;
-  }
 
-  return parseLeadQueueTime(lead.followUpAt) !== null;
-}
 
 function isScheduledForToday(lead: { status?: string; followUpAt?: Date | string | null }) {
   if (lead.status === "Qualified") {
@@ -1943,11 +1921,7 @@ function getCurrentPhDayRange() {
   };
 }
 
-function createScheduledTodayFilter() {
-  const { start, end } = getCurrentPhDayRange();
 
-  return { followUpAt: { $gte: start, $lt: end } };
-}
 
 function createContactedTodayFilter() {
   const { start, end } = getCurrentPhDayRange();
@@ -2943,13 +2917,14 @@ export async function listEmployeeLeadLogs(request: Request, response: Response)
 }
 
 export async function readAgentLeadDashboard(request: Request, response: Response) {
+  const window = dashboardReadWindow(request);
   const phToday = formatPhDate(new Date());
   const selectedMonth = normalizeDashboardMonth(request.query.month);
   const selectedCallDate = normalizeDashboardDate(request.query.callDate);
   const callDateStart = parseDateRangeBoundary(selectedCallDate, "start") || new Date(0);
   const callDateEnd = parseDateRangeBoundary(selectedCallDate, "end") || new Date();
   const phCallDate = formatPhDate(callDateStart);
-  const selectedDateRange = createDashboardSelectedDateRange(request, selectedMonth);
+  const selectedDateRange = window || createDashboardSelectedDateRange(request, selectedMonth);
   const callLogStart = new Date(Math.min(callDateStart.getTime(), selectedDateRange.start.getTime()));
   const callLogEnd = new Date(Math.max(callDateEnd.getTime(), selectedDateRange.end.getTime()));
   const now = Date.now();
@@ -3091,7 +3066,8 @@ export async function readAgentLeadDashboard(request: Request, response: Respons
       row.lastActivityAt = event.createdAt || null;
     }
 
-    if (isSamePhDay(event.createdAt, phToday)) {
+    if (event.createdAt) window?.recordActivity(row.employeeId, String(lead._id), event.createdAt, Boolean(options.isComment));
+    if (window ? isWithinDashboardDateRange(event.createdAt, window) : isSamePhDay(event.createdAt, phToday)) {
       row.activityToday += 1;
       row.touchedLeadIdsToday.add(String(lead._id));
       globalTouchedLeadIdsToday.add(String(lead._id));
@@ -3148,7 +3124,7 @@ export async function readAgentLeadDashboard(request: Request, response: Respons
       monthlyOptions.add(callMonth);
     }
 
-    if (isSamePhDay(calledAt, phCallDate)) {
+    if (window ? isWithinDashboardDateRange(calledAt, window) : isSamePhDay(calledAt, phCallDate)) {
       row.callsToday += 1;
     }
 
@@ -3206,7 +3182,7 @@ export async function readAgentLeadDashboard(request: Request, response: Respons
         assignedRow.dueFollowUps += 1;
       }
 
-      if (isSamePhDay(lead.followUpAt, phToday)) {
+      if (window ? isWithinDashboardDateRange(lead.followUpAt, window) : isSamePhDay(lead.followUpAt, phToday)) {
         assignedRow.scheduledToday += 1;
       }
     }
@@ -3362,7 +3338,9 @@ export async function readAgentLeadDashboard(request: Request, response: Respons
         const productivityScore = touchedLeads * 4 + row.comments * 3 + row.actions + qualified * 2;
         const qualifiedLeads = Array.from(row.qualifiedLeadDetails.values())
           .sort((first, second) => dateTimeValue(second.statusAt) - dateTimeValue(first.statusAt));
-        const { addedLeadIds, followUpLeadIds, qualifiedLeadIds, archiveDeadLeadIds, qualifiedLeadDetails, touchedLeadIds, ...publicRow } = row;
+        const publicRow = Object.fromEntries(Object.entries(row).filter(([key]) => ![
+          "addedLeadIds", "followUpLeadIds", "qualifiedLeadIds", "archiveDeadLeadIds", "qualifiedLeadDetails", "touchedLeadIds",
+        ].includes(key))) as Omit<typeof row, "addedLeadIds" | "followUpLeadIds" | "qualifiedLeadIds" | "archiveDeadLeadIds" | "qualifiedLeadDetails" | "touchedLeadIds">;
 
         return {
           ...publicRow,
@@ -3540,9 +3518,7 @@ function createAdminAssignmentFilters(request: Request) {
   return assignmentFilters;
 }
 
-function escapeRegExp(value: string) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
+
 
 function createAdminBaseFilter(request: Request, options: { includeStateFilter?: boolean } = {}) {
   const includeStateFilter = options.includeStateFilter !== false;

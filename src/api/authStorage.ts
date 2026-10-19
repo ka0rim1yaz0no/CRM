@@ -7,7 +7,7 @@ export type AuthBusiness = {
 
 export type AuthUser =
     | { userType: "admin"; user: { id: string; name: string; role: string; employeeCode: string }; access?: "full" | "tracker"; sessionToken?: string | null; business?: AuthBusiness; allowedBusinesses?: AuthBusiness[] }
-    | { userType: "employee"; user: Employee; business?: AuthBusiness; allowedBusinesses?: AuthBusiness[] };
+    | { userType: "employee"; user: Employee; attendanceHubSession?: string | null; business?: AuthBusiness; allowedBusinesses?: AuthBusiness[] };
 
 export function getAuthUser() {
     const rawUser = localStorage.getItem("authUser");
@@ -26,7 +26,8 @@ export function getAuthUser() {
 
 export function setAuthUser(user: AuthUser) {
     if (user.userType === "employee") {
-        const { profileImage, ...safeEmployee } = user.user;
+        const safeEmployee = { ...user.user };
+        delete safeEmployee.profileImage;
         localStorage.setItem("authUser", JSON.stringify({ ...user, user: safeEmployee }));
         return;
     }

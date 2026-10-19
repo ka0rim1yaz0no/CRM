@@ -30,6 +30,7 @@ export type CallDashboardRow = {
 
 export type CallDashboardSnapshot = {
     generatedAt: string;
+    serverTime?: string;
     business: { id: string; name: string };
     shift: { start: string; end: string };
     employees: CallDashboardRow[];

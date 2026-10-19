@@ -1,5 +1,5 @@
 import { Fragment, type FormEvent } from "react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
     FiCopy,
@@ -169,19 +169,19 @@ export default function Credentials() {
     const [page, setPage] = useState(1);
     const [pageSize, setPageSize] = useState(10);
 
-    const { data: credentials = [], isLoading, isError } = useQuery({
+    const { data: credentials = EMPTY_QUERY_ROWS, isLoading, isError } = useQuery({
         queryKey: ["credentials"],
         queryFn: getCredentials,
     });
-    const { data: businesses = [] } = useQuery({
+    const { data: businesses = EMPTY_QUERY_ROWS } = useQuery({
         queryKey: ["businesses"],
         queryFn: getBusinesses,
     });
-    const { data: branches = [] } = useQuery({
+    const { data: branches = EMPTY_QUERY_ROWS } = useQuery({
         queryKey: ["branches"],
         queryFn: getBranches,
     });
-    const { data: teams = [] } = useQuery({
+    const { data: teams = EMPTY_QUERY_ROWS } = useQuery({
         queryKey: ["teams"],
         queryFn: getTeams,
     });
@@ -404,31 +404,56 @@ export default function Credentials() {
         archiveCredentialMutation.mutate(deleteTarget._id, { onSuccess: closeDeletePrompt });
     };
 
-    useEffect(() => {
-        setPage(1);
-    }, [branchFilter, search, teamFilter, toolFilter]);
+    const [previousCredentialPageFilters, setPreviousCredentialPageFilters] = useState<readonly unknown[] | null>(null);
+    const credentialPageFiltersInputs = [branchFilter, search, teamFilter, toolFilter];
+    if (previousCredentialPageFilters === null || credentialPageFiltersInputs.some((input, index) => !Object.is(input, previousCredentialPageFilters[index]))) {
+        setPreviousCredentialPageFilters(credentialPageFiltersInputs);
+        (() => {
+            setPage(1);
+        })();
+    }
 
-    useEffect(() => {
-        setPage((currentPage) => Math.min(currentPage, totalPages));
-    }, [totalPages]);
+    const [previousCredentialPageLimit, setPreviousCredentialPageLimit] = useState<readonly unknown[] | null>(null);
+    const credentialPageLimitInputs = [totalPages];
+    if (previousCredentialPageLimit === null || credentialPageLimitInputs.some((input, index) => !Object.is(input, previousCredentialPageLimit[index]))) {
+        setPreviousCredentialPageLimit(credentialPageLimitInputs);
+        (() => {
+            setPage((currentPage) => Math.min(currentPage, totalPages));
+        })();
+    }
 
-    useEffect(() => {
-        if (toolFilter !== "All tools" && !toolOptions.includes(toolFilter)) {
-            setToolFilter("All tools");
-        }
-    }, [toolFilter, toolOptions]);
+    const [previousCredentialTools, setPreviousCredentialTools] = useState<readonly unknown[] | null>(null);
+    const credentialToolsInputs = [toolFilter, toolOptions];
+    if (previousCredentialTools === null || credentialToolsInputs.some((input, index) => !Object.is(input, previousCredentialTools[index]))) {
+        setPreviousCredentialTools(credentialToolsInputs);
+        (() => {
+            if (toolFilter !== "All tools" && !toolOptions.includes(toolFilter)) {
+                setToolFilter("All tools");
+            }
+        })();
+    }
 
-    useEffect(() => {
-        if (branchFilter !== ALL_COMPANIES && !branchOptions.includes(branchFilter)) {
-            setBranchFilter(ALL_COMPANIES);
-        }
-    }, [branchFilter, branchOptions]);
+    const [previousCredentialBranches, setPreviousCredentialBranches] = useState<readonly unknown[] | null>(null);
+    const credentialBranchesInputs = [branchFilter, branchOptions];
+    if (previousCredentialBranches === null || credentialBranchesInputs.some((input, index) => !Object.is(input, previousCredentialBranches[index]))) {
+        setPreviousCredentialBranches(credentialBranchesInputs);
+        (() => {
+            if (branchFilter !== ALL_COMPANIES && !branchOptions.includes(branchFilter)) {
+                setBranchFilter(ALL_COMPANIES);
+            }
+        })();
+    }
 
-    useEffect(() => {
-        if (teamFilter !== ALL_TEAMS && !teamOptions.includes(teamFilter)) {
-            setTeamFilter(ALL_TEAMS);
-        }
-    }, [teamFilter, teamOptions]);
+    const [previousCredentialTeams, setPreviousCredentialTeams] = useState<readonly unknown[] | null>(null);
+    const credentialTeamsInputs = [teamFilter, teamOptions];
+    if (previousCredentialTeams === null || credentialTeamsInputs.some((input, index) => !Object.is(input, previousCredentialTeams[index]))) {
+        setPreviousCredentialTeams(credentialTeamsInputs);
+        (() => {
+            if (teamFilter !== ALL_TEAMS && !teamOptions.includes(teamFilter)) {
+                setTeamFilter(ALL_TEAMS);
+            }
+        })();
+    }
 
     return (
         <AdminLayout>
@@ -872,3 +897,5 @@ export default function Credentials() {
         </AdminLayout>
     );
 }
+
+const EMPTY_QUERY_ROWS: [] = [];

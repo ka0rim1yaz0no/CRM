@@ -1,6 +1,6 @@
 import { Schema, Types } from "mongoose";
 import { tenantModel } from "../config/tenancy";
-import { attendanceV2Enabled } from "../config/rolloutFlags";
+import { attendanceIntegrityEnabled, attendanceV2Enabled } from "../config/rolloutFlags";
 
 export type AttendanceSource =
   | "Login"
@@ -23,6 +23,9 @@ export type AttendanceDocument = {
   isArchived: boolean;
   eventId?: string;
   syncPending?: boolean;
+  isEffective?: boolean;
+  ledgerIdentity?: string;
+  ledgerRevision?: number;
 };
 
 const attendanceSchema = new Schema<AttendanceDocument>(
@@ -49,12 +52,18 @@ const attendanceSchema = new Schema<AttendanceDocument>(
     isArchived: { type: Boolean, default: false },
     eventId: { type: String, default: undefined },
     syncPending: { type: Boolean, default: undefined },
+    isEffective: { type: Boolean, default: undefined },
+    ledgerIdentity: String,
+    ledgerRevision: Number,
   },
   { timestamps: true }
 );
 
 attendanceSchema.index({ employee: 1, isArchived: 1, timeIn: -1 });
-if (attendanceV2Enabled()) {
+attendanceSchema.index({ ledgerIdentity: 1, ledgerRevision: 1 });
+attendanceSchema.pre("find", function () { this.where({ isEffective: { $ne: false } }); });
+attendanceSchema.pre("findOne", function () { this.where({ isEffective: { $ne: false } }); });
+if (attendanceV2Enabled() || attendanceIntegrityEnabled()) {
   attendanceSchema.index({ employee: 1, eventId: 1 }, { unique: true, partialFilterExpression: { eventId: { $type: "string" } } });
 }
 export const Attendance = tenantModel<AttendanceDocument>("Attendance", attendanceSchema);

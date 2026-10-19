@@ -39,6 +39,7 @@ import { callTimingV2Enabled } from "../config/rolloutFlags";
 import { CallBridgeObservation } from "../models/CallBridgeObservation";
 import { canReserveCall, confirmedCallEnd, unconfirmedDialRetryAt } from "../services/callTiming";
 import { acquireCallBridgeLease } from "../services/callBridgeReservation";
+import { bridgeAvailabilityChangedAt } from "../services/callDashboardService";
 import {
   hasReliableTwoWayAudioDetection,
   hasTrackedActiveCall,
@@ -353,6 +354,7 @@ export async function claimCallBridgePairing(request: Request, response: Respons
     bridgeVersion: cleanString(request.body.bridgeVersion, 40),
     lastSeenAt: now,
     lastStateChangedAt: now,
+    lastBridgeAvailabilityChangedAt: now,
   };
 
   if (accountSwitchingEnabled) {
@@ -568,6 +570,7 @@ export async function activateCallBridgeForEmployee(request: Request, response: 
 
     device.employeeCode = employeeCode;
     device.employeeName = employee.name;
+    device.lastBridgeAvailabilityChangedAt = now;
 
     await Promise.all([
       Schedule.findOneAndUpdate(
@@ -681,6 +684,12 @@ export async function updateCallBridgeHeartbeat(request: Request, response: Resp
 
   device.state = nextState;
   device.nextivaProcessDetected = Boolean(request.body.nextivaProcessDetected);
+  device.lastBridgeAvailabilityChangedAt = bridgeAvailabilityChangedAt({
+    state: previousState,
+    nextivaProcessDetected: previousNextivaProcessDetected,
+    lastSeenAt: device.lastSeenAt,
+    lastBridgeAvailabilityChangedAt: device.lastBridgeAvailabilityChangedAt,
+  }, { state: nextState, nextivaProcessDetected: device.nextivaProcessDetected }, now);
   device.audioSessionActive = requestedAudioSessionActive && nextState === "active";
   if (nextState === "idle") {
     device.lastIdleAt = now;

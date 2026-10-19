@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type CSSProperties } from "react";
 import { NavLink } from "react-router";
 import { useQuery } from "@tanstack/react-query";
 import {
@@ -29,6 +29,7 @@ import {
 } from "../../lib/announcementReadState";
 import { isPocOperationsUser } from "../../lib/roleAccess";
 import { MdPassword } from "react-icons/md";
+import "../../components/WorkspaceSidebar.css";
 
 const navItems = [
   {
@@ -142,9 +143,14 @@ export default function SideBar() {
     return () => window.removeEventListener("crm:sidebar-toggle", syncSidebar);
   }, []);
 
-  useEffect(() => {
-    setAnnouncementSeenAt(readAnnouncementSeenAt(employeeId));
-  }, [employeeId]);
+  const [previousAnnouncementIdentity, setPreviousAnnouncementIdentity] = useState<readonly unknown[] | null>(null);
+    const announcementIdentityInputs = [employeeId];
+    if (previousAnnouncementIdentity === null || announcementIdentityInputs.some((input, index) => !Object.is(input, previousAnnouncementIdentity[index]))) {
+        setPreviousAnnouncementIdentity(announcementIdentityInputs);
+        (() => {
+        setAnnouncementSeenAt(readAnnouncementSeenAt(employeeId));
+      })();
+    }
 
   useEffect(() => {
     if (!employeeId || typeof window === "undefined") return undefined;
@@ -186,8 +192,8 @@ export default function SideBar() {
   };
 
   return (
-    <aside className={["theme-shell-bg fixed inset-y-0 left-0 z-10 flex flex-col border-r border-white/10 text-white shadow-2xl shadow-black/20 backdrop-blur-xl transition-[width] duration-200", isCollapsed ? "w-[5rem]" : "w-[16rem]"].join(" ")}>
-      <div className={["flex w-full items-center border-b border-white/10 py-5", isCollapsed ? "justify-center px-2" : "justify-center px-6"].join(" ")}>
+    <aside className={["workspace-sidebar theme-shell-bg fixed inset-y-0 left-0 z-10 flex flex-col border-r border-white/10 text-white shadow-2xl shadow-black/20 backdrop-blur-xl transition-[width] duration-200", isCollapsed ? "w-[5rem]" : "w-[16rem]"].join(" ")}>
+      <div className={["workspace-sidebar-brand flex w-full items-center border-b border-white/10 py-5", isCollapsed ? "justify-center px-2" : "justify-center px-6"].join(" ")}>
         {isCollapsed ? (
           <div className="h-10 w-10 overflow-hidden" aria-label="Assistly">
             <img className="theme-sidebar-logo theme-sidebar-logo-dark h-auto w-[9.75rem] max-w-none" src="/images/logoaside.png" alt="" />
@@ -201,9 +207,10 @@ export default function SideBar() {
         )}
       </div>
 
-      <div className={["flex min-h-0 flex-1 flex-col justify-between py-5", isCollapsed ? "px-2" : "px-3"].join(" ")}>
+      <div className={["workspace-sidebar-body flex min-h-0 flex-1 flex-col justify-between py-5", isCollapsed ? "px-2" : "px-3"].join(" ")}>
         <nav
-          className="content-scroll min-h-0 overflow-y-auto pr-1"
+          className="workspace-sidebar-flat-nav content-scroll min-h-0 overflow-y-auto pr-1"
+          style={{ "--sidebar-item-count": visibleNavItems.length } as CSSProperties}
           aria-label="Main navigation"
         >
           <ul className="flex flex-col gap-1">
@@ -221,9 +228,11 @@ export default function SideBar() {
                 <li key={label}>
                   <NavLink
                     to={path}
+                    title={label}
+                    aria-label={label}
                     className={({ isActive }) =>
                       [
-                        "flex h-11 items-center gap-3 rounded-lg text-sm font-medium transition",
+                        "admin-sidebar-link flex h-11 items-center gap-3 rounded-lg text-sm font-medium transition",
                         isCollapsed ? "justify-center px-2" : "px-4",
                         isActive
                           ? "bg-white text-[var(--shell-bg)] shadow-lg shadow-white/10"
@@ -231,7 +240,9 @@ export default function SideBar() {
                       ].join(" ")
                     }
                   >
-                    <Icon className="size-5 shrink-0" aria-hidden="true" />
+                    <span className="admin-sidebar-icon flex shrink-0 items-center justify-center">
+                      <Icon className="size-5 shrink-0" aria-hidden="true" />
+                    </span>
                     {!isCollapsed && <span className="min-w-0 flex-1 truncate">{label}</span>}
                     {!isCollapsed && badgeCount > 0 && (
                       <span className="ml-auto inline-flex min-w-5 shrink-0 items-center justify-center rounded-full bg-[#6d35f5] px-1.5 py-0.5 text-[0.68rem] font-bold leading-none text-white shadow-sm shadow-[#6d35f5]/30">
@@ -245,7 +256,7 @@ export default function SideBar() {
           </ul>
         </nav>
 
-        <nav aria-label="Account navigation">
+        <nav className="workspace-sidebar-account" aria-label="Account navigation">
           <NavLink
             to="/login"
             onClick={handleLogout}

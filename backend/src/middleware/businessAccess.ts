@@ -2,6 +2,15 @@ import type { NextFunction, Request, Response } from "express";
 import { findConfiguredAdmin } from "../config/adminUsers";
 import { getBusinessAccessForEmployeeCode } from "../models/BusinessUserAccess";
 import { Employee } from "../models/Employee";
+import { verifyAdminDashboardSession } from "../config/adminDashboardSession";
+
+export function verifiedAdminOnly(request: Request, response: Response, next: NextFunction) {
+  if (!verifyAdminDashboardSession(request.header("x-crm-admin-session"))) {
+    response.status(403).json({ message: "A verified administrator session is required." });
+    return;
+  }
+  next();
+}
 
 export async function businessAccessMiddleware(request: Request, response: Response, next: NextFunction) {
   const userType = String(request.header("x-crm-user-type") || "").trim().toLowerCase();

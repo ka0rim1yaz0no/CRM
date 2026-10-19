@@ -53,9 +53,12 @@ import {
 import { buildOffPhoneAttendanceSessions, formatAttendanceDuration } from "../../../lib/attendanceRecords";
 import { socket } from "../../../lib/socket";
 import { DataTablePagination } from "../../../components/admin/DataTable";
-import { useToast } from "../../../components/ToastProvider";
+import { useToast } from "../../../lib/toast";
 import { roleWorkspacePath } from "../../../lib/roleAccess";
 import { EvaluationWorkspace } from "../evaluations";
+import AttendanceCorrections from "../../../components/AttendanceCorrections";
+import { attendanceIntegrityEnabled } from "../../../api/attendanceSession";
+import "../../../components/AttendanceHub.css";
 
 const fallbackRoles = ["Sales Agent", "Team Lead", "Manager", "Support Agent"];
 const employmentStatuses: EmployeeStatus[] = ["Active", "Training", "Paused", "Archived"];
@@ -143,7 +146,7 @@ function splitPhoneParts(phone = "") {
     const parsedPhone = splitPhoneExtension(phone);
     const digits = digitsOnly(parsedPhone.number);
     let areaCode = "";
-    let operatorCode = "";
+    let operatorCode: string;
     let mobileNumber = "";
 
     if (digits.startsWith("63") && digits.length > 2) {
@@ -463,12 +466,11 @@ function employeeInitials(name = "") {
 }
 
 type CustomDropdownProps = {
+    buttonRef: React.RefObject<HTMLButtonElement | null>;
     label: string;
     value?: string;
     placeholder?: string;
-    onOpen: () => void;
-    buttonRef: React.RefObject<HTMLButtonElement | null>;
-};
+    onOpen: () => void;};
 
 function CustomDropdown({
     label,
@@ -512,15 +514,15 @@ export default function AdminEmployees() {
     const isEmployeeRoutePage = Boolean(employeeId);
     const { showToast } = useToast();
 
-    const { data: employees = [], isLoading, isError } = useQuery({
+    const { data: employees = EMPTY_QUERY_ROWS, isLoading, isError } = useQuery({
         queryKey: ["employees", "include-archived"],
         queryFn: () => getEmployeeSummaries({ includeArchived: true }),
     });
-    const { data: roleRecords = [] } = useQuery({
+    const { data: roleRecords = EMPTY_QUERY_ROWS } = useQuery({
         queryKey: ["roles"],
         queryFn: getRoles,
     });
-    const { data: businesses = [] } = useQuery({
+    const { data: businesses = EMPTY_QUERY_ROWS } = useQuery({
         queryKey: ["businesses"],
         queryFn: getBusinesses,
         staleTime: Number.POSITIVE_INFINITY,
@@ -561,6 +563,7 @@ export default function AdminEmployees() {
     const [selectedEmployeeLeadIds, setSelectedEmployeeLeadIds] = useState<string[]>([]);
     const [archiveTarget, setArchiveTarget] = useState<{ employee: Employee; id: string } | null>(null);
     const [openDropdown, setOpenDropdown] = useState<"role" | "department" | "status" | "contactRelationship" | null>(null);
+    const [dropdownStyle, setDropdownStyle] = useState<React.CSSProperties>({});
     const [page, setPage] = useState(1);
     const [pageSize, setPageSize] = useState(10);
     const [roleSearch, setRoleSearch] = useState("");
@@ -629,9 +632,7 @@ export default function AdminEmployees() {
             value: newEmployee.role,
             options: roleRecords.length ? roleRecords.map((role) => role.name) : fallbackRoles,
             searchable: true,
-            search: roleSearch,
-            buttonRef: roleButtonRef,
-            onSearch: setRoleSearch,
+            search: roleSearch,            onSearch: setRoleSearch,
             onChange: (role: string) => {
                 const matchedRole = roleRecords.find((roleRecord) => roleRecord.name === role);
                 setNewEmployee((employee) => ({
@@ -647,9 +648,7 @@ export default function AdminEmployees() {
             value: newEmployee.team,
             options: departmentOptions.length ? departmentOptions : ["General", "Sales", "Operations", "Support"],
             searchable: false,
-            search: "",
-            buttonRef: departmentButtonRef,
-            onSearch: () => undefined,
+            search: "",            onSearch: () => undefined,
             onChange: (department: string) => {
                 setNewEmployee((employee) => ({ ...employee, team: department }));
                 setOpenDropdown(null);
@@ -659,9 +658,7 @@ export default function AdminEmployees() {
             value: newEmployee.status,
             options: employmentStatuses,
             searchable: false,
-            search: "",
-            buttonRef: statusButtonRef,
-            onSearch: () => undefined,
+            search: "",            onSearch: () => undefined,
             onChange: (status: string) => {
                 setNewEmployee((employee) => ({ ...employee, status: status as EmployeeStatus }));
                 setOpenDropdown(null);
@@ -671,9 +668,7 @@ export default function AdminEmployees() {
             value: newEmployee.contactRelationship,
             options: contactRelationship,
             searchable: false,
-            search: "",
-            buttonRef: statusButtonRel,
-            onSearch: () => undefined,
+            search: "",            onSearch: () => undefined,
             onChange: (status: string) => {
                 setNewEmployee((employee) => ({ ...employee, contactRelationship: status as ContactRelationships }));
                 setOpenDropdown(null);
@@ -721,24 +716,24 @@ export default function AdminEmployees() {
                 : [],
         [viewingEmployee],
     );
-    const { data: employeeNotices = [] } = useQuery({
+    const { data: employeeNotices = EMPTY_QUERY_ROWS } = useQuery({
         queryKey: ["employee-notices", viewingEmployee?._id],
         queryFn: () => getEmployeeNotices(viewingEmployee?._id || ""),
         enabled: Boolean(viewingEmployee?._id && employeeRecordTab === "notices"),
     });
-    const { data: employeeLeaveRequests = [], isLoading: isLoadingEmployeeLeaveRequests } = useQuery({
+    const { data: employeeLeaveRequests = EMPTY_QUERY_ROWS, isLoading: isLoadingEmployeeLeaveRequests } = useQuery({
         queryKey: ["employee-leave-requests", viewingEmployee?._id],
         queryFn: () => getEmployeeLeaveRequests(viewingEmployee?._id || ""),
         enabled: Boolean(viewingEmployee?._id && employeeRecordTab === "leave"),
     });
     const pendingEmployeeLeaveCount = employeeLeaveRequests.filter((leaveRequest) => leaveRequest.status === "Pending").length;
-    const { data: employeeLeads = [], isLoading: isLoadingEmployeeLeads } = useQuery({
+    const { data: employeeLeads = EMPTY_QUERY_ROWS, isLoading: isLoadingEmployeeLeads } = useQuery({
         queryKey: ["employee-leads", viewingEmployee?._id, employeeLeadNames.join("|")],
         queryFn: () => getLeads({ assignedAgent: viewingEmployee?._id || "", assignedAgentNames: employeeLeadNames }),
         enabled: Boolean(viewingEmployee?._id && employeeRecordTab === "leads"),
     });
-    const { data: employeeAttendance = [] } = useQuery({
-        queryKey: ["employee-attendance", viewingEmployee?._id],
+    const { data: employeeAttendance = EMPTY_QUERY_ROWS } = useQuery({
+        queryKey: ["employee-attendance", getActiveBusinessId(), viewingEmployee?._id],
         queryFn: () => getEmployeeAttendance(viewingEmployee?._id || "", { all: true }),
         enabled: Boolean(viewingEmployee?._id && employeeRecordTab === "attendance"),
     });
@@ -804,7 +799,7 @@ export default function AdminEmployees() {
         () => buildOffPhoneAttendanceSessions(selectedAttendanceDay?.records || []),
         [selectedAttendanceDay],
     );
-    const { data: employeeTransactions = [] } = useQuery({
+    const { data: employeeTransactions = EMPTY_QUERY_ROWS } = useQuery({
         queryKey: ["employee-transactions", viewingEmployee?._id, transactionDate],
         queryFn: () => getEmployeeTransactions(viewingEmployee?._id || "", transactionDate),
         enabled: Boolean(viewingEmployee?._id && employeeRecordTab === "transactions"),
@@ -858,7 +853,7 @@ export default function AdminEmployees() {
         mutationFn: ({ record, timeIn }: { record: AttendanceRecord; timeIn: string }) =>
             updateEmployeeAttendance(viewingEmployee?._id || "", record._id, { source: record.source, timeIn }),
         onSuccess: (updatedRecord) => {
-            queryClient.setQueryData<AttendanceRecord[]>(["employee-attendance", viewingEmployee?._id], (records = []) =>
+            queryClient.setQueryData<AttendanceRecord[]>(["employee-attendance", getActiveBusinessId(), viewingEmployee?._id], (records = []) =>
                 records.map((record) => record._id === updatedRecord._id ? updatedRecord : record)
             );
             [
@@ -1319,80 +1314,100 @@ export default function AdminEmployees() {
         });
     };
 
-    useEffect(() => {
-        if (!routedEmployee) return;
+    const [previousEmployeeRouteDraft, setPreviousEmployeeRouteDraft] = useState<readonly unknown[] | null>(null);
+    const employeeRouteDraftInputs = [isEmployeeDetailPage, isEmployeeEditPage, location.search, routedEmployee];
+    if (previousEmployeeRouteDraft === null || employeeRouteDraftInputs.some((input, index) => !Object.is(input, previousEmployeeRouteDraft[index]))) {
+        setPreviousEmployeeRouteDraft(employeeRouteDraftInputs);
+        (() => {
+            if (!routedEmployee) return;
 
-        if (isEmployeeDetailPage) {
-            const requestedTab = new URLSearchParams(location.search).get("tab");
-            const requestedRecordTab: EmployeeRecordTab = requestedTab && [
-                "details",
-                "hr",
-                "leads",
-                "notices",
-                "leave",
-                "attendance",
-                "evaluations",
-                "transactions",
-            ].includes(requestedTab)
-                ? requestedTab as EmployeeRecordTab
-                : "details";
-            setViewingEmployee(routedEmployee);
-            setEmployeeRecordTab(requestedRecordTab);
-            setSelectedAttendanceDateKey("");
-            setAttendanceMonthOffset(0);
-            setTransactionDate(todayInputValue());
-            setLeaveReviewNotes({});
-            cancelEditNotice();
-        }
+            if (isEmployeeDetailPage) {
+                const requestedTab = new URLSearchParams(location.search).get("tab");
+                const requestedRecordTab: EmployeeRecordTab = requestedTab && [
+                    "details",
+                    "hr",
+                    "leads",
+                    "notices",
+                    "leave",
+                    "attendance",
+                    "evaluations",
+                    "transactions",
+                ].includes(requestedTab)
+                    ? requestedTab as EmployeeRecordTab
+                    : "details";
+                setViewingEmployee(routedEmployee);
+                setEmployeeRecordTab(requestedRecordTab);
+                setSelectedAttendanceDateKey("");
+                setAttendanceMonthOffset(0);
+                setTransactionDate(todayInputValue());
+                setLeaveReviewNotes({});
+                cancelEditNotice();
+            }
 
-        if (isEmployeeEditPage) {
-            const parsedPhone = splitPhoneParts(routedEmployee.phone);
-            const employeeDetails = { ...routedEmployee } as EmployeeInput & { _id?: string; __v?: number };
-            delete employeeDetails._id;
-            delete employeeDetails.__v;
-            setNewEmployee({
-                ...employeeDetails,
-                aliases: routedEmployee.aliases || [],
-                salary: routedEmployee.salary || 0,
-                businessAccessIds: routedEmployee.businessAccessIds?.length
-                    ? routedEmployee.businessAccessIds
-                    : getActiveBusinessId()
-                        ? [getActiveBusinessId()]
-                        : [],
-            });
-            setPhoneOperatorCode(parsedPhone.operatorCode);
-            setPhoneMobileNumber(parsedPhone.mobileNumber);
-            setPhoneExtension(parsedPhone.extension);
-            setEditingEmployeeId(routedEmployee._id);
-            setProfileImageChanged(false);
-            setModalMode("edit");
-            setOpenDropdown(null);
-        }
-    }, [isEmployeeDetailPage, isEmployeeEditPage, location.search, routedEmployee]);
+            if (isEmployeeEditPage) {
+                const parsedPhone = splitPhoneParts(routedEmployee.phone);
+                const employeeDetails = { ...routedEmployee } as EmployeeInput & { _id?: string; __v?: number };
+                delete employeeDetails._id;
+                delete employeeDetails.__v;
+                setNewEmployee({
+                    ...employeeDetails,
+                    aliases: routedEmployee.aliases || [],
+                    salary: routedEmployee.salary || 0,
+                    businessAccessIds: routedEmployee.businessAccessIds?.length
+                        ? routedEmployee.businessAccessIds
+                        : getActiveBusinessId()
+                            ? [getActiveBusinessId()]
+                            : [],
+                });
+                setPhoneOperatorCode(parsedPhone.operatorCode);
+                setPhoneMobileNumber(parsedPhone.mobileNumber);
+                setPhoneExtension(parsedPhone.extension);
+                setEditingEmployeeId(routedEmployee._id);
+                setProfileImageChanged(false);
+                setModalMode("edit");
+                setOpenDropdown(null);
+            }
+        })();
+    }
 
-    useEffect(() => {
-        if (!isEmployeeRoutePage || isEmployeeDetailPage) {
-            setEditingEmployeeId(null);
-            setOpenDropdown(null);
-        }
+    const [previousEmployeeRouteMode, setPreviousEmployeeRouteMode] = useState<readonly unknown[] | null>(null);
+    const employeeRouteModeInputs = [isEmployeeDetailPage, isEmployeeRoutePage];
+    if (previousEmployeeRouteMode === null || employeeRouteModeInputs.some((input, index) => !Object.is(input, previousEmployeeRouteMode[index]))) {
+        setPreviousEmployeeRouteMode(employeeRouteModeInputs);
+        (() => {
+            if (!isEmployeeRoutePage || isEmployeeDetailPage) {
+                setEditingEmployeeId(null);
+                setOpenDropdown(null);
+            }
 
-        if (!isEmployeeRoutePage) {
-            setViewingEmployee(null);
-        }
-    }, [isEmployeeDetailPage, isEmployeeRoutePage]);
+            if (!isEmployeeRoutePage) {
+                setViewingEmployee(null);
+            }
+        })();
+    }
 
-    useEffect(() => {
-        if (!viewingEmployeeDetails) return;
-        setViewingEmployee((currentEmployee) =>
-            currentEmployee?._id === viewingEmployeeDetails._id
-                ? { ...currentEmployee, ...viewingEmployeeDetails }
-                : currentEmployee,
-        );
-    }, [viewingEmployeeDetails]);
+    const [previousEmployeeDetails, setPreviousEmployeeDetails] = useState<readonly unknown[] | null>(null);
+    const employeeDetailsInputs = [viewingEmployeeDetails];
+    if (previousEmployeeDetails === null || employeeDetailsInputs.some((input, index) => !Object.is(input, previousEmployeeDetails[index]))) {
+        setPreviousEmployeeDetails(employeeDetailsInputs);
+        (() => {
+            if (!viewingEmployeeDetails) return;
+            setViewingEmployee((currentEmployee) =>
+                currentEmployee?._id === viewingEmployeeDetails._id
+                    ? { ...currentEmployee, ...viewingEmployeeDetails }
+                    : currentEmployee,
+            );
+        })();
+    }
 
-    useEffect(() => {
-        setPage((currentPage) => Math.min(currentPage, totalPages));
-    }, [totalPages]);
+    const [previousEmployeePageLimit, setPreviousEmployeePageLimit] = useState<readonly unknown[] | null>(null);
+    const employeePageLimitInputs = [totalPages];
+    if (previousEmployeePageLimit === null || employeePageLimitInputs.some((input, index) => !Object.is(input, previousEmployeePageLimit[index]))) {
+        setPreviousEmployeePageLimit(employeePageLimitInputs);
+        (() => {
+            setPage((currentPage) => Math.min(currentPage, totalPages));
+        })();
+    }
 
     useEffect(() => {
         socket.connect();
@@ -1420,25 +1435,35 @@ export default function AdminEmployees() {
         };
     }, [queryClient]);
 
-    useEffect(() => {
-        setEmployeeLeadSearch("");
-        setSelectedEmployeeLeadIds([]);
-    }, [viewingEmployee?._id, employeeRecordTab]);
+    const [previousEmployeeLeadScope, setPreviousEmployeeLeadScope] = useState<readonly unknown[] | null>(null);
+    const employeeLeadScopeInputs = [viewingEmployee?._id, employeeRecordTab];
+    if (previousEmployeeLeadScope === null || employeeLeadScopeInputs.some((input, index) => !Object.is(input, previousEmployeeLeadScope[index]))) {
+        setPreviousEmployeeLeadScope(employeeLeadScopeInputs);
+        (() => {
+            setEmployeeLeadSearch("");
+            setSelectedEmployeeLeadIds([]);
+        })();
+    }
 
-    useEffect(() => {
-        const employeeLeadIds = new Set(employeeLeads.map((lead) => lead._id));
-        setSelectedEmployeeLeadIds((currentIds) => {
-            const nextIds = currentIds.filter((leadId) => employeeLeadIds.has(leadId));
-            return nextIds.length === currentIds.length ? currentIds : nextIds;
-        });
-    }, [employeeLeads]);
+    const [previousEmployeeLeadSelection, setPreviousEmployeeLeadSelection] = useState<readonly unknown[] | null>(null);
+    const employeeLeadSelectionInputs = [employeeLeads];
+    if (previousEmployeeLeadSelection === null || employeeLeadSelectionInputs.some((input, index) => !Object.is(input, previousEmployeeLeadSelection[index]))) {
+        setPreviousEmployeeLeadSelection(employeeLeadSelectionInputs);
+        (() => {
+            const employeeLeadIds = new Set(employeeLeads.map((lead) => lead._id));
+            setSelectedEmployeeLeadIds((currentIds) => {
+                const nextIds = currentIds.filter((leadId) => employeeLeadIds.has(leadId));
+                return nextIds.length === currentIds.length ? currentIds : nextIds;
+            });
+        })();
+    }
 
     useEffect(() => {
         if (!openDropdown) return;
 
         const handleOutsideClick = (event: globalThis.MouseEvent) => {
             const target = event.target as Node | null;
-            const activeButton = activeDropdown?.buttonRef.current;
+            const activeButton = { role: roleButtonRef, department: departmentButtonRef, status: statusButtonRef, contactRelationship: statusButtonRel }[openDropdown].current;
             if (!target || activeButton?.contains(target) || dropdownMenuRef.current?.contains(target)) {
                 return;
             }
@@ -1447,7 +1472,7 @@ export default function AdminEmployees() {
 
         document.addEventListener("mousedown", handleOutsideClick);
         return () => document.removeEventListener("mousedown", handleOutsideClick);
-    }, [activeDropdown, openDropdown]);
+    }, [openDropdown]);
 
     const shouldRenderEmployeeForm = isEmployeeEditPage && editingEmployeeId === employeeId;
 
@@ -1811,21 +1836,30 @@ export default function AdminEmployees() {
                             <CustomDropdown
                                 label="Department"
                                 value={newEmployee.team}
-                                onOpen={() => setOpenDropdown((current) => (current === "department" ? null : "department"))}
+                                onOpen={() => {
+                                                setDropdownStyle(getDropdownStyle(departmentButtonRef.current) ?? {});
+                                                setOpenDropdown((current) => (current === "department" ? null : "department"));
+                                            }}
                                 buttonRef={departmentButtonRef}
                             />
 
                             <CustomDropdown
                                 label="Role"
                                 value={newEmployee.role}
-                                onOpen={() => setOpenDropdown((current) => (current === "role" ? null : "role"))}
+                                onOpen={() => {
+                                                setDropdownStyle(getDropdownStyle(roleButtonRef.current) ?? {});
+                                                setOpenDropdown((current) => (current === "role" ? null : "role"));
+                                            }}
                                 buttonRef={roleButtonRef}
                             />
 
                             <CustomDropdown
                                 label="Employment Status"
                                 value={newEmployee.status}
-                                onOpen={() => setOpenDropdown((current) => (current === "status" ? null : "status"))}
+                                onOpen={() => {
+                                                setDropdownStyle(getDropdownStyle(statusButtonRef.current) ?? {});
+                                                setOpenDropdown((current) => (current === "status" ? null : "status"));
+                                            }}
                                 buttonRef={statusButtonRef}
                             />
 
@@ -2019,7 +2053,10 @@ export default function AdminEmployees() {
                                     label=""
                                     placeholder="Relationship"
                                     value={newEmployee.contactRelationship}
-                                    onOpen={() => setOpenDropdown((current) => (current === "contactRelationship" ? null : "contactRelationship"))}
+                                    onOpen={() => {
+                                                setDropdownStyle(getDropdownStyle(statusButtonRel.current) ?? {});
+                                                setOpenDropdown((current) => (current === "contactRelationship" ? null : "contactRelationship"));
+                                            }}
                                     buttonRef={statusButtonRel}
                                 />
                                 <input
@@ -2099,7 +2136,7 @@ export default function AdminEmployees() {
                         <div
                             ref={dropdownMenuRef}
                             className="fixed z-[60] overflow-hidden rounded-lg border border-white/10 bg-[#11141d] shadow-2xl shadow-black/40"
-                            style={getDropdownStyle(activeDropdown.buttonRef.current)}
+                            style={dropdownStyle}
                             onMouseDown={(event) => event.stopPropagation()}
                         >
                             {activeDropdown.searchable && (
@@ -2963,6 +3000,7 @@ export default function AdminEmployees() {
                                                 </div>
                                             </div>
 
+                                            {viewingEmployee && selectedAttendanceDay && <AttendanceCorrections employeeId={viewingEmployee._id} dayKey={selectedAttendanceDay.dateKey} />}
                                             <div className="mt-4 space-y-3">
                                                 {!selectedAttendanceDay?.records.length && (
                                                     <div className="rounded-lg border border-dashed border-slate-300 bg-white p-6 text-center">
@@ -3006,6 +3044,7 @@ export default function AdminEmployees() {
                                                                 className="flex size-8 shrink-0 items-center justify-center rounded-lg border border-slate-300 bg-white text-slate-600 transition hover:border-[#842cff]/40 hover:bg-violet-50 hover:text-[#5f27cd]"
                                                                 type="button"
                                                                 onClick={() => {
+                                                                    if (attendanceIntegrityEnabled) { navigate(`/admin/hr/attendance/${viewingEmployee._id}/${selectedAttendanceDay.dateKey}/edit`); return; }
                                                                     setAttendanceEditRecord(attendance);
                                                                     setAttendanceEditTime(attendanceDateTimeInput(attendance.timeIn));
                                                                 }}
@@ -3287,3 +3326,5 @@ export default function AdminEmployees() {
         </AdminLayout>
     );
 }
+
+const EMPTY_QUERY_ROWS: [] = [];

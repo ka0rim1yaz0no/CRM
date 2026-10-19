@@ -1,0 +1,10 @@
+.workspace-mobile-menu,.workspace-nav-backdrop{display:none}
+@media(max-width:760px){
+  .theme-app-bg:has([data-mobile-navigation])>aside{z-index:60;width:min(16rem,80vw)!important;transform:translateX(-100%);visibility:hidden;pointer-events:none;box-shadow:none;backdrop-filter:none}
+  .theme-app-bg.workspace-nav-open:has([data-mobile-navigation])>aside{transform:translateX(0);visibility:visible;pointer-events:auto}
+  .theme-app-bg:has([data-mobile-navigation])>main{padding-left:0!important}
+  .theme-app-bg:has([data-mobile-navigation])>main :is(button[aria-label="Collapse sidebar"],button[aria-label="Expand sidebar"]){display:none}
+  .workspace-mobile-menu{display:inline-flex;width:36px;height:36px;min-width:36px;align-items:center;justify-content:center;border:1px solid var(--profile-border,#748094);border-radius:4px;background:#fff;color:var(--profile-text,#172033)}
+  .profile-v2 .workspace-mobile-menu{background:var(--panel-bg)}
+  .workspace-nav-backdrop{display:block;position:fixed;inset:0;background:#0008;z-index:50}
+}

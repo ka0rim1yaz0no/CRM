@@ -1,5 +1,6 @@
 import type { FormEvent } from "react";
-import { useEffect, useMemo, useState } from "react";
+import { formatAttendanceTimePair as formatTimePair } from "../../../lib/attendancePresentation";
+import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useSearchParams } from "react-router";
 import { FiBriefcase, FiDownload, FiEdit2, FiFileText, FiPhone, FiPlus, FiRefreshCw, FiSearch, FiStar, FiTrash2, FiUsers, FiX } from "react-icons/fi";
@@ -281,7 +282,7 @@ function splitPhoneExtension(phone = "") {
 function splitPhoneParts(phone = "") {
     const parsedPhone = splitPhoneExtension(phone);
     const digits = parsedPhone.number.replace(/\D/g, "");
-    let operatorCode = "";
+    let operatorCode: string;
     let mobileNumber = "";
 
     if (digits.startsWith("63") && digits.length > 2) {
@@ -360,23 +361,23 @@ export default function AdminHr() {
     const [exportingAttendance, setExportingAttendance] = useState(false);
     const [archivedDeleteTarget, setArchivedDeleteTarget] = useState<ArchivedDeleteTarget | null>(null);
 
-    const { data: jobs = [], isLoading: jobsLoading, isError: jobsError } = useQuery({
+    const { data: jobs = EMPTY_QUERY_ROWS, isLoading: jobsLoading, isError: jobsError } = useQuery({
         queryKey: ["hr-jobs", search],
         queryFn: () => getJobPostings({ search }),
     });
-    const { data: applicants = [], isLoading: applicantsLoading, isError: applicantsError } = useQuery({
+    const { data: applicants = EMPTY_QUERY_ROWS, isLoading: applicantsLoading, isError: applicantsError } = useQuery({
         queryKey: ["hr-applicants", search],
         queryFn: () => getApplicants({ search }),
     });
-    const { data: archivedApplicants = [], isLoading: archivedApplicantsLoading, isError: archivedApplicantsError } = useQuery({
+    const { data: archivedApplicants = EMPTY_QUERY_ROWS, isLoading: archivedApplicantsLoading, isError: archivedApplicantsError } = useQuery({
         queryKey: ["hr-applicants-archived", search],
         queryFn: () => getApplicants({ search, archived: true }),
     });
-    const { data: archivedJobs = [], isLoading: archivedJobsLoading, isError: archivedJobsError } = useQuery({
+    const { data: archivedJobs = EMPTY_QUERY_ROWS, isLoading: archivedJobsLoading, isError: archivedJobsError } = useQuery({
         queryKey: ["hr-jobs-archived", search],
         queryFn: () => getJobPostings({ search, archived: true }),
     });
-    const { data: employees = [], isLoading: employeesLoading, isError: employeesError } = useQuery({
+    const { data: employees = EMPTY_QUERY_ROWS, isLoading: employeesLoading, isError: employeesError } = useQuery({
         queryKey: ["employees", "hr", "includeArchived"],
         queryFn: () => getEmployees({ includeArchived: true }),
     });
@@ -470,11 +471,16 @@ export default function AdminHr() {
             closeHrDetailsModal();
         },
     });
-    useEffect(() => {
-        if (routeTab === "attendance") {
-            setActiveTab("Attendance");
-        }
-    }, [routeTab]);
+    const [previousHrRoute, setPreviousHrRoute] = useState<readonly unknown[] | null>(null);
+    const hrRouteInputs = [routeTab];
+    if (previousHrRoute === null || hrRouteInputs.some((input, index) => !Object.is(input, previousHrRoute[index]))) {
+        setPreviousHrRoute(hrRouteInputs);
+        (() => {
+            if (routeTab === "attendance") {
+                setActiveTab("Attendance");
+            }
+        })();
+    }
     const stats = useMemo(
         () => [
             { label: "Open Jobs", value: jobs.filter((job) => job.status === "Open").length.toString(), icon: FiBriefcase },
@@ -503,18 +509,20 @@ export default function AdminHr() {
                 .sort((first, second) => first.name.localeCompare(second.name)),
         [employees]
     );
-    const attendanceEmployees = useMemo(
-        () =>
-            attendanceEmployeeOptions
-                .filter((employee) => matchesEmployeeSearch(employee, employeeSearch))
-                .filter((employee) => !attendanceEmployeeId || employee._id === attendanceEmployeeId),
-        [attendanceEmployeeId, attendanceEmployeeOptions, employeeSearch]
-    );
-    useEffect(() => {
-        if (attendanceEmployeeId && !attendanceEmployeeOptions.some((employee) => employee._id === attendanceEmployeeId)) {
-            setAttendanceEmployeeId("");
-        }
-    }, [attendanceEmployeeId, attendanceEmployeeOptions]);
+    const attendanceEmployees = useMemo(() => attendanceEmployeeOptions
+        .filter((employee) => matchesEmployeeSearch(employee, search.trim().toLowerCase()))
+        .filter((employee) => !attendanceEmployeeId || employee._id === attendanceEmployeeId),
+    [attendanceEmployeeOptions, attendanceEmployeeId, search]);
+    const [previousAttendanceEmployeeSelection, setPreviousAttendanceEmployeeSelection] = useState<readonly unknown[] | null>(null);
+    const attendanceEmployeeSelectionInputs = [attendanceEmployeeId, attendanceEmployeeOptions];
+    if (previousAttendanceEmployeeSelection === null || attendanceEmployeeSelectionInputs.some((input, index) => !Object.is(input, previousAttendanceEmployeeSelection[index]))) {
+        setPreviousAttendanceEmployeeSelection(attendanceEmployeeSelectionInputs);
+        (() => {
+            if (attendanceEmployeeId && !attendanceEmployeeOptions.some((employee) => employee._id === attendanceEmployeeId)) {
+                setAttendanceEmployeeId("");
+            }
+        })();
+    }
     const archivedCount = archivedApplicants.length + archivedJobs.length + archivedEmployees.length;
     const isDeletingArchivedRecord = permanentlyDeleteJobMutation.isPending || permanentlyDeleteApplicantMutation.isPending || permanentlyDeleteEmployeeMutation.isPending;
     const deleteArchivedJob = (job: JobPosting) => {
@@ -1415,12 +1423,6 @@ function firstAttendanceRecord(records: AttendanceRecord[], sources: AttendanceR
     return records.find((record) => sources.includes(record.source));
 }
 
-function formatTimePair(first?: string, second?: string, timeZone = ATTENDANCE_TIME_ZONE) {
-    const firstLabel = formatTimeInTimeZone(first, timeZone) || "00:00:00";
-    const secondLabel = formatTimeInTimeZone(second, timeZone) || "00:00:00";
-    return `${firstLabel} - ${secondLabel}`;
-}
-
 function formatDuration(milliseconds: number) {
     if (milliseconds <= 0) return "-";
     const totalMinutes = Math.round(milliseconds / 60000);
@@ -2153,3 +2155,5 @@ function Modal({ title, subtitle, children, onClose, onSubmit, submitLabel = "Sa
         </div>
     );
 }
+
+const EMPTY_QUERY_ROWS: [] = [];

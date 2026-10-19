@@ -1,5 +1,5 @@
 import type { FormEvent, KeyboardEvent } from "react";
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router";
 import {
@@ -219,12 +219,12 @@ export default function AdminKnowledgeBase() {
     const [faqForm, setFaqForm] = useState<KnowledgeBaseInput>(emptyFaq);
     const [articleForm, setArticleForm] = useState<KnowledgeBaseInput>(emptyArticle);
 
-    const { data: entries = [], isLoading, isError } = useQuery({
+    const { data: entries = EMPTY_QUERY_ROWS, isLoading, isError } = useQuery({
         queryKey: ["knowledge-base"],
         queryFn: () => getKnowledgeBaseEntries(),
     });
 
-    const { data: pendingSuggestions = [] } = useQuery({
+    const { data: pendingSuggestions = EMPTY_QUERY_ROWS } = useQuery({
         queryKey: ["knowledge-base-suggestions", "Pending"],
         queryFn: () => getKnowledgeBaseSuggestions({ status: "Pending" }),
     });
@@ -326,35 +326,60 @@ export default function AdminKnowledgeBase() {
         return counts;
     }, [pendingSuggestions]);
 
-    useEffect(() => {
-        setPage(1);
-    }, [activeTab, pageSize]);
+    const [previousKnowledgePageFilters, setPreviousKnowledgePageFilters] = useState<readonly unknown[] | null>(null);
+    const knowledgePageFiltersInputs = [activeTab, pageSize];
+    if (previousKnowledgePageFilters === null || knowledgePageFiltersInputs.some((input, index) => !Object.is(input, previousKnowledgePageFilters[index]))) {
+        setPreviousKnowledgePageFilters(knowledgePageFiltersInputs);
+        (() => {
+            setPage(1);
+        })();
+    }
 
-    useEffect(() => {
-        setActiveSearchSuggestionIndex(-1);
-    }, [activeTab, searchTerm]);
+    const [previousKnowledgeSuggestions, setPreviousKnowledgeSuggestions] = useState<readonly unknown[] | null>(null);
+    const knowledgeSuggestionsInputs = [activeTab, searchTerm];
+    if (previousKnowledgeSuggestions === null || knowledgeSuggestionsInputs.some((input, index) => !Object.is(input, previousKnowledgeSuggestions[index]))) {
+        setPreviousKnowledgeSuggestions(knowledgeSuggestionsInputs);
+        (() => {
+            setActiveSearchSuggestionIndex(-1);
+        })();
+    }
 
-    useEffect(() => {
-        const tabFromSearch = getTabFromSearchParam(searchParams.get("tab"));
+    const [previousKnowledgeRoute, setPreviousKnowledgeRoute] = useState<readonly unknown[] | null>(null);
+    const knowledgeRouteInputs = [activeTab, searchParams];
+    if (previousKnowledgeRoute === null || knowledgeRouteInputs.some((input, index) => !Object.is(input, previousKnowledgeRoute[index]))) {
+        setPreviousKnowledgeRoute(knowledgeRouteInputs);
+        (() => {
+            const tabFromSearch = getTabFromSearchParam(searchParams.get("tab"));
 
-        if (tabFromSearch && tabFromSearch !== activeTab) {
-            setActiveTab(tabFromSearch);
-        }
-    }, [activeTab, searchParams]);
+            if (tabFromSearch && tabFromSearch !== activeTab) {
+                setActiveTab(tabFromSearch);
+            }
+        })();
+    }
 
-    useEffect(() => {
-        setPage((currentPage) => Math.min(currentPage, totalPages));
-    }, [totalPages]);
+    const [previousKnowledgePageLimit, setPreviousKnowledgePageLimit] = useState<readonly unknown[] | null>(null);
+    const knowledgePageLimitInputs = [totalPages];
+    if (previousKnowledgePageLimit === null || knowledgePageLimitInputs.some((input, index) => !Object.is(input, previousKnowledgePageLimit[index]))) {
+        setPreviousKnowledgePageLimit(knowledgePageLimitInputs);
+        (() => {
+            setPage((currentPage) => Math.min(currentPage, totalPages));
+        })();
+    }
 
-    useEffect(() => {
-        const selectedId = detailEntry?._id;
+    const [previousKnowledgeDetails, setPreviousKnowledgeDetails] = useState<readonly unknown[] | null>(null);
+    const knowledgeDetailsInputs = [activeEntries, detailEntry?._id];
+    if (previousKnowledgeDetails === null || knowledgeDetailsInputs.some((input, index) => !Object.is(input, previousKnowledgeDetails[index]))) {
+        setPreviousKnowledgeDetails(knowledgeDetailsInputs);
+        (() => {
+            const selectedId = detailEntry?._id;
 
-        if (selectedId && activeEntries.some((entry) => entry._id === selectedId)) {
-            return;
-        }
+            if (selectedId && activeEntries.some((entry) => entry._id === selectedId)) {
+                return;
+            }
 
-        setDetailEntry(activeEntries[0] || null);
-    }, [activeEntries, detailEntry?._id]);
+            setDetailEntry(activeEntries[0] || null);
+        })();
+    }
 
     const invalidateKnowledge = () => queryClient.invalidateQueries({ queryKey: ["knowledge-base"] });
 
@@ -1516,3 +1541,5 @@ export default function AdminKnowledgeBase() {
         </AdminLayout>
     );
 }
+
+const EMPTY_QUERY_ROWS: [] = [];

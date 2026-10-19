@@ -8,6 +8,7 @@ import { ensureEmployeeIndexes } from "./models/Employee";
 import { createSocketServer } from "./socket";
 import { startHempSurveyLeadQueueWorker } from "./services/hempSurveyLeadQueue";
 import { startAttendanceReconciliationWorker } from "./services/attendanceReconciliationWorker";
+import { startAttendanceIntegrityWorker } from "./services/attendanceRecoveryWorker";
 
 const port = Number(process.env.PORT || 4000);
 const host = process.env.HOST || "127.0.0.1";
@@ -24,6 +25,7 @@ createSocketServer(httpServer);
 startLeadAutoAssignmentScheduler();
 startHempSurveyLeadQueueWorker();
 startAttendanceReconciliationWorker();
+startAttendanceIntegrityWorker();
 
 httpServer.listen(port, host, () => {
   console.log(`API server running on http://${host}:${port}`);

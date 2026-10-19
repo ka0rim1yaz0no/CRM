@@ -1,5 +1,5 @@
 import { Fragment, type FormEvent } from "react";
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FiAlertTriangle, FiArchive, FiCheck, FiChevronDown, FiCreditCard, FiDroplet, FiEdit2, FiGitBranch, FiPlus, FiSave, FiShield, FiSliders, FiTag, FiTool, FiX } from "react-icons/fi";
 import AdminLayout from "../adminLayout";
@@ -33,8 +33,8 @@ import {
     type PayrollBillingCycle,
 } from "../../../api/systemSettings";
 import { DataTablePagination } from "../../../components/admin/DataTable";
-import { setAppTheme } from "../../../components/ThemeProvider";
-import { emitToast } from "../../../components/ToastProvider";
+import { setAppTheme } from "../../../lib/appTheme";
+import { emitToast } from "../../../lib/toast";
 import { themeOptions, type ThemeKey } from "../../../lib/themes";
 
 type SettingsTab = "Businesses" | "Departments" | "Branches" | "Tools" | "Product Categories" | "Features" | "Themes" | "System";
@@ -68,27 +68,27 @@ export default function AdminSettings() {
     const [page, setPage] = useState(1);
     const [pageSize, setPageSize] = useState(10);
 
-    const { data: roles = [], isLoading: rolesLoading, isError: rolesError } = useQuery({
+    const { data: roles = EMPTY_QUERY_ROWS, isLoading: rolesLoading, isError: rolesError } = useQuery({
         queryKey: ["roles"],
         queryFn: getRoles,
     });
-    const { data: branches = [], isLoading: branchesLoading, isError: branchesError } = useQuery({
+    const { data: branches = EMPTY_QUERY_ROWS, isLoading: branchesLoading, isError: branchesError } = useQuery({
         queryKey: ["branches"],
         queryFn: getBranches,
     });
-    const { data: tools = [], isLoading: toolsLoading, isError: toolsError } = useQuery({
+    const { data: tools = EMPTY_QUERY_ROWS, isLoading: toolsLoading, isError: toolsError } = useQuery({
         queryKey: ["tools"],
         queryFn: getTools,
     });
-    const { data: productCategories = [], isLoading: productCategoriesLoading, isError: productCategoriesError } = useQuery({
+    const { data: productCategories = EMPTY_QUERY_ROWS, isLoading: productCategoriesLoading, isError: productCategoriesError } = useQuery({
         queryKey: ["product-categories"],
         queryFn: getProductCategories,
     });
-    const { data: features = [], isLoading: featuresLoading, isError: featuresError } = useQuery({
+    const { data: features = EMPTY_QUERY_ROWS, isLoading: featuresLoading, isError: featuresError } = useQuery({
         queryKey: ["features"],
         queryFn: getFeatures,
     });
-    const { data: businesses = [], isLoading: businessesLoading, isError: businessesError } = useQuery({
+    const { data: businesses = EMPTY_QUERY_ROWS, isLoading: businessesLoading, isError: businessesError } = useQuery({
         queryKey: ["businesses"],
         queryFn: getBusinesses,
     });
@@ -176,9 +176,14 @@ export default function AdminSettings() {
         },
     });
 
-    useEffect(() => {
-        setBusinessNameDrafts(Object.fromEntries(businesses.map((business) => [business.id, business.name])));
-    }, [businesses]);
+    const [previousBusinessNames, setPreviousBusinessNames] = useState<readonly unknown[] | null>(null);
+    const businessNamesInputs = [businesses];
+    if (previousBusinessNames === null || businessNamesInputs.some((input, index) => !Object.is(input, previousBusinessNames[index]))) {
+        setPreviousBusinessNames(businessNamesInputs);
+        (() => {
+            setBusinessNameDrafts(Object.fromEntries(businesses.map((business) => [business.id, business.name])));
+        })();
+    }
 
     const openAddBusinessModal = () => {
         setBusinessForm({ name: "" });
@@ -418,13 +423,23 @@ export default function AdminSettings() {
     const visibleFeatures = paginateRows(features);
     const visibleThemes = paginateRows(themeOptions);
 
-    useEffect(() => {
-        setPage(1);
-    }, [activeTab]);
+    const [previousSettingsTab, setPreviousSettingsTab] = useState<readonly unknown[] | null>(null);
+    const settingsTabInputs = [activeTab];
+    if (previousSettingsTab === null || settingsTabInputs.some((input, index) => !Object.is(input, previousSettingsTab[index]))) {
+        setPreviousSettingsTab(settingsTabInputs);
+        (() => {
+            setPage(1);
+        })();
+    }
 
-    useEffect(() => {
-        setPage((currentPage) => Math.min(currentPage, Math.max(1, Math.ceil(activeTotalItems / pageSize))));
-    }, [activeTotalItems, pageSize]);
+    const [previousSettingsPageLimit, setPreviousSettingsPageLimit] = useState<readonly unknown[] | null>(null);
+    const settingsPageLimitInputs = [activeTotalItems, pageSize];
+    if (previousSettingsPageLimit === null || settingsPageLimitInputs.some((input, index) => !Object.is(input, previousSettingsPageLimit[index]))) {
+        setPreviousSettingsPageLimit(settingsPageLimitInputs);
+        (() => {
+            setPage((currentPage) => Math.min(currentPage, Math.max(1, Math.ceil(activeTotalItems / pageSize))));
+        })();
+    }
 
     return (
         <AdminLayout>
@@ -1667,3 +1682,5 @@ function TwoStepDeleteModal({
         </div>
     );
 }
+
+const EMPTY_QUERY_ROWS: [] = [];

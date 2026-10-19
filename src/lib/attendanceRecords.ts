@@ -1,4 +1,5 @@
 import type { AttendanceRecord } from "../api/attendance";
+import { compareAttendanceRecords } from "./attendancePresentation";
 
 export type OffPhoneAttendanceSession = {
     id: string;
@@ -20,9 +21,7 @@ export function buildOffPhoneAttendanceSessions(
     records: AttendanceRecord[],
     fallbackEndAt = Date.now()
 ): OffPhoneAttendanceSession[] {
-    const chronologicalRecords = [...records].sort(
-        (first, second) => attendanceTimestamp(first) - attendanceTimestamp(second)
-    );
+    const chronologicalRecords = [...records].sort(compareAttendanceRecords);
     const sessions: OffPhoneAttendanceSession[] = [];
     let openRecord: AttendanceRecord | null = null;
 

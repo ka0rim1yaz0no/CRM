@@ -458,7 +458,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { FiClock, FiCoffee, FiLogIn, FiLogOut, FiPhoneOff, FiPower, FiRefreshCw } from "react-icons/fi";
+import { FiClock, FiCoffee, FiLogIn, FiLogOut, FiPhoneOff, FiPower, FiRefreshCw, FiMenu } from "react-icons/fi";
 import { breakInEmployee, breakOutEmployee, getEmployeeAttendance, lunchBreakInEmployee, lunchBreakOutEmployee, reportEmployeeActivity, timeInEmployee, timeOutEmployee, type AttendanceRecord } from "../../api/attendance";
 import { getAuthUser } from "../../api/authStorage";
 import { getEmployeeSummary, normalizeEmployeeAvailabilityStatus, type Employee, type EmployeeAvailabilityStatus } from "../../api/employees";
@@ -473,12 +473,18 @@ import {
     isAttendanceTimeOutUndertime,
 } from "../../lib/attendanceSlots";
 import { buildOffPhoneAttendanceSessions, formatAttendanceDuration } from "../../lib/attendanceRecords";
-const timeAccountingV2 = import.meta.env.VITE_CRM_TIME_ACCOUNTING_V2 === "true" ||
-    (import.meta.env.DEV && import.meta.env.VITE_CRM_TIME_ACCOUNTING_V2 !== "false");
 import { formatDateInTimeZone, formatTimeInTimeZone } from "../../lib/dateTime";
 import MainLayout from "../layout";
+import { attendanceIntegrityEnabled, getAttendanceSession, sessionEventRecord, type AttendanceSessionSnapshot } from "../../api/attendanceSession";
+import { attendanceServerNow } from "../../lib/attendanceHubState";
+import { getActiveBusinessId } from "../../api/businessStorage";
+import "./attendance.css";
+import { socket } from "../../lib/socket";
+import { refreshAttendanceWorkspace, refreshEmployeeWorkspace } from "../../lib/employeeWorkspaceCache";
+import { Link } from "react-router";
+import { attendanceEventPresentation, attendanceOnlineActionLabel, compareAttendanceRecords, displayedAttendanceSession, mergeAttendanceHistory } from "../../lib/attendancePresentation";
 
-const attendanceQueryKey = (employeeId?: string) => ["employee-attendance", employeeId];
+const attendanceQueryKey = (employeeId?: string) => ["employee-attendance", getActiveBusinessId(), employeeId];
 const REGULAR_BREAK_LIMIT_MS = 15 * 60 * 1000;
 const LUNCH_BREAK_LIMIT_MS = 60 * 60 * 1000;
 
@@ -530,9 +536,9 @@ function isBreakSource(source?: AttendanceRecord["source"]) {
     return source === "Break Out" || source === "Break In" || source === "Lunch Break Out" || source === "Lunch Break In";
 }
 
-function getBreakLimitMs(source?: AttendanceRecord["source"]) {
-    if (source === "Lunch Break Out" || source === "Lunch Break In") return LUNCH_BREAK_LIMIT_MS;
-    if (source === "Break Out" || source === "Break In") return REGULAR_BREAK_LIMIT_MS;
+function getBreakLimitMs(source?: AttendanceRecord["source"], allowances?: { breakMinutes: number; lunchMinutes: number }) {
+    if (source === "Lunch Break Out" || source === "Lunch Break In") return allowances ? allowances.lunchMinutes * 60_000 : LUNCH_BREAK_LIMIT_MS;
+    if (source === "Break Out" || source === "Break In") return allowances ? allowances.breakMinutes * 60_000 : REGULAR_BREAK_LIMIT_MS;
     return 0;
 }
 
@@ -571,6 +577,26 @@ export default function AttendancePage() {
     const [showOfflineConfirm, setShowOfflineConfirm] = useState(false);
     const [nowMs, setNowMs] = useState(() => Date.now());
     const [manualOffPhoneStartedAt, setManualOffPhoneStartedAt] = useState<number | null>(null);
+    const [mobileNavigationOpen, setMobileNavigationOpen] = useState(false);
+    useEffect(() => {
+        const root = document.querySelector(".theme-app-bg");
+        root?.classList.toggle("employee-attendance-nav-open", mobileNavigationOpen);
+        return () => root?.classList.remove("employee-attendance-nav-open");
+    }, [mobileNavigationOpen]);
+    const businessId = getActiveBusinessId();
+    const sessionQueryKey = ["attendance-session", businessId, employeeId];
+    const sessionQuery = useQuery({ queryKey: sessionQueryKey, queryFn: () => getAttendanceSession(employeeId),
+        enabled: attendanceIntegrityEnabled && Boolean(employeeId), refetchInterval: 30_000, refetchOnWindowFocus: true });
+    const confirmedSession = sessionQuery.data;
+    const serverNowMs = confirmedSession ? attendanceServerNow(confirmedSession.serverTime, confirmedSession.receivedAt, nowMs) : nowMs;
+    useEffect(() => {
+        if (!attendanceIntegrityEnabled) return;
+        const refresh = () => { setNowMs(Date.now()); void refreshAttendanceWorkspace(queryClient); };
+        const ownUpdate = (payload: { employeeId?: string }) => { if (payload.employeeId === employeeId) refresh(); };
+        socket.on("employee:availability-updated", ownUpdate); socket.on("connect", refresh); socket.connect();
+        document.addEventListener("visibilitychange", refresh);
+        return () => { socket.off("employee:availability-updated", ownUpdate); socket.off("connect", refresh); document.removeEventListener("visibilitychange", refresh); };
+    }, [queryClient, businessId, employeeId]);
 
     useEffect(() => {
         const timer = window.setInterval(() => setNowMs(Date.now()), 1000);
@@ -598,24 +624,26 @@ export default function AttendancePage() {
     const recordsBySlot = useMemo(() => groupAttendanceRecordsBySlot(attendance, attendanceSettings), [attendance, attendanceSettings]);
     const latestTimeInRecord = attendance.find((record) => isAttendanceTimeInSource(record.source));
     const latestSlotKey = latestTimeInRecord ? formatAttendanceSlotKey(latestTimeInRecord.timeIn, attendanceSettings) : "";
-    const nowSlotKey = formatAttendanceSlotKey(new Date(), attendanceSettings);
+    const nowSlotKey = formatAttendanceSlotKey(new Date(serverNowMs), attendanceSettings);
     const latestSlotRecords = latestSlotKey ? [...(recordsBySlot[latestSlotKey] || [])].sort((left, right) => new Date(right.timeIn).getTime() - new Date(left.timeIn).getTime()) : [];
     const latestSlotTimeIn = latestSlotRecords.find((record) => isAttendanceTimeInSource(record.source));
     const latestSlotTimeOut = latestSlotRecords.find((record) => record.source === "Logout" || record.source === "Time Out");
     const latestSlotHasOpenAttendance = Boolean(
-        latestSlotKey === nowSlotKey
-        && latestSlotTimeIn
+        latestSlotTimeIn
         && (!latestSlotTimeOut || getRecordTime(latestSlotTimeIn) > getRecordTime(latestSlotTimeOut))
     );
     const actionSlotKey = latestSlotKey && latestSlotHasOpenAttendance ? latestSlotKey : nowSlotKey;
-    const displaySlotKey = latestSlotKey === nowSlotKey ? latestSlotKey : nowSlotKey;
-    const actionSlotRecords = [...(recordsBySlot[actionSlotKey] || [])].sort((left, right) => new Date(right.timeIn).getTime() - new Date(left.timeIn).getTime());
-    const slotRecords = [...(recordsBySlot[displaySlotKey] || [])].sort((left, right) => new Date(right.timeIn).getTime() - new Date(left.timeIn).getTime());
+    const displayedServerSession = confirmedSession && displayedAttendanceSession(confirmedSession.sessions, confirmedSession.sessionId);
+    const displaySlotKey = displayedServerSession?.shift?.dayKey || confirmedSession?.assignedShift?.dayKey || (latestSlotHasOpenAttendance ? latestSlotKey : nowSlotKey);
+    const activeServerRecords = confirmedSession?.sessions.find((session) => session.id === confirmedSession.sessionId)?.events.map((event) => sessionEventRecord(event, employeeId));
+    const displayedServerRecords = displayedServerSession?.events.map((event) => sessionEventRecord(event, employeeId));
+    const actionSlotRecords: AttendanceRecord[] = [...(attendanceIntegrityEnabled ? activeServerRecords || [] : recordsBySlot[actionSlotKey] || [])].sort((left, right) => compareAttendanceRecords(right, left));
+    const slotRecords: AttendanceRecord[] = [...(displayedServerRecords || recordsBySlot[displaySlotKey] || [])].sort((left, right) => compareAttendanceRecords(right, left));
     const slotLabel = formatAttendanceSlotLabel(displaySlotKey);
     const latestRecord = slotRecords[0] || attendance[0];
     const actionTimeIn = actionSlotRecords.find((record) => isAttendanceTimeInSource(record.source));
     const actionTimeOut = actionSlotRecords.find((record) => record.source === "Logout" || record.source === "Time Out");
-    const hasOpenAttendanceSlot = Boolean(
+    const hasOpenAttendanceSlot = attendanceIntegrityEnabled ? Boolean(confirmedSession?.sessionId) : Boolean(
         actionTimeIn && (!actionTimeOut || getRecordTime(actionTimeIn) > getRecordTime(actionTimeOut))
     );
     const activeCycleStartedAt = hasOpenAttendanceSlot ? getRecordTime(actionTimeIn) : 0;
@@ -629,7 +657,7 @@ export default function AttendancePage() {
     const breakInCount = activeCycleRecords.filter((record) => record.source === "Break In").length;
     const latestBreakOutRecord = activeCycleRecords.find((record) => record.source === "Break Out");
     const latestBreakOutTime = latestBreakOutRecord ? new Date(latestBreakOutRecord.timeIn).getTime() : 0;
-    const hasBreakGapElapsed = !latestBreakOutTime || nowMs - latestBreakOutTime >= 30 * 60 * 1000;
+    const hasBreakGapElapsed = !latestBreakOutTime || serverNowMs - latestBreakOutTime >= 30 * 60 * 1000;
     const latestActionStatus: EmployeeAvailabilityStatus =
         latestActionSource === "Break Out"
             ? "BREAK"
@@ -642,7 +670,7 @@ export default function AttendancePage() {
                         : "ONLINE";
     // Attendance buttons follow the employee's manual record sequence. A stale
     // replicated availability value must never disable or change an action.
-    const currentStatus: EmployeeAvailabilityStatus = hasOpenAttendanceSlot
+    const currentStatus: EmployeeAvailabilityStatus = attendanceIntegrityEnabled ? confirmedSession?.state || "OFFLINE" : hasOpenAttendanceSlot
         ? latestActionStatus
         : "OFFLINE";
     const isOnBreak = currentStatus === "BREAK" || latestActionSource === "Break Out";
@@ -650,24 +678,24 @@ export default function AttendancePage() {
     const activeBreakOutRecord = isOnBreak ? activeCycleRecords.find((record) => record.source === "Break Out") : null;
     const activeLunchOutRecord = isOnLunchBreak ? activeCycleRecords.find((record) => record.source === "Lunch Break Out") : null;
     const activeBreakRecord = activeBreakOutRecord || activeLunchOutRecord;
-    const activeBreakLimitMs = getBreakLimitMs(activeBreakRecord?.source);
-    const activeBreakLabel = activeBreakOutRecord ? "Break timer · 15 minutes" : activeLunchOutRecord ? "Lunch timer · 1 hour" : "";
+    const activeBreakLimitMs = getBreakLimitMs(activeBreakRecord?.source, confirmedSession?.allowances);
+    const activeBreakLabel = activeBreakOutRecord ? `Break timer · ${confirmedSession?.allowances?.breakMinutes ?? 15} minutes` : activeLunchOutRecord ? `Lunch timer · ${confirmedSession?.allowances?.lunchMinutes ?? 60} minutes` : "";
     const activeBreakStartedAt = getRecordTime(activeBreakRecord);
-    const activeBreakElapsedMs = activeBreakStartedAt ? nowMs - activeBreakStartedAt : 0;
+    const activeBreakElapsedMs = activeBreakStartedAt ? serverNowMs - activeBreakStartedAt : 0;
     const activeBreakRemainingMs = activeBreakLimitMs ? activeBreakLimitMs - activeBreakElapsedMs : 0;
     const isActiveBreakOvertime = activeBreakLimitMs > 0 && activeBreakElapsedMs > activeBreakLimitMs;
-    const offPhoneSessions = buildOffPhoneAttendanceSessions(slotRecords, nowMs);
+    const offPhoneSessions = buildOffPhoneAttendanceSessions(slotRecords, serverNowMs);
     const activeOffPhoneSession = offPhoneSessions.find((session) => session.isOpen) || null;
     const activeOffPhoneStartedAt = currentStatus === "OFF THE PHONE"
         ? getRecordTime(activeOffPhoneSession?.startRecord) || manualOffPhoneStartedAt || getEmployeeStatusTime(currentEmployee) || getRecordTime(latestRecord)
         : 0;
-    const activeOffPhoneElapsedMs = activeOffPhoneStartedAt ? nowMs - activeOffPhoneStartedAt : 0;
-    const slotRecordsChronological = [...slotRecords].sort((left, right) => getRecordTime(left) - getRecordTime(right));
+    const activeOffPhoneElapsedMs = activeOffPhoneStartedAt ? serverNowMs - activeOffPhoneStartedAt : 0;
+    const slotRecordsChronological = [...slotRecords].sort(compareAttendanceRecords);
 
     const getBreakDurationMs = (record: AttendanceRecord) => {
         if (record.source === "Break Out" || record.source === "Lunch Break Out") {
             if (activeBreakRecord?._id === record._id) {
-                return nowMs - getRecordTime(record);
+                return serverNowMs - getRecordTime(record);
             }
 
             return null;
@@ -706,16 +734,20 @@ export default function AttendancePage() {
         queryClient.setQueryData<Employee | undefined>(["employee", employeeId], (current) =>
             current ? { ...current, availabilityStatus } : employee ? { ...employee, availabilityStatus } : current
         );
+        refreshEmployeeWorkspace(queryClient, employeeId);
+        void refreshAttendanceWorkspace(queryClient);
     };
 
     const updateAttendanceCache = (record: AttendanceRecord, availabilityStatus: EmployeeAvailabilityStatus) => {
-        queryClient.setQueryData<AttendanceRecord[]>(attendanceQueryKey(employeeId), (current = []) => [record, ...current]);
+        if (record.sessionSnapshot) queryClient.setQueryData<AttendanceSessionSnapshot>(sessionQueryKey, (current) =>
+            !current || current.revision <= record.sessionSnapshot!.revision ? record.sessionSnapshot : current);
+        queryClient.setQueryData<AttendanceRecord[]>(attendanceQueryKey(employeeId), (current = []) => mergeAttendanceHistory(current, [record]));
         updateEmployeeStatusCache(availabilityStatus);
     };
 
     const refreshAttendanceState = () => {
         void Promise.all([
-            queryClient.invalidateQueries({ queryKey: attendanceQueryKey(employeeId) }),
+            refreshAttendanceWorkspace(queryClient),
             queryClient.invalidateQueries({ queryKey: ["employee", employeeId] }),
         ]);
     };
@@ -794,13 +826,12 @@ export default function AttendancePage() {
                 reason: status === "OFF THE PHONE" ? "manual-off-the-phone" : "manual-online",
             }),
         onSuccess: (result, status) => {
+            const snapshot = result.attendanceRecords?.find((record) => record.sessionSnapshot)?.sessionSnapshot;
+            if (snapshot) queryClient.setQueryData<AttendanceSessionSnapshot>(sessionQueryKey, (current) => !current || current.revision <= snapshot.revision ? snapshot : current);
             const availabilityStatus = normalizeEmployeeAvailabilityStatus(result.availabilityStatus);
             updateEmployeeStatusCache(availabilityStatus);
             if (result.attendanceRecords?.length) {
-                queryClient.setQueryData<AttendanceRecord[]>(attendanceQueryKey(employeeId), (current = []) => [
-                    ...result.attendanceRecords!,
-                    ...current,
-                ]);
+                queryClient.setQueryData<AttendanceRecord[]>(attendanceQueryKey(employeeId), (current = []) => mergeAttendanceHistory(current, result.attendanceRecords!));
             }
             queryClient.invalidateQueries({ queryKey: attendanceQueryKey(employeeId) });
             setManualOffPhoneStartedAt(status === "OFF THE PHONE" ? Date.now() : null);
@@ -820,18 +851,10 @@ export default function AttendancePage() {
         lunchBreakInMutation.isPending ||
         activityStatusMutation.isPending;
 
-    const sourceLabel = (source?: AttendanceRecord["source"], history = false) => {
-        if (timeAccountingV2 && history && source === "Break In") return "Break ended";
-        if (timeAccountingV2 && history && source === "Lunch Break In") return "Lunch ended";
-        if (source === "Login" || source === "Time In" || source === "Break In" || source === "Lunch Break In" || source === "Off the Phone In") return statusLabels.ONLINE;
-        if (source === "Logout" || source === "Time Out") return statusLabels.OFFLINE;
-        if (source === "Break Out") return statusLabels.BREAK;
-        if (source === "Lunch Break Out") return statusLabels.LUNCH;
-        if (source === "Off the Phone Out") return statusLabels["OFF THE PHONE"];
-        return "No attendance yet";
-    };
+    const sourceLabel = (source?: AttendanceRecord["source"]) => attendanceEventPresentation(source).label;
 
     const statusDisabled = (status: EmployeeAvailabilityStatus) => {
+        if (attendanceIntegrityEnabled && (!confirmedSession || sessionQuery.isError || confirmedSession.reviewState !== "verified")) return true;
         if (!employeeId || isLoading || isEmployeeLoading || isSaving || status === currentStatus) return true;
         if (status === "ONLINE") return !canSetOnline;
         if (status === "OFFLINE") return !canSetOffline;
@@ -883,9 +906,24 @@ export default function AttendancePage() {
         }
     };
 
+    const actionButtons = statusOrder.map((status) => {
+        const Icon = statusIcon[status];
+        const isActive = status === currentStatus;
+        const disabled = statusDisabled(status);
+        const label = status === "ONLINE" ? attendanceOnlineActionLabel(currentStatus) : statusLabels[status];
+        return <button key={status} type="button" disabled={disabled} onClick={() => handleStatusChange(status)}
+            className={["inline-flex h-12 items-center justify-center gap-2 rounded-lg border px-4 text-sm font-semibold shadow-lg transition disabled:cursor-not-allowed disabled:border-slate-300 disabled:bg-slate-200 disabled:text-slate-500 disabled:shadow-none",
+                isActive ? "ring-2 ring-slate-950/20 ring-offset-2" : "", statusButtonStyles[status]].join(" ")}>
+            <Icon className="shrink-0" aria-hidden="true" /><span>{isSaving && !disabled ? "Saving..." : label}</span>
+        </button>;
+    });
+
+    const displayedMessage = confirmedSession && !confirmedSession.syncPending && message.includes("Sync to another business is pending") ? "Attendance saved and synchronized." : message;
     return (
         <MainLayout>
-            <section className="mx-auto flex w-full max-w-6xl flex-col gap-5 text-slate-950">
+            <section className="employee-attendance-page mx-auto flex w-full max-w-6xl flex-col gap-5 text-slate-950">
+                {mobileNavigationOpen && <button className="employee-attendance-nav-backdrop" type="button" aria-label="Close navigation" onClick={() => setMobileNavigationOpen(false)} />}
+                <button className="employee-attendance-menu" type="button" aria-label="Toggle navigation" aria-expanded={mobileNavigationOpen} onClick={() => setMobileNavigationOpen(!mobileNavigationOpen)}><FiMenu /></button>
                 <header className="rounded-xl border border-[#b79cff] bg-[#550fdf12] p-6 shadow-sm">
                     <p className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">Employee Workspace</p>
                     <div className="mt-2 flex flex-wrap items-end justify-between gap-4">
@@ -912,7 +950,16 @@ export default function AttendancePage() {
                             </div>
                             <div>
                                 <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Current Status</p>
-                                <p className="text-xl font-semibold text-slate-950">{statusLabels[currentStatus]}</p>
+                                <p className="text-xl font-semibold text-slate-950">{attendanceIntegrityEnabled && !confirmedSession ? "Checking attendance..." : statusLabels[currentStatus]}</p>
+                                {attendanceIntegrityEnabled && sessionQuery.isError && <div role="alert" className="text-sm text-amber-700">
+                                    <p>{attendanceRequestError(sessionQuery.error, "Status could not be confirmed. Refresh before changing attendance.")}</p>
+                                    {(sessionQuery.error as { response?: { status?: number } })?.response?.status === 401 &&
+                                        <Link to="/login" className="font-semibold underline">Sign in again</Link>}
+                                </div>}
+                                {confirmedSession?.review.length ? <p className="text-sm text-amber-700">{confirmedSession.historyReviewRequired && confirmedSession.reviewState === "verified"
+                                    ? "Historical attendance needs administrator review. Your current manual attendance controls remain available."
+                                    : `Attendance needs review: ${confirmedSession.review[0]}`}</p> : null}
+                                {confirmedSession?.recoveryEnabled && confirmedSession.systemClosure && <p className="text-sm text-amber-700">Previous shift closed automatically because time-out was missing. Please request an attendance correction.</p>}
                             </div>
                         </div>
 
@@ -958,36 +1005,17 @@ export default function AttendancePage() {
                         )}
 
                         {message && (
-                            <p className="mt-4 rounded-lg border border-[#7ccfbf] bg-[#c8f7ef] px-3 py-2 text-sm font-medium text-slate-950">{message}</p>
+                            <p className="mt-4 rounded-lg border border-[#7ccfbf] bg-[#c8f7ef] px-3 py-2 text-sm font-medium text-slate-950">{displayedMessage}</p>
                         )}
 
-                        <p className="mt-5 rounded-lg border border-[#b7a7d3] bg-white/60 px-3 py-2 text-xs font-semibold text-slate-700">
-                            Use ONLINE to time in or return from LUNCH, Break, or Off the Phone. Break is limited to 15 minutes. Lunch is limited to 1 hour. Off the Phone has no time limit.
-                        </p>
+                        <dl className="employee-attendance-allowances">
+                            <div><dt>Break</dt><dd>{confirmedSession?.allowances?.breakMinutes ?? 15} min</dd></div>
+                            <div><dt>Lunch</dt><dd>{confirmedSession?.allowances?.lunchMinutes ?? 60} min</dd></div>
+                            <div><dt>Off the phone</dt><dd>No time limit</dd></div>
+                        </dl>
 
                         <div className="mt-3 grid gap-3 sm:grid-cols-2">
-                            {statusOrder.map((status) => {
-                                const Icon = statusIcon[status];
-                                const isActive = status === currentStatus;
-                                const disabled = statusDisabled(status);
-
-                                return (
-                                    <button
-                                        key={status}
-                                        type="button"
-                                        disabled={disabled}
-                                        onClick={() => handleStatusChange(status)}
-                                        className={[
-                                            "inline-flex h-12 items-center justify-center gap-2 rounded-lg border px-4 text-sm font-semibold shadow-lg transition disabled:cursor-not-allowed disabled:border-slate-300 disabled:bg-slate-200 disabled:text-slate-500 disabled:shadow-none",
-                                            isActive ? "ring-2 ring-slate-950/20 ring-offset-2" : "",
-                                            statusButtonStyles[status],
-                                        ].join(" ")}
-                                    >
-                                        <Icon />
-                                        {isSaving && !disabled ? "Saving..." : statusLabels[status]}
-                                    </button>
-                                );
-                            })}
+                            {actionButtons}
                         </div>
                     </section>
 
@@ -1012,8 +1040,10 @@ export default function AttendancePage() {
                                 <p className="rounded-lg border border-[#b7a7d3] bg-white/70 p-4 text-sm text-slate-700">No records in this attendance slot yet.</p>
                             )}
                             {slotRecords.map((record) => {
+                                const presentation = attendanceEventPresentation(record.source);
+                                const eventColor = { online: "bg-[#10ac84]", offline: "bg-[#ee5253]", break: "bg-orange-600", lunch: "bg-violet-600", "off-phone": "bg-sky-600", unknown: "bg-slate-600" }[presentation.kind];
                                 const breakDurationMs = getBreakDurationMs(record);
-                                const breakLimitMs = getBreakLimitMs(record.source);
+                                const breakLimitMs = getBreakLimitMs(record.source, confirmedSession?.allowances);
                                 const breakRemainingMs = typeof breakDurationMs === "number" ? breakLimitMs - breakDurationMs : 0;
                                 const isBreakOvertime = breakLimitMs > 0 && typeof breakDurationMs === "number" && breakDurationMs > breakLimitMs;
                                 const offPhoneSession = offPhoneSessions.find((session) =>
@@ -1023,22 +1053,12 @@ export default function AttendancePage() {
                                 const displayedAttendanceStatus = record.attendanceStatus || (isUnderTime ? "Undertime" : "");
 
                                 return (
-                                    <article key={record._id} className="flex items-center justify-between gap-4 rounded-lg border border-[#9bbde8] bg-white/75 p-4 shadow-sm">
-                                        <div className="flex items-center gap-3">
+                                    <article key={record._id} className="employee-attendance-event flex flex-wrap items-center justify-between gap-3 rounded-lg border border-[#9bbde8] bg-white/75 p-4 shadow-sm">
+                                        <div className="flex min-w-0 max-w-full items-center gap-3">
                                             <span
                                                 className={[
-                                                    "flex size-9 items-center justify-center rounded-lg text-white",
-                                                    timeAccountingV2 && record.source.startsWith("Lunch Break")
-                                                        ? "bg-violet-600"
-                                                        : timeAccountingV2 && record.source.startsWith("Break")
-                                                            ? "bg-orange-600"
-                                                    : record.source === "Off the Phone Out"
-                                                        ? "bg-sky-600"
-                                                        : record.source === "Login" || record.source === "Time In" || record.source === "Break In" || record.source === "Lunch Break In" || record.source === "Off the Phone In"
-                                                        ? "bg-[#10ac84]"
-                                                        : record.source === "Break Out" || record.source === "Lunch Break Out"
-                                                            ? "bg-[#f59e0b]"
-                                                            : "bg-[#ee5253]",
+                                                    "flex size-9 shrink-0 items-center justify-center rounded-lg text-white",
+                                                    eventColor,
                                                 ].join(" ")}
                                             >
                                                 {record.source === "Off the Phone Out"
@@ -1049,8 +1069,8 @@ export default function AttendancePage() {
                                                             ? <FiLogOut />
                                                             : <FiLogIn />}
                                             </span>
-                                            <div>
-                                                <p className="text-sm font-semibold text-slate-950">{sourceLabel(record.source, true)}</p>
+                                            <div className="min-w-0">
+                                                <p className="text-sm font-semibold text-slate-950">{presentation.label}</p>
                                                 <p className="text-xs text-slate-600">{formatAttendanceDateTime(record.timeIn, attendanceTimeZone)}</p>
                                             </div>
                                         </div>
@@ -1080,7 +1100,7 @@ export default function AttendancePage() {
                                                     {displayedAttendanceStatus}
                                                 </span>
                                             )}
-                                            <span className="rounded-full bg-[#f4efff] px-3 py-1 text-xs font-semibold text-slate-700">{slotLabel || formatDateInTimeZone(record.timeIn, attendanceTimeZone)}</span>
+                                            <span className="employee-attendance-date rounded-full bg-[#f4efff] px-3 py-1 text-xs font-semibold text-slate-700">{slotLabel || formatDateInTimeZone(record.timeIn, attendanceTimeZone)}</span>
                                         </div>
                                     </article>
                                 );

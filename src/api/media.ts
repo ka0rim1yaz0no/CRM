@@ -21,6 +21,7 @@ export async function getMediaAssets() {
 }
 
 export async function uploadMediaAsset({ file, role }: { file: File; role: string }) {
+    if (!file.size || file.size > 50 * 1024 * 1024) throw new Error("Media files must be between 1 byte and 50 MB.");
     const dataUrl = await new Promise<string>((resolve, reject) => {
         const reader = new FileReader();
         reader.onload = () => resolve(String(reader.result || ""));

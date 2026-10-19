@@ -1,4 +1,5 @@
 import { api } from "../lib/api";
+import { getAuthUser } from "./authStorage";
 
 export type NoticeSeverity = "Info" | "Warning" | "Critical";
 
@@ -73,6 +74,10 @@ export async function replyToEmployeeNotice(employeeId: string, noticeId: string
 }
 
 export async function markEmployeeNoticesRead(employeeId: string) {
-    const response = await api.patch<Notice[]>(`/employees/${employeeId}/notices/read`);
+    const auth = getAuthUser();
+    const headers = auth?.userType === "admin"
+        ? { "X-CRM-Admin-Session": auth.sessionToken || "" }
+        : { "X-CRM-Attendance-Session": auth?.attendanceHubSession || "" };
+    const response = await api.patch<Notice[]>(`/employees/${employeeId}/notices/read`, undefined, { headers });
     return response.data;
 }

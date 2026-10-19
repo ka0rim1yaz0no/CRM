@@ -1,0 +1,19 @@
+{
+  "query1": "7152cca70b937aed42a7e0c761a8ac563d33bf9a32868c9e0a4d334d6a3ae0da",
+  "query2": "203702b02f0d550ef58f8c1b95bc58a87f726822896595b3903c31f05e3bb800",
+  "query3": "a74f6216260fc1fdf95bea57b8eaff7ebd9b83f92673f2f6015cff29ff3e4efc",
+  "query4": "228b1daedea2938a218ef602912294c8a276b209ae1aa63a2a0e8e37eefecd17",
+  "markNoticeReadMutation": "45d5fdc2aa20d565a490af97de2eceeb41f7cbfe27544a89fb2de0ecd9e3acd8",
+  "markAllNoticesReadMutation": "76a2a04117a10b642d10a0eac999a0146475458542dd54b2705cc32def6d068d",
+  "acknowledgeNoticeMutation": "c03e6c39df33fb54e5274c115dc93d76840511d19e4f07c9bef0886aab0329ed",
+  "replyNoticeMutation": "7adb909f289e79a5d4018cd9581463daceb4d35ae4c0aade6e4d13570d6d249a",
+  "updateProfileMutation": "addf263f67e70186eb632e3813fa5fbe12725a88a3b5358663f066b1816fec99",
+  "createLeaveRequestMutation": "fc79e3bc79b88d2a0944f0b8c85f0b9f54b427b29ed17fefeb2ab3cf666ff671",
+  "updateLeaveRequestMutation": "5c7b144e211495cb16fa6adc908856d08656114758bde0fc35b1685def9d18aa",
+  "replyLeaveRequestMutation": "ea73e7218a96444f2e486bce5de222411ed0ee5fd6d167664b869d38c9796e89",
+  "updateProfileForm": "ef276b7c0bbdd682be708ceac5568639f09552e7cdd15c5f8ad5511558da78af",
+  "updateProfileImage": "0dbe489ba32cdccc00ab09ba1d9cb92502bb648e8c5e5d8f88fceb2100f3f651",
+  "toggleLeaveDate": "6b99f4d8a34b2d681941fded8b61826c7872beb7cccf2fae46feed31e73b4e6d",
+  "submitLeaveRequest": "789dfbe0e8f26ed00d1626df84428a9d363d5d0b02d88213f1bedae6adf672d3",
+  "startEditLeaveRequest": "6c25d961f2dcdfd5029c86729ccdf5d35b3b5d183b2997f57ae1e325a911b391"
+}

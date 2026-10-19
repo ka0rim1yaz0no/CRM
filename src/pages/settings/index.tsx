@@ -15,7 +15,7 @@ import { getAuthUser } from "../../api/authStorage";
 import { getEmployeeSummary, normalizeEmployeeAvailabilityStatus } from "../../api/employees";
 import { getNextAutoCallLead } from "../../api/leads";
 import { getSystemSettings } from "../../api/systemSettings";
-import { getStoredThemeKey, hasAppThemeOverride, setAppTheme } from "../../components/ThemeProvider";
+import { getStoredThemeKey, hasAppThemeOverride, setAppTheme } from "../../lib/appTheme";
 import { isWithinAutoCallWindow } from "../../lib/employeeAutoCall";
 import { defaultThemeKey, themeOptions, type ThemeKey } from "../../lib/themes";
 import MainLayout from "../layout";

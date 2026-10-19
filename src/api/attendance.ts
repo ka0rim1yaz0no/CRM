@@ -1,5 +1,6 @@
 import { api } from "../lib/api";
 import { getAuthUser } from "./authStorage";
+import { attendanceIntegrityEnabled, attendanceSessionHeaders, getAttendanceSession, performAttendanceAction, sessionEventRecord, type AttendanceSessionSnapshot } from "./attendanceSession";
 
 const attendanceV2 = import.meta.env.VITE_CRM_ATTENDANCE_V2 === "true" ||
     (import.meta.env.DEV && import.meta.env.VITE_CRM_ATTENDANCE_V2 !== "false");
@@ -13,6 +14,7 @@ function adminAttendanceHeaders() {
 }
 
 export type AttendanceRecord = {
+    sequence?: number;
     _id: string;
     employee: string;
     timeIn: string;
@@ -30,6 +32,7 @@ export type AttendanceRecord = {
     attendanceStatus?: "On time" | "Late" | "Undertime" | "";
     isArchived?: boolean;
     syncPending?: boolean;
+    sessionSnapshot?: AttendanceSessionSnapshot;
     createdAt: string;
 };
 
@@ -38,6 +41,7 @@ export type AttendanceInput = Pick<AttendanceRecord, "source"> & {
 };
 
 export type AttendanceQuery = {
+    businessId?: string;
     archived?: boolean;
     all?: boolean;
     limit?: number;
@@ -46,7 +50,14 @@ export type AttendanceQuery = {
 };
 
 export async function getEmployeeAttendance(employeeId: string, params: AttendanceQuery = {}) {
+    if (attendanceIntegrityEnabled) {
+        const snapshot = await getAttendanceSession(employeeId, params.businessId);
+        const records = snapshot.records.map((event) => sessionEventRecord(event, employeeId)).reverse()
+            .filter((record) => (!params.from || record.timeIn >= params.from) && (!params.to || record.timeIn <= params.to));
+        return params.all ? records : records.slice(0, params.limit || 300);
+    }
     const response = await api.get<AttendanceRecord[]>(`/employees/${employeeId}/attendance`, {
+        headers: { ...attendanceSessionHeaders(), ...(params.businessId ? { "X-Business-Id": params.businessId } : {}) },
         params: params.all ? params : { limit: params.limit ?? 300, ...params },
     });
     return response.data;
@@ -54,6 +65,7 @@ export async function getEmployeeAttendance(employeeId: string, params: Attendan
 
 export async function getEmployeesAttendance(employeeIds: string[], params: Pick<AttendanceQuery, "all" | "from" | "to"> = {}) {
     const response = await api.get<AttendanceRecord[]>("/attendance", {
+        headers: attendanceSessionHeaders(),
         params: { employeeIds: employeeIds.join(","), ...params },
     });
     return response.data;
@@ -86,39 +98,56 @@ export async function archiveEmployeeAttendance(employeeId: string, attendanceId
 }
 
 export async function timeInEmployee(employeeId: string) {
-    const response = await api.post<AttendanceRecord>(`/employees/${employeeId}/attendance/time-in`, attendanceEventPayload());
+    if (attendanceIntegrityEnabled) return runSessionAction(employeeId, "Time In");
+    const response = await api.post<AttendanceRecord>(`/employees/${employeeId}/attendance/time-in`, attendanceEventPayload(), { headers: attendanceSessionHeaders() });
     return response.data;
 }
 
 export async function timeOutEmployee(employeeId: string) {
+    if (attendanceIntegrityEnabled) return runSessionAction(employeeId, "Time Out");
     const response = await api.post<AttendanceRecord>(`/employees/${employeeId}/attendance/time-out`, {
         intent: "manual-attendance-time-out",
         ...attendanceEventPayload(),
-    });
+    }, { headers: attendanceSessionHeaders() });
     return response.data;
 }
 
 export async function breakOutEmployee(employeeId: string) {
-    const response = await api.post<AttendanceRecord>(`/employees/${employeeId}/attendance/break-out`, attendanceEventPayload());
+    if (attendanceIntegrityEnabled) return runSessionAction(employeeId, "Break Out");
+    const response = await api.post<AttendanceRecord>(`/employees/${employeeId}/attendance/break-out`, attendanceEventPayload(), { headers: attendanceSessionHeaders() });
     return response.data;
 }
 
 export async function breakInEmployee(employeeId: string) {
-    const response = await api.post<AttendanceRecord>(`/employees/${employeeId}/attendance/break-in`, attendanceEventPayload());
+    if (attendanceIntegrityEnabled) return runSessionAction(employeeId, "Break In");
+    const response = await api.post<AttendanceRecord>(`/employees/${employeeId}/attendance/break-in`, attendanceEventPayload(), { headers: attendanceSessionHeaders() });
     return response.data;
 }
 
 export async function lunchBreakOutEmployee(employeeId: string) {
-    const response = await api.post<AttendanceRecord>(`/employees/${employeeId}/attendance/lunch-break-out`, attendanceEventPayload());
+    if (attendanceIntegrityEnabled) return runSessionAction(employeeId, "Lunch Break Out");
+    const response = await api.post<AttendanceRecord>(`/employees/${employeeId}/attendance/lunch-break-out`, attendanceEventPayload(), { headers: attendanceSessionHeaders() });
     return response.data;
 }
 
 export async function lunchBreakInEmployee(employeeId: string) {
-    const response = await api.post<AttendanceRecord>(`/employees/${employeeId}/attendance/lunch-break-in`, attendanceEventPayload());
+    if (attendanceIntegrityEnabled) return runSessionAction(employeeId, "Lunch Break In");
+    const response = await api.post<AttendanceRecord>(`/employees/${employeeId}/attendance/lunch-break-in`, attendanceEventPayload(), { headers: attendanceSessionHeaders() });
     return response.data;
 }
 
 export async function reportEmployeeActivity(employeeId: string, state: "active" | "idle", options: { idleStartedAt?: string; reason?: string } = {}) {
-    const response = await api.post<{ availabilityStatus: string; attendanceRecords?: AttendanceRecord[] }>(`/employees/${employeeId}/activity`, { state, ...options });
+    if (attendanceIntegrityEnabled) {
+        const record = await runSessionAction(employeeId, state === "idle" ? "Off the Phone Out" : "Off the Phone In");
+        return { availabilityStatus: record.sessionSnapshot!.state, attendanceRecords: [record] };
+    }
+    const response = await api.post<{ availabilityStatus: string; attendanceRecords?: AttendanceRecord[] }>(`/employees/${employeeId}/activity`, { state, ...options }, { headers: attendanceSessionHeaders() });
     return response.data;
+}
+
+async function runSessionAction(employeeId: string, source: AttendanceRecord["source"]): Promise<AttendanceRecord> {
+    const snapshot = await performAttendanceAction(employeeId, source);
+    const event = [...snapshot.records].reverse().find((item) => item.source === source);
+    if (!event) throw new Error("The saved attendance result could not be confirmed. Refresh attendance.");
+    return { ...sessionEventRecord(event, employeeId), sessionSnapshot: snapshot, syncPending: snapshot.syncPending };
 }

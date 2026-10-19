@@ -15,6 +15,7 @@ import {
     FiFileText,
     FiMessageCircle,
     FiPhoneCall,
+    FiRefreshCw,
     FiTarget,
     FiX,
 } from "react-icons/fi";
@@ -24,10 +25,13 @@ import { getEmployeeNotices } from "../api/notices";
 import { getAgentLeadDashboard, getEmployeeLeadLogs, getMyLeadCallSummary, getMyLeadCounts, getMyLeads, type AgentLeadMonthlyRow, type AgentLeadProgress, type EmployeeLeadLog, type LeadCallStat, type LeadCountResult, type LeadStatus } from "../api/leads";
 import { getTasks, type CrmTask, type TaskStatus } from "../api/tasks";
 import { getKnowledgeBaseEntries, type KnowledgeBaseEntry } from "../api/knowledgeBase";
-import { formatPhDate, formatPhDateTime, formatPhTime } from "../lib/dateTime";
+import { formatPhDate, formatPhDateTime, formatPhTime, formatPhDateTimeInput, parsePhDateTimeInput } from "../lib/dateTime";
 import { isAttendanceTimeOutUndertime } from "../lib/attendanceSlots";
 import { getPlainTextFromRichText } from "../lib/richText";
 import { getAuthUser } from "../api/authStorage";
+import { getActiveBusinessId } from "../api/businessStorage";
+import { attendanceIntegrityEnabled, getAttendanceSession, sessionEventRecord, type AttendanceSessionSnapshot } from "../api/attendanceSession";
+import { compareAttendanceRecords } from "../lib/attendancePresentation";
 
 type WorkspaceDashboardProps = {
     userName: string;
@@ -93,7 +97,7 @@ const priorityClass: Record<string, string> = {
     Urgent: "border-rose-200 bg-rose-50 text-rose-700",
 };
 
-const dashboardOverviewPanelClass = "min-h-[17rem] rounded-lg border border-slate-200 bg-white p-5 shadow-sm";
+const dashboardOverviewPanelClass = "rounded-lg border border-slate-200 bg-white p-5 shadow-sm";
 
 function formatNumber(value?: number) {
     return numberFormatter.format(value || 0);
@@ -193,7 +197,7 @@ function leadCount(counts: LeadCountResult | undefined, key: LeadStatus | "ALL" 
 }
 
 function latestAttendance(records: AttendanceRecord[]) {
-    return [...records].sort((first, second) => new Date(second.timeIn || second.createdAt).getTime() - new Date(first.timeIn || first.createdAt).getTime());
+    return [...records].sort((first, second) => compareAttendanceRecords(second, first));
 }
 
 function statusBadgeClass(value?: string) {
@@ -217,7 +221,7 @@ function StatCard({ stat }: { stat: DashboardStat }) {
     const Icon = stat.icon;
 
     return (
-        <article className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
+        <article className="employee-stat rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
             <div className="flex items-start justify-between gap-4">
                 <span className={`flex size-11 items-center justify-center rounded-lg border ${statToneClass[stat.tone]}`}>
                     <Icon className="size-5" aria-hidden="true" />
@@ -392,6 +396,8 @@ function QualifiedLeadsModal({ row, onClose }: { row: AgentLeadMonthlyRow; onClo
 }
 
 function EmployeeAgentProductivity() {
+    const identity = getAuthUser();
+    const employeeId = identity?.userType === "employee" ? identity.user._id : "";
     const [selectedMonth, setSelectedMonth] = useState(() => getMonthInputValue(new Date()));
     const [isMonthMenuOpen, setIsMonthMenuOpen] = useState(false);
     const [agentPage, setAgentPage] = useState(1);
@@ -400,13 +406,13 @@ function EmployeeAgentProductivity() {
     const selectedMonthlyRange = useMemo(() => getMonthlyDashboardDateRange(selectedMonth), [selectedMonth]);
     const monthlyRangeLabel = useMemo(() => formatDateRangeLabel(selectedMonthlyRange.dateFrom, selectedMonthlyRange.dateTo), [selectedMonthlyRange]);
     const dashboardQuery = useQuery({
-        queryKey: ["employee-agent-lead-dashboard", selectedMonth, selectedMonthlyRange.dateFrom, selectedMonthlyRange.dateTo],
+        queryKey: ["employee-agent-lead-dashboard", getActiveBusinessId(), employeeId, selectedMonth, selectedMonthlyRange.dateFrom, selectedMonthlyRange.dateTo],
         queryFn: () => getAgentLeadDashboard({ month: selectedMonth, dateFrom: selectedMonthlyRange.dateFrom, dateTo: selectedMonthlyRange.dateTo }),
         refetchInterval: 60_000,
     });
 
-    const agents = dashboardQuery.data?.agents || [];
-    const monthlyAgents = dashboardQuery.data?.monthlyAgents || [];
+    const agents = useMemo(() => dashboardQuery.data?.agents || [], [dashboardQuery.data?.agents]);
+    const monthlyAgents = useMemo(() => dashboardQuery.data?.monthlyAgents || [], [dashboardQuery.data?.monthlyAgents]);
     const monthOptions = useMemo(() => {
         return Array.from(new Set([selectedMonth, dashboardQuery.data?.selectedMonth || "", ...(dashboardQuery.data?.monthOptions || [])]))
             .filter(Boolean)
@@ -587,7 +593,7 @@ function EmployeeAgentProductivity() {
                     </div>
                 </div>
                 <div className="mt-4 overflow-x-auto rounded-lg border border-slate-300 bg-white">
-                    <table className="w-full min-w-0 table-fixed border-separate border-spacing-0">
+                    <table className="w-full min-w-[50rem] table-fixed border-separate border-spacing-0">
                         <colgroup>
                             <col className="w-[31%]" />
                             <col className="w-[10%]" />
@@ -859,6 +865,7 @@ type AttendanceOverBreakRow = {
 };
 
 type AttendanceShiftRow = {
+    allowanceLabel?: string;
     id: string;
     shiftDateValue: string;
     shiftStart: Date;
@@ -918,11 +925,11 @@ function isTimeOutSource(source?: AttendanceRecord["source"]) {
 }
 
 function getChronologicalAttendance(records: AttendanceRecord[]) {
-    return [...records].sort((first, second) => getAttendanceTimestamp(first) - getAttendanceTimestamp(second));
+    return [...records].sort(compareAttendanceRecords);
 }
 
 function getLatestAttendanceInShift(records: AttendanceRecord[]) {
-    return [...records].sort((first, second) => getAttendanceTimestamp(second) - getAttendanceTimestamp(first));
+    return latestAttendance(records);
 }
 
 function findBreakEndRecord(records: AttendanceRecord[], startIndex: number, returnSource: string) {
@@ -1093,15 +1100,26 @@ function buildAttendanceShiftRows(records: AttendanceRecord[]) {
         .sort((first, second) => first.shiftStart.getTime() - second.shiftStart.getTime());
 }
 
-function AttendancePanel({ employee, attendance }: { employee?: Employee | null; attendance: AttendanceRecord[] }) {
-    const status = normalizeEmployeeAvailabilityStatus(employee?.availabilityStatus);
-    const todayDateValue = getCurrentShiftDateValue();
+function AttendancePanel({ employee, attendance, confirmedStatus, session }: { employee?: Employee | null; attendance: AttendanceRecord[]; confirmedStatus?: string; session?: AttendanceSessionSnapshot }) {
+    const status = confirmedStatus || normalizeEmployeeAvailabilityStatus(employee?.availabilityStatus);
+    const todayDateValue = session?.currentShiftDay || getCurrentShiftDateValue();
     const [selectedAttendanceDate, setSelectedAttendanceDate] = useState("");
     const [attendanceDateFrom, setAttendanceDateFrom] = useState("");
     const [attendanceDateTo, setAttendanceDateTo] = useState("");
-    const [selectedShiftRow, setSelectedShiftRow] = useState<AttendanceShiftRow | null>(null);
+    const [selectedShiftId, setSelectedShiftId] = useState<string | null>(null);
     const sortedAllAttendance = useMemo(() => latestAttendance(attendance), [attendance]);
-    const allShiftRows = useMemo(() => buildAttendanceShiftRows(sortedAllAttendance), [sortedAllAttendance]);
+    const allShiftRows = useMemo<AttendanceShiftRow[]>(() => session?.dashboardDays ? session.dashboardDays.map((day) => {
+        const ids = new Set(day.eventIds);
+        const records = sortedAllAttendance.filter((record) => ids.has(record._id));
+        return { id: day.dayKey, shiftDateValue: day.dayKey, shiftStart: new Date(day.shiftStart), shiftEnd: new Date(day.shiftEnd),
+            records, overBreakRows: day.overBreakRows, totalOverBreakMs: day.milliseconds.overBreak + day.milliseconds.overLunch,
+            firstTimeIn: records.find((record) => record.timeIn === day.timeIn && isTimeInSource(record.source)) || null,
+            lastTimeOut: records.find((record) => record.timeIn === day.timeOut && isTimeOutSource(record.source)) || null,
+            lateRecords: records.filter((record) => record.attendanceStatus === "Late"),
+            underTimeRecords: records.filter((record) => record.attendanceStatus === "Undertime"),
+            allowanceLabel: `Break ${day.breakMinutes}m · Lunch ${day.lunchMinutes}m` };
+    }) : buildAttendanceShiftRows(sortedAllAttendance), [sortedAllAttendance, session]);
+    const selectedShiftRow = allShiftRows.find((row) => row.id === selectedShiftId) || null;
     const filteredShiftRows = useMemo(() => {
         const exactDateStart = selectedAttendanceDate ? getDateStart(selectedAttendanceDate) : null;
         const exactDateEnd = selectedAttendanceDate ? getDateEnd(selectedAttendanceDate) : null;
@@ -1265,7 +1283,7 @@ function AttendancePanel({ employee, attendance }: { employee?: Employee | null;
                         <p className="text-xs font-semibold uppercase tracking-[0.12em] text-slate-500">Shift Attendance Table</p>
                         <p className="mt-1 text-xs text-slate-500">Click View to open every punch, issue, and break detail inside that shift. {filterSummary}</p>
                     </div>
-                    <span className="rounded-full bg-white px-2.5 py-1 text-[0.65rem] font-bold text-slate-500">Shift 11PM-8AM · Break 15m · Lunch 1h</span>
+                    <span className="rounded-full bg-white px-2.5 py-1 text-[0.65rem] font-bold text-slate-500">Shift 11PM-8AM · Break {session?.allowances?.breakMinutes ?? 15}m · Lunch {session?.allowances?.lunchMinutes ?? 60}m</span>
                 </div>
 
                 <div className="content-scroll max-h-[34rem] overflow-auto">
@@ -1294,8 +1312,8 @@ function AttendancePanel({ employee, attendance }: { employee?: Employee | null;
                         </thead>
                         <tbody className="divide-y divide-slate-200">
                             {filteredShiftRows.map((row) => (
-                                <tr key={row.id} className="text-slate-700 transition hover:bg-violet-50/40" onClick={() => setSelectedShiftRow(row)}>
-                                    <td className="px-3 py-3 font-semibold text-slate-900">{formatDateOrDash(row.shiftDateValue)}</td>
+                                <tr key={row.id} className="text-slate-700 transition hover:bg-violet-50/40" onClick={() => setSelectedShiftId(row.id)}>
+                                    <td className="px-3 py-3 font-semibold text-slate-900"><button type="button" className="underline underline-offset-4" aria-label={`View attendance for ${formatDateOrDash(row.shiftDateValue)}`} onClick={(event) => { event.stopPropagation(); setSelectedShiftId(row.id); }}>{formatDateOrDash(row.shiftDateValue)}</button></td>
                                     <td className="px-3 py-3">
                                         <p className="font-semibold text-slate-950">{getShiftLabel(row)}</p>
                                         <p className="mt-0.5 text-xs text-slate-500">11:00 PM to 8:00 AM next day</p>
@@ -1340,7 +1358,7 @@ function AttendancePanel({ employee, attendance }: { employee?: Employee | null;
             {selectedShiftRow && (
                 <AttendanceShiftDetailsModal
                     row={selectedShiftRow}
-                    onClose={() => setSelectedShiftRow(null)}
+                    onClose={() => setSelectedShiftId(null)}
                 />
             )}
         </section>
@@ -1348,9 +1366,7 @@ function AttendancePanel({ employee, attendance }: { employee?: Employee | null;
 }
 
 function AttendanceShiftDetailsModal({ row, onClose }: { row: AttendanceShiftRow; onClose: () => void }) {
-    const chronologicalShiftRecords = [...row.records].sort(
-        (first, second) => getAttendanceTimestamp(first) - getAttendanceTimestamp(second)
-    );
+    const chronologicalShiftRecords = getChronologicalAttendance(row.records);
     const chronologicalOverBreakRows = [...row.overBreakRows].sort(
         (first, second) => getDateValue(first.startedAt) - getDateValue(second.startedAt)
     );
@@ -1469,7 +1485,7 @@ function AttendanceShiftDetailsModal({ row, onClose }: { row: AttendanceShiftRow
                     <div className="mt-5 rounded-lg border border-slate-300 bg-white p-4">
                         <div className="flex flex-wrap items-center justify-between gap-3">
                             <p className="text-xs font-semibold uppercase tracking-[0.12em] text-slate-500">Over Break Details</p>
-                            <span className="rounded-full bg-slate-100 px-2.5 py-1 text-[0.65rem] font-bold text-slate-500">Break 15m · Lunch 1h</span>
+                            <span className="rounded-full bg-slate-100 px-2.5 py-1 text-[0.65rem] font-bold text-slate-500">{row.allowanceLabel || "Break 15m · Lunch 1h"}</span>
                         </div>
 
                         <div className="mt-3 space-y-2">
@@ -2105,13 +2121,6 @@ function getDateEnd(value: string) {
 
 
 // date picker helper
-function formatTimeInputValue(date: Date) {
-    const hours = String(date.getHours()).padStart(2, "0");
-    const minutes = String(date.getMinutes()).padStart(2, "0");
-
-    return `${hours}:${minutes}`;
-}
-
 function combineDateAndTime(dateValue: string, timeValue: string) {
     if (!dateValue) {
         return "";
@@ -2218,9 +2227,10 @@ void filterLeadCallStatsByDateTimeRange;
 
 export default function WorkspaceDashboard({ userName, employee }: WorkspaceDashboardProps) {
     const employeeId = employee?._id || "";
+    const businessId = getActiveBusinessId();
 
     const employeeQuery = useQuery({
-        queryKey: ["employee-dashboard-profile", employeeId],
+        queryKey: ["employee", employeeId, businessId],
         queryFn: () => getEmployeeSummary(employeeId),
         enabled: Boolean(employeeId),
     });
@@ -2230,43 +2240,49 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
     const namesKey = names.join("|");
 
     const tasksQuery = useQuery({
-        queryKey: ["employee-dashboard-tasks", employeeId],
+        queryKey: ["employee-dashboard-tasks", employeeId, businessId],
         queryFn: () => getTasks({ assignedTo: employeeId }),
         enabled: Boolean(employeeId),
     });
 
     const leadCountsQuery = useQuery({
-        queryKey: ["employee-dashboard-lead-counts", employeeId, namesKey],
+        queryKey: ["employee-dashboard-lead-counts", employeeId, businessId, namesKey],
         queryFn: () => getMyLeadCounts({ employeeId, employeeNames: names }),
         enabled: Boolean(employeeId),
     });
 
     const queueQuery = useQuery({
-        queryKey: ["employee-dashboard-lead-queue", employeeId, namesKey],
+        queryKey: ["employee-dashboard-lead-queue", employeeId, businessId, namesKey],
         queryFn: () => getMyLeads({ employeeId, employeeNames: names, page: 1, limit: 6, tab: "my" }),
         enabled: Boolean(employeeId),
     });
 
     const logsQuery = useQuery({
-        queryKey: ["employee-dashboard-lead-logs", currentEmployee?.name || userName],
+        queryKey: ["employee-dashboard-lead-logs", businessId, employeeId, currentEmployee?.name || userName],
         queryFn: () => getEmployeeLeadLogs({ employee: currentEmployee?.name || userName, limit: 6 }),
         enabled: Boolean(currentEmployee?.name || userName),
     });
 
     const noticesQuery = useQuery({
-        queryKey: ["employee-dashboard-notices", employeeId],
+        queryKey: ["employee-notices", employeeId],
         queryFn: () => getEmployeeNotices(employeeId),
         enabled: Boolean(employeeId),
     });
 
     const attendanceQuery = useQuery({
-        queryKey: ["employee-dashboard-attendance", employeeId],
-        queryFn: () => getEmployeeAttendance(employeeId, { limit: 120 }),
-        enabled: Boolean(employeeId),
+        queryKey: ["employee-dashboard-attendance", employeeId, businessId],
+        queryFn: () => getEmployeeAttendance(employeeId, { all: true, businessId }),
+        enabled: Boolean(employeeId) && !attendanceIntegrityEnabled,
+    });
+    const sessionQuery = useQuery({
+        queryKey: ["attendance-session", businessId, employeeId],
+        queryFn: () => getAttendanceSession(employeeId, businessId),
+        enabled: Boolean(employeeId) && attendanceIntegrityEnabled,
+        refetchInterval: 30_000,
     });
 
     const announcementsQuery = useQuery({
-        queryKey: ["employee-dashboard-announcements"],
+        queryKey: ["employee-dashboard-announcements", businessId, employeeId],
         queryFn: () => getKnowledgeBaseEntries("Article"),
         enabled: Boolean(employeeId),
     });
@@ -2275,40 +2291,45 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
     const announcements = announcementsQuery.data || [];
     const counts = leadCountsQuery.data;
     const notices = noticesQuery.data || [];
-    const attendance = attendanceQuery.data || [];
+    const attendance = useMemo(() => attendanceIntegrityEnabled
+        ? (sessionQuery.data?.records || []).map((event) => sessionEventRecord(event, employeeId)).reverse()
+        : attendanceQuery.data || [], [sessionQuery.data, attendanceQuery.data, employeeId]);
+    const confirmedStatus = attendanceIntegrityEnabled ? sessionQuery.isError ? "UNKNOWN" : sessionQuery.data?.state || "CHECKING" : undefined;
     const queueLeads = queueQuery.data?.leads || [];
     const recentLogs = logsQuery.data || [];
     const openTasks = countOpenTasks(tasks);
     const dueTasks = countDueTasks(tasks);
     const unreadNotices = countUnreadNotices(notices);
-    const isLoading = tasksQuery.isLoading || leadCountsQuery.isLoading || queueQuery.isLoading || noticesQuery.isLoading || attendanceQuery.isLoading || announcementsQuery.isLoading;
-    const hasError = tasksQuery.isError || leadCountsQuery.isError || queueQuery.isError || noticesQuery.isError || attendanceQuery.isError || announcementsQuery.isError;
+    const attendanceLoading = attendanceIntegrityEnabled ? sessionQuery.isLoading : attendanceQuery.isLoading;
+    const attendanceError = attendanceIntegrityEnabled ? sessionQuery.isError : attendanceQuery.isError;
+    const isLoading = tasksQuery.isLoading || leadCountsQuery.isLoading || queueQuery.isLoading || noticesQuery.isLoading || attendanceLoading || announcementsQuery.isLoading;
+    const hasError = employeeQuery.isError || logsQuery.isError || tasksQuery.isError || leadCountsQuery.isError || queueQuery.isError || noticesQuery.isError || attendanceError || announcementsQuery.isError;
 
     const stats: DashboardStat[] = [
         {
             label: "Assigned Leads",
-            value: leadCount(counts, "ALL"),
+            value: leadCountsQuery.isError && !counts ? "Unavailable" : leadCount(counts, "ALL"),
             detail: `${leadCount(counts, "Follow up")} follow-ups in queue`,
             tone: "violet",
             icon: FiTarget,
         },
         {
             label: "Contacted Today",
-            value: leadCount(counts, "ContactedToday"),
+            value: leadCountsQuery.isError && !counts ? "Unavailable" : leadCount(counts, "ContactedToday"),
             detail: "Leads already touched today",
             tone: "emerald",
             icon: FiPhoneCall,
         },
         {
             label: "Open Tasks",
-            value: openTasks,
+            value: tasksQuery.isError && !tasksQuery.data ? "Unavailable" : openTasks,
             detail: `${tasks.filter((task) => task.status === "In Progress").length} in progress`,
             tone: "sky",
             icon: FiBriefcase,
         },
         {
             label: "Due / Unread",
-            value: `${dueTasks}/${unreadNotices}`,
+            value: (tasksQuery.isError && !tasksQuery.data) || (noticesQuery.isError && !noticesQuery.data) ? "Unavailable" : `${dueTasks}/${unreadNotices}`,
             detail: "Due tasks / unread notices",
             tone: dueTasks || unreadNotices ? "amber" : "emerald",
             icon: dueTasks || unreadNotices ? FiAlertCircle : FiCheckCircle,
@@ -2440,19 +2461,19 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
 
     const [callFilterTimeTo, setCallFilterTimeTo] = useState("08:00");
 
+    const callFrom = callFilterDateFrom ? parsePhDateTimeInput(`${callFilterDateFrom}T${callFilterTimeFrom || "00:00"}`) : null;
+    const callTo = callFilterDateTo ? parsePhDateTimeInput(`${callFilterDateTo}T${callFilterTimeTo || "23:59"}`) : null;
+    const invalidCallRange = Boolean((callFilterDateFrom && !callFrom) || (callFilterDateTo && !callTo) || (callFrom && callTo && callFrom > callTo));
+
 
     const leadCallStatsQuery = useQuery({
-        queryKey: ["lead-call-summary", "me", authEmployeeId, callFilterDateFrom, callFilterTimeFrom, callFilterDateTo, callFilterTimeTo],
+        queryKey: ["lead-call-summary", "me", authEmployeeId, businessId, callFilterDateFrom, callFilterTimeFrom, callFilterDateTo, callFilterTimeTo],
         queryFn: () => getMyLeadCallSummary({
             employeeId: authEmployeeId,
-            from: callFilterDateFrom
-                ? new Date(combineDateAndTime(callFilterDateFrom, callFilterTimeFrom || "00:00")).toISOString()
-                : undefined,
-            to: callFilterDateTo
-                ? new Date(combineDateAndTime(callFilterDateTo, callFilterTimeTo || "23:59")).toISOString()
-                : undefined,
+            from: callFrom?.toISOString(),
+            to: callTo?.toISOString(),
         }),
-        enabled: Boolean(authEmployeeId),
+        enabled: Boolean(authEmployeeId) && !invalidCallRange,
         refetchInterval: 60_000,
     });
 
@@ -2498,27 +2519,22 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
     };
 
     const applyTodayCallFilter = () => {
-        const today = new Date();
-        const tomorrow = new Date(today);
-
-        tomorrow.setDate(tomorrow.getDate() + 1);
-
-        setCallFilterDateFrom(formatDateInputValue(today));
+        const today = formatPhDateTimeInput(new Date()).slice(0, 10);
+        const tomorrow = formatPhDateTimeInput(new Date(new Date(`${today}T00:00:00+08:00`).getTime() + 86_400_000)).slice(0, 10);
+        setCallFilterDateFrom(today);
         setCallFilterTimeFrom("23:00");
 
-        setCallFilterDateTo(formatDateInputValue(tomorrow));
+        setCallFilterDateTo(tomorrow);
         setCallFilterTimeTo("08:00");
     };
 
     const applyThisMonthCallFilter = () => {
-        const today = new Date();
-        const firstDay = new Date(today.getFullYear(), today.getMonth(), 1);
-
-        setCallFilterDateFrom(formatDateInputValue(firstDay));
+        const today = formatPhDateTimeInput(new Date());
+        setCallFilterDateFrom(`${today.slice(0, 7)}-01`);
         setCallFilterTimeFrom("00:00");
 
-        setCallFilterDateTo(formatDateInputValue(today));
-        setCallFilterTimeTo(formatTimeInputValue(today));
+        setCallFilterDateTo(today.slice(0, 10));
+        setCallFilterTimeTo(today.slice(11, 16));
     };
 
     if (!employeeId) {
@@ -2532,16 +2548,15 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
 
 
     return (
-        <section className="space-y-5 text-slate-950">
+        <section className="employee-dashboard space-y-5 text-slate-950">
             <div className="flex flex-wrap items-start justify-between gap-4">
                 <div>
                     <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Employee Workspace</p>
                     <h1 className="mt-1 text-2xl font-semibold text-slate-950">Welcome back, {currentEmployee?.name || userName}</h1>
-                    <p className="mt-1 text-sm text-slate-600">Your leads, tasks, attendance, and notices are loaded from the CRM database in PH time.</p>
                 </div>
                 <div className="flex flex-wrap gap-2">
-                    <span className={`inline-flex h-10 items-center rounded-lg border px-3 text-sm font-bold ${statusBadgeClass(currentEmployee?.availabilityStatus)}`}>
-                        {normalizeEmployeeAvailabilityStatus(currentEmployee?.availabilityStatus)}
+                    <span className={`inline-flex h-10 items-center rounded-lg border px-3 text-sm font-bold ${statusBadgeClass(confirmedStatus || currentEmployee?.availabilityStatus)}`}>
+                        {confirmedStatus || normalizeEmployeeAvailabilityStatus(currentEmployee?.availabilityStatus)}
                     </span>
                     <Link className="inline-flex h-10 items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 text-sm font-semibold text-slate-700 shadow-sm transition hover:bg-slate-50" to="/attendance">
                         <FiCalendar className="size-4" aria-hidden="true" />
@@ -2551,9 +2566,9 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
             </div>
 
             {isLoading && <p className="rounded-lg border border-slate-200 bg-white p-3 text-sm font-semibold text-slate-600">Loading dashboard data...</p>}
-            {hasError && <p className="rounded-lg border border-rose-200 bg-rose-50 p-3 text-sm font-semibold text-rose-700">Some dashboard data could not be loaded. The available sections are still shown.</p>}
+            {hasError && <p role="alert" className="rounded-lg border border-rose-200 bg-rose-50 p-3 text-sm font-semibold text-rose-700">Some dashboard data could not be loaded.<button type="button" className="employee-dashboard-retry" onClick={() => { for (const query of [employeeQuery, logsQuery, tasksQuery, leadCountsQuery, queueQuery, noticesQuery, announcementsQuery, attendanceIntegrityEnabled ? sessionQuery : attendanceQuery]) void query.refetch(); }}><FiRefreshCw aria-hidden="true" />Retry</button></p>}
 
-            <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+            <div className="employee-dashboard-stats grid gap-4 md:grid-cols-2 xl:grid-cols-4">
                 {stats.map((stat) => (
                     <StatCard key={stat.label} stat={stat} />
                 ))}
@@ -2566,7 +2581,7 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
                 </div>
 
                 {/* Call logger */}
-                <div className="flex w-full flex-col col-span-2 rounded-lg border border-slate-200 bg-white p-4 text-slate-950 shadow-sm">
+                <div className="employee-call-counts flex min-w-0 w-full flex-col xl:col-span-2 rounded-lg border border-slate-200 bg-white p-4 text-slate-950 shadow-sm">
                     <div className="flex flex-wrap items-center justify-between gap-3 py-4 pb-6">
                         <div>
                             <p className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">
@@ -2683,7 +2698,7 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
                         </div>
                     </div>
 
-                    {!authEmployeeId ? (
+                    {invalidCallRange ? <p role="alert" className="py-4 text-sm text-rose-600">Choose a valid date range with From before To.</p> : leadCallStatsQuery.isError ? <p role="alert" className="py-4 text-sm text-rose-600">Call counts could not load.<button type="button" className="employee-dashboard-retry" onClick={() => void leadCallStatsQuery.refetch()}><FiRefreshCw aria-hidden="true" />Retry</button></p> : !authEmployeeId ? (
                         <div className="mt-4">
                             <EmptyPanel
                                 title="User not found"
@@ -2858,7 +2873,7 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
                     </div>
                     <div className="mt-5 space-y-3">
                         {notices.slice(0, 4).map((notice) => (
-                            <article key={notice._id} className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                            <Link key={notice._id} to={notice.href || `/profile?tab=notices&notice=${encodeURIComponent(notice._id)}`} className="block rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
                                 <div className="flex items-start justify-between gap-3">
                                     <div className="min-w-0">
                                         <p className="truncate text-sm font-semibold text-slate-950">{notice.title}</p>
@@ -2867,14 +2882,14 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
                                     <span className="shrink-0 rounded-full bg-white px-2 py-1 text-[0.65rem] font-bold uppercase tracking-[0.08em] text-slate-600">{notice.severity}</span>
                                 </div>
                                 <p className="mt-2 text-xs text-slate-500">{formatPhDateTime(notice.createdAt)}</p>
-                            </article>
+                            </Link>
                         ))}
                         {notices.length === 0 && <p className="rounded-lg border border-dashed border-slate-300 bg-slate-50 p-4 text-sm text-slate-500">No admin notices yet.</p>}
                     </div>
                 </section>
             </div>
             <MyTasksTable tasks={tasks} />
-            <AttendancePanel employee={currentEmployee} attendance={attendance} />
+            {!attendanceLoading && !attendanceError && <AttendancePanel employee={currentEmployee} attendance={attendance} confirmedStatus={confirmedStatus} session={sessionQuery.data} />}
 
             {selectedCallEmployeeRow && (
                 <EmployeeLeadCallsModal

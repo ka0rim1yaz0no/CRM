@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { callDashboardStatus, currentAttendanceShift, offPhoneTimeInShift } from "./callDashboardService";
+import { bridgeAvailabilityChangedAt, callDashboardStatus, currentAttendanceShift,
+  offPhoneDashboardClock, offPhoneTimeInShift } from "./callDashboardService";
 
 const at = (value: string) => new Date(value);
 
@@ -32,7 +33,7 @@ test("v2 uses the observed call start, break precedence, and a stale bridge stat
     assert.equal(callDashboardStatus({ ...base, availabilityStatus: "BREAK" }).status, "BREAK");
     const disconnected = callDashboardStatus({ ...base, devices: [{ ...device, lastSeenAt: at("2026-09-15T16:09:00Z") }] });
     assert.equal(disconnected.status, "ONLINE");
-    assert.equal(disconnected.statusStartedAt?.toISOString(), shift.start.toISOString());
+    assert.equal(disconnected.statusStartedAt?.toISOString(), "2026-09-15T16:09:20.000Z");
     assert.equal(callDashboardStatus({ ...base, devices: [] }).status, "ONLINE");
   } finally {
     if (previous === undefined) delete process.env.CRM_CALL_DASHBOARD_V2;
@@ -111,7 +112,7 @@ test("dial launch is provisional until Nextiva activity, and call status stays i
   assert.equal(outside.statusStartedAt, null);
 });
 
-test("v2 keeps online time anchored to attendance while a dial is pending", () => {
+test("v2 starts a pending-dial online timer when the dial begins", () => {
   const previous = process.env.CRM_CALL_DASHBOARD_V2;
   process.env.CRM_CALL_DASHBOARD_V2 = "true";
   try {
@@ -125,11 +126,102 @@ test("v2 keeps online time anchored to attendance while a dial is pending", () =
       now: at("2026-09-15T16:02:00Z"), shift,
     });
     assert.equal(status.status, "ONLINE");
-    assert.equal(status.statusStartedAt?.toISOString(), shift.start.toISOString());
+    assert.equal(status.statusStartedAt?.toISOString(), "2026-09-15T16:01:50.000Z");
   } finally {
     if (previous === undefined) delete process.env.CRM_CALL_DASHBOARD_V2;
     else process.env.CRM_CALL_DASHBOARD_V2 = previous;
   }
+});
+
+test("bridge availability timestamp changes only when readiness or connectivity changes", () => {
+  const previous = { state: "idle", nextivaProcessDetected: true,
+    lastSeenAt: at("2026-10-15T16:52:10Z"),
+    lastBridgeAvailabilityChangedAt: at("2026-10-15T16:50:00Z") };
+  const now = at("2026-10-15T16:52:15Z");
+  assert.equal(bridgeAvailabilityChangedAt(previous, { state: "idle", nextivaProcessDetected: true }, now),
+    previous.lastBridgeAvailabilityChangedAt);
+  assert.equal(bridgeAvailabilityChangedAt(previous, { state: "idle", nextivaProcessDetected: false }, now), now);
+  assert.equal(bridgeAvailabilityChangedAt({ ...previous, lastSeenAt: at("2026-10-15T16:51:50Z") },
+    { state: "idle", nextivaProcessDetected: true }, now), now);
+  assert.equal(bridgeAvailabilityChangedAt(previous, { state: "active", nextivaProcessDetected: true }, now), now);
+  assert.equal(bridgeAvailabilityChangedAt({ ...previous, lastBridgeAvailabilityChangedAt: null },
+    { state: "idle", nextivaProcessDetected: true }, now), now);
+});
+
+test("v2 online timer starts at a bridge availability change, not an earlier time-in", () => {
+  const previous = process.env.CRM_CALL_DASHBOARD_V2;
+  process.env.CRM_CALL_DASHBOARD_V2 = "true";
+  try {
+    const shift = { start: at("2026-10-15T15:00:00Z"), end: at("2026-10-16T00:00:00Z") };
+    const timeIn = at("2026-10-15T16:45:00Z");
+    const changedAt = at("2026-10-15T16:52:30Z");
+    const now = at("2026-10-15T16:52:35Z");
+    const status = callDashboardStatus({ availabilityStatus: "ONLINE",
+      attendance: [{ source: "Time In", timeIn }],
+      devices: [{ bridgeVersion: "0.4.1", state: "idle", audioSessionActive: false,
+        nextivaProcessDetected: false, lastSeenAt: now,
+        lastStateChangedAt: at("2026-10-15T16:52:02Z"),
+        lastBridgeAvailabilityChangedAt: changedAt }],
+      schedule: { lastCallEndedAt: at("2026-10-15T16:52:00Z"),
+        nextCallAllowedAt: at("2026-10-15T16:52:30Z") },
+      now, shift });
+    assert.equal(status.status, "ONLINE");
+    assert.equal(status.statusStartedAt?.toISOString(), changedAt.toISOString());
+  } finally {
+    if (previous === undefined) delete process.env.CRM_CALL_DASHBOARD_V2;
+    else process.env.CRM_CALL_DASHBOARD_V2 = previous;
+  }
+});
+
+test("v2 online timer starts at bridge staleness after an active call", () => {
+  const previous = process.env.CRM_CALL_DASHBOARD_V2;
+  process.env.CRM_CALL_DASHBOARD_V2 = "true";
+  try {
+    const shift = { start: at("2026-10-15T15:00:00Z"), end: at("2026-10-16T00:00:00Z") };
+    const lastSeenAt = at("2026-10-15T16:52:10Z");
+    const status = callDashboardStatus({ availabilityStatus: "ONLINE",
+      attendance: [{ source: "Time In", timeIn: shift.start }],
+      devices: [{ bridgeVersion: "0.4.1", state: "active", audioSessionActive: true,
+        nextivaProcessDetected: true, lastSeenAt,
+        lastStateChangedAt: at("2026-10-15T16:52:00Z"),
+        lastBridgeAvailabilityChangedAt: at("2026-10-15T16:52:00Z") }],
+      now: at("2026-10-15T16:52:35Z"), shift });
+    assert.equal(status.status, "ONLINE");
+    assert.equal(status.statusStartedAt?.toISOString(), "2026-10-15T16:52:30.000Z");
+  } finally {
+    if (previous === undefined) delete process.env.CRM_CALL_DASHBOARD_V2;
+    else process.env.CRM_CALL_DASHBOARD_V2 = previous;
+  }
+});
+
+test("v2 unavailable-bridge timer starts when call waiting expires", () => {
+  const previous = process.env.CRM_CALL_DASHBOARD_V2;
+  process.env.CRM_CALL_DASHBOARD_V2 = "true";
+  try {
+    const shift = { start: at("2026-10-15T15:00:00Z"), end: at("2026-10-16T00:00:00Z") };
+    const endedAt = at("2026-10-15T16:52:00Z");
+    const waitingUntil = at("2026-10-15T16:52:30Z");
+    const status = callDashboardStatus({ availabilityStatus: "ONLINE",
+      attendance: [{ source: "Time In", timeIn: shift.start }],
+      devices: [], schedule: { lastCallEndedAt: endedAt, nextCallAllowedAt: waitingUntil },
+      now: at("2026-10-15T16:52:35Z"), shift });
+    assert.equal(status.status, "ONLINE");
+    assert.equal(status.statusStartedAt?.toISOString(), waitingUntil.toISOString());
+  } finally {
+    if (previous === undefined) delete process.env.CRM_CALL_DASHBOARD_V2;
+    else process.env.CRM_CALL_DASHBOARD_V2 = previous;
+  }
+});
+
+test("active off-phone time is split so the dashboard can tick it between polls", () => {
+  const clock = offPhoneDashboardClock({ totalMs: 5 * 60_000, state: "offPhone",
+    stateSince: at("2026-10-15T16:28:00Z"), shiftEnd: at("2026-10-16T00:00:00Z"),
+    now: at("2026-10-15T16:30:00Z") });
+  assert.equal(clock.completedMs, 3 * 60_000);
+  assert.equal(clock.activeStartedAt?.toISOString(), "2026-10-15T16:28:00.000Z");
+  assert.deepEqual(offPhoneDashboardClock({ totalMs: 5 * 60_000, state: "online",
+    stateSince: at("2026-10-15T16:28:00Z"), shiftEnd: at("2026-10-16T00:00:00Z"),
+    now: at("2026-10-15T16:30:00Z") }), { completedMs: 5 * 60_000, activeStartedAt: null });
 });
 
 test("call waiting is only the 30 seconds after a call ends", () => {

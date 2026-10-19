@@ -9,6 +9,11 @@ lerna-debug.log*
 
 node_modules
 dist
+dist-*/
+outputs/
+.env
+.env.*
+!.env.example
 callbridge/dist
 callbridge/.package
 dist-ssr

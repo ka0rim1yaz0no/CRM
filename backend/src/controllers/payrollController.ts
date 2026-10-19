@@ -1,4 +1,6 @@
 import type { Request, Response } from "express";
+import { createHash } from "node:crypto";
+import { excessClickedSessionMinutes } from "../services/timeAccounting";
 import type { SortOrder } from "mongoose";
 import { Types } from "mongoose";
 import { getBusinessById, getCurrentBusinessId, runWithBusiness } from "../config/tenancy";
@@ -384,28 +386,7 @@ function shiftHasEnded(slotKey: string, settings?: PayrollCutoffSettings & {
   return nowMinutes !== null && shiftEndMinutes !== null && nowMinutes >= shiftEndMinutes;
 }
 
-function elapsedMinutes(start?: Date | null, end?: Date | null) {
-  if (!start || !end || end <= start) return 0;
-  return Math.max(0, Math.round((end.getTime() - start.getTime()) / 60000));
-}
-
-export function excessClickedSessionMinutes<TRecord extends { source: string; timeIn: Date }>(
-  records: TRecord[],
-  outSource: string,
-  inSource: string,
-  allowanceMinutes: number
-) {
-  let open: Date | null = null;
-  let excess = 0;
-  for (const record of records) {
-    if (record.source === outSource && !open) open = record.timeIn;
-    if (record.source === inSource && open) {
-      excess += Math.max(0, elapsedMinutes(open, record.timeIn) - allowanceMinutes);
-      open = null;
-    }
-  }
-  return excess;
-}
+export { excessClickedSessionMinutes } from "../services/timeAccounting";
 
 export function visiblePayrollDtrRows<TRow extends { status: string }>(rows: TRow[]) {
   return rows.filter((row) => row.status !== "Scheduled");
@@ -509,11 +490,7 @@ function payTypeForCycle(cycle = "Semi-monthly"): PayrollPayType {
   return "Monthly";
 }
 
-function grossPayForCycle(monthlySalary: number, cycle = "Semi-monthly") {
-  if (cycle === "Semi-monthly") return Math.round((monthlySalary / 2) * 100) / 100;
-  if (cycle === "Weekly") return Math.round((monthlySalary / 4) * 100) / 100;
-  return monthlySalary;
-}
+
 
 function roundMoney(value: number) {
   return Math.round(value * 100) / 100;
@@ -802,7 +779,6 @@ export async function syncEmployeePayrollRecords(payPeriod = "", payDate = "", e
   const resolvedPayPeriod = payPeriod || currentPeriod(settings.payrollBillingCycle, settings);
   const resolvedPayType: PayrollPayType = payTypeForCycle(settings.payrollBillingCycle);
   const resolvedPayDate = selectedPayDateLabel(payDate) || scheduledPayDateLabel(settings.payrollBillingCycle, settings, resolvedPayPeriod);
-  const monthlyWorkingDays = monthlyWorkingDaysForPayPeriod(resolvedPayPeriod);
   const employeeFilter: Record<string, unknown> = { status: { $ne: "Archived" } };
   if (employeeCodes.length) employeeFilter.employeeCode = { $in: employeeCodes };
   const employees = await Employee.find(employeeFilter).sort({ employeeCode: 1 });
@@ -863,8 +839,13 @@ export async function syncEmployeePayrollRecords(payPeriod = "", payDate = "", e
       continue;
     }
 
-    records.push(
-      await PayrollRecord.create({
+    // The deterministic _id is Mongo's existing unique fence for concurrent first-use requests.
+    const archived = await PayrollRecord.findOne({ employeeId: employee.employeeCode, payPeriod: resolvedPayPeriod, isArchived: true })
+      .sort({ updatedAt: -1, _id: -1 }).select("_id").lean();
+    const creationId = new Types.ObjectId(createHash("sha256").update(JSON.stringify([
+      getCurrentBusinessId(), employee.employeeCode, resolvedPayPeriod, String(archived?._id || "initial"),
+    ])).digest("hex").slice(0, 24));
+    const createdRecord = await PayrollRecord.findOneAndUpdate({ _id: creationId }, { $setOnInsert: {
         employeeName: employee.name,
         email: String(employee.email || "").trim(),
         employeeId: employee.employeeCode,
@@ -896,8 +877,9 @@ export async function syncEmployeePayrollRecords(payPeriod = "", payDate = "", e
         status: attendance.incompleteShiftDays > 0 || grossPay <= 0 ? "Review" : "Pending",
         paidOn: resolvedPayDate,
         payPeriod: resolvedPayPeriod,
-      })
-    );
+      } }, { upsert: true, returnDocument: "after", runValidators: true, setDefaultsOnInsert: true });
+    if (!createdRecord) throw new Error("The payroll record could not be confirmed. Please refresh payroll.");
+    records.push(createdRecord);
   }
 
   return records;
@@ -946,13 +928,14 @@ function payrollPeriodForAttendanceDate(value: Date, settings: PayrollCutoffSett
 export async function recalculateEmployeePayrollAfterAttendanceEdit(
   employeeObjectId: string,
   previousTime: Date,
-  updatedTime: Date
+  updatedTime: Date,
+  scope?: { businessIds?: string[]; attendanceDates?: Date[] }
 ) {
   const employee = await Employee.findById(employeeObjectId).select("employeeCode status businessAccessIds").lean();
   if (!employee || employee.status === "Archived") return;
 
   const controlledBusinessIds = await getBusinessAccessForEmployeeCode(employee.employeeCode);
-  const businessIds = Array.from(new Set([
+  const businessIds = Array.from(new Set(scope?.businessIds || [
     ...controlledBusinessIds,
     ...normalizeBusinessAccessIds(employee.businessAccessIds),
     getCurrentBusinessId(),
@@ -968,8 +951,7 @@ export async function recalculateEmployeePayrollAfterAttendanceEdit(
 
       const settings = await getSystemSettings();
       const payPeriods = new Set([
-        payrollPeriodForAttendanceDate(previousTime, settings),
-        payrollPeriodForAttendanceDate(updatedTime, settings),
+        ...(scope?.attendanceDates || [previousTime, updatedTime]).map((date) => payrollPeriodForAttendanceDate(date, settings)),
       ]);
 
       for (const payPeriod of payPeriods) {

@@ -61,5 +61,6 @@ const leaveRequestSchema = new Schema<LeaveRequestDocument>(
 
 leaveRequestSchema.index({ employee: 1, createdAt: -1 });
 leaveRequestSchema.index({ status: 1, createdAt: -1 });
+leaveRequestSchema.index({ employee: 1, status: 1, startDate: 1, endDate: 1 });
 
 export const LeaveRequest = tenantModel<LeaveRequestDocument>("LeaveRequest", leaveRequestSchema);

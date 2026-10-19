@@ -193,7 +193,7 @@ export function createSocketServer(httpServer: HttpServer) {
 
     socket.on(
       "presence:register",
-      (_payload: { userType?: "admin" | "employee"; employeeId?: string; employeeName?: string; adminName?: string } = {}) => {
+      () => {
         if (socket.data.authUserType === "admin") {
           socket.join(`business:${socket.data.businessId}:admins`);
           return;

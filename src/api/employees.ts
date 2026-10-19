@@ -79,8 +79,8 @@ function employeeListParams(params?: unknown) {
     };
 }
 
-export async function getEmployees(params?: EmployeeListParams | unknown) {
-    const response = await api.get<Employee[]>("/employees", { params: employeeListParams(params) });
+export async function getEmployees(params?: EmployeeListParams | unknown, options: { businessId?: string } = {}) {
+    const response = await api.get<Employee[]>("/employees", { params: employeeListParams(params), headers: options.businessId ? { "X-Business-Id": options.businessId } : undefined });
     return response.data;
 }
 

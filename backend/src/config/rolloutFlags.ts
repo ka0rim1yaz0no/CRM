@@ -9,3 +9,8 @@ export const callTimingV2Enabled = () => enabled("CRM_CALL_TIMING_V2");
 export const attendanceV2Enabled = () => enabled("CRM_ATTENDANCE_V2");
 export const timeAccountingV2Enabled = () => enabled("CRM_TIME_ACCOUNTING_V2");
 export const callDashboardV2Enabled = () => enabled("CRM_CALL_DASHBOARD_V2");
+export const attendanceHubEnabled = () => enabled("CRM_ATTENDANCE_HUB");
+export const dashboardWorkspaceEnabled = () => enabled("CRM_DASHBOARD_V2");
+export const attendanceIntegrityEnabled = () => enabled("CRM_ATTENDANCE_INTEGRITY");
+export const attendanceActiveSessionEnabled = () => attendanceIntegrityEnabled() || enabled("CRM_ATTENDANCE_ACTIVE_SESSION");
+export const attendanceRecoveryEnvironmentEnabled = () => String(process.env.CRM_ATTENDANCE_RECOVERY_CUTOFF || "").toLowerCase() === "true";

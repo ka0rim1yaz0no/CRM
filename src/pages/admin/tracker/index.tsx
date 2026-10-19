@@ -326,14 +326,14 @@ export default function AdminTracker() {
         refetchInterval: trackerRefetchIntervalMs,
         refetchIntervalInBackground: true,
     });
-    const events = eventsQuery.data || [];
+    const events = useMemo(() => eventsQuery.data || [], [eventsQuery.data]);
     const syntheticSiteVisits = useMemo(() => buildSyntheticSiteVisits(events), [events]);
     const eventRows = useMemo(() => {
         const siteVisits = events.filter((event) => event.eventType === "site_visit");
         const visibleRawEvents = events.filter((event) => !noisyEventTypes.has(event.eventType) && event.eventType !== "site_visit");
         return [...siteVisits, ...syntheticSiteVisits, ...visibleRawEvents].sort((left, right) => dateMs(right.occurredAt) - dateMs(left.occurredAt));
     }, [events, syntheticSiteVisits]);
-    const screenshots = screenshotsQuery.data || [];
+    const screenshots = useMemo(() => screenshotsQuery.data || [], [screenshotsQuery.data]);
     const filteredEvents = useMemo(
         () =>
             eventRows.filter((event) => {

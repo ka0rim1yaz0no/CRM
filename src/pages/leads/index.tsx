@@ -1,5 +1,5 @@
 import type { FormEvent, UIEvent } from "react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FiArchive, FiCalendar, FiCheckCircle, FiClock, FiEdit2, FiMail, FiMessageCircle, FiPhone, FiPlus, FiSave, FiSearch, FiStar, FiUserPlus, FiVoicemail, FiX } from "react-icons/fi";
 import { FaWhatsapp } from "react-icons/fa";
@@ -10,7 +10,7 @@ import { getEmployees, type Employee } from "../../api/employees";
 import { addLeadComment, archiveLead, assignLead, createLead, getLead, getLeadCallStat, getMyLeadCounts, getMyLeads, logConnectedLeadCall, logLeadNotConnected, logLeadVoicemail, recordLeadCall, scheduleLeadFollowUp, toggleLeadFavorite, updateLead, updateLeadStatus, type EmployeeLeadTab, type Lead, type LeadInput, type LeadStatus, type MyLeadsPage } from "../../api/leads";
 import { getSystemSettings } from "../../api/systemSettings";
 import { getLatestCallBridgeAttempt } from "../../api/callBridge";
-import { useToast } from "../../components/ToastProvider";
+import { useToast } from "../../lib/toast";
 import { useFeatureFlags } from "../../hooks/useFeatureFlags";
 import { formatCstDate, formatLeadScheduleDate, formatLeadScheduleDateTime, formatLeadScheduleDateTimeInput, getCurrentLeadScheduleDateTimeInput, parseLeadScheduleDateTimeInput, formatPhDateTime } from "../../lib/dateTime";
 import { clearAutoCallPendingComment, getAutoCallPendingComment, getEmployeeCommentMarker, startAutoCallPendingComment } from "../../lib/employeeAutoCall";
@@ -535,8 +535,8 @@ export default function Leads() {
             }),
         enabled: Boolean(employeeId),
     });
-    const leads = leadPageData?.leads || [];
-    const leadStateOptions = leadPageData?.stateOptions || [];
+    const leads = leadPageData?.leads || EMPTY_QUERY_ROWS;
+    const leadStateOptions = leadPageData?.stateOptions || EMPTY_QUERY_ROWS;
     const { data: requestedLead } = useQuery({
         queryKey: ["lead", requestedLeadId],
         queryFn: () => getLead(requestedLeadId),
@@ -547,7 +547,7 @@ export default function Leads() {
         queryFn: () => getMyLeadCounts({ employeeId, employeeNames: employeeLeadNames, state: leadStateFilter !== "ALL" ? leadStateFilter : undefined }),
         enabled: Boolean(employeeId),
     });
-    const { data: employees = [] } = useQuery({
+    const { data: employees = EMPTY_QUERY_ROWS } = useQuery({
         queryKey: ["employees"],
         queryFn: getEmployees,
     });
@@ -614,7 +614,7 @@ export default function Leads() {
                         .includes(searchText)
                 );
         return isGlobalLeadSearchActive ? searchFilteredLeads : sortEmployeeLeadsForWorkQueue(searchFilteredLeads, queueClock);
-    }, [activeCategoryTab, activeTab, canUseLeadCategories, effectiveLeadSearch, employeeId, isGlobalLeadSearchActive, leads, queueClock, showFavoritesOnly, workedLeadHolds]);
+    }, [activeCategoryTab, activeTab, canUseLeadCategories, effectiveLeadSearch, employeeId, isGlobalLeadSearchActive, leads, queueClock, showFavoritesOnly]);
     const contactedTodayCount = leadCounts.ContactedToday ?? leads.filter((lead) => isNewWorkQueueLead(lead) && isHiddenFromEmployeeQueueToday(lead)).length;
 
     const routeSelectedLead = requestedLeadId
@@ -657,7 +657,8 @@ export default function Leads() {
         }
     };
 
-    const fetchMoreLeads = async () => {
+    const employeeLeadNameKey = employeeLeadNames.join("|");
+    const fetchMoreLeads = useCallback(async () => {
         if (!employeeId || leadFetchInFlightRef.current || !hasMoreLeads) {
             return;
         }
@@ -692,31 +693,46 @@ export default function Leads() {
             leadFetchInFlightRef.current = false;
             setIsFetchingMoreLeads(false);
         }
-    };
+    }, [employeeId, hasMoreLeads, employeeLeadNames, requestedEmployeeLeadTab, effectiveLeadSearch, isGlobalLeadSearchActive, leadStateFilter, queryClient, leadQueryKey, showToast]);
 
+    const [previousLeadPagingScope1, setPreviousLeadPagingScope1] = useState<readonly unknown[] | null>(null);
+    const leadPagingScope1Inputs = [employeeId, employeeLeadNameKey, effectiveLeadSearch, isGlobalLeadSearchActive, leadStateFilter, requestedEmployeeLeadTab];
+    if (previousLeadPagingScope1 === null || leadPagingScope1Inputs.some((input, index) => !Object.is(input, previousLeadPagingScope1[index]))) {
+        setPreviousLeadPagingScope1(leadPagingScope1Inputs);
+        setLeadPage(1);
+        setHasMoreLeads(leadPageData?.hasMore ?? true);
+    }
     useEffect(() => {
         leadPageRef.current = 1;
         leadFetchInFlightRef.current = false;
-        setLeadPage(1);
-        setHasMoreLeads(leadPageData?.hasMore ?? true);
-    }, [employeeId, employeeLeadNames.join("|"), effectiveLeadSearch, isGlobalLeadSearchActive, leadStateFilter, requestedEmployeeLeadTab]);
+    }, [employeeId, employeeLeadNameKey, effectiveLeadSearch, isGlobalLeadSearchActive, leadStateFilter, requestedEmployeeLeadTab]);
 
-    useEffect(() => {
-        if (leadStateFilter === "ALL" || leadStateOptions.length === 0) {
-            return;
-        }
+    const [previousLeadStateSelection, setPreviousLeadStateSelection] = useState<readonly unknown[] | null>(null);
+    const leadStateSelectionInputs = [leadStateFilter, leadStateOptions];
+    if (previousLeadStateSelection === null || leadStateSelectionInputs.some((input, index) => !Object.is(input, previousLeadStateSelection[index]))) {
+        setPreviousLeadStateSelection(leadStateSelectionInputs);
+        (() => {
+            if (leadStateFilter === "ALL" || leadStateOptions.length === 0) {
+                return;
+            }
 
-        if (!leadStateOptions.some((option) => option.code === leadStateFilter)) {
-            setLeadStateFilter("ALL");
-        }
-    }, [leadStateFilter, leadStateOptions]);
+            if (!leadStateOptions.some((option) => option.code === leadStateFilter)) {
+                setLeadStateFilter("ALL");
+            }
+        })();
+    }
 
-    useEffect(() => {
-        if (visibleTabs.length > 0 && !visibleTabs.includes(activeTab)) {
-            setActiveTab(visibleTabs[0]);
-            setActiveCategoryTab("ALL");
-        }
-    }, [activeTab, visibleTabs]);
+    const [previousLeadVisibleTabs, setPreviousLeadVisibleTabs] = useState<readonly unknown[] | null>(null);
+    const leadVisibleTabsInputs = [activeTab, visibleTabs];
+    if (previousLeadVisibleTabs === null || leadVisibleTabsInputs.some((input, index) => !Object.is(input, previousLeadVisibleTabs[index]))) {
+        setPreviousLeadVisibleTabs(leadVisibleTabsInputs);
+        (() => {
+            if (visibleTabs.length > 0 && !visibleTabs.includes(activeTab)) {
+                setActiveTab(visibleTabs[0]);
+                setActiveCategoryTab("ALL");
+            }
+        })();
+    }
 
     const handleLeadListScroll = (event: UIEvent<HTMLDivElement>) => {
         const list = event.currentTarget;
@@ -754,11 +770,16 @@ export default function Leads() {
         setSelectedLeadId(remainingHistory[0] || filteredLeads.find((lead) => lead._id !== leadId)?._id || null);
     };
 
-    useEffect(() => {
-        if (!showLeadMiniTabs) {
-            setLeadHistoryIds([]);
-        }
-    }, [showLeadMiniTabs]);
+    const [previousLeadMiniTabs, setPreviousLeadMiniTabs] = useState<readonly unknown[] | null>(null);
+    const leadMiniTabsInputs = [showLeadMiniTabs];
+    if (previousLeadMiniTabs === null || leadMiniTabsInputs.some((input, index) => !Object.is(input, previousLeadMiniTabs[index]))) {
+        setPreviousLeadMiniTabs(leadMiniTabsInputs);
+        (() => {
+            if (!showLeadMiniTabs) {
+                setLeadHistoryIds([]);
+            }
+        })();
+    }
 
     const invalidateEmployeeLeads = () => {
         void queryClient.invalidateQueries({ queryKey: ["leads", employeeId] });
@@ -1145,21 +1166,36 @@ export default function Leads() {
         }
     };
 
-    useEffect(() => {
-        setDetailDraft(createLeadDetailDraft(selectedLead));
-        setIsDetailEditing(false);
-        setCommentDraft("");
-        setPassAgentId("");
-        setPassConfirm(null);
-    }, [selectedLead?._id]);
+    const [previousLeadDetailDraft, setPreviousLeadDetailDraft] = useState<readonly unknown[] | null>(null);
+    const leadDetailDraftInputs = [selectedLead?._id];
+    if (previousLeadDetailDraft === null || leadDetailDraftInputs.some((input, index) => !Object.is(input, previousLeadDetailDraft[index]))) {
+        setPreviousLeadDetailDraft(leadDetailDraftInputs);
+        (() => {
+            setDetailDraft(createLeadDetailDraft(selectedLead));
+            setIsDetailEditing(false);
+            setCommentDraft("");
+            setPassAgentId("");
+            setPassConfirm(null);
+        })();
+    }
 
-    useEffect(() => {
-        setStatusDraft(selectedLead?.status || "NEW");
-    }, [selectedLead?._id, selectedLead?.status]);
+    const [previousLeadStatusDraft, setPreviousLeadStatusDraft] = useState<readonly unknown[] | null>(null);
+    const leadStatusDraftInputs = [selectedLead?._id, selectedLead?.status];
+    if (previousLeadStatusDraft === null || leadStatusDraftInputs.some((input, index) => !Object.is(input, previousLeadStatusDraft[index]))) {
+        setPreviousLeadStatusDraft(leadStatusDraftInputs);
+        (() => {
+            setStatusDraft(selectedLead?.status || "NEW");
+        })();
+    }
 
-    useEffect(() => {
-        setFollowUpDateTime(formatLeadScheduleDateTimeInput(selectedLead?.followUpAt) || getCurrentLeadScheduleDateTimeInput());
-    }, [selectedLead?._id, selectedLead?.followUpAt]);
+    const [previousLeadScheduleDraft, setPreviousLeadScheduleDraft] = useState<readonly unknown[] | null>(null);
+    const leadScheduleDraftInputs = [selectedLead?._id, selectedLead?.followUpAt];
+    if (previousLeadScheduleDraft === null || leadScheduleDraftInputs.some((input, index) => !Object.is(input, previousLeadScheduleDraft[index]))) {
+        setPreviousLeadScheduleDraft(leadScheduleDraftInputs);
+        (() => {
+            setFollowUpDateTime(formatLeadScheduleDateTimeInput(selectedLead?.followUpAt) || getCurrentLeadScheduleDateTimeInput());
+        })();
+    }
 
     useEffect(() => {
         const timeoutId = window.setTimeout(() => {
@@ -1169,37 +1205,42 @@ export default function Leads() {
         return () => window.clearTimeout(timeoutId);
     }, [leadSearch]);
 
-    useEffect(() => {
-        const routeSearch = searchParams.get("leadSearch") || "";
-        const routeLeadId = searchParams.get("lead") || "";
-        const shouldSearchAll = searchParams.get("scope") === "all" && Boolean(routeSearch);
+    const [previousLeadRoute, setPreviousLeadRoute] = useState<readonly unknown[] | null>(null);
+    const leadRouteInputs = [canViewAllLeads, searchParams];
+    if (previousLeadRoute === null || leadRouteInputs.some((input, index) => !Object.is(input, previousLeadRoute[index]))) {
+        setPreviousLeadRoute(leadRouteInputs);
+        (() => {
+            const routeSearch = searchParams.get("leadSearch") || "";
+            const routeLeadId = searchParams.get("lead") || "";
+            const shouldSearchAll = searchParams.get("scope") === "all" && Boolean(routeSearch);
 
-        if (!shouldSearchAll && !routeLeadId) {
-            return;
-        }
+            if (!shouldSearchAll && !routeLeadId) {
+                return;
+            }
 
-        if (shouldSearchAll) {
-            setLeadSearch(routeSearch);
-            setDebouncedLeadSearch(routeSearch);
-            setIsGlobalLeadSearch(true);
-            setActiveTab("ALL");
-            setShowFavoritesOnly(false);
-            setActiveCategoryTab("ALL");
-        }
-
-        if (routeLeadId) {
-            if (!shouldSearchAll && !canViewAllLeads) {
-                setLeadSearch("");
-                setDebouncedLeadSearch("");
-                setIsGlobalLeadSearch(false);
-                setActiveTab("NEW");
+            if (shouldSearchAll) {
+                setLeadSearch(routeSearch);
+                setDebouncedLeadSearch(routeSearch);
+                setIsGlobalLeadSearch(true);
+                setActiveTab("ALL");
                 setShowFavoritesOnly(false);
                 setActiveCategoryTab("ALL");
             }
 
-            setSelectedLeadId(routeLeadId);
-        }
-    }, [canViewAllLeads, searchParams]);
+            if (routeLeadId) {
+                if (!shouldSearchAll && !canViewAllLeads) {
+                    setLeadSearch("");
+                    setDebouncedLeadSearch("");
+                    setIsGlobalLeadSearch(false);
+                    setActiveTab("NEW");
+                    setShowFavoritesOnly(false);
+                    setActiveCategoryTab("ALL");
+                }
+
+                setSelectedLeadId(routeLeadId);
+            }
+        })();
+    }
 
     useEffect(() => {
         const intervalId = window.setInterval(() => {
@@ -1209,39 +1250,64 @@ export default function Leads() {
         return () => window.clearInterval(intervalId);
     }, []);
 
-    useEffect(() => {
-        if (!canSearchLeads && !isGlobalLeadSearch) {
-            setLeadSearch("");
-            setDebouncedLeadSearch("");
-        }
-    }, [canSearchLeads, isGlobalLeadSearch]);
+    const [previousLeadSearchPermission, setPreviousLeadSearchPermission] = useState<readonly unknown[] | null>(null);
+    const leadSearchPermissionInputs = [canSearchLeads, isGlobalLeadSearch];
+    if (previousLeadSearchPermission === null || leadSearchPermissionInputs.some((input, index) => !Object.is(input, previousLeadSearchPermission[index]))) {
+        setPreviousLeadSearchPermission(leadSearchPermissionInputs);
+        (() => {
+            if (!canSearchLeads && !isGlobalLeadSearch) {
+                setLeadSearch("");
+                setDebouncedLeadSearch("");
+            }
+        })();
+    }
 
-    useEffect(() => {
-        if (!canUseLeadCategories) {
-            setActiveCategoryTab("ALL");
-        }
-    }, [canUseLeadCategories]);
+    const [previousLeadCategoryPermission, setPreviousLeadCategoryPermission] = useState<readonly unknown[] | null>(null);
+    const leadCategoryPermissionInputs = [canUseLeadCategories];
+    if (previousLeadCategoryPermission === null || leadCategoryPermissionInputs.some((input, index) => !Object.is(input, previousLeadCategoryPermission[index]))) {
+        setPreviousLeadCategoryPermission(leadCategoryPermissionInputs);
+        (() => {
+            if (!canUseLeadCategories) {
+                setActiveCategoryTab("ALL");
+            }
+        })();
+    }
 
-    useEffect(() => {
-        if (!canAddLeads) {
-            setIsLeadModalOpen(false);
-        }
-    }, [canAddLeads]);
+    const [previousLeadCreatePermission, setPreviousLeadCreatePermission] = useState<readonly unknown[] | null>(null);
+    const leadCreatePermissionInputs = [canAddLeads];
+    if (previousLeadCreatePermission === null || leadCreatePermissionInputs.some((input, index) => !Object.is(input, previousLeadCreatePermission[index]))) {
+        setPreviousLeadCreatePermission(leadCreatePermissionInputs);
+        (() => {
+            if (!canAddLeads) {
+                setIsLeadModalOpen(false);
+            }
+        })();
+    }
 
-    useEffect(() => {
-        leadPageRef.current = 1;
-        leadFetchInFlightRef.current = false;
+    const [previousLeadPagingScope2, setPreviousLeadPagingScope2] = useState<readonly unknown[] | null>(null);
+    const leadPagingScope2Inputs = [activeTab, effectiveLeadSearch, employeeId];
+    if (previousLeadPagingScope2 === null || leadPagingScope2Inputs.some((input, index) => !Object.is(input, previousLeadPagingScope2[index]))) {
+        setPreviousLeadPagingScope2(leadPagingScope2Inputs);
         setLeadPage(1);
         setHasMoreLeads(leadPageData?.hasMore ?? true);
         setSelectedLeadId(requestedLeadId || null);
         setActiveCategoryTab("ALL");
+    }
+    useEffect(() => {
+        leadPageRef.current = 1;
+        leadFetchInFlightRef.current = false;
     }, [activeTab, effectiveLeadSearch, employeeId]);
 
-    useEffect(() => {
-        if (!isLoading && leadPage === 1) {
-            setHasMoreLeads(Boolean(leadPageData?.hasMore));
-        }
-    }, [isLoading, leadPage, leadPageData?.hasMore]);
+    const [previousLeadPageAvailability, setPreviousLeadPageAvailability] = useState<readonly unknown[] | null>(null);
+    const leadPageAvailabilityInputs = [isLoading, leadPage, leadPageData?.hasMore];
+    if (previousLeadPageAvailability === null || leadPageAvailabilityInputs.some((input, index) => !Object.is(input, previousLeadPageAvailability[index]))) {
+        setPreviousLeadPageAvailability(leadPageAvailabilityInputs);
+        (() => {
+            if (!isLoading && leadPage === 1) {
+                setHasMoreLeads(Boolean(leadPageData?.hasMore));
+            }
+        })();
+    }
 
     useEffect(() => {
         const list = leadListRef.current;
@@ -1250,7 +1316,7 @@ export default function Leads() {
         if (list.scrollHeight <= list.clientHeight + 1) {
             void fetchMoreLeads();
         }
-    }, [filteredLeads.length, hasMoreLeads, isFetchingMoreLeads, isLoading]);
+    }, [filteredLeads.length, hasMoreLeads, isFetchingMoreLeads, isLoading, fetchMoreLeads]);
 
     const saveComment = () => {
         if (addCommentMutation.isPending || pendingCommentSaveRef.current) {
@@ -1593,13 +1659,14 @@ export default function Leads() {
         ]);
     };
 
-    const handleCallStatError = (error: any) => {
+    const handleCallStatError = (error: unknown) => {
+        const callError = error as { response?: { data?: { message?: string } }; message?: string } | null;
         const errorMessage =
-            error?.response?.data?.message ||
-            error?.message ||
+            callError?.response?.data?.message ||
+            callError?.message ||
             "Could not update call count. Please try again.";
 
-        console.error("Lead call stat error:", error?.response?.data || error);
+        console.error("Lead call stat error:", callError?.response?.data || error);
 
         showToast({
             tone: "error",
@@ -2820,3 +2887,5 @@ export default function Leads() {
         </MainLayout>
     );
 }
+
+const EMPTY_QUERY_ROWS: [] = [];

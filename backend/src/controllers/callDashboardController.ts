@@ -5,7 +5,7 @@ import { Attendance } from "../models/Attendance";
 import { Employee } from "../models/Employee";
 import { getCallBridgeDeviceModel, getCallBridgeScheduleModel } from "../models/CallBridge";
 import { getSystemSettings } from "./systemSettingsController";
-import { callDashboardStatus, currentAttendanceShift, offPhoneTimeInShift } from "../services/callDashboardService";
+import { callDashboardStatus, currentAttendanceShift, offPhoneDashboardClock, offPhoneTimeInShift } from "../services/callDashboardService";
 import { callDashboardV2Enabled, timeAccountingV2Enabled } from "../config/rolloutFlags";
 import { accountTime, bucketForAttendanceSource } from "../services/timeAccounting";
 import { verifyAdminDashboardSession } from "../config/adminDashboardSession";
@@ -52,7 +52,7 @@ async function getCallDashboardForBusiness(request: Request, response: Response)
   const codes = [...grouped.keys()];
   const [devices, schedules, observations] = await Promise.all([
     getCallBridgeDeviceModel().find({ employeeCode: { $in: codes }, bridgeVersion: { $ne: "ringcentral-api-v1" } })
-      .select("employeeCode bridgeVersion state audioSessionActive nextivaProcessDetected lastSeenAt lastStateChangedAt lastIdleAt").lean(),
+      .select("employeeCode bridgeVersion state audioSessionActive nextivaProcessDetected lastSeenAt lastStateChangedAt lastBridgeAvailabilityChangedAt lastIdleAt").lean(),
     getCallBridgeScheduleModel().find({ employeeCode: { $in: codes } })
       .select("employeeCode callLeaseUntil lastCallEndedAt nextCallAllowedAt lastDialStartedAt dialIntentUntil lastCallStartedAt").lean(),
     CallBridgeObservation.find({ employeeCode: { $in: codes }, endedAt: { $gte: shift.start, $lte: now } })
@@ -77,6 +77,8 @@ async function getCallDashboardForBusiness(request: Request, response: Response)
     const status = callDashboardStatus({ availabilityStatus, devices: employeeDevices, schedule,
       attendance: events, offPhoneStartedAt: accounted.state === "offPhone" ? accounted.stateSince : null,
       now, shift, provider: "nextiva" });
+    const offPhone = offPhoneDashboardClock({ totalMs: accounted.milliseconds.offPhone,
+      state: accounted.state, stateSince: accounted.stateSince, shiftEnd: shift.end, now });
     const latestDevice = [...employeeDevices].sort((a, b) => b.lastSeenAt.getTime() - a.lastSeenAt.getTime())[0];
     const heartbeatAgeMs = latestDevice ? Math.max(0, now.getTime() - latestDevice.lastSeenAt.getTime()) : null;
     const employeeCalls = observations.filter((observation) => observation.employeeCode === code);
@@ -85,7 +87,7 @@ async function getCallDashboardForBusiness(request: Request, response: Response)
       businessId: group.businesses[0]?.id || "", businessName: group.businesses[0]?.name || "",
       businesses: group.businesses, businessBreakdown, role: group.employee.role, team: group.employee.team,
       ...status, timeBucketsMs: accounted.milliseconds,
-      offPhoneCompletedMs: accounted.milliseconds.offPhone, offPhoneActiveStartedAt: null,
+      offPhoneCompletedMs: offPhone.completedMs, offPhoneActiveStartedAt: offPhone.activeStartedAt,
       offPhoneTotalMs: accounted.milliseconds.offPhone,
       breakRemainingMs: accounted.remainingBreakMs, lunchRemainingMs: accounted.remainingLunchMs,
       allowanceOverdue: accounted.overdue, heartbeatAgeMs,
@@ -96,7 +98,7 @@ async function getCallDashboardForBusiness(request: Request, response: Response)
     };
   }).sort((a, b) => a.name.localeCompare(b.name));
   response.set("Cache-Control", "no-store");
-  response.json({ generatedAt: now, serverTime: now,
+  response.json({ generatedAt: now, serverTime: new Date(),
     business: { id: selectedBusiness.id, name: selectedBusiness.name }, shift, employees: rows,
     totals: { employees: rows.length, onlineMs: rows.reduce((sum, row) => sum + row.timeBucketsMs.online, 0),
       breakMs: rows.reduce((sum, row) => sum + row.timeBucketsMs.break, 0),

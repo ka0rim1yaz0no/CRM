@@ -1,8 +1,11 @@
 import type { FormEvent, KeyboardEvent } from "react";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { createObjectUrlStore } from "../../lib/objectUrlStore";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useLocation, useSearchParams } from "react-router";
-import { FiCheck, FiChevronLeft, FiChevronRight, FiCornerUpLeft, FiDownload, FiEdit2, FiFile, FiHash, FiMessageCircle, FiPaperclip, FiPhone, FiPlus, FiSearch, FiSend, FiSmile, FiTrash2, FiUserPlus, FiUsers, FiX } from "react-icons/fi";
+import { FiCheck, FiCornerUpLeft, FiDownload, FiEdit2, FiFile, FiHash, FiMessageCircle, FiPaperclip, FiPhone, FiPlus, FiSearch, FiSend, FiSmile, FiTrash2, FiUserPlus, FiUsers, FiVolume2, FiX } from "react-icons/fi";
+import { messageSound } from "../../lib/messageSound";
+import { emitToast } from "../../lib/toast";
 import MainLayout from "../layout";
 import AdminLayout from "../admin/adminLayout";
 import {
@@ -93,15 +96,10 @@ function MessageAttachmentView({ attachment, isMine }: { attachment: MessageAtta
         queryFn: () => getMessageAttachmentBlob(attachment.url),
         staleTime: Number.POSITIVE_INFINITY,
     });
-    const [objectUrl, setObjectUrl] = useState("");
+    const objectUrlStore = useMemo(() => createObjectUrlStore(blob), [blob]);
+    const objectUrl = useSyncExternalStore(objectUrlStore.subscribe, objectUrlStore.getSnapshot);
     const [isImagePreviewOpen, setIsImagePreviewOpen] = useState(false);
 
-    useEffect(() => {
-        if (!blob) return;
-        const nextUrl = URL.createObjectURL(blob);
-        setObjectUrl(nextUrl);
-        return () => URL.revokeObjectURL(nextUrl);
-    }, [blob]);
 
     if (attachment.kind === "image") {
         return objectUrl ? (
@@ -184,15 +182,15 @@ export default function Messages() {
     const authUser = getAuthUser();
     const isAdminRoute = location.pathname.startsWith("/admin");
     const { messageNotifications, markConversationMessagesRead } = useMessageNotifications();
-    const { data: conversations = [] } = useQuery({
+    const { data: conversations = EMPTY_QUERY_ROWS } = useQuery({
         queryKey: ["conversations"],
         queryFn: getConversations,
     });
-    const { data: employees = [] } = useQuery({
+    const { data: employees = EMPTY_QUERY_ROWS } = useQuery({
         queryKey: ["employees"],
         queryFn: getEmployees,
     });
-    const { data: teams = [] } = useQuery({
+    const { data: teams = EMPTY_QUERY_ROWS } = useQuery({
         queryKey: ["teams"],
         queryFn: getTeams,
     });
@@ -211,6 +209,12 @@ export default function Messages() {
     const [pendingDirectTarget, setPendingDirectTarget] = useState(searchParams.get("to") || searchParams.get("call") || "");
     const [pendingCallTarget, setPendingCallTarget] = useState(searchParams.get("call") || "");
     const [pendingTeamTarget, setPendingTeamTarget] = useState(searchParams.get("team") || "");
+    const [routeAction, setRouteAction] = useState<{
+        search: string;
+        clearAll: boolean;
+        callTarget?: { _id: string; name: string; role: string };
+    } | null>(null);
+    const completedRouteAction = useRef<typeof routeAction>(null);
     const [isDirectoryOpen, setIsDirectoryOpen] = useState(false);
     const [teamEditor, setTeamEditor] = useState<TeamEditorState | null>(null);
     const [teamMemberSearch, setTeamMemberSearch] = useState("");
@@ -248,7 +252,7 @@ export default function Messages() {
     const selectedTeam = selectedConversation?.type === "team"
         ? accessibleTeams.find((team) => team._id === selectedConversation.team?._id) || null
         : null;
-    const { data: messages = [] } = useQuery({
+    const { data: messages = EMPTY_QUERY_ROWS } = useQuery({
         queryKey: ["messages", selectedConversation?._id],
         queryFn: () => getMessages(selectedConversation?._id || ""),
         enabled: Boolean(selectedConversation?._id),
@@ -417,10 +421,15 @@ export default function Messages() {
         };
     }, [selectedConversation?._id]);
 
-    useEffect(() => {
-        if (draftConversation || selectedConversationId || visibleConversations.length === 0) return;
-        setSelectedConversationId(visibleConversations[0]._id);
-    }, [draftConversation, selectedConversationId, visibleConversations]);
+    const [previousMessageSelection, setPreviousMessageSelection] = useState<readonly unknown[] | null>(null);
+    const messageSelectionInputs = [draftConversation, selectedConversationId, visibleConversations];
+    if (previousMessageSelection === null || messageSelectionInputs.some((input, index) => !Object.is(input, previousMessageSelection[index]))) {
+        setPreviousMessageSelection(messageSelectionInputs);
+        (() => {
+            if (draftConversation || selectedConversationId || visibleConversations.length === 0) return;
+            setSelectedConversationId(visibleConversations[0]._id);
+        })();
+    }
 
     useLayoutEffect(() => {
         const conversationId = selectedConversation?._id;
@@ -454,121 +463,131 @@ export default function Messages() {
         return () => document.removeEventListener("visibilitychange", markVisibleMessagesSeen);
     }, [currentReaderKey, currentUser._id, messages, queryClient, selectedConversation?._id]);
 
-    useEffect(() => {
-        const targetConversationId = searchParams.get("conversation") || "";
-        if (!targetConversationId) {
-            return;
-        }
-
-        const targetConversation = visibleConversations.find((conversation) => conversation._id === targetConversationId);
-        if (!targetConversation) {
-            return;
-        }
-
+    const targetConversationId = searchParams.get("conversation") || "";
+    const targetConversation = visibleConversations.find((conversation) => conversation._id === targetConversationId);
+    const [handledConversationRoute, setHandledConversationRoute] = useState("");
+    const conversationRouteKey = `${searchParams.toString()}:${targetConversation?._id || ""}`;
+    if (!targetConversationId && handledConversationRoute) {
+        setHandledConversationRoute("");
+    }
+    if (targetConversation && handledConversationRoute !== conversationRouteKey) {
+        setHandledConversationRoute(conversationRouteKey);
         setSelectedConversationId(targetConversation._id);
         setMode(targetConversation.type === "team" ? "team" : "direct");
         setSearch("");
+        setRouteAction({ search: searchParams.toString(), clearAll: false });
+    }
 
-        const nextSearchParams = new URLSearchParams(searchParams);
-        nextSearchParams.delete("conversation");
-        setSearchParams(nextSearchParams, { replace: true });
-    }, [searchParams, setSearchParams, visibleConversations]);
+    const [previousMessageRoute, setPreviousMessageRoute] = useState<readonly unknown[] | null>(null);
+    const messageRouteInputs = [searchParams];
+    if (previousMessageRoute === null || messageRouteInputs.some((input, index) => !Object.is(input, previousMessageRoute[index]))) {
+        setPreviousMessageRoute(messageRouteInputs);
+        (() => {
+            const targetEmail = searchParams.get("to") || searchParams.get("call") || "";
+            const callEmail = searchParams.get("call") || "";
+            const teamId = searchParams.get("team") || "";
+            if (targetEmail !== pendingDirectTarget) {
+                setPendingDirectTarget(targetEmail);
+            }
+            if (callEmail !== pendingCallTarget) {
+                setPendingCallTarget(callEmail);
+            }
+            if (teamId !== pendingTeamTarget) {
+                setPendingTeamTarget(teamId);
+            }
+        })();
+    }
 
-    useEffect(() => {
-        const targetEmail = searchParams.get("to") || searchParams.get("call") || "";
-        const callEmail = searchParams.get("call") || "";
-        const teamId = searchParams.get("team") || "";
-        if (targetEmail !== pendingDirectTarget) {
-            setPendingDirectTarget(targetEmail);
-        }
-        if (callEmail !== pendingCallTarget) {
-            setPendingCallTarget(callEmail);
-        }
-        if (teamId !== pendingTeamTarget) {
-            setPendingTeamTarget(teamId);
-        }
-    }, [pendingCallTarget, pendingDirectTarget, pendingTeamTarget, searchParams]);
+    const [previousDirectRoute, setPreviousDirectRoute] = useState<readonly unknown[] | null>(null);
+    const directRouteInputs = [conversations, createDirectMutation.isPending, employees, isAdminRoute, pendingCallTarget, pendingDirectTarget, currentUser._id];
+    if (previousDirectRoute === null || directRouteInputs.some((input, index) => !Object.is(input, previousDirectRoute[index]))) {
+        setPreviousDirectRoute(directRouteInputs);
+        (() => {
+            if (!pendingDirectTarget || !currentUser || createDirectMutation.isPending) {
+                return;
+            }
 
-    useEffect(() => {
-        if (!pendingDirectTarget || !currentUser || createDirectMutation.isPending) {
-            return;
-        }
+            const targetEmployee = employees.find(
+                (employee) => employee.email.toLowerCase() === pendingDirectTarget.toLowerCase()
+            );
 
-        const targetEmployee = employees.find(
-            (employee) => employee.email.toLowerCase() === pendingDirectTarget.toLowerCase()
-        );
+            if (!targetEmployee || (!isAdminRoute && targetEmployee._id === currentUser._id)) {
+                return;
+            }
 
-        if (!targetEmployee || (!isAdminRoute && targetEmployee._id === currentUser._id)) {
-            return;
-        }
+            const callTarget = pendingCallTarget && targetEmployee.email.toLowerCase() === pendingCallTarget.toLowerCase()
+                ? { _id: targetEmployee._id, name: targetEmployee.name, role: targetEmployee.role }
+                : undefined;
+            setRouteAction({ search: searchParams.toString(), clearAll: true, callTarget });
 
-        if (pendingCallTarget && targetEmployee.email.toLowerCase() === pendingCallTarget.toLowerCase()) {
-            startEmployeeVoiceCall({ _id: targetEmployee._id, name: targetEmployee.name, role: targetEmployee.role });
-        }
+            const existingConversation = conversations.find((conversation) =>
+                Boolean(conversation.lastMessageAt) &&
+                (isAdminRoute
+                    ? conversation.type === "direct" && Boolean(conversation.includeAdmin) && conversation.participants.some((participant) => participant._id === targetEmployee._id)
+                    : conversation.type === "direct" &&
+                      conversation.participants.some((participant) => participant._id === currentUser._id) &&
+                      conversation.participants.some((participant) => participant._id === targetEmployee._id))
+            );
 
-        const existingConversation = conversations.find((conversation) =>
-            Boolean(conversation.lastMessageAt) &&
-            (isAdminRoute
-                ? conversation.type === "direct" && Boolean(conversation.includeAdmin) && conversation.participants.some((participant) => participant._id === targetEmployee._id)
-                : conversation.type === "direct" &&
-                  conversation.participants.some((participant) => participant._id === currentUser._id) &&
-                  conversation.participants.some((participant) => participant._id === targetEmployee._id))
-        );
+            if (existingConversation) {
+                setDraftConversation(null);
+                setSelectedConversationId(existingConversation._id);
+                setPendingDirectTarget("");
+                setPendingCallTarget("");
+                return;
+            }
 
-        if (existingConversation) {
-            setDraftConversation(null);
-            setSelectedConversationId(existingConversation._id);
+            setSelectedConversationId(null);
+            setDraftConversation({
+                type: "direct",
+                targetId: targetEmployee._id,
+                title: targetEmployee.name,
+                subtitle: isAdminRoute ? "Admin direct message" : "Direct message",
+                includeAdmin: isAdminRoute,
+            });
             setPendingDirectTarget("");
             setPendingCallTarget("");
-            setSearchParams({}, { replace: true });
-            return;
-        }
+            })();
+    }
 
-        setSelectedConversationId(null);
-        setDraftConversation({
-            type: "direct",
-            targetId: targetEmployee._id,
-            title: targetEmployee.name,
-            subtitle: isAdminRoute ? "Admin direct message" : "Direct message",
-            includeAdmin: isAdminRoute,
-        });
-        setPendingDirectTarget("");
-        setPendingCallTarget("");
-        setSearchParams({}, { replace: true });
-    }, [
-        conversations,
-        createDirectMutation,
-        employees,
-        isAdminRoute,
-        pendingCallTarget,
-        pendingDirectTarget,
-        setSearchParams,
-    ]);
+    const [previousTeamRoute, setPreviousTeamRoute] = useState<readonly unknown[] | null>(null);
+    const teamRouteInputs = [accessibleTeams, conversations, createTeamMutation.isPending, pendingTeamTarget];
+    if (previousTeamRoute === null || teamRouteInputs.some((input, index) => !Object.is(input, previousTeamRoute[index]))) {
+        setPreviousTeamRoute(teamRouteInputs);
+        (() => {
+            if (!pendingTeamTarget || createTeamMutation.isPending) {
+                return;
+            }
+
+            const existingConversation = conversations.find(
+                (conversation) => Boolean(conversation.lastMessageAt) && conversation.type === "team" && conversation.team?._id === pendingTeamTarget
+            );
+
+            if (existingConversation) {
+                setDraftConversation(null);
+                setSelectedConversationId(existingConversation._id);
+                setPendingTeamTarget("");
+                setRouteAction({ search: searchParams.toString(), clearAll: true });
+                return;
+            }
+
+            const targetTeam = accessibleTeams.find((team) => team._id === pendingTeamTarget);
+            if (!targetTeam) return;
+            setSelectedConversationId(null);
+            setDraftConversation({ type: "team", targetId: targetTeam._id, title: targetTeam.name, subtitle: "Team conversation" });
+            setPendingTeamTarget("");
+            setRouteAction({ search: searchParams.toString(), clearAll: true });
+            })();
+    }
 
     useEffect(() => {
-        if (!pendingTeamTarget || createTeamMutation.isPending) {
-            return;
-        }
-
-        const existingConversation = conversations.find(
-            (conversation) => Boolean(conversation.lastMessageAt) && conversation.type === "team" && conversation.team?._id === pendingTeamTarget
-        );
-
-        if (existingConversation) {
-            setDraftConversation(null);
-            setSelectedConversationId(existingConversation._id);
-            setPendingTeamTarget("");
-            setSearchParams({}, { replace: true });
-            return;
-        }
-
-        const targetTeam = accessibleTeams.find((team) => team._id === pendingTeamTarget);
-        if (!targetTeam) return;
-        setSelectedConversationId(null);
-        setDraftConversation({ type: "team", targetId: targetTeam._id, title: targetTeam.name, subtitle: "Team conversation" });
-        setPendingTeamTarget("");
-        setSearchParams({}, { replace: true });
-    }, [accessibleTeams, conversations, createTeamMutation, pendingTeamTarget, setSearchParams]);
+        if (!routeAction || completedRouteAction.current === routeAction) return;
+        completedRouteAction.current = routeAction;
+        if (routeAction.callTarget) startEmployeeVoiceCall(routeAction.callTarget);
+        const nextParams = new URLSearchParams(routeAction.clearAll ? "" : routeAction.search);
+        nextParams.delete("conversation");
+        setSearchParams(nextParams, { replace: true });
+    }, [routeAction, setSearchParams]);
 
     const activeEmployees = useMemo(
         () => employees.filter((employee) => employee.status !== "Archived"),
@@ -829,9 +848,15 @@ export default function Messages() {
                                 <h2 className="text-xl font-bold text-slate-950">Messages</h2>
                                 <p className="mt-1 text-xs font-medium text-slate-500">{visibleConversations.length} active thread{visibleConversations.length === 1 ? "" : "s"}</p>
                             </div>
+                            <div className="flex items-center gap-2">
+                            <button className="grid size-9 place-items-center rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-100" type="button" aria-label="Test message sound" title="Test message sound" onClick={async () => {
+                                const played = await messageSound.preview();
+                                emitToast({ tone: played ? "success" : "info", message: played ? "Message sound played. Check your device volume if you did not hear it." : "Sound is blocked. Allow sound for this site in your browser settings and try again." });
+                            }}><FiVolume2 className="size-5" aria-hidden="true" /></button>
                             <button className="flex size-9 items-center justify-center rounded-lg border border-[#0084ff]/15 bg-[#e7f3ff] text-[#0084ff] transition hover:border-[#0084ff]/25 hover:bg-[#dceeff]" type="button" aria-label={isDirectoryOpen ? "Close new chat" : "Start new chat"} title={isDirectoryOpen ? "Close" : "New chat"} onClick={() => setIsDirectoryOpen((open) => !open)}>
                                 {isDirectoryOpen ? <FiX className="size-5" aria-hidden="true" /> : <FiPlus className="size-5" aria-hidden="true" />}
                             </button>
+                            </div>
                         </div>
                         <label className="mt-4 flex h-10 items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 text-slate-500 transition focus-within:border-[#0084ff]/40 focus-within:ring-2 focus-within:ring-[#0084ff]/10">
                             <FiSearch className="size-4" aria-hidden="true" />
@@ -1173,154 +1198,7 @@ export default function Messages() {
                     </form>
                 </main>
 
-                {false && <aside className="hidden">
-                    {!isDirectoryOpen ? (
-                        <div className="flex flex-col items-center gap-3">
-                            <button
-                                className="flex size-10 items-center justify-center rounded-full bg-[#f0f2f5] text-slate-700 transition hover:bg-[#e4e6eb]"
-                                type="button"
-                                aria-label="Expand contact panel"
-                                title="Expand"
-                                onClick={() => setIsDirectoryOpen(true)}
-                            >
-                                {isAdminRoute ? <FiChevronLeft className="size-4" aria-hidden="true" /> : <FiChevronRight className="size-4" aria-hidden="true" />}
-                            </button>
-                            <span className="flex size-10 items-center justify-center rounded-full bg-[#e7f3ff] text-[#0084ff]">
-                                {mode === "team" ? <FiUsers className="size-4" aria-hidden="true" /> : <FiMessageCircle className="size-4" aria-hidden="true" />}
-                            </span>
-                            <span className="rotate-90 whitespace-nowrap pt-6 text-xs font-semibold text-slate-500">
-                                People
-                            </span>
-                        </div>
-                    ) : (
-                        <>
-                            <div className="mb-4 flex items-center justify-between gap-3">
-                                <div>
-                                    <h3 className="text-lg font-bold text-slate-950">People</h3>
-                                    <p className="mt-0.5 text-xs text-slate-500">{mode === "direct" ? `${directContacts.length} employees` : `${filteredTeams.length} teams`}</p>
-                                </div>
-                                <button
-                                    className="flex size-9 items-center justify-center rounded-full bg-[#f0f2f5] text-slate-700 transition hover:bg-[#e4e6eb]"
-                                    type="button"
-                                    aria-label="Collapse contact panel"
-                                    title="Collapse"
-                                    onClick={() => setIsDirectoryOpen(false)}
-                                >
-                                    {isAdminRoute ? <FiChevronRight className="size-4" aria-hidden="true" /> : <FiChevronLeft className="size-4" aria-hidden="true" />}
-                                </button>
-                            </div>
 
-                            <div className="flex rounded-full bg-[#f0f2f5] p-1">
-                                {(["direct", "team"] as const).map((option) => (
-                                    <button
-                                        key={option}
-                                        className={[
-                                            "h-9 flex-1 rounded-full text-sm font-semibold capitalize transition",
-                                            mode === option ? "bg-white text-slate-950 shadow-sm" : "text-slate-700 hover:bg-white/70",
-                                        ].join(" ")}
-                                        type="button"
-                                        onClick={() => setMode(option)}
-                                    >
-                                        {option}
-                                    </button>
-                                ))}
-                            </div>
-
-                            <div className="mt-3 flex gap-2">
-                                <label className="flex h-10 min-w-0 flex-1 items-center rounded-full bg-[#f0f2f5] px-3 focus-within:ring-2 focus-within:ring-[#0084ff]/20">
-                                    <FiSearch className="mr-2 size-4 shrink-0 text-slate-400" aria-hidden="true" />
-                                    <input
-                                        ref={directorySearchRef}
-                                        className="h-full min-w-0 flex-1 bg-transparent text-sm text-slate-950 outline-none placeholder:text-slate-400"
-                                        value={directorySearch}
-                                        onChange={(event) => setDirectorySearch(event.target.value)}
-                                        placeholder={mode === "direct" ? "Search employees" : "Search teams"}
-                                        type="search"
-                                    />
-                                </label>
-                                <button
-                                    className="flex size-10 shrink-0 items-center justify-center rounded-full bg-[#e7f3ff] text-[#0084ff] transition hover:bg-[#dceeff]"
-                                    type="button"
-                                    aria-label={mode === "direct" ? "Search employees" : "Search teams"}
-                                    onClick={() => directorySearchRef.current?.focus()}
-                                >
-                                    <FiSearch className="size-4" aria-hidden="true" />
-                                </button>
-                            </div>
-
-                            <div className="content-scroll mt-4 min-h-0 flex-1 space-y-2 overflow-y-auto">
-                                {mode === "direct" && !isAdminRoute && (!directorySearchText || "admin support operations".includes(directorySearchText)) && (
-                                    <button
-                                        className="flex w-full items-center gap-3 rounded-xl px-2 py-2 text-left transition hover:bg-[#f0f2f5]"
-                                        type="button"
-                                        onClick={startAdminConversation}
-                                    >
-                                        <span className="flex size-11 shrink-0 items-center justify-center rounded-full bg-slate-800 text-sm font-bold text-white">A</span>
-                                        <span className="min-w-0 flex-1">
-                                            <span className="block truncate text-sm font-semibold text-slate-950">Admin</span>
-                                            <span className="mt-0.5 block truncate text-xs text-slate-500">Support and operations</span>
-                                        </span>
-                                        <span className="flex size-8 shrink-0 items-center justify-center rounded-full bg-[#e7f3ff] text-[#0084ff]">
-                                            <FiPlus className="size-4" aria-hidden="true" />
-                                        </span>
-                                    </button>
-                                )}
-                                {mode === "direct" &&
-                                    directContacts
-                                        .map((employee) => (
-                                            <button
-                                                key={employee._id}
-                                                className="flex w-full items-center gap-3 rounded-xl px-2 py-2 text-left transition hover:bg-[#f0f2f5]"
-                                                type="button"
-                                                onClick={() => startDirectConversation(employee._id)}
-                                            >
-                                                <span className="flex size-11 shrink-0 items-center justify-center rounded-full bg-[#0084ff] text-sm font-bold text-white">
-                                                    {getInitials(employee.name)}
-                                                </span>
-                                                <span className="min-w-0 flex-1">
-                                                    <span className="block truncate text-sm font-semibold text-slate-950">{employee.name}</span>
-                                                    <span className="mt-0.5 block truncate text-xs text-slate-500">{employee.role}{employee.team ? ` · ${employee.team}` : ""}</span>
-                                                </span>
-                                                <span className="flex size-8 shrink-0 items-center justify-center rounded-full bg-[#e7f3ff] text-[#0084ff]">
-                                                    <FiPlus className="size-4" aria-hidden="true" />
-                                                </span>
-                                            </button>
-                                        ))}
-                                {mode === "direct" && directContacts.length === 0 && (isAdminRoute || directorySearchText) && (
-                                    <p className="rounded-2xl border border-dashed border-slate-200 bg-[#f7f8fa] p-4 text-sm text-slate-500">
-                                        No employees match your search.
-                                    </p>
-                                )}
-
-                                {mode === "team" &&
-                                    filteredTeams.map((team) => (
-                                        <button
-                                            key={team._id}
-                                            className="flex w-full items-center gap-3 rounded-xl px-2 py-2 text-left transition hover:bg-[#f0f2f5]"
-                                            type="button"
-                                            onClick={() => startTeamConversation(team._id)}
-                                        >
-                                            <span className="flex size-11 shrink-0 items-center justify-center rounded-full bg-slate-200 text-slate-700">
-                                                <FiUsers className="size-4" aria-hidden="true" />
-                                            </span>
-                                            <span className="min-w-0 flex-1">
-                                                <span className="block truncate text-sm font-semibold text-slate-950">{team.name}</span>
-                                                <span className="mt-0.5 block truncate text-xs text-slate-500">{team.members.length} members</span>
-                                            </span>
-                                            <span className="flex size-8 shrink-0 items-center justify-center rounded-full bg-[#e7f3ff] text-[#0084ff]">
-                                                <FiPlus className="size-4" aria-hidden="true" />
-                                            </span>
-                                        </button>
-                                    ))}
-                                {mode === "team" && filteredTeams.length === 0 && (
-                                    <p className="rounded-2xl border border-dashed border-slate-200 bg-[#f7f8fa] p-4 text-sm text-slate-500">
-                                        No teams match your search.
-                                    </p>
-                                )}
-                            </div>
-                        </>
-                    )}
-                </aside>}
             </section>
 
             {isAdminRoute && teamEditor && (
@@ -1405,3 +1283,5 @@ function getConversationTitle(conversation: Conversation, currentUserId: string)
     const otherParticipant = conversation.participants.find((participant) => participant._id !== currentUserId);
     return otherParticipant?.name || conversation.title || "Direct message";
 }
+
+const EMPTY_QUERY_ROWS: [] = [];

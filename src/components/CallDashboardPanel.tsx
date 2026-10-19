@@ -55,11 +55,11 @@ function visibleStatus(row: CallDashboardRow, now: number, shiftStart: number, s
 export default function CallDashboardPanel({ businessId, businessName }: { businessId: string; businessName?: string }) {
     const queryClient = useQueryClient();
     const lastDeadlineRefresh = useRef(0);
-    const [clock, setClock] = useState(Date.now);
+    const [clock, setClock] = useState(() => performance.now());
     const { data, isLoading, isError } = useQuery({
         queryKey: ["admin-call-dashboard", businessId],
         queryFn: async () => {
-            const snapshot = { ...(await getCallDashboard()), receivedAt: Date.now() };
+            const snapshot = { ...(await getCallDashboard()), receivedAt: performance.now() };
             const previous = queryClient.getQueryData<typeof snapshot>(["admin-call-dashboard", businessId]);
             return previous && new Date(previous.generatedAt).getTime() > new Date(snapshot.generatedAt).getTime()
                 ? previous : snapshot;
@@ -70,7 +70,7 @@ export default function CallDashboardPanel({ businessId, businessName }: { busin
     });
 
     useEffect(() => {
-        const interval = window.setInterval(() => setClock(Date.now()), 1_000);
+        const interval = window.setInterval(() => setClock(performance.now()), 1_000);
         return () => window.clearInterval(interval);
     }, []);
 
@@ -94,8 +94,7 @@ export default function CallDashboardPanel({ businessId, businessName }: { busin
         };
     }, [businessId, queryClient]);
 
-    const serverOffset = data ? new Date(data.generatedAt).getTime() - data.receivedAt : 0;
-    const serverNow = clock + serverOffset;
+    const serverNow = data ? new Date(data.serverTime || data.generatedAt).getTime() + Math.max(0, clock - data.receivedAt) : 0;
     const nextDeadline = dashboardV2 ? data?.employees.reduce((earliest, row) => {
         const deadline = row.transitionUntil ? new Date(row.transitionUntil).getTime() : 0;
         return deadline > 0 && (earliest === 0 || deadline < earliest) ? deadline : earliest;
@@ -108,6 +107,9 @@ export default function CallDashboardPanel({ businessId, businessName }: { busin
     }, [businessId, nextDeadline, serverNow, queryClient]);
     const shiftStart = data ? new Date(data.shift.start).getTime() : 0;
     const shiftEnd = data ? new Date(data.shift.end).getTime() : 0;
+    const snapshotStale = Boolean(dashboardV2 && data && serverNow - new Date(data.generatedAt).getTime() > 45_000);
+    const displayNow = snapshotStale && data
+        ? new Date(data.serverTime || data.generatedAt).getTime() + 45_000 : serverNow;
     const rows = data?.employees.map((row) => ({ row, visible: visibleStatus(row, serverNow, shiftStart, shiftEnd) })) || [];
     const counts = {
         onCall: rows.filter(({ visible }) => visible.status === "ON CALL").length,
@@ -122,17 +124,16 @@ export default function CallDashboardPanel({ businessId, businessName }: { busin
     const displayRows = rows.map(({ row, visible }) => {
         const startedAt = visible.startedAt;
         const activeOffPhoneAt = row.offPhoneActiveStartedAt ? new Date(row.offPhoneActiveStartedAt).getTime() : 0;
-        const offPhoneMs = row.offPhoneCompletedMs + (activeOffPhoneAt ? Math.max(0, Math.min(serverNow, shiftEnd) - activeOffPhoneAt) : 0);
+        const offPhoneMs = row.offPhoneCompletedMs + (activeOffPhoneAt ? Math.max(0, Math.min(displayNow, shiftEnd) - activeOffPhoneAt) : 0);
 
         return {
             row,
             visible,
-            statusTime: startedAt ? duration(Math.min(serverNow, shiftEnd) - Math.max(startedAt, shiftStart)) : "--:--:--",
+            statusTime: startedAt ? duration(Math.min(displayNow, shiftEnd) - Math.max(startedAt, shiftStart)) : "--:--:--",
             statusTimeTitle: startedAt ? formatPhTime(new Date(startedAt)) : "No recorded status transition",
             offPhoneTime: duration(offPhoneMs),
         };
     });
-    const snapshotStale = dashboardV2 && data && serverNow - new Date(data.generatedAt).getTime() > 45_000;
     return (
         <section className="overflow-hidden rounded-lg border border-slate-300 bg-white text-slate-950 shadow-lg shadow-slate-950/10" aria-labelledby="call-dashboard-title">
             <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 bg-slate-50 px-4 py-3">
@@ -164,7 +165,7 @@ export default function CallDashboardPanel({ businessId, businessName }: { busin
                         <tr>
                             <th className="px-4 py-2.5 text-left font-semibold">User</th>
                             <th className="px-4 py-2.5 text-left font-semibold">Status</th>
-                            <th className="px-4 py-2.5 text-right font-semibold">Time</th>
+                            <th className="px-4 py-2.5 text-right font-semibold">Time in Status</th>
                             <th className="px-4 py-2.5 text-right font-semibold">Total Off the Phone</th>
                         </tr>
                     </thead>
@@ -215,7 +216,7 @@ export default function CallDashboardPanel({ businessId, businessName }: { busin
                         </div>
                         <dl className="mt-3 grid grid-cols-2 gap-3 rounded-md border border-slate-200 bg-slate-50 p-3">
                             <div className="min-w-0">
-                                <dt className="text-[11px] font-semibold uppercase text-slate-500">Time</dt>
+                                <dt className="text-[11px] font-semibold uppercase text-slate-500">Time in Status</dt>
                                 <dd className="mt-1 font-mono text-sm tabular-nums" title={statusTimeTitle}>{statusTime}</dd>
                             </div>
                             <div className="min-w-0 text-right">

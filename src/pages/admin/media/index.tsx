@@ -6,19 +6,12 @@ import { archiveMediaAsset, getMediaAssets, uploadMediaAsset, type MediaAsset } 
 import { getEmployees } from "../../../api/employees";
 import { backendOrigin } from "../../../lib/backendUrl";
 import { formatCstDate } from "../../../lib/dateTime";
+import { mediaAssetUrl } from "../../../lib/mediaAssetUrl";
+import { getActiveBusinessId } from "../../../api/businessStorage";
 
 function getMediaUrl(url: string) {
-    if (!url) return "";
-    if (/^https?:\/\//i.test(url)) return url;
-
-    const normalizedUrl = url.startsWith("/") ? url : `/${url}`;
-    const legacyMediaPrefix = "/uploads/media/";
-
-    if (normalizedUrl.startsWith(legacyMediaPrefix)) {
-        return `${backendOrigin}/api/media/file/${encodeURIComponent(normalizedUrl.slice(legacyMediaPrefix.length))}`;
-    }
-
-    return `${backendOrigin}${normalizedUrl}`;
+    const origin = import.meta.env.VITE_API_URL === "/api" ? "" : backendOrigin;
+    return mediaAssetUrl(url, origin, getActiveBusinessId());
 }
 
 function toDisplayText(value: unknown, fallback = "") {
@@ -282,6 +275,7 @@ export default function AdminMedia() {
 
                     <div className="content-scroll min-h-0 flex-1 overflow-auto p-4">
                         {uploadMutation.isPending && <p className="mb-3 text-sm font-semibold text-emerald-700">Uploading media...</p>}
+                        {uploadMutation.isError && <p role="alert" className="mb-3 text-sm font-semibold text-rose-700">{uploadMutation.error.message || "Media upload failed. Please try again."}</p>}
                         {isLoading && <p className="text-sm text-slate-600">Loading media...</p>}
                         {isError && <p className="text-sm text-red-700">Unable to load media.</p>}
                         {!isLoading && !isError && filteredAssets.length === 0 && (

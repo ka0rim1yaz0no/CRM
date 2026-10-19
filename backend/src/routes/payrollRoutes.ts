@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { verifiedAdminOnly } from "../middleware/businessAccess";
 import {
   archivePayrollItem,
   archivePayrollRecord,
@@ -20,6 +21,7 @@ import {
 } from "../controllers/payrollController";
 
 export const payrollRouter = Router();
+payrollRouter.use(verifiedAdminOnly);
 
 payrollRouter.get("/stats", listPayrollStats);
 payrollRouter.get("/dtr/:employeeId", getPayrollDtr);

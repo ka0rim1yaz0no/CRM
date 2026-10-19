@@ -47,6 +47,8 @@ export type EmployeeDocument = {
   availabilityStatusReason: string;
   availabilityRevision: number;
   businessAccessIds: string[];
+  attendanceRevision?: number;
+  activeAttendanceSessionId?: string;
 };
 
 const employeeSchema = new Schema<EmployeeDocument>(
@@ -75,6 +77,8 @@ const employeeSchema = new Schema<EmployeeDocument>(
     bankRoutingNumber: { type: String, trim: true, default: "" },
     salary: { type: Number, min: 0, default: 0 },
     businessAccessIds: { type: [String], default: [] },
+    attendanceRevision: Number,
+    activeAttendanceSessionId: String,
     status: {
       type: String,
       enum: ["Active", "Training", "Paused", "Archived"],

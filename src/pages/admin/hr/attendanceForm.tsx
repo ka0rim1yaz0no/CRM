@@ -19,6 +19,10 @@ import {
 } from "../../../lib/attendanceSlots";
 import { buildOffPhoneAttendanceSessions } from "../../../lib/attendanceRecords";
 import { formatTimeInTimeZone } from "../../../lib/dateTime";
+import { attendanceInputValue, buildAttendanceDraftChanges, type DraftField } from "../../../lib/attendanceCommandDraft";
+import { attendanceIntegrityEnabled, getAttendanceSession, previewAttendanceCommand, submitAttendanceCommand, sessionEventRecord, type AttendanceCommand } from "../../../api/attendanceSession";
+import { getActiveBusinessId } from "../../../api/businessStorage";
+import { getAuthUser } from "../../../api/authStorage";
 
 const emptyAttendanceShiftForm: AttendanceShiftForm = {
     timeIn: "",
@@ -108,20 +112,37 @@ type AttendanceHistoryRow = {
 type AttendanceTimeInStatus = "Early" | "On time" | "Late" | "No time in";
 
 export default function AdminAttendanceForm() {
+    const { employeeId = "new", dateKey = "new" } = useParams();
+    return <AttendanceForm key={`${employeeId}:${dateKey}`} />;
+}
+
+function AttendanceForm() {
     const navigate = useNavigate();
     const queryClient = useQueryClient();
     const { employeeId: routeEmployeeId = "", dateKey = "" } = useParams<{ employeeId?: string; dateKey?: string }>();
     const [searchParams] = useSearchParams();
     const isEditing = Boolean(routeEmployeeId && dateKey);
-    const [selectedEmployeeId, setSelectedEmployeeId] = useState(routeEmployeeId || searchParams.get("employeeId") || "");
+    const [pickedEmployeeId, setSelectedEmployeeId] = useState(routeEmployeeId || searchParams.get("employeeId") || "");
+    const selectedEmployeeId = routeEmployeeId || pickedEmployeeId;
     const [attendanceShiftForm, setAttendanceShiftForm] = useState<AttendanceShiftForm>(emptyAttendanceShiftForm);
     const [formError, setFormError] = useState("");
+    const [reason, setReason] = useState("");
+    const [savedNotice, setSavedNotice] = useState("");
+    const [baselineRevision, setBaselineRevision] = useState<number | null>(null);
+    const [confirmation, setConfirmation] = useState<{ command: AttendanceCommand; count: number; removed: number } | null>(null);
+    const draftBaseline = useRef<Record<string, DraftField>>({});
+    const hydrated = useRef("");
+    const dirty = useRef(false);
+    const [isDirty, setIsDirty] = useState(false);
+    const [selectedSessionId, setSelectedSessionId] = useState("");
+    const businessId = searchParams.get("business") || getActiveBusinessId();
+    const businessName = getAuthUser()?.allowedBusinesses?.find((business) => business.id === businessId)?.name || businessId;
     const [isEmployeePickerOpen, setIsEmployeePickerOpen] = useState(false);
     const employeePickerRef = useRef<HTMLDivElement | null>(null);
 
     const { data: employees = [], isLoading: areEmployeesLoading } = useQuery({
-        queryKey: ["employees"],
-        queryFn: getEmployees,
+        queryKey: ["employees", businessId],
+        queryFn: () => getEmployees(undefined, { businessId }),
     });
     const { data: systemSettings } = useQuery({
         queryKey: ["system-settings"],
@@ -134,23 +155,31 @@ export default function AdminAttendanceForm() {
         [activeEmployees, employees, selectedEmployeeId]
     );
     const { data: employeeAttendance = [], isLoading: isAttendanceLoading } = useQuery({
-        queryKey: ["employee-attendance", selectedEmployeeId],
-        queryFn: () => getEmployeeAttendance(selectedEmployeeId, { all: true }),
+        queryKey: ["employee-attendance", businessId, selectedEmployeeId],
+        queryFn: () => getEmployeeAttendance(selectedEmployeeId, { all: true, businessId }),
         enabled: Boolean(selectedEmployeeId),
     });
     const attendanceRows = useMemo(
         () => buildAttendanceHistoryRows(employeeAttendance, attendanceSettings),
         [attendanceSettings, employeeAttendance]
     );
-    const editingRow = useMemo(
-        () => (dateKey ? attendanceRows.find((row) => row.dateKey === dateKey) : undefined),
-        [attendanceRows, dateKey]
-    );
+    const sessionQuery = useQuery({ queryKey: ["attendance-session", businessId, selectedEmployeeId],
+        queryFn: () => getAttendanceSession(selectedEmployeeId, businessId), enabled: attendanceIntegrityEnabled && Boolean(selectedEmployeeId) });
+    const sessionOptions = useMemo(() => sessionQuery.data?.sessions.filter((session) => session.shift?.dayKey === dateKey) || [], [sessionQuery.data, dateKey]);
+    const selectedSession = sessionOptions.find((session) => session.id === selectedSessionId) || sessionOptions.at(-1);
+    const editingRow = useMemo(() => {
+        if (attendanceIntegrityEnabled && selectedSession) return buildAttendanceHistoryRows(selectedSession.events.map((event) => sessionEventRecord(event, selectedEmployeeId)), attendanceSettings)[0];
+        return dateKey ? attendanceRows.find((row) => row.dateKey === dateKey) : undefined;
+    }, [selectedSession, selectedEmployeeId, attendanceSettings, attendanceRows, dateKey]);
 
     const saveAttendanceMutation = useMutation({
         mutationFn: async () => {
             const employeeId = routeEmployeeId || selectedEmployeeId;
             if (!employeeId) throw new Error("Select an employee before saving attendance.");
+            if (attendanceIntegrityEnabled) {
+                if (!confirmation) throw new Error("Review the attendance changes before confirming.");
+                return submitAttendanceCommand(employeeId, confirmation.command, businessId);
+            }
 
             const filledEntries = attendanceFields.filter(({ field }) => attendanceShiftForm[field].trim());
             if (!filledEntries.length) throw new Error("Add at least one attendance time.");
@@ -182,25 +211,24 @@ export default function AdminAttendanceForm() {
 
             await Promise.all(updates);
         },
-        onSuccess: async () => {
+        onSuccess: async (result) => {
+            if (attendanceIntegrityEnabled) {
+                if (result) queryClient.setQueryData(["attendance-session", businessId, selectedEmployeeId], result);
+                setSavedNotice(result?.syncPending ? "Saved. Business synchronization is pending and will retry automatically." : "Attendance saved and synchronized.");
+                setConfirmation(null); dirty.current = false; setIsDirty(false); hydrated.current = "";
+            }
             await queryClient.invalidateQueries({ queryKey: ["employee-attendance"] });
-            navigate("/admin/hr?tab=attendance");
+            await queryClient.invalidateQueries({ queryKey: ["attendance-session"] });
+            await queryClient.invalidateQueries({ queryKey: ["attendance-hub"] });
+            if (!attendanceIntegrityEnabled) navigate("/admin/hr?tab=attendance");
         },
         onError: (error) => {
-            setFormError(error instanceof Error ? error.message : "Unable to save attendance.");
+            setFormError((error as { response?: { data?: { message?: string } } }).response?.data?.message || (error instanceof Error ? error.message : "Unable to save attendance."));
+            void sessionQuery.refetch();
+            void queryClient.invalidateQueries({ queryKey: ["employee-attendance"] });
         },
     });
 
-
-    useEffect(() => {
-        if (routeEmployeeId) {
-            setSelectedEmployeeId(routeEmployeeId);
-        }
-    }, [routeEmployeeId]);
-
-    useEffect(() => {
-        setFormError("");
-    }, [attendanceShiftForm, selectedEmployeeId]);
 
     useEffect(() => {
         if (!isEmployeePickerOpen) return;
@@ -226,13 +254,18 @@ export default function AdminAttendanceForm() {
     }, [isEmployeePickerOpen]);
 
     useEffect(() => {
+        const key = `${businessId}:${selectedEmployeeId}:${dateKey}:${selectedSession?.id || "new"}`;
+        if (hydrated.current === key || dirty.current) return;
+        if (attendanceIntegrityEnabled && !sessionQuery.data) return;
         if (!isEditing) {
-            setAttendanceShiftForm(emptyAttendanceShiftForm);
+            draftBaseline.current = {};
+            hydrated.current = key;
+            queueMicrotask(() => setBaselineRevision(sessionQuery.data?.revision ?? null));
             return;
         }
         if (!editingRow) return;
 
-        setAttendanceShiftForm({
+        const form = {
             timeIn: formatDateTimeInputInTimeZone(editingRow.timeInRecord?.timeIn),
             timeOut: formatDateTimeInputInTimeZone(editingRow.timeOutRecord?.timeIn),
             firstBreakOut: formatDateTimeInputInTimeZone(editingRow.firstBreakOutRecord?.timeIn),
@@ -241,18 +274,46 @@ export default function AdminAttendanceForm() {
             lunchIn: formatDateTimeInputInTimeZone(editingRow.lunchInRecord?.timeIn),
             secondBreakOut: formatDateTimeInputInTimeZone(editingRow.secondBreakOutRecord?.timeIn),
             secondBreakIn: formatDateTimeInputInTimeZone(editingRow.secondBreakInRecord?.timeIn),
-        });
-    }, [editingRow, isEditing]);
+        };
+        for (const { field } of attendanceFields) {
+            const record = editingRow[attendanceRecordKeyByField[field]];
+            form[field] = attendanceInputValue(record?.timeIn);
+            draftBaseline.current[field] = { value: form[field], source: attendanceSources[field],
+                original: record ? { id: record._id, source: record.source, at: record.timeIn } : undefined };
+        }
+        let cancelled = false;
+        // Hydrate once from the external query, never over a dirty draft or a changed route.
+        queueMicrotask(() => { if (!cancelled && !dirty.current) { setAttendanceShiftForm(form); setBaselineRevision(sessionQuery.data?.revision ?? null); hydrated.current = key; } });
+        return () => { cancelled = true; };
+    }, [businessId, selectedEmployeeId, dateKey, selectedSession?.id, editingRow, isEditing, sessionQuery.data]);
 
     const latestRow = attendanceRows[0];
+    const rowDuration = (row?: AttendanceHistoryRow) => {
+        const sessions = sessionQuery.data?.sessions.filter((item) => item.shift?.dayKey === row?.dateKey) || [];
+        return attendanceIntegrityEnabled ? sessions.some((session) => session.time) ? formatDuration(sessions.reduce((total, session) => total + (session.time?.scheduled.online || 0), 0)) : "-" : row?.duration || "-";
+    };
     const visibleRows = attendanceRows.slice(0, 12);
     const formTitle = isEditing ? "Edit Attendance" : "Add Attendance";
     const canSave = Boolean((routeEmployeeId || selectedEmployeeId) && (!isEditing || editingRow));
 
-    const handleSubmit = (event: FormEvent<HTMLFormElement>) => {
+    const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
         event.preventDefault();
         setFormError("");
-        saveAttendanceMutation.mutate();
+        if (!attendanceIntegrityEnabled) { saveAttendanceMutation.mutate(); return; }
+        try {
+            if (!reason.trim()) throw new Error("Enter a reason for this attendance correction.");
+            const fields = attendanceFields.map(({ field }) => ({ ...draftBaseline.current[field], value: attendanceShiftForm[field], source: attendanceSources[field] }));
+            const changes = buildAttendanceDraftChanges(fields) as AttendanceCommand["changes"];
+            if (!changes?.length) throw new Error("No attendance times changed. Nothing was saved.");
+            const snapshot = sessionQuery.data;
+            if (!snapshot) throw new Error("Attendance is unavailable. Retry loading before saving.");
+            const command: AttendanceCommand = { commandId: crypto.randomUUID(), operation: "correct", reason: reason.trim(),
+                expectedRevision: baselineRevision ?? snapshot.revision, fingerprint: snapshot.fingerprint, changes };
+            await previewAttendanceCommand(routeEmployeeId || selectedEmployeeId, command, businessId);
+            setConfirmation({ command, count: changes.length, removed: changes.filter((change) => change.remove).length });
+        } catch (error) {
+            setFormError((error as { response?: { data?: { message?: string } } }).response?.data?.message || (error instanceof Error ? error.message : "Unable to preview changes."));
+        }
     };
 
     return (
@@ -265,7 +326,7 @@ export default function AdminAttendanceForm() {
                             Back to attendance
                         </Link>
                         <h2 className="mt-3 text-2xl font-semibold !text-slate-950">{formTitle}</h2>
-                        <p className="mt-1 text-sm !text-slate-600">Manual attendance entries use PH attendance slots.</p>
+                        <p className="mt-1 text-sm !text-slate-600">{businessName} · Asia/Manila</p>
                     </div>
                     <Link className="inline-flex h-10 items-center gap-2 rounded-lg border border-slate-300 bg-white px-3 text-sm font-semibold !text-slate-700 transition hover:bg-slate-50 hover:!text-slate-950" to="/admin/hr?tab=attendance">
                         Cancel
@@ -292,7 +353,7 @@ export default function AdminAttendanceForm() {
                         <div className="grid gap-3 border-b border-slate-200 p-4 sm:grid-cols-3">
                             <SummaryTile label="Latest Slot" value={latestRow?.date || "-"} icon={FiCalendar} />
                             <SummaryTile label="Status" value={latestRow?.timeInStatus || "-"} icon={FiCheck} />
-                            <SummaryTile label="Duration" value={latestRow?.duration || "-"} icon={FiClock} />
+                            <SummaryTile label="Duration" value={rowDuration(latestRow)} icon={FiClock} />
                         </div>
 
                         <div className="content-scroll max-h-[34rem] overflow-y-auto p-4">
@@ -325,7 +386,7 @@ export default function AdminAttendanceForm() {
                                             <AttendancePair label="Off the Phone" value={row.offPhoneInOut} />
                                         </div>
                                         <div className="mt-3 flex flex-wrap gap-2">
-                                            <span className="rounded-md bg-slate-100 px-2.5 py-1 text-xs font-semibold !text-slate-700">Duration {row.duration}</span>
+                                            <span className="rounded-md bg-slate-100 px-2.5 py-1 text-xs font-semibold !text-slate-700">Duration {rowDuration(row)}</span>
                                             <span className="rounded-md bg-violet-50 px-2.5 py-1 text-xs font-semibold !text-violet-700">OT {row.overtime}</span>
                                             {row.offPhoneDuration !== "-" && (
                                                 <span className="rounded-md bg-sky-50 px-2.5 py-1 text-xs font-semibold !text-sky-700">Off Phone {row.offPhoneDuration}</span>
@@ -381,6 +442,7 @@ export default function AdminAttendanceForm() {
                                                             aria-selected={isSelected}
                                                             onClick={() => {
                                                                 setSelectedEmployeeId(employee._id);
+                                                                dirty.current = false; setIsDirty(false); hydrated.current = ""; draftBaseline.current = {}; setAttendanceShiftForm(emptyAttendanceShiftForm); setConfirmation(null); setFormError("");
                                                                 setIsEmployeePickerOpen(false);
                                                             }}
                                                         >
@@ -406,6 +468,13 @@ export default function AdminAttendanceForm() {
                                 </div>
                             </label>
 
+                            {isEditing && sessionOptions.length > 1 && <label className="grid gap-2 text-sm !text-slate-700">Session
+                                <select className="rounded-md border border-slate-300 bg-white p-3 !text-slate-950" value={selectedSession?.id || ""} disabled={isDirty || saveAttendanceMutation.isPending}
+                                    title={isDirty ? "Save or cancel this draft before switching sessions" : "Choose the session to correct"}
+                                    onChange={(event) => { setSelectedSessionId(event.target.value); hydrated.current = ""; draftBaseline.current = {}; setConfirmation(null); }}>
+                                    {sessionOptions.map((session) => <option key={session.id} value={session.id}>{new Date(session.startedAt).toLocaleString("en-US", { timeZone: "Asia/Manila" })} PH - {session.lifecycle}</option>)}
+                                </select>
+                            </label>}
                             <div className="grid gap-4 md:grid-cols-2">
                                 {attendanceFields.map(({ label, field }) => (
                                     <label key={field}>
@@ -413,16 +482,42 @@ export default function AdminAttendanceForm() {
                                         <input
                                             className="mt-2 h-12 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm font-semibold !text-slate-950 outline-none transition focus:border-violet-500 focus:ring-2 focus:ring-violet-200"
                                             type="datetime-local"
+                                            step="0.001"
+                                            disabled={saveAttendanceMutation.isPending}
                                             value={attendanceShiftForm[field]}
-                                            onChange={(event) => setAttendanceShiftForm((form) => ({ ...form, [field]: event.target.value }))}
+                                            onChange={(event) => { dirty.current = true; setIsDirty(true); setConfirmation(null); setAttendanceShiftForm((form) => ({ ...form, [field]: event.target.value })); }}
                                         />
                                     </label>
                                 ))}
                             </div>
 
+                            {attendanceIntegrityEnabled && <label className="grid gap-2 text-sm !text-slate-700">Correction reason
+                                <textarea className="rounded-md border border-slate-300 bg-white p-3 !text-slate-950" required disabled={saveAttendanceMutation.isPending} maxLength={1000} value={reason} onChange={(event) => { setReason(event.target.value); setConfirmation(null); }} />
+                            </label>}
+                            {attendanceIntegrityEnabled && baselineRevision !== null && sessionQuery.data && baselineRevision !== sessionQuery.data.revision && isDirty && <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm !text-slate-900">
+                                <p>Attendance changed while this draft was open. Your entries have been retained.</p>
+                                <button type="button" className="mt-2 underline" onClick={() => {
+                                    const rebased = { ...attendanceShiftForm };
+                                    for (const { field } of attendanceFields) {
+                                        const previous = draftBaseline.current[field];
+                                        const record = editingRow?.[attendanceRecordKeyByField[field]];
+                                        const latestValue = attendanceInputValue(record?.timeIn);
+                                        if (attendanceShiftForm[field] === (previous?.value || "")) rebased[field] = latestValue;
+                                        draftBaseline.current[field] = { value: latestValue, source: attendanceSources[field], original: record ? { id: record._id, source: record.source, at: record.timeIn } : undefined };
+                                    }
+                                    setAttendanceShiftForm(rebased); setBaselineRevision(sessionQuery.data.revision); setConfirmation(null); setFormError("");
+                                }}>Review my changes against the latest records</button>
+                            </div>}
+                            {confirmation && <div role="alertdialog" aria-label="Confirm attendance correction" className="rounded-md border border-amber-300 bg-amber-50 p-4 text-sm text-slate-900">
+                                <p>{confirmation.count} intentional change(s), including {confirmation.removed} explicit removal(s). Original evidence is retained. Missing checkout stays missing unless you enter it. Pending payroll will recalculate; finalized payroll remains unchanged.</p>
+                                <button type="button" className="mt-3 rounded-md bg-emerald-700 px-4 py-2 text-white disabled:opacity-50" disabled={saveAttendanceMutation.isPending} onClick={() => saveAttendanceMutation.mutate()}>{saveAttendanceMutation.isPending ? "Saving..." : "Confirm changes"}</button>
+                                <button type="button" className="ml-3 underline" onClick={() => setConfirmation(null)}>Cancel</button>
+                            </div>}
+
                             {formError && (
                                 <p className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm font-semibold text-red-700">{formError}</p>
                             )}
+                            {savedNotice && <p role="status" className="rounded-md border border-emerald-200 bg-emerald-50 p-3 text-sm !text-emerald-800">{savedNotice}</p>}
 
                             {isEditing && selectedEmployeeId && !isAttendanceLoading && !editingRow && (
                                 <p className="rounded-lg border border-yellow-200 bg-yellow-50 px-3 py-2 text-sm font-semibold text-yellow-800">Attendance record not found for this date.</p>
@@ -493,8 +588,8 @@ function firstAttendanceRecord(records: AttendanceRecord[], sources: AttendanceR
 }
 
 function formatTimePair(first?: string, second?: string, timeZone = ATTENDANCE_TIME_ZONE) {
-    const firstLabel = formatTimeInTimeZone(first, timeZone) || "00:00:00";
-    const secondLabel = formatTimeInTimeZone(second, timeZone) || "00:00:00";
+    const firstLabel = formatTimeInTimeZone(first, timeZone) || "--";
+    const secondLabel = formatTimeInTimeZone(second, timeZone) || (first ? "Open" : "--");
     return `${firstLabel} - ${secondLabel}`;
 }
 

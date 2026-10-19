@@ -13,6 +13,7 @@ export type CallDashboardDevice = {
   nextivaProcessDetected: boolean;
   lastSeenAt: Date;
   lastStateChangedAt: Date;
+  lastBridgeAvailabilityChangedAt?: Date | null;
   lastIdleAt?: Date | null;
 };
 
@@ -29,6 +30,32 @@ const heartbeatFreshnessMs = 20_000;
 // Windows can leave a Nextiva audio session open after a call ends. A bridge
 // signal that never transitions must not hold the dashboard ON CALL forever.
 const maximumActiveCallSignalMs = 30 * 60 * 1000;
+
+export function bridgeAvailabilityChangedAt(previous: Pick<CallDashboardDevice,
+  "state" | "nextivaProcessDetected" | "lastSeenAt" | "lastBridgeAvailabilityChangedAt">, next: {
+  state: string;
+  nextivaProcessDetected: boolean;
+}, now: Date) {
+  // Heartbeats repeat every few seconds; only a state/process change or a
+  // stale-to-fresh reconnect starts a new dashboard availability interval.
+  return !previous.lastBridgeAvailabilityChangedAt || previous.state !== next.state ||
+    previous.nextivaProcessDetected !== next.nextivaProcessDetected ||
+    previous.lastSeenAt.getTime() < now.getTime() - heartbeatFreshnessMs
+    ? now : previous.lastBridgeAvailabilityChangedAt;
+}
+
+export function offPhoneDashboardClock(input: {
+  totalMs: number;
+  state: string;
+  stateSince: Date;
+  shiftEnd: Date;
+  now: Date;
+}) {
+  const activeStartedAt = input.state === "offPhone" ? input.stateSince : null;
+  const activeMs = activeStartedAt
+    ? Math.max(0, Math.min(input.now.getTime(), input.shiftEnd.getTime()) - activeStartedAt.getTime()) : 0;
+  return { completedMs: Math.max(0, input.totalMs - activeMs), activeStartedAt };
+}
 
 function zonedDateParts(date: Date, timeZone: string) {
   const parts = new Intl.DateTimeFormat("en-US", {
@@ -244,7 +271,8 @@ export function callDashboardStatus(input: {
   if (ready && schedule?.lastDialStartedAt && schedule.dialIntentUntil && schedule.dialIntentUntil > now) {
     return {
       status: "ONLINE" as const,
-      statusStartedAt: withinShift(callDashboardV2Enabled() ? onlineAt : schedule.lastDialStartedAt),
+      statusStartedAt: withinShift(callDashboardV2Enabled()
+        ? latestDate(schedule.lastDialStartedAt, onlineAt) : schedule.lastDialStartedAt),
       transitionUntil: schedule.dialIntentUntil,
       detail: `Opening ${providerName} · call not confirmed`,
     };
@@ -272,6 +300,7 @@ export function callDashboardStatus(input: {
       statusStartedAt: withinShift(latestDate(
         schedule?.dialIntentUntil && schedule.dialIntentUntil <= now ? schedule.dialIntentUntil : null,
         waitingUntil && waitingUntil <= now ? waitingUntil : null,
+        callDashboardV2Enabled() ? ready.lastBridgeAvailabilityChangedAt : null,
         trustworthyReadyTransition,
         onlineAt
       )),
@@ -285,7 +314,15 @@ export function callDashboardStatus(input: {
     : null;
   return {
     status: "ONLINE" as const,
-    statusStartedAt: withinShift(callDashboardV2Enabled() ? onlineAt : latestDate(disconnectedAt, latestDevice && fresh.length ? latestDevice.lastStateChangedAt : null, offlineAt)),
+    statusStartedAt: withinShift(callDashboardV2Enabled() ? latestDate(
+      onlineAt,
+      schedule?.lastCallEndedAt,
+      schedule?.lastDialStartedAt,
+      schedule?.dialIntentUntil && schedule.dialIntentUntil <= now ? schedule.dialIntentUntil : null,
+      waitingUntil && waitingUntil <= now ? waitingUntil : null,
+      disconnectedAt,
+      latestDevice && fresh.length ? latestDevice.lastBridgeAvailabilityChangedAt || latestDevice.lastStateChangedAt : null
+    ) : latestDate(disconnectedAt, latestDevice && fresh.length ? latestDevice.lastStateChangedAt : null, offlineAt)),
     transitionUntil: null,
     detail: conflictingActiveDevice ? "Conflicting Call Bridge sessions" : fresh.length
       ? `Online · ${providerName} unavailable`

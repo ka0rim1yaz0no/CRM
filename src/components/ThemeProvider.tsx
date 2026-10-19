@@ -1,66 +1,27 @@
 import { useEffect, type ReactNode } from "react";
-import { defaultThemeKey, getTheme, isThemeKey, type ThemeKey } from "../lib/themes";
-
-const storedThemeKey = "crmThemeKey";
-const storedThemeOverrideKey = "crmThemeUserOverride";
-
-function applyTheme(themeKey: ThemeKey) {
-    const theme = getTheme(themeKey);
-    const root = document.documentElement;
-
-    root.dataset.theme = theme.key;
-    root.style.setProperty("--app-bg", theme.colors.app);
-    root.style.setProperty("--shell-bg", theme.colors.shell);
-    root.style.setProperty("--surface-bg", theme.colors.surface);
-    root.style.setProperty("--panel-bg", theme.colors.panel);
-    root.style.setProperty("--modal-bg", theme.colors.modal);
-    root.style.setProperty("--primary", theme.colors.primary);
-    root.style.setProperty("--primary-dark", theme.colors.primaryDark);
-    root.style.setProperty("--primary-soft", theme.colors.primarySoft);
-    root.style.setProperty("--primary-text", theme.colors.primaryText);
-    root.style.setProperty("--secondary", theme.colors.secondary);
-}
-
-type SetAppThemeOptions = {
-    userOverride?: boolean;
-};
-
-export function getStoredThemeKey() {
-    const cachedThemeKey = localStorage.getItem(storedThemeKey);
-    return cachedThemeKey && isThemeKey(cachedThemeKey) ? cachedThemeKey : defaultThemeKey;
-}
-
-export function hasAppThemeOverride() {
-    return localStorage.getItem(storedThemeOverrideKey) === "true";
-}
-
-export function setAppTheme(themeKey: string, options: SetAppThemeOptions = {}) {
-    const safeThemeKey = isThemeKey(themeKey) ? themeKey : defaultThemeKey;
-    localStorage.setItem(storedThemeKey, safeThemeKey);
-
-    if (options.userOverride === true) {
-        localStorage.setItem(storedThemeOverrideKey, "true");
-    }
-
-    if (options.userOverride === false) {
-        localStorage.removeItem(storedThemeOverrideKey);
-    }
-
-    applyTheme(safeThemeKey);
-}
+import { getStoredThemeKey, hasAppThemeOverride, setAppTheme } from "../lib/appTheme";
+import { getActiveBusinessId } from "../api/businessStorage";
 
 export function ThemeProvider({ children }: { children: ReactNode }) {
     useEffect(() => {
         setAppTheme(getStoredThemeKey());
 
-        void import("../api/systemSettings")
-            .then(({ getSystemSettings }) => getSystemSettings())
-            .then((settings) => {
-                if (!hasAppThemeOverride()) {
-                    setAppTheme(settings.themeKey, { userOverride: false });
-                }
-            })
-            .catch(() => undefined);
+        let generation = 0;
+        const refresh = () => {
+            const request = ++generation;
+            const business = getActiveBusinessId();
+            void import("../api/systemSettings")
+                .then(({ getSystemSettings }) => getSystemSettings())
+                .then((settings) => {
+                    if (request === generation && business === getActiveBusinessId() && !hasAppThemeOverride()) {
+                        setAppTheme(settings.themeKey, { userOverride: false });
+                    }
+                })
+                .catch(() => undefined);
+        };
+        refresh();
+        window.addEventListener("crm:business-changed", refresh);
+        return () => { generation++; window.removeEventListener("crm:business-changed", refresh); };
     }, []);
 
     return children;

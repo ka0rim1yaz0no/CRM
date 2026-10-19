@@ -4,6 +4,9 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
+    "dev:attendance": "node scripts/start-attendance-local.mjs",
+    "dev:local-review": "node scripts/start-attendance-local.mjs --local-review --adopt-legacy",
+    "preview:local-review": "node scripts/preview-local-review.mjs",
     "dev": "vite",
     "dev:backend": "npm run dev --prefix backend",
     "call-bridge:package": "powershell -NoProfile -ExecutionPolicy Bypass -File callbridge/package-call-bridge.ps1",
@@ -22,6 +25,7 @@
     "ckeditor5": "^48.1.1",
     "dompurify": "^3.4.7",
     "dotenv": "^18.0.7",
+    "gsap": "^3.15.0",
     "html-to-image": "^1.11.13",
     "libphonenumber-js": "^1.13.9",
     "react": "^19.2.5",

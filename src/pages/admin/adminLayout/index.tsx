@@ -1,4 +1,4 @@
-import type { ElementType, FormEvent, ReactNode } from "react";
+import type { CSSProperties, ElementType, FormEvent, ReactNode } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, NavLink, Navigate, useLocation, useNavigate } from "react-router";
@@ -13,12 +13,15 @@ import { getEvaluations } from "../../../api/evaluations";
 import { getAdminLeads } from "../../../api/leads";
 import { useFeatureFlags } from "../../../hooks/useFeatureFlags";
 import { useClickOutside } from "../../../hooks/useClickOutside";
+import { canSelectSearchResult } from "../../../../shared/workspaceSearch";
+import { emitToast } from "../../../lib/toast";
 import { useMessageNotifications } from "../../../hooks/useMessageNotifications";
 import { formatPhDate, formatPhDateTime } from "../../../lib/dateTime";
 import { getEmployeeEvaluationReminders } from "../../../lib/employeeEvaluation";
 import { refreshSocketBusinessContext } from "../../../lib/socket";
 import {
     FiBarChart2,
+    FiClock,
     FiBell,
     FiBookOpen,
     FiChevronDown,
@@ -43,6 +46,7 @@ import { FaRegMoneyBillAlt } from "react-icons/fa";
 import { MdPassword } from "react-icons/md";
 import { isPocOperationsPath, isPocOperationsUser, roleWorkspacePath } from "../../../lib/roleAccess";
 import MainLayout from "../../layout";
+import "../../../components/WorkspaceSidebar.css";
 
 type Props = {
     children: ReactNode;
@@ -106,6 +110,8 @@ const adminNavSections: AdminNavSection[] = [
         title: "Workspace",
         items: [
             { label: "HR", path: "/admin/hr", icon: FiFileText, feature: "hr" },
+            ...(import.meta.env.VITE_CRM_ATTENDANCE_HUB === "true" || (import.meta.env.DEV && import.meta.env.VITE_CRM_ATTENDANCE_HUB !== "false")
+                ? [{ label: "Attendance", path: "/admin/attendance", icon: FiClock, feature: "hr" as const }] : []),
             { label: "Knowledge Base", path: "/admin/knowledge-base", icon: FiBookOpen, feature: "knowledge-base" },
             { label: "Media", path: "/admin/media", icon: FiImage, feature: "media" },
             { label: "Messages", path: "/admin/messages", icon: FiMessageCircle, feature: "messages" },
@@ -294,6 +300,10 @@ export default function AdminLayout({ children }: Props) {
         event.preventDefault();
         const search = adminSearch.trim();
         if (!search) return;
+        if (!canSelectSearchResult(search, normalizedAdminSearch, isAdminLeadSearchFetching)) {
+            setIsAdminSearchOpen(true);
+            return;
+        }
 
         const normalizedSearch = search.toLowerCase();
         const exactEmployee = matchingEmployees.find((employee) =>
@@ -308,6 +318,12 @@ export default function AdminLayout({ children }: Props) {
         );
         const employee = exactEmployee;
         const lead = exactLead;
+
+        if (!employee && !lead) {
+            setIsAdminSearchOpen(true);
+            emitToast({ tone: "info", message: "No exact employee or lead match. Choose a result or enter the complete name, code, email, or phone." });
+            return;
+        }
 
         setIsAdminSearchOpen(false);
         setAdminSearch("");
@@ -365,12 +381,12 @@ export default function AdminLayout({ children }: Props) {
     }
 
     return (
-        <div className="theme-app-bg h-screen overflow-hidden text-white">
+        <div className="theme-app-bg h-screen overflow-hidden text-white" data-sidebar-collapsed={isSidebarCollapsed}>
             <div className="pointer-events-none fixed inset-0 bg-[radial-gradient(circle_at_8%_14%,color-mix(in_srgb,var(--primary)_20%,transparent),transparent_28%),radial-gradient(circle_at_98%_0%,color-mix(in_srgb,var(--secondary)_12%,transparent),transparent_25%),linear-gradient(135deg,rgba(255,255,255,0.035),transparent_26%)]" />
             <div className="pointer-events-none fixed inset-0 bg-[linear-gradient(90deg,rgba(255,255,255,0.025)_1px,transparent_1px),linear-gradient(180deg,rgba(255,255,255,0.018)_1px,transparent_1px)] bg-[size:4rem_4rem] opacity-20" />
 
-            <aside className={["theme-shell-bg fixed inset-y-0 left-0 z-10 flex flex-col border-r border-white/10 text-white shadow-2xl shadow-black/20 backdrop-blur-xl transition-[width] duration-200", isSidebarCollapsed ? "w-[5rem]" : "w-[13.5rem] 2xl:w-[16rem]"].join(" ")}>
-                <div className={["flex w-full items-center border-b border-white/10 py-4 2xl:py-5", isSidebarCollapsed ? "justify-center px-2" : "justify-center px-4 2xl:px-6"].join(" ")}>
+            <aside className={["workspace-sidebar theme-shell-bg fixed inset-y-0 left-0 z-10 flex flex-col border-r border-white/10 text-white shadow-2xl shadow-black/20 backdrop-blur-xl transition-[width] duration-200", isSidebarCollapsed ? "w-[5rem]" : "w-[13.5rem] 2xl:w-[16rem]"].join(" ")}>
+                <div className={["workspace-sidebar-brand flex w-full items-center border-b border-white/10 py-4 2xl:py-5", isSidebarCollapsed ? "justify-center px-2" : "justify-center px-4 2xl:px-6"].join(" ")}>
                     {isSidebarCollapsed ? (
                         <div className="h-10 w-10 overflow-hidden" aria-label="Assistly">
                             <img className="theme-sidebar-logo theme-sidebar-logo-dark h-auto w-[9.75rem] max-w-none" src="/images/logoaside.png" alt="" />
@@ -384,11 +400,11 @@ export default function AdminLayout({ children }: Props) {
                     )}
                 </div>
 
-                <div className={["flex min-h-0 flex-1 flex-col py-4 2xl:py-5", isSidebarCollapsed ? "px-2" : "px-2.5 2xl:px-3"].join(" ")}>
+                <div className={["workspace-sidebar-body flex min-h-0 flex-1 flex-col py-4 2xl:py-5", isSidebarCollapsed ? "px-2" : "px-2.5 2xl:px-3"].join(" ")}>
                     <nav className="admin-sidebar-nav-command content-scroll min-h-0 flex-1 overflow-y-auto pr-1" aria-label="Admin navigation">
-                        <div className="flex flex-col gap-5">
+                        <div className="admin-sidebar-groups">
                             {visibleNavSections.map((section) => (
-                                <div key={section.title}>
+                                <div className="admin-sidebar-group" key={section.title} style={{ "--sidebar-item-count": section.items.length } as CSSProperties}>
                                     <div className="admin-sidebar-section-title mb-2 flex items-center gap-2 px-3 text-xs font-semibold uppercase tracking-[0.16em] text-white/35 2xl:px-4">
                                         {section.title === "Admin" && <FiShield className="size-4" aria-hidden="true" />}
                                         {!isSidebarCollapsed && <span>{section.title}</span>}
@@ -398,6 +414,8 @@ export default function AdminLayout({ children }: Props) {
                                             <li key={label}>
                                                 <NavLink
                                                     to={path}
+                                                    title={label}
+                                                    aria-label={label}
                                                     className={({ isActive }) =>
                                                         [
                                                             "admin-sidebar-link flex h-10 items-center rounded-lg text-sm font-medium transition 2xl:h-11",
@@ -500,7 +518,7 @@ export default function AdminLayout({ children }: Props) {
                                 {isSidebarCollapsed ? <FiChevronRight className="size-4" /> : <FiChevronLeft className="size-4" />}
                             </button>
                             <div className="min-w-0">
-                                <p className="text-xs font-medium uppercase tracking-[0.18em] text-white/40">{isPocOperations ? "Operations Workspace" : "Admin Workspace"}</p>
+                                <p className="text-xs font-medium uppercase tracking-[0.18em] text-white/40">{import.meta.env.DEV && import.meta.env.VITE_CRM_LOCAL_REVIEW === "true" ? "Local Review Copy" : isPocOperations ? "Operations Workspace" : "Admin Workspace"}</p>
                                 <h1 className="mt-1 truncate text-xl font-semibold text-white">{currentPageTitle}</h1>
                             </div>
                         </div>

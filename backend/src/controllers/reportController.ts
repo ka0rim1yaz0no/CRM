@@ -175,19 +175,7 @@ function createAgentRow(employee: EmployeeReportRecord): AgentReportRow {
   };
 }
 
-function getLeadAssignedAgentId(lead: unknown) {
-  const assignedAgent = (lead as { assignedAgent?: unknown })?.assignedAgent;
 
-  if (!assignedAgent) {
-    return null;
-  }
-
-  if (typeof assignedAgent === "object" && "_id" in assignedAgent) {
-    return String((assignedAgent as { _id?: unknown })._id || "");
-  }
-
-  return String(assignedAgent);
-}
 
 function statusFromAttendanceSource(source: AttendanceSource): AvailabilityStatus | null {
   if (source === "Time In" || source === "Login" || source === "Break In" || source === "Lunch Break In") {
@@ -592,14 +580,18 @@ export async function readAgentProductivityReport(request: Request, response: Re
   });
 
   const publicAgents = Array.from(rows.values())
-    .map(({ leadIds, ...row }) => ({
-      ...row,
-      activeMinutes: Math.round(row.activeMinutes),
-      idleMinutes: Math.round(row.idleMinutes),
-      breakMinutes: Math.round(row.breakMinutes),
-      lunchMinutes: Math.round(row.lunchMinutes),
-      offlineMinutes: Math.round(row.offlineMinutes),
-    }))
+    .map(({ leadIds, ...row }) => {
+      // Internal aggregation sets are not part of the response.
+      void leadIds;
+      return {
+        ...row,
+        activeMinutes: Math.round(row.activeMinutes),
+        idleMinutes: Math.round(row.idleMinutes),
+        breakMinutes: Math.round(row.breakMinutes),
+        lunchMinutes: Math.round(row.lunchMinutes),
+        offlineMinutes: Math.round(row.offlineMinutes),
+      };
+    })
     .filter((row) => {
       const rowLooksLikeAgent = /\b(agent|sales|lead|closer|setter|appointment)\b/i.test([row.role, row.team, row.employeeName, row.employeeCode].join(" "));
       return agentFilter !== "ALL" || row.leadActions > 0 || row.activeMinutes > 0 || row.idleMinutes > 0 || row.breakMinutes > 0 || rowLooksLikeAgent;

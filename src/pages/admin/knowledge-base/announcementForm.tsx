@@ -1,5 +1,5 @@
 import type { FormEvent } from "react";
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate, useParams } from "react-router";
 import { FiArrowLeft, FiImage, FiPlus, FiSave, FiTrash2 } from "react-icons/fi";
@@ -14,7 +14,7 @@ import {
     type KnowledgeBaseEntry,
     type KnowledgeBaseInput,
 } from "../../../api/knowledgeBase";
-import { useToast } from "../../../components/ToastProvider";
+import { useToast } from "../../../lib/toast";
 import { getPlainTextFromRichText } from "../../../lib/richText";
 import { ClassicEditor, createKnowledgeBaseEditorConfig, normalizeKnowledgeBaseRichTextImages } from "./richTextEditor";
 import { backendOrigin } from "../../../lib/backendUrl";
@@ -108,22 +108,27 @@ export default function AdminAnnouncementForm() {
     });
     const editEntry = entries.find((entry) => entry._id === entryId);
 
-    useEffect(() => {
-        if (!isEditing) {
-            setInitialEditorData("");
-            setLoadedEntryId(null);
-            return;
-        }
+    const [previousAnnouncementDraft, setPreviousAnnouncementDraft] = useState<readonly unknown[] | null>(null);
+    const announcementDraftInputs = [editEntry, isEditing, loadedEntryId];
+    if (previousAnnouncementDraft === null || announcementDraftInputs.some((input, index) => !Object.is(input, previousAnnouncementDraft[index]))) {
+        setPreviousAnnouncementDraft(announcementDraftInputs);
+        (() => {
+            if (!isEditing) {
+                setInitialEditorData("");
+                setLoadedEntryId(null);
+                return;
+            }
 
-        if (!editEntry || loadedEntryId === editEntry._id) {
-            return;
-        }
+            if (!editEntry || loadedEntryId === editEntry._id) {
+                return;
+            }
 
-        const nextForm = entryToInput(editEntry);
-        setForm(nextForm);
-        setInitialEditorData(nextForm.description);
-        setLoadedEntryId(editEntry._id);
-    }, [editEntry, isEditing, loadedEntryId]);
+            const nextForm = entryToInput(editEntry);
+            setForm(nextForm);
+            setInitialEditorData(nextForm.description);
+            setLoadedEntryId(editEntry._id);
+        })();
+    }
 
     const createMutation = useMutation({
         mutationFn: createKnowledgeBaseEntry,

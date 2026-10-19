@@ -1,4 +1,6 @@
 import type { Request, Response } from "express";
+import { attendanceIntegrityEnabled } from "../config/rolloutFlags";
+import { verifyAdminDashboardSession } from "../config/adminDashboardSession";
 import { Employee, normalizeEmployeeAvailabilityStatus, type EmployeeAvailabilityStatus, type EmployeeStatus } from "../models/Employee";
 import { Lead } from "../models/Lead";
 import {
@@ -166,7 +168,7 @@ function respondIfEmployeeCannotAccess(request: Request, response: Response, emp
 }
 
 function respondIfNotAdmin(request: Request, response: Response) {
-  if (actorType(request) === "admin") return false;
+  if (actorType(request) === "admin" && verifyAdminDashboardSession(request.header("x-crm-admin-session"))) return false;
   response.status(403).json({ message: "Administrator access is required." });
   return true;
 }
@@ -210,6 +212,7 @@ async function syncEmployeeBusinessAccess(
       ? toProfileImage((employeePayloadForTargets as Record<string, unknown>).profileImage)
       : toProfileImage(sourceProfileImage),
   } as Record<string, unknown>;
+  if (attendanceIntegrityEnabled()) delete safeTargetPayload.availabilityStatus;
 
   if (normalizedPreviousEmployeeCode && normalizedPreviousEmployeeCode !== normalizedEmployeeCode) {
     await deleteBusinessAccessForEmployeeCode(normalizedPreviousEmployeeCode);
@@ -424,6 +427,7 @@ export async function updateEmployee(request: Request, response: Response) {
   const previousEmployeeCode = toText(existingEmployee.employeeCode);
   const previousBusinessAccessIds = validBusinessAccessIds(existingEmployee.businessAccessIds);
   const payload = employeePayload(request.body, { includeProfileImage: shouldUpdateProfileImage });
+  if (attendanceIntegrityEnabled()) delete (payload as Record<string, unknown>).availabilityStatus;
 
   if (previousName && !sameNormalizedName(previousName, payload.name)) {
     payload.aliases = toAliases([...payload.aliases, previousName]);

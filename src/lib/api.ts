@@ -1,6 +1,6 @@
 import axios from "axios";
 import { backendOrigin } from "./backendUrl";
-import { emitToast } from "../components/ToastProvider";
+import { emitToast } from "./toast";
 import { getActiveBusinessId } from "../api/businessStorage";
 import { getAuthUser } from "../api/authStorage";
 
@@ -15,11 +15,12 @@ api.interceptors.request.use((config) => {
     const businessId = getActiveBusinessId();
     const authUser = getAuthUser();
 
-    if (businessId) {
+    if (businessId && !config.headers["X-Business-Id"]) {
         config.headers["X-Business-Id"] = businessId;
     }
 
     if (authUser) {
+        if (authUser.userType === "admin" && authUser.sessionToken && !config.headers["X-CRM-Admin-Session"]) config.headers["X-CRM-Admin-Session"] = authUser.sessionToken;
         config.headers["X-CRM-User-Code"] = authUser.user.employeeCode;
         config.headers["X-CRM-User-Name"] = authUser.user.name;
         config.headers["X-CRM-User-Type"] = authUser.userType;

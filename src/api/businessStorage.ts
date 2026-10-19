@@ -15,8 +15,10 @@ export function setActiveBusinessId(businessId: string) {
 
     if (!normalizedBusinessId) {
         localStorage.removeItem(activeBusinessStorageKey);
+        window.dispatchEvent(new Event("crm:business-changed"));
         return;
     }
 
     localStorage.setItem(activeBusinessStorageKey, normalizedBusinessId);
+    window.dispatchEvent(new Event("crm:business-changed"));
 }

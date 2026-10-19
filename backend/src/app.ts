@@ -32,15 +32,17 @@ import { errorHandler } from "./middleware/errorHandler";
 import { callRouter } from "./routes/callLoggerRoutes";
 import { callBridgeRouter } from "./routes/callBridgeRoutes";
 import { callDashboardRouter } from "./routes/callDashboardRoutes";
+import { dashboardWorkspaceRouter } from "./routes/dashboardWorkspaceRoutes";
 import { tomTomQuotaRouter } from "./routes/tomTomQuotaRoutes";
 import { businessContextMiddleware, createBusiness, getPublicBusinesses, updateBusinessDisplayName } from "./config/tenancy";
 import { publicSurveyRouter } from "./routes/publicSurveyRoutes";
 import { employeeEvaluationRouter } from "./routes/employeeEvaluationRoutes";
 import { businessAccessMiddleware, configuredAdminOnly } from "./middleware/businessAccess";
+import { configuredUploadRoot, uploadRoot } from "./config/uploadPaths";
 
 const appDirectory = path.dirname(fileURLToPath(import.meta.url));
 const backendRootDirectory = path.resolve(appDirectory, "..");
-const uploadDirectories = Array.from(
+const uploadDirectories = configuredUploadRoot ? [uploadRoot] : Array.from(
   new Set([
     path.resolve("public", "uploads"),
     path.resolve("uploads"),
@@ -121,6 +123,8 @@ export function createApp() {
         "X-CRM-User-Code",
         "X-CRM-User-Name",
         "X-CRM-User-Type",
+        "X-CRM-Admin-Session",
+        "X-CRM-Attendance-Session",
         "X-TomTom-Quota-Secret",
       ],
       exposedHeaders: ["X-Business-Id"],
@@ -210,6 +214,7 @@ export function createApp() {
   app.use("/api/browser-activity", browserActivityRouter);
   app.use("/api/call-bridge", callBridgeRouter);
   app.use("/api/call-dashboard", callDashboardRouter);
+  app.use("/api/dashboard-workspace", dashboardWorkspaceRouter);
   app.use("/api", noticeRouter);
   app.use("/api", leaveRequestRouter);
   app.use("/api", attendanceRouter);

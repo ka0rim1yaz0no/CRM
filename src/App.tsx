@@ -14,6 +14,9 @@ const Leads = lazy(() => import('./pages/leads'))
 const Teams = lazy(() => import('./pages/teams'))
 const Calendar = lazy(() => import('./pages/calendar'))
 const Attendance = lazy(() => import('./pages/attendance'))
+const AdminAttendanceHub = lazy(() => import('./pages/admin/attendance'))
+const attendanceHubEnabled = import.meta.env.VITE_CRM_ATTENDANCE_HUB === 'true' ||
+  (import.meta.env.DEV && import.meta.env.VITE_CRM_ATTENDANCE_HUB !== 'false')
 const Profile = lazy(() => import('./pages/profile'))
 const Settings = lazy(() => import('./pages/settings'))
 const Messages = lazy(() => import('./pages/messages'))
@@ -129,6 +132,7 @@ function RoutedApp() {
           <Route path="/admin/employees/:employeeId/edit" element={<ProtectedRoute type="admin"><FeatureRoute feature="employees" scope="admin"><AdminEmployees /></FeatureRoute></ProtectedRoute>} />
           <Route path="/admin/employees/:employeeId" element={<ProtectedRoute type="admin"><FeatureRoute feature="employees" scope="admin"><AdminEmployees /></FeatureRoute></ProtectedRoute>} />
           <Route path="/admin/hr" element={<ProtectedRoute type="admin"><FeatureRoute feature="hr" scope="admin"><AdminHr /></FeatureRoute></ProtectedRoute>} />
+          <Route path="/admin/attendance" element={<ProtectedRoute type="admin"><FeatureRoute feature="hr" scope="admin">{attendanceHubEnabled ? <AdminAttendanceHub /> : <Navigate to="/admin/hr" replace />}</FeatureRoute></ProtectedRoute>} />
           <Route path="/admin/hr/attendance/new" element={<ProtectedRoute type="admin"><FeatureRoute feature="hr" scope="admin"><AdminAttendanceForm /></FeatureRoute></ProtectedRoute>} />
           <Route path="/admin/hr/attendance/:employeeId/:dateKey/edit" element={<ProtectedRoute type="admin"><FeatureRoute feature="hr" scope="admin"><AdminAttendanceForm /></FeatureRoute></ProtectedRoute>} />
           <Route path="/admin/settings" element={<ProtectedRoute type="admin"><FeatureRoute feature="settings" scope="admin"><AdminSettings /></FeatureRoute></ProtectedRoute>} />

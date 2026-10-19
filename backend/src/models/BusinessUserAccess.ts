@@ -46,6 +46,15 @@ export async function getBusinessAccessForEmployeeCode(employeeCode: string) {
   return normalizeBusinessAccessIds(access?.businessIds);
 }
 
+export async function getAttendanceBusinessIdentity(employeeCode: string) {
+  const access = await getBusinessUserAccessModel().findOne({ employeeCode }).lean();
+  return access ? { id: String(access._id), businessIds: normalizeBusinessAccessIds(access.businessIds) } : null;
+}
+export async function getAttendanceBusinessIdentities(employeeCodes: string[]) {
+  const access = await getBusinessUserAccessModel().find({ employeeCode: { $in: employeeCodes } }).select("_id employeeCode businessIds").lean();
+  return new Map(access.map((entry) => [entry.employeeCode, { id: String(entry._id), businessIds: normalizeBusinessAccessIds(entry.businessIds) }]));
+}
+
 export async function setBusinessAccessForEmployeeCode(employeeCode: string, businessIds: string[]) {
   const normalizedEmployeeCode = String(employeeCode || "").trim();
 

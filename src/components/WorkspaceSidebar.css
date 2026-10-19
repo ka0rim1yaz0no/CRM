@@ -1,0 +1,63 @@
+:root[data-theme] aside.workspace-sidebar.theme-shell-bg { background: var(--shell-bg) !important; }
+.workspace-sidebar .workspace-sidebar-brand {
+    height: clamp(52px, 8dvh, 68px);
+    flex-shrink: 0;
+    padding-block: 8px;
+}
+.workspace-sidebar .workspace-sidebar-brand > img { max-height: 40px; width: auto; object-fit: contain; }
+.workspace-sidebar .workspace-sidebar-body { padding-block: 8px; }
+.workspace-sidebar .admin-sidebar-nav-command { display: flex; overflow-y: auto; padding-right: 0; }
+.workspace-sidebar .admin-sidebar-groups { display: flex; flex-direction: column; flex: 1 0 auto; min-height: min-content; gap: 4px; }
+.workspace-sidebar .admin-sidebar-group { display: flex; flex-direction: column; flex: var(--sidebar-item-count) 0 auto; min-height: calc(var(--sidebar-item-count) * 42px + 17px); }
+.workspace-sidebar .admin-sidebar-section-title {
+    flex: 0 0 16px;
+    margin-bottom: 3px;
+    font-size: 10px;
+    line-height: 16px;
+    letter-spacing: 0 !important;
+}
+.workspace-sidebar .admin-sidebar-group > ul,
+.workspace-sidebar .workspace-sidebar-flat-nav > ul {
+    display: grid;
+    grid-template-rows: repeat(var(--sidebar-item-count), minmax(40px, 1fr));
+    flex: 1;
+    min-height: min-content;
+    gap: 2px;
+}
+.workspace-sidebar :is(.admin-sidebar-group, .workspace-sidebar-flat-nav) li { min-height: 40px; display: flex; }
+:root[data-theme] .workspace-sidebar .admin-sidebar-nav-command .admin-sidebar-link,
+.workspace-sidebar .workspace-sidebar-flat-nav li > a {
+    width: 100%;
+    height: 100%;
+    min-height: 40px;
+    max-height: 48px;
+    padding-block: 0;
+    font-size: 14px;
+    line-height: 20px;
+}
+:root[data-theme] .workspace-sidebar .admin-sidebar-icon { width: 32px; height: 32px; }
+.workspace-sidebar :is(.admin-sidebar-icon, .workspace-sidebar-flat-nav a) > svg { width: 20px; height: 20px; }
+.workspace-sidebar .admin-sidebar-account-command { margin-top: 8px; padding-top: 8px; }
+.workspace-sidebar .admin-sidebar-profile { min-height: 36px; padding: 4px 8px; margin-bottom: 4px; }
+.workspace-sidebar .admin-sidebar-profile > span { width: 28px; height: 28px; }
+.workspace-sidebar .admin-sidebar-profile p { font-size: 12px; line-height: 15px; }
+.workspace-sidebar .admin-sidebar-logout,
+.workspace-sidebar .workspace-sidebar-account > a { height: 36px; min-height: 36px; font-size: 14px; }
+.workspace-sidebar .workspace-sidebar-flat-nav { display: flex; flex: 1; min-height: 0; overflow-y: auto; padding-right: 0; }
+.workspace-sidebar .workspace-sidebar-flat-nav > ul { flex: 1 0 auto; width: 100%; min-height: calc(var(--sidebar-item-count) * 42px - 2px); }
+.workspace-sidebar .workspace-sidebar-account { flex-shrink: 0; margin-top: 8px; padding-top: 8px; border-top: 1px solid color-mix(in srgb, currentColor 15%, transparent); }
+.workspace-sidebar a:focus-visible { outline: 2px solid var(--primary-text); outline-offset: -2px; }
+:root:not([data-theme^="light-"]):not([data-theme^="mail-"]) .workspace-sidebar a[aria-current="page"] .admin-sidebar-icon {
+    background: var(--panel-bg);
+    color: var(--primary-text);
+}
+@media (max-height: 640px) {
+    .workspace-sidebar .workspace-sidebar-body { padding-block: 6px; }
+    .workspace-sidebar .admin-sidebar-profile { display: none; }
+    .workspace-sidebar .admin-sidebar-groups { gap: 4px; }
+}
+@media (max-height: 480px) {
+    .workspace-sidebar .admin-sidebar-section-title { display: none; }
+    .workspace-sidebar .admin-sidebar-group { min-height: calc(var(--sidebar-item-count) * 42px - 2px); }
+    .workspace-sidebar .workspace-sidebar-brand { height: 44px; }
+}

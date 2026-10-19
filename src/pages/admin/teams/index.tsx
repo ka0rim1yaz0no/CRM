@@ -1,5 +1,5 @@
 import type { FormEvent } from "react";
-import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router";
 import { FiArchive, FiCheck, FiChevronDown, FiEdit2, FiMessageCircle, FiPhone, FiPlus, FiSearch, FiUserPlus, FiUsers, FiX } from "react-icons/fi";
@@ -29,15 +29,15 @@ export default function AdminTeams() {
     const membersDropdownRef = useRef<HTMLDivElement>(null);
     const queryClient = useQueryClient();
     const navigate = useNavigate();
-    const { data: teams = [], isLoading, isError } = useQuery({
+    const { data: teams = EMPTY_QUERY_ROWS, isLoading, isError } = useQuery({
         queryKey: ["teams"],
         queryFn: getTeams,
     });
-    const { data: employees = [] } = useQuery({
+    const { data: employees = EMPTY_QUERY_ROWS } = useQuery({
         queryKey: ["employees", "summary"],
         queryFn: getEmployeeSummaries,
     });
-    const { data: branches = [] } = useQuery({
+    const { data: branches = EMPTY_QUERY_ROWS } = useQuery({
         queryKey: ["branches"],
         queryFn: getBranches,
     });
@@ -45,6 +45,8 @@ export default function AdminTeams() {
     const [editingTeamId, setEditingTeamId] = useState<string | null>(null);
     const [modalMode, setModalMode] = useState<"add" | "edit" | "members">("add");
     const [isLeadDropdownOpen, setIsLeadDropdownOpen] = useState(false);
+    const [leadDropdownStyle, setLeadDropdownStyle] = useState<React.CSSProperties>({});
+    const [membersDropdownStyle, setMembersDropdownStyle] = useState<React.CSSProperties>({});
     const [isMembersDropdownOpen, setIsMembersDropdownOpen] = useState(false);
     const [leadSearch, setLeadSearch] = useState("");
     const [memberSearch, setMemberSearch] = useState("");
@@ -103,7 +105,7 @@ export default function AdminTeams() {
     const teamStats = useMemo(
         () => [
             ["Teams", teams.length.toString()],
-            ["Agents", teams.reduce((total, team) => total + getActiveTeamMembers(team).length, 0).toString()],
+            ["Agents", teams.reduce((total, team) => total + (activeTeamMembersByTeamId.get(team._id)?.length || 0), 0).toString()],
             ["Active Leads", teams.reduce((total, team) => total + team.activeLeads, 0).toString()],
         ],
         [activeTeamMembersByTeamId, teams],
@@ -285,9 +287,14 @@ export default function AdminTeams() {
         setPage(1);
     };
 
-    useEffect(() => {
-        setPage((currentPage) => Math.min(currentPage, totalPages));
-    }, [totalPages]);
+    const [previousTeamPageLimit, setPreviousTeamPageLimit] = useState<readonly unknown[] | null>(null);
+    const teamPageLimitInputs = [totalPages];
+    if (previousTeamPageLimit === null || teamPageLimitInputs.some((input, index) => !Object.is(input, previousTeamPageLimit[index]))) {
+        setPreviousTeamPageLimit(teamPageLimitInputs);
+        (() => {
+            setPage((currentPage) => Math.min(currentPage, totalPages));
+        })();
+    }
 
     return (
         <AdminLayout>
@@ -669,6 +676,7 @@ export default function AdminTeams() {
                                         type="button"
                                         onClick={() => {
                                             setIsMembersDropdownOpen(false);
+                                            setLeadDropdownStyle(getDropdownStyle(leadButtonRef.current) ?? {});
                                             setIsLeadDropdownOpen((current) => !current);
                                         }}
                                     >
@@ -688,6 +696,7 @@ export default function AdminTeams() {
                                         type="button"
                                         onClick={() => {
                                             setIsLeadDropdownOpen(false);
+                                            setMembersDropdownStyle(getDropdownStyle(membersButtonRef.current) ?? {});
                                             setIsMembersDropdownOpen((current) => !current);
                                         }}
                                     >
@@ -746,7 +755,7 @@ export default function AdminTeams() {
                         <div
                             ref={leadDropdownRef}
                             className="fixed z-[60] overflow-hidden rounded-lg border border-white/10 bg-[#11141d] shadow-2xl shadow-black/40"
-                            style={getDropdownStyle(leadButtonRef.current)}
+                            style={leadDropdownStyle}
                         >
                             <label className="flex h-10 items-center gap-2 border-b border-white/10 px-3 text-white/45">
                                 <FiSearch className="size-4 shrink-0" aria-hidden="true" />
@@ -791,7 +800,7 @@ export default function AdminTeams() {
                         <div
                             ref={membersDropdownRef}
                             className="fixed z-[60] overflow-hidden rounded-lg border border-white/10 bg-[#11141d] shadow-2xl shadow-black/40"
-                            style={getDropdownStyle(membersButtonRef.current)}
+                            style={membersDropdownStyle}
                         >
                             <label className="flex h-10 items-center gap-2 border-b border-white/10 px-3 text-white/45">
                                 <FiSearch className="size-4 shrink-0" aria-hidden="true" />
@@ -835,3 +844,5 @@ export default function AdminTeams() {
         </AdminLayout>
     );
 }
+
+const EMPTY_QUERY_ROWS: [] = [];

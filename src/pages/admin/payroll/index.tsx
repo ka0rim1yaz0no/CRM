@@ -632,7 +632,7 @@ export default function PayrollPage() {
 
     const { data: stats } = useQuery({ queryKey: ["payroll-stats"], queryFn: getPayrollStats });
     const { data: systemSettings } = useQuery({ queryKey: ["system-settings"], queryFn: getSystemSettings });
-    const { data: employees = [], isLoading: isPayrollLoading, isError: isPayrollError } = useQuery({
+    const { data: employees = EMPTY_QUERY_ROWS, isLoading: isPayrollLoading, isError: isPayrollError } = useQuery({
         queryKey: ["payroll-records", recordQueryParams],
         queryFn: () => getPayrollRecords(recordQueryParams),
         enabled: activeTab === "Employee Payroll" || activeTab === "Archived",
@@ -647,12 +647,12 @@ export default function PayrollPage() {
         queryFn: () => getPayrollDtr(payslipRecord?.employeeId || "", payslipCutoffPeriod),
         enabled: Boolean(payslipRecord?.employeeId && payslipCutoffPeriod),
     });
-    const { data: payrollItems = [], isLoading: areItemsLoading, isError: areItemsError } = useQuery({
+    const { data: payrollItems = EMPTY_QUERY_ROWS, isLoading: areItemsLoading, isError: areItemsError } = useQuery({
         queryKey: ["payroll-items", itemCategory],
         queryFn: () => getPayrollItems(itemCategory),
         enabled: Boolean(itemCategory),
     });
-    const { data: archivedPayrollItems = [], isLoading: areArchivedItemsLoading, isError: areArchivedItemsError } = useQuery({
+    const { data: archivedPayrollItems = EMPTY_QUERY_ROWS, isLoading: areArchivedItemsLoading, isError: areArchivedItemsError } = useQuery({
         queryKey: ["payroll-items", "archived"],
         queryFn: () => getPayrollItems(undefined, { archived: true }),
         enabled: activeTab === "Archived",
@@ -664,7 +664,7 @@ export default function PayrollPage() {
         queryClient.invalidateQueries({ queryKey: ["payroll-stats"] });
     };
 
-    const { data: bankEmployees = [], isLoading: areBankEmployeesLoading } = useQuery({
+    const { data: bankEmployees = EMPTY_QUERY_ROWS, isLoading: areBankEmployeesLoading } = useQuery({
         queryKey: ["employees", "payroll-bank"],
         queryFn: getEmployees,
         enabled: activeTab === "Bank Accounts",
@@ -950,15 +950,25 @@ export default function PayrollPage() {
         updateBankMutation.mutate({ employee: bankEditEmployee, bank: bankForm });
     };
 
-    useEffect(() => {
-        setSelectedRecordIds((current) => current.filter((id) => employees.some((employee) => employee._id === id)));
-    }, [employees]);
+    const [previousPayrollSelection, setPreviousPayrollSelection] = useState<readonly unknown[] | null>(null);
+    const payrollSelectionInputs = [employees];
+    if (previousPayrollSelection === null || payrollSelectionInputs.some((input, index) => !Object.is(input, previousPayrollSelection[index]))) {
+        setPreviousPayrollSelection(payrollSelectionInputs);
+        (() => {
+            setSelectedRecordIds((current) => current.filter((id) => employees.some((employee) => employee._id === id)));
+        })();
+    }
 
-    useEffect(() => {
-        setPayslipCutoffPeriod(payslipRecord?.payPeriod || "");
-        setIsPayslipCutoffOpen(false);
-        setPayslipDeliveryStatus("");
-    }, [payslipRecord?._id, payslipRecord?.payPeriod]);
+    const [previousPayslipDraft, setPreviousPayslipDraft] = useState<readonly unknown[] | null>(null);
+    const payslipDraftInputs = [payslipRecord?._id, payslipRecord?.payPeriod];
+    if (previousPayslipDraft === null || payslipDraftInputs.some((input, index) => !Object.is(input, previousPayslipDraft[index]))) {
+        setPreviousPayslipDraft(payslipDraftInputs);
+        (() => {
+            setPayslipCutoffPeriod(payslipRecord?.payPeriod || "");
+            setIsPayslipCutoffOpen(false);
+            setPayslipDeliveryStatus("");
+        })();
+    }
 
     useEffect(() => {
         if (!isPayslipCutoffOpen) return;
@@ -1895,8 +1905,8 @@ export default function PayrollPage() {
                                         <p className="mt-1 text-base font-semibold text-white">{Math.round((workedMinutesTarget.scheduledHours || 0) * 60)} min</p>
                                     </div>
                                 </div>
-                                <label className="mt-4 block text-xs font-semibold uppercase tracking-[0.14em] text-white/45">Total worked minutes for this cutoff</label>
-                                <input className="mt-2 h-11 w-full rounded-lg border border-white/10 bg-black/20 px-3 text-sm font-semibold text-white outline-none focus:border-[#842cff] focus:ring-2 focus:ring-[#842cff]/20" type="number" min="0" max={Math.round((workedMinutesTarget.scheduledHours || 0) * 60)} step="1" required autoFocus value={workedMinutesInput} onChange={(event) => { setWorkedMinutesInput(event.target.value); setWorkedMinutesError(""); }} />
+                                <label htmlFor="payroll-worked-minutes" className="mt-4 block text-xs font-semibold uppercase tracking-[0.14em] text-white/45">Total worked minutes for this cutoff</label>
+                                <input id="payroll-worked-minutes" className="mt-2 h-11 w-full rounded-lg border border-white/10 bg-black/20 px-3 text-sm font-semibold text-white outline-none focus:border-[#842cff] focus:ring-2 focus:ring-[#842cff]/20" type="number" min="0" max={Math.round((workedMinutesTarget.scheduledHours || 0) * 60)} step="1" required autoFocus value={workedMinutesInput} onChange={(event) => { setWorkedMinutesInput(event.target.value); setWorkedMinutesError(""); }} />
                                 <p className="mt-2 text-xs leading-5 text-white/45">Only minutes inside official shifts are counted. Early clock-ins do not increase paid work time. Saving recalculates deductions, gross/net pay, DTR, and payslip data across assigned businesses.</p>
                                 {workedMinutesError && <p className="mt-3 rounded-lg border border-rose-300/20 bg-rose-300/10 px-3 py-2 text-sm font-semibold text-rose-100">{workedMinutesError}</p>}
                             </div>
@@ -1971,3 +1981,5 @@ export default function PayrollPage() {
         </AdminLayout>
     );
 }
+
+const EMPTY_QUERY_ROWS: [] = [];
