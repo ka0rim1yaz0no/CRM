@@ -102,6 +102,9 @@
 .attendance-hub-table-scroll th button { color: var(--hub-text); }
 .attendance-hub-day-link { color: var(--hub-accent); font-weight: 700; }
 .attendance-hub-table-scroll small { display: block; color: var(--hub-muted); }
+.attendance-hub-break-record { display: grid; gap: 3px; font-variant-numeric: tabular-nums; }
+.attendance-hub-break-record small { display: block; font-size: 11px; font-weight: 400; color: var(--hub-muted); }
+.attendance-hub-breakdown .attendance-hub-break-record { font-size: 12px; }
 .attendance-hub-note-preview { display: block; max-width: 180px; overflow: hidden; text-overflow: ellipsis; }
 .attendance-hub-badges { display: flex; flex-wrap: wrap; gap: 4px; }
 .attendance-hub-badge { display: inline-block; padding: 3px 5px; border-radius: 3px; font-size: 9px; font-weight: 700; }

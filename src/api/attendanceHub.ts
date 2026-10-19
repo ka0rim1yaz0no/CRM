@@ -3,18 +3,20 @@ import { getAuthUser } from "./authStorage";
 
 export type HubStatus = "ONLINE" | "BREAK" | "LUNCH" | "OFF THE PHONE" | "OFFLINE";
 export type HubEvent = { id: string; source: string; at: string; eventId: string | null };
+export type HubBreakSession = { startedAt: string; endedAt: string | null; durationMs: number; isOpen: boolean };
 export type HubDay = {
     dayKey: string; shiftStart: string; shiftEnd: string; timeIn: string | null; timeOut: string | null;
     employeeCode: string; employeeId: string; employeeName: string; role: string; team: string; scopeKey: string;
     businessId: string; businessName: string; status: string; inProgress: boolean; excused: boolean; absent: boolean;
     mismatch: boolean; issues: string[]; review: string[]; note: string; leave: string | null;
     graceMinutes: number; breakMinutes: number; lunchMinutes: number;
+    breakSessions: HubBreakSession[];
     noteRevisions: Array<{ reason: string; excused: boolean; by: string; at: string }>;
     audit: Array<{ _id: string; occurredAt: string; description: string; metadata?: Record<string, string> }>;
     milliseconds: Record<"online" | "break" | "lunch" | "offPhone" | "offline" | "late" | "underTime" | "overBreak" | "overLunch" | "overtime", number>;
     events: HubEvent[];
     timeline: Array<{ bucket: string; start: string; end: string }>;
-    businesses: Array<{ businessId: string; businessName: string; status: string; issues: string[]; milliseconds: HubDay["milliseconds"]; events: HubEvent[]; mismatch: boolean }>;
+    businesses: Array<{ businessId: string; businessName: string; status: string; issues: string[]; milliseconds: HubDay["milliseconds"]; events: HubEvent[]; breakSessions: HubBreakSession[]; mismatch: boolean }>;
 };
 export type HubFilters = {
     preset: string; from?: string; to?: string; business?: string; employee?: string; team?: string; role?: string;

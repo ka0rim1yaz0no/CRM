@@ -174,6 +174,43 @@ test("real API: repeated note saves, reloads and clearing stay scoped to every c
   assert.equal(denied.status, 403);
 });
 
+test("real API: individual break pairs, duration sorting and CSV stay consistent in three businesses", async () => {
+  const person = await fixture();
+  await runWithBusiness("test-c", () => Employee.create({ employeeCode: person.actor.code, name: "Synthetic break employee", role: "Test", dateHired: "2026-10-01" }));
+  await setBusinessAccessForEmployeeCode(person.actor.code, ["test-a", "test-b", "test-c"]);
+  const identity = await runWithBusiness("test-a", () => resolveAttendanceIdentity(String(person.employees[0]._id), admin));
+  const changes = [
+    ["Time In", "2026-10-15T15:00:00Z"], ["Break Out", "2026-10-15T17:00:12Z"], ["Break In", "2026-10-15T17:15:12Z"],
+    ["Break Out", "2026-10-15T22:00:00Z"], ["Break In", "2026-10-15T22:18:00Z"], ["Time Out", "2026-10-16T00:00:00Z"],
+    ["Time In", "2026-10-16T15:00:00Z"], ["Break Out", "2026-10-16T17:00:00Z"],
+  ].map(([source, at]) => ({ source: source as "Time In" | "Time Out" | "Break Out" | "Break In", at }));
+  await executeAttendanceCommand(identity, { commandId: crypto.randomUUID(), expectedRevision: 0, operation: "correct", reason: "Synthetic separate-break fixture", changes }, admin);
+  await deliverAttendanceLedger(identity.key);
+  const token = createAdminDashboardSession(admin.code)!;
+  for (const business of ["test-a", "test-b", "test-c"]) {
+    const response = await request(`/attendance-hub/days?shiftView=date&shiftDate=2026-10-15&employee=${person.actor.code}&business=${business}&sort=firstBreak`, token, "GET", undefined, true);
+    assert.equal(response.status, 200);
+    const day = (await response.json()).rows[0];
+    assert.deepEqual(day.breakSessions.map((entry: { durationMs: number }) => entry.durationMs), [900_000, 1_080_000]);
+    assert.equal(day.breakSessions[0].startedAt, "2026-10-15T17:00:12.000Z");
+    assert.equal(day.breakSessions[1].endedAt, "2026-10-15T22:18:00.000Z");
+    assert.ok(day.businesses.every((replica: { breakSessions: unknown }) => JSON.stringify(replica.breakSessions) === JSON.stringify(day.breakSessions)));
+  }
+  const sorted = await request(`/attendance-hub/days?preset=custom&from=2026-10-15&to=2026-10-16&employee=${person.actor.code}&business=test-a&sort=secondBreak&direction=desc`, token, "GET", undefined, true);
+  assert.equal(sorted.status, 200);
+  const rows = (await sorted.json()).rows;
+  assert.deepEqual(rows.map((row: { dayKey: string }) => row.dayKey), ["2026-10-15", "2026-10-16"]);
+  assert.equal(rows[1].breakSessions[0].endedAt, null);
+  assert.equal(rows[1].breakSessions[0].isOpen, true);
+  const csv = await request(`/attendance-hub/export?preset=custom&from=2026-10-15&to=2026-10-15&employee=${person.actor.code}&business=test-a`, token, "GET", undefined, true);
+  assert.equal(csv.status, 200);
+  const text = await csv.text();
+  assert.match(text, /1st break out \(UTC\)/);
+  assert.match(text, /2nd break duration seconds/);
+  assert.match(text, /"900","false"/);
+  assert.match(text, /"1080","false"/);
+});
+
 test("real Mongo: one atomic batch preserves original evidence and replays after a lost response", async () => {
   const { identity } = await fixture();
   const input = { commandId: crypto.randomUUID(), expectedRevision: 0, operation: "correct" as const, reason: "Synthetic HR correction", changes: [

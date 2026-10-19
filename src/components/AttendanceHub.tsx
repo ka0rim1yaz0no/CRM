@@ -4,7 +4,7 @@ import { useSearchParams } from "react-router";
 import { FiAlertCircle, FiChevronDown, FiDownload, FiFilter, FiHelpCircle, FiMenu, FiPrinter, FiRefreshCw, FiX } from "react-icons/fi";
 import { getAuthUser } from "../api/authStorage";
 import { downloadAttendanceHubCsv, getAttendanceHubDay, getAttendanceHubDays, getAttendanceHubLive,
-    type HubDay, type HubFilters, type HubResponse } from "../api/attendanceHub";
+    type HubDay, type HubBreakSession, type HubFilters, type HubResponse } from "../api/attendanceHub";
 import { socket } from "../lib/socket";
 import "./AttendanceHub.css";
 import AttendanceCorrections from "./AttendanceCorrections";
@@ -21,12 +21,13 @@ const presets = [
     ["this-month", "This month"], ["last-month", "Last month"], ["last-7-days", "Last 7 days"],
     ["last-30-days", "Last 30 days"], ["custom", "Custom range"],
 ];
-const columns = ["shift", "timeIn", "timeOut", "worked", "break", "lunch", "offPhone", "late", "underTime", "overtime", "issues", "notes"] as const;
+const columns = ["shift", "timeIn", "timeOut", "worked", "firstBreak", "secondBreak", "break", "lunch", "offPhone", "late", "underTime", "overtime", "issues", "notes"] as const;
 type Column = typeof columns[number];
 const columnLabels: Record<Column, string> = { shift: "Shift", timeIn: "Time In", timeOut: "Time Out", worked: "Worked",
-    break: "Breaks", lunch: "Lunch", offPhone: "Off phone", late: "Late", underTime: "Undertime", overtime: "OT", issues: "Status", notes: "Notes" };
+    firstBreak: "1st Break", secondBreak: "2nd Break", break: "Total Breaks", lunch: "Lunch", offPhone: "Off phone", late: "Late", underTime: "Undertime", overtime: "OT", issues: "Status", notes: "Notes" };
 const numberFormat = new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 });
 const timeFormat = new Intl.DateTimeFormat("en-US", { timeZone: "Asia/Manila", hour: "numeric", minute: "2-digit" });
+const breakTimeFormat = new Intl.DateTimeFormat("en-US", { timeZone: "Asia/Manila", hour: "numeric", minute: "2-digit", second: "2-digit" });
 const dateFormat = new Intl.DateTimeFormat("en-US", { timeZone: "Asia/Manila", month: "short", day: "numeric", year: "numeric" });
 const dateTimeFormat = new Intl.DateTimeFormat("en-US", { timeZone: "Asia/Manila", month: "short", day: "numeric", hour: "numeric", minute: "2-digit", second: "2-digit" });
 const duration = (ms: number) => `${numberFormat.format(Math.round(Math.max(0, ms) / 60_000))}m`;
@@ -37,6 +38,16 @@ const clock = (ms: number) => {
 const localTime = (value: string | null | undefined) => value ? timeFormat.format(new Date(value)) : "--";
 const detailTime = (value: string) => dateTimeFormat.format(new Date(value));
 const labelDay = (key: string) => dateFormat.format(new Date(`${key}T12:00:00+08:00`));
+
+function BreakRecord({ entry, label, available = true }: { entry?: HubBreakSession; label: string; available?: boolean }) {
+    if (!available) return <span className="attendance-hub-break-record">Detail unavailable</span>;
+    if (!entry) return <span className="attendance-hub-break-record">--<small>Not taken</small></span>;
+    return <span className="attendance-hub-break-record" aria-label={label}>
+        <span><time dateTime={entry.startedAt} title={detailTime(entry.startedAt)}>{breakTimeFormat.format(new Date(entry.startedAt))}</time>
+            {" - "}{entry.endedAt ? <time dateTime={entry.endedAt} title={detailTime(entry.endedAt)}>{breakTimeFormat.format(new Date(entry.endedAt))}</time> : "Not returned"}</span>
+        <small>Duration {clock(entry.durationMs)}{entry.isOpen ? " · Open" : ""}</small>
+    </span>;
+}
 
 function issueClass(issue: string) {
     if (issue === "EXCUSED") return "attendance-hub-badge good";
@@ -147,6 +158,10 @@ function DayDrawer({ selected, onClose, admin }: { selected: { dayKey: string; e
                         style={{ flexGrow: Date.parse(interval.end) - Date.parse(interval.start) }} title={`${interval.bucket}: ${localTime(interval.start)} - ${localTime(interval.end)}`} />)}
                 </div>
                 <div className="attendance-hub-legend">Online · Break · Lunch · Off phone · Offline</div>
+                <h3>Breaks</h3>
+                {day.breakSessions?.length ? <dl className="attendance-hub-breakdown">{day.breakSessions.map((entry, index) => <div key={`${entry.startedAt}:${index}`}>
+                    <dt>Break {index + 1} · {day.breakMinutes}m allowance</dt><dd><BreakRecord entry={entry} label={`Break ${index + 1}`} /></dd>
+                </div>)}</dl> : <p>{day.breakSessions ? "No recorded breaks." : "Break detail unavailable."}</p>}
                 <table><thead><tr><th>Event</th><th>PH time</th><th>Source</th></tr></thead><tbody>
                     {timeline.map((event) => <tr key={event.id}><td>{event.source}</td><td>{detailTime(event.at)}</td><td>Attendance</td></tr>)}
                 </tbody></table>
@@ -179,6 +194,9 @@ function DayRow({ day, visible, dense, open }: { day: HubDay; visible: Set<Colum
     const value: Record<Column, ReactNode> = {
         shift: `${localTime(day.shiftStart)} - ${localTime(day.shiftEnd)}`, timeIn: localTime(day.timeIn), timeOut: localTime(day.timeOut),
         worked: duration(day.milliseconds.online), break: <div><span>{duration(day.milliseconds.break)} used / +{duration(day.milliseconds.overBreak)} over</span><small>{attendanceBreakAllowanceLabel(day.breakMinutes)}</small></div>,
+        firstBreak: <BreakRecord entry={day.breakSessions?.[0]} label="1st break" available={Boolean(day.breakSessions)} />,
+        secondBreak: <><BreakRecord entry={day.breakSessions?.[1]} label="2nd break" available={Boolean(day.breakSessions)} />
+            {day.breakSessions?.length > 2 && <small>{day.breakSessions.length - 2} additional break(s) in shift detail</small>}</>,
         lunch: `${duration(day.milliseconds.lunch)} / ${day.lunchMinutes}m per lunch / +${duration(day.milliseconds.overLunch)}`,
         offPhone: duration(day.milliseconds.offPhone), late: duration(day.milliseconds.late), underTime: duration(day.milliseconds.underTime),
         overtime: duration(day.milliseconds.overtime), issues: <div className="attendance-hub-badges">{day.issues.map((issue) => <span key={issue} className={issueClass(issue)}>{attendanceIssueLabel(issue)}</span>)}
@@ -191,7 +209,9 @@ function DayRow({ day, visible, dense, open }: { day: HubDay; visible: Set<Colum
         {columns.filter((column) => visible.has(column)).map((column) => <td key={column}>{value[column]}</td>)}
     </tr><tr className="attendance-hub-mobile-row"><td><button type="button" onClick={() => open(day)}><strong>{labelDay(day.dayKey)}</strong>
         <span>{day.status} · {duration(day.milliseconds.online)} worked</span>
-        <span>Breaks: {duration(day.milliseconds.break)} used · {attendanceBreakAllowanceLabel(day.breakMinutes)}</span>
+        <span>1st Break · {day.breakMinutes}m allowance<BreakRecord entry={day.breakSessions?.[0]} label="1st break" available={Boolean(day.breakSessions)} /></span>
+        <span>2nd Break · {day.breakMinutes}m allowance<BreakRecord entry={day.breakSessions?.[1]} label="2nd break" available={Boolean(day.breakSessions)} /></span>
+        {day.breakSessions?.length > 2 && <span>{day.breakSessions.length - 2} additional break(s) in shift detail</span>}
         <span>{day.issues.map(attendanceIssueLabel).join(" · ") || "No issues"}</span>{day.note && <span>{day.note}</span>}</button></td></tr></>;
 }
 
@@ -211,7 +231,7 @@ export default function AttendanceHub({ admin = false, actions, message, embedde
     const [expanded, setExpanded] = useState<Set<string>>(new Set());
     const [navOpen, setNavOpen] = useState(false);
     const [dense, setDense] = useState(false);
-    const [visible, setVisible] = useState<Set<Column>>(() => new Set(columns));
+    const [visible, setVisible] = useState<Set<Column>>(() => new Set(columns.filter((column) => column !== "break")));
     const [exporting, setExporting] = useState(false);
     const [exportError, setExportError] = useState("");
     const activeBusiness = getActiveBusinessId();
@@ -362,7 +382,7 @@ export default function AttendanceHub({ admin = false, actions, message, embedde
                         {isPlaceholderData ? <p className="attendance-hub-empty" role="status">Loading selected shifts...</p> : (!days.length || (filters.shiftView !== "all" && days.every((day) => !day.events.length))) ? <p className="attendance-hub-empty">No shift record for this date {days.flatMap((day) => day.issues).map((issue) => <span className={issueClass(issue)} key={issue}>{attendanceIssueLabel(issue)}</span>)}</p> : <table><thead><tr><th scope="col">
                         <button type="button" onClick={() => setSort("date")}>Date</button></th>
                         {columns.filter((column) => visible.has(column)).map((column) => <th scope="col" key={column} aria-sort={filters.sort === column ? filters.direction === "asc" ? "ascending" : "descending" : "none"}>
-                            {column === "notes" ? columnLabels[column] : <button type="button" onClick={() => setSort(column)}>{columnLabels[column]}</button>}</th>)}</tr></thead><tbody>
+                            {column === "notes" ? columnLabels[column] : <button type="button" onClick={() => setSort(column)}>{columnLabels[column]}{(column === "firstBreak" || column === "secondBreak") && ` (${data.thresholds.breakMinutes}m)`}</button>}</th>)}</tr></thead><tbody>
                         {days.map((day) => <DayRow key={`${day.employeeCode}:${day.dayKey}`} day={day} visible={visible} dense={dense} open={showDay} />)}
                     </tbody></table>}</div>}</div></div>)}
                 {filters.shiftView === "all" && data.history && <nav className="attendance-hub-pagination" aria-label="Shift history windows">

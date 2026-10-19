@@ -26,7 +26,7 @@ type HubDay = ReturnType<typeof calculateHubDay> & {
 };
 const dayPattern = /^\d{4}-\d{2}-\d{2}$/;
 const issueTypes = new Set(["worked", "online", "break", "lunch", "off-phone", "late", "over-break", "over-lunch", "over-rest", "under-time", "overtime", "absent", "open-session", "excused", "needs-review", "mismatch", "on-time"]);
-const sortFields = new Set(["date", "employee", "shift", "timeIn", "timeOut", "worked", "late", "break", "lunch", "offPhone", "underTime", "overtime", "issues", "review"]);
+const sortFields = new Set(["date", "employee", "shift", "timeIn", "timeOut", "worked", "late", "break", "firstBreak", "secondBreak", "lunch", "offPhone", "underTime", "overtime", "issues", "review"]);
 const maxRangeDays = 92;
 
 function scalar(value: unknown) { return typeof value === "string" ? value.trim() : ""; }
@@ -240,7 +240,7 @@ async function loadHub(actor: Actor, filters: ReturnType<typeof assertQuery>, no
       new Set(group.map((row) => `${row.shiftStart}:${row.shiftEnd}`)).size > 1;
     const primary = group.find((row) => row.businessId === preferredBusiness) || group.find((row) => row.events.length) || group[0];
     return { ...primary, mismatch, businesses: group.map((row) => ({ businessId: row.businessId, businessName: row.businessName,
-      status: row.status, issues: row.issues, milliseconds: row.milliseconds, events: row.events, mismatch })) };
+      status: row.status, issues: row.issues, milliseconds: row.milliseconds, events: row.events, breakSessions: row.breakSessions, mismatch })) };
   });
   return { rows: deduped, businesses: businesses.map((business) => ({ id: business.id, name: business.name })),
     roster: Array.from(roster.values()).sort((a, b) => a.employeeName.localeCompare(b.employeeName) || a.scopeKey.localeCompare(b.scopeKey)), earliestDay: Array.from(earliestByBusiness.values()).sort()[0] || null, earliestByBusiness,
@@ -282,6 +282,7 @@ function sortedRows(rows: Awaited<ReturnType<typeof loadHub>>["rows"], sort: str
   const measure = (row: typeof rows[number]) => sort === "employee" ? row.employeeName.toLowerCase() :
     sort === "shift" ? row.shiftStart : sort === "timeIn" ? row.timeIn || "" : sort === "timeOut" ? row.timeOut || "" :
     sort === "worked" ? row.milliseconds.online : sort === "late" ? row.milliseconds.late :
+    sort === "firstBreak" ? row.breakSessions[0]?.durationMs || 0 : sort === "secondBreak" ? row.breakSessions[1]?.durationMs || 0 :
     sort === "break" ? row.milliseconds.break : sort === "lunch" ? row.milliseconds.lunch :
     sort === "offPhone" ? row.milliseconds.offPhone : sort === "underTime" ? row.milliseconds.underTime :
     sort === "overtime" ? row.milliseconds.overtime : sort === "review" ? row.review.length :
@@ -325,10 +326,12 @@ async function handleHubRead(request: Request, response: Response, mode: "days" 
       };
       const settings = `Break allowance: ${loaded.thresholds.breakMinutes} min per break, Lunch allowance: ${loaded.thresholds.lunchMinutes} min; shift and grace are listed per row`;
       const lines = [["Attendance", filters.from, filters.to, hubTimeZone], [settings],
-        ["Employee code", "Employee", "Shift day", "Business", "Shift start", "Shift end", "Grace minutes", "Status", "Time In", "Time Out", "Online minutes", "Break minutes", "Lunch minutes", "Off-phone minutes", "Late minutes", "Over break minutes", "Over lunch minutes", "Under time minutes", "Overtime minutes", "Issues", "Needs review", "Note"],
+        ["Employee code", "Employee", "Shift day", "Business", "Shift start", "Shift end", "Grace minutes", "Status", "Time In", "Time Out", "Online minutes", "Break minutes", "Lunch minutes", "Off-phone minutes", "Late minutes", "Over break minutes", "Over lunch minutes", "Under time minutes", "Overtime minutes", "Issues", "Needs review", "Note",
+          "1st break out (UTC)", "1st break in (UTC)", "1st break duration seconds", "1st break open", "2nd break out (UTC)", "2nd break in (UTC)", "2nd break duration seconds", "2nd break open"],
         ...matching.map((row) => [row.employeeCode, row.employeeName, row.dayKey, row.businessName, row.shiftStart, row.shiftEnd, row.graceMinutes, row.status, row.timeIn, row.timeOut,
           ...(["online", "break", "lunch", "offPhone", "late", "overBreak", "overLunch", "underTime", "overtime"] as const).map((field) => Math.round(row.milliseconds[field] / 60_000)),
-          row.issues.join("; "), row.review.join("; "), row.note])];
+          row.issues.join("; "), row.review.join("; "), row.note,
+          ...[0, 1].flatMap((index) => { const entry = row.breakSessions[index]; return entry ? [entry.startedAt, entry.endedAt, Math.floor(entry.durationMs / 1000), entry.isOpen] : ["", "", "", ""]; })])];
       response.type("text/csv").set("Content-Disposition", `attachment; filename="attendance-${filters.from}-${filters.to}.csv"`)
         .send(`\uFEFF${lines.map((line) => line.map(quoted).join(",")).join("\r\n")}`);
       return;

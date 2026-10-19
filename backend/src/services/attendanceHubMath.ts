@@ -1,6 +1,6 @@
 import { attendanceSlotKey } from "./attendanceShift";
 import type { AttendanceSource } from "../models/Attendance";
-import { accountTime, breakAllowanceMs, bucketForAttendanceSource, lunchAllowanceMs, excessClickedSessionMilliseconds } from "./timeAccounting";
+import { accountTime, breakAllowanceMs, bucketForAttendanceSource, lunchAllowanceMs, excessClickedSessionMilliseconds, clickedSessionIntervals } from "./timeAccounting";
 import { projectAttendance } from "./attendanceSessionState";
 
 export type HubEvent = { id: string; source: AttendanceSource; at: Date; eventId?: string; createdAt?: Date; sequence?: number };
@@ -51,6 +51,10 @@ export function calculateHubDay(dayKey: string, sourceEvents: HubEvent[], settin
 
   const clickedRecords = events.map((event) => ({ source: event.source, timeIn: event.at }));
   const asOf = new Date(Math.min(now.getTime(), end.getTime()));
+  const breakSessions = clickedSessionIntervals(clickedRecords, "Break Out", "Break In", asOf).map((interval) => ({
+    startedAt: interval.start.toISOString(), endedAt: interval.open ? null : interval.end.toISOString(),
+    durationMs: interval.milliseconds, isOpen: interval.open,
+  }));
   const breakOverMs = excessClickedSessionMilliseconds(clickedRecords, "Break Out", "Break In", breakLimit, asOf);
   const lunchOverMs = excessClickedSessionMilliseconds(clickedRecords, "Lunch Break Out", "Lunch Break In", lunchLimit, asOf);
   const review: string[] = projection.issues.map((issue) => issue.message);
@@ -102,7 +106,7 @@ export function calculateHubDay(dayKey: string, sourceEvents: HubEvent[], settin
   if (excused) issues.push("EXCUSED");
   return {
     dayKey, shiftStart: start.toISOString(), shiftEnd: end.toISOString(),
-    breakMinutes: breakLimit / 60_000, lunchMinutes: lunchLimit / 60_000,
+    breakMinutes: breakLimit / 60_000, lunchMinutes: lunchLimit / 60_000, breakSessions,
     timeline: buckets.intervals.map((interval) => ({ bucket: interval.bucket, start: interval.start.toISOString(), end: interval.end.toISOString() })),
     timeIn: timeIn?.at.toISOString() || null, timeOut: hasOpenSession ? null : timeOut?.at.toISOString() || null,
     inProgress: isInProgress, excused, issues: excused ? issues.filter((issue) => issue === "EXCUSED" || issue === "OPEN SESSION") : issues,

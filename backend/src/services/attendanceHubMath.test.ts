@@ -40,6 +40,10 @@ test("two separate breaks each receive their allowance without sharing unused mi
     event("Break Out", 420), event("Break In", 435), event("Time Out", 540)], settings, time(600));
   assert.equal(minutes(regular.milliseconds.break), 30);
   assert.equal(regular.milliseconds.overBreak, 0);
+  assert.deepEqual(regular.breakSessions, [
+    { startedAt: time(120).toISOString(), endedAt: time(135).toISOString(), durationMs: 15 * 60_000, isOpen: false },
+    { startedAt: time(420).toISOString(), endedAt: time(435).toISOString(), durationMs: 15 * 60_000, isOpen: false },
+  ]);
   assert.ok(!regular.issues.includes("OVER BREAK"));
   const excess = calculateHubDay(start, [event("Time In", 0), event("Break Out", 120), event("Break In", 140),
     event("Break Out", 420), event("Break In", 430), event("Time Out", 510)], settings, time(600));
@@ -47,6 +51,31 @@ test("two separate breaks each receive their allowance without sharing unused mi
   assert.equal(minutes(excess.milliseconds.overBreak), 5);
   assert.ok(excess.issues.includes("OVER BREAK"));
   assert.ok(excess.issues.includes("UNDER TIME"));
+});
+
+test("break details retain seconds, order overnight events and leave missing returns open", () => {
+  const seconds = { ...event("Break Out", 120), at: new Date(time(120).getTime() + 12_345) };
+  const source = [event("Time In", 0), seconds, event("Break In", 135), event("Break Out", 420)];
+  const day = calculateHubDay(start, [...source].reverse(), settings, time(430));
+  assert.equal(day.breakSessions.length, 2);
+  assert.equal(day.breakSessions[0].startedAt, seconds.at.toISOString());
+  assert.equal(day.breakSessions[0].durationMs, 15 * 60_000 - 12_345);
+  assert.equal(day.breakSessions[1].endedAt, null);
+  assert.equal(day.breakSessions[1].durationMs, 10 * 60_000);
+  assert.equal(day.breakSessions[1].isOpen, true);
+  const endedShift = calculateHubDay(start, source, settings, time(600));
+  assert.equal(endedShift.breakSessions[1].endedAt, null);
+  assert.equal(endedShift.breakSessions[1].isOpen, true);
+  assert.ok(endedShift.review.includes("Unclosed break"));
+});
+
+test("missing and duplicate break events never fabricate a second completed break", () => {
+  assert.deepEqual(calculateHubDay(start, [event("Time In", 0)], settings, time(60)).breakSessions, []);
+  const duplicate = calculateHubDay(start, [event("Time In", 0), event("Break In", 60),
+    event("Break Out", 120), event("Break Out", 121), event("Break In", 135)], settings, time(150));
+  assert.equal(duplicate.breakSessions.length, 1);
+  assert.equal(duplicate.breakSessions[0].durationMs, 15 * 60_000);
+  assert.ok(duplicate.review.includes("Break In without Break Out"));
 });
 
 test("a missing manual checkout stays open after shift end without an undertime verdict", () => {
