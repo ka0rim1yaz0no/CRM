@@ -47,6 +47,7 @@ import {
     updatePayrollWorkedMinutes,
     type PayrollItemCategory,
     type PayrollDtrRow,
+    type PayrollDtr,
     type PayrollListItem,
     type PayrollRecord,
     type PayrollStatus,
@@ -304,6 +305,54 @@ function numberToWords(value: number): string {
     return `${numberToWords(millions)} Million${remainder ? ` ${numberToWords(remainder)}` : ""}`;
 }
 
+function payslipAmountInWords(value: number) {
+    const cents = Math.round(Math.max(0, value) * 100);
+    return `${numberToWords(Math.floor(cents / 100))} and ${String(cents % 100).padStart(2, "0")}/100`;
+}
+
+function payslipDeductionRows(record: PayrollRecord) {
+    const rows = [
+        { label: "Late", minutes: record.lateMinutes ?? Math.round((record.lateHours ?? 0) * 60) },
+        { label: "Excess lunch", minutes: record.excessLunchMinutes ?? 0 },
+        { label: "Excess break", minutes: record.excessBreakMinutes ?? 0 },
+        { label: "Undertime", minutes: record.earlyTimeOutMinutes ?? 0 },
+        { label: "Absence", minutes: record.absenceMinutes ?? 0 },
+    ];
+    const totalMinutes = rows.reduce((sum, row) => sum + row.minutes, 0);
+    const cents = Math.round(record.deductions * 100);
+    if (!totalMinutes) return [...rows.map(row => ({ ...row, amount: 0 })), ...(cents ? [{ label: "Other saved deductions", minutes: 0, amount: cents / 100 }] : [])];
+    // Allocate only the saved total, in cents; never recalculate attendance or payroll here.
+    const shares = rows.map((row, index) => ({ index, exact: cents * row.minutes / totalMinutes }));
+    const allocated = shares.map(share => Math.floor(share.exact));
+    const remainder = cents - allocated.reduce((sum, amount) => sum + amount, 0);
+    shares.sort((a, b) => (b.exact - Math.floor(b.exact)) - (a.exact - Math.floor(a.exact)) || a.index - b.index);
+    for (let index = 0; index < remainder; index++) allocated[shares[index].index]++;
+    return rows.map((row, index) => ({ ...row, amount: allocated[index] / 100 }));
+}
+
+function payslipOutputReady({ record, dtr, fetching, error, accuracyEnabled }: {
+    record: PayrollRecord | null; dtr?: PayrollDtr; fetching: boolean; error: boolean; accuracyEnabled?: boolean;
+}) {
+    if (!record || !dtr || fetching || error || accuracyEnabled === undefined || (accuracyEnabled && !dtr.storedCutoff)) return false;
+    if (record.employeeId !== dtr.employee.employeeCode || record.payPeriod !== dtr.payPeriod) return false;
+    const amounts = [record.grossPay, record.deductions, record.netPay];
+    return amounts.every(amount => Number.isFinite(amount) && amount >= 0) &&
+        Math.round(record.grossPay * 100) - Math.round(record.deductions * 100) === Math.round(record.netPay * 100);
+}
+
+function payrollMatchesSearch(values: unknown[], search: string) {
+    const term = search.trim().toLowerCase();
+    return !term || values.some(value => String(value ?? "").toLowerCase().includes(term));
+}
+
+function payrollCsv(rows: unknown[][]) {
+    return rows.map(row => row.map(cell => {
+        const text = String(cell ?? "");
+        const safe = typeof cell === "string" && /^[\s]*[=+@-]|^[\t\r]/.test(text) ? `'${text}` : text;
+        return `"${safe.replaceAll('"', '""')}"`;
+    }).join(",")).join("\r\n");
+}
+
 function countWeekdays(start: Date, end: Date) {
     let days = 0;
     const cursor = new Date(start);
@@ -383,27 +432,9 @@ function PayslipDocument({
     const overtimeHours = record.overtimeHours ?? 0;
     const basePay = record.basicPay ?? record.grossPay;
     const minuteRate = record.minuteRate ?? (record.hourlyRate !== undefined ? record.hourlyRate / 60 : 0);
-    const hourlyRate = minuteRate * 60;
+    const hourlyRate = record.hourlyRate ?? minuteRate * 60;
     const overtimePay = Math.max(0, Math.round((record.grossPay - basePay) * 100) / 100);
-    const deductionMinutes = [
-        { label: "Late", minutes: record.lateMinutes ?? Math.round(lateHours * 60) },
-        { label: "Excess lunch", minutes: record.excessLunchMinutes ?? 0 },
-        { label: "Excess break", minutes: record.excessBreakMinutes ?? 0 },
-        { label: "Undertime", minutes: record.earlyTimeOutMinutes ?? 0 },
-        { label: "Absence", minutes: record.absenceMinutes ?? 0 },
-    ];
-    const totalDeductionMinutes = deductionMinutes.reduce((sum, item) => sum + item.minutes, 0);
-    const lastDeductionIndex = deductionMinutes.reduce((last, item, index) => item.minutes > 0 ? index : last, -1);
-    let allocatedDeductions = 0;
-    const deductionRows = deductionMinutes.map((item, index) => {
-        const amount = totalDeductionMinutes === 0
-            ? 0
-            : index === lastDeductionIndex
-                ? Math.round((record.deductions - allocatedDeductions) * 100) / 100
-                : Math.round((record.deductions * item.minutes / totalDeductionMinutes) * 100) / 100;
-        allocatedDeductions += amount;
-        return { ...item, amount };
-    });
+    const deductionRows = payslipDeductionRows(record);
 
     return (
         <div className="payslip-print bg-white p-8 text-[11px] leading-tight text-slate-950">
@@ -464,7 +495,7 @@ function PayslipDocument({
                         <tbody>
                             <tr>
                                 <td className="border border-slate-200 px-3 py-2">Basic Pay</td>
-                                <td className="border border-slate-200 px-3 py-2 text-right font-semibold">{money(basePay || record.grossPay)}</td>
+                                <td className="border border-slate-200 px-3 py-2 text-right font-semibold">{money(basePay)}</td>
                             </tr>
                             {overtimePay > 0 && (
                                 <tr>
@@ -489,7 +520,7 @@ function PayslipDocument({
                         <tbody>
                             {deductionRows.map((item) => (
                                 <tr key={item.label}>
-                                    <td className="border border-slate-200 px-3 py-2">{item.label} ({item.minutes} min)</td>
+                                    <td className="border border-slate-200 px-3 py-2">{item.label}{item.label !== "Other saved deductions" && ` (${item.minutes} min)`}</td>
                                     <td className="border border-slate-200 px-3 py-2 text-right font-semibold">{money(item.amount)}</td>
                                 </tr>
                             ))}
@@ -505,7 +536,7 @@ function PayslipDocument({
                     <div className="flex items-center justify-between gap-4">
                         <div>
                             <p className="text-[0.58rem] font-bold uppercase tracking-[0.16em] text-violet-700">Amount in words</p>
-                            <p className="mt-1 font-semibold text-slate-950">{numberToWords(record.netPay)} only</p>
+                            <p className="mt-1 font-semibold text-slate-950">{payslipAmountInWords(record.netPay)} only</p>
                         </div>
                         <div className="text-right">
                             <p className="text-[0.58rem] font-bold uppercase tracking-[0.16em] text-violet-700">Net Pay</p>
@@ -647,7 +678,7 @@ export default function PayrollPage() {
         queryFn: () => getPayrollDtr(dtrRecord?.employeeId || "", dtrRecord?.payPeriod),
         enabled: Boolean(dtrRecord?.employeeId),
     });
-    const { data: payslipDtr, isLoading: isPayslipDtrLoading } = useQuery({
+    const { data: payslipDtr, isFetching: isPayslipDtrLoading, isError: isPayslipDtrError, error: payslipDtrError } = useQuery({
         queryKey: ["payroll-payslip-dtr", payslipRecord?.employeeId, payslipCutoffPeriod],
         queryFn: () => getPayrollDtr(payslipRecord?.employeeId || "", payslipCutoffPeriod),
         enabled: Boolean(payslipRecord?.employeeId && payslipCutoffPeriod),
@@ -669,11 +700,18 @@ export default function PayrollPage() {
         queryClient.invalidateQueries({ queryKey: ["payroll-stats"] });
     };
 
-    const { data: bankEmployees = EMPTY_QUERY_ROWS, isLoading: areBankEmployeesLoading } = useQuery({
+    const { data: bankEmployees = EMPTY_QUERY_ROWS, isLoading: areBankEmployeesLoading, isError: areBankEmployeesError } = useQuery({
         queryKey: ["employees", "payroll-bank"],
         queryFn: () => getEmployees({ details: true }),
         enabled: activeTab === "Bank Accounts",
     });
+
+    const filteredBankEmployees = bankEmployees.filter(employee => payrollMatchesSearch([employee.name, employee.employeeCode, employee.bankName, employee.bankAccountName], search));
+    const filterItem = (item: PayrollListItem) => payrollMatchesSearch([item.name, item.second, item.third, item.fourth, item.category], search) && (statusFilter === "All statuses" || item.status === statusFilter);
+    const filteredPayrollItems = payrollItems.filter(filterItem);
+    const filteredArchivedItems = archivedPayrollItems.filter(filterItem);
+    const isExportUnavailable = activeTab === "Bank Accounts" ? areBankEmployeesLoading || areBankEmployeesError :
+        itemCategory ? areItemsLoading || areItemsError : isPayrollLoading || isPayrollError || (activeTab === "Archived" && (areArchivedItemsLoading || areArchivedItemsError));
 
     const payslipCutoffs = useMemo(() => payslipCutoffOptions(payslipRecord, systemSettings, payslipCutoffPeriod), [payslipCutoffPeriod, payslipRecord, systemSettings]);
     const selectedPayslipCutoff = useMemo(
@@ -714,6 +752,8 @@ export default function PayrollPage() {
             payPeriod: payslipDtr.payPeriod,
         };
     }, [payslipCutoffPeriod, payslipDtr, payslipRecord]);
+    const isPayslipOutputReady = payslipOutputReady({ record: payslipPreviewRecord, dtr: payslipDtr,
+        fetching: isPayslipDtrLoading, error: isPayslipDtrError, accuracyEnabled: accuracyConfig?.enabled });
     const markPaidMutation = useMutation({ mutationFn: markPayrollRecordPaid, onSuccess: refreshPayroll });
     const markUnpaidMutation = useMutation({ mutationFn: markPayrollRecordUnpaid, onSuccess: refreshPayroll });
     const updateOvertimeMutation = useMutation({
@@ -773,9 +813,8 @@ export default function PayrollPage() {
     });
     const sendPayslipMutation = useMutation({
         mutationFn: async () => {
-            if (!payslipPreviewRecord || !payslipDtr?.employee._id) throw new Error("The selected payslip is still loading.");
+            if (!isPayslipOutputReady || !payslipPreviewRecord || !payslipDtr?.employee._id) throw new Error("Load a saved, verified cutoff before sending its payslip.");
             if (!payslipImageRef.current) throw new Error("The payslip preview is not ready yet.");
-            const conversation = await createDirectConversation([payslipDtr.employee._id], true);
             const record = payslipPreviewRecord;
             await document.fonts?.ready;
             await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
@@ -794,6 +833,7 @@ export default function PayrollPage() {
             const safeEmployee = record.employeeName.replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "") || record.employeeId;
             const safePeriod = record.payPeriod.replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "") || "pay-period";
             const imageFile = new File([imageBlob], `Payslip-${safeEmployee}-${safePeriod}.png`, { type: "image/png" });
+            const conversation = await createDirectConversation([payslipDtr.employee._id], true);
             const attachment = await uploadMessageAttachment(conversation._id, imageFile);
             await sendMessage(conversation._id, {
                 senderId: null,
@@ -852,8 +892,9 @@ export default function PayrollPage() {
     };
 
     const exportCsv = () => {
-        const header = ["Employee", "Email", "Employee ID", "Department", "Pay Type", "Days", "Absent Days", "Absent Time", "Late Days", "Late Time", "Worked Hours", "Approved OT Hours", "Gross Pay", "Deductions", "Net Pay", "Status", "Paid On", "Pay Period"];
-        const rows = employees.map((employee) => [
+        if (isExportUnavailable) return;
+        let header = ["Employee", "Email", "Employee ID", "Department", "Pay Type", "Days", "Absent Days", "Absent Time", "Late Days", "Late Time", "Worked Hours", "Approved OT Hours", "Gross Pay", "Deductions", "Net Pay", "Status", "Paid On", "Pay Period"];
+        let rows: unknown[][] = employees.map((employee) => [
             employee.employeeName,
             employee.email,
             employee.employeeId,
@@ -873,12 +914,23 @@ export default function PayrollPage() {
             employee.paidOn,
             employee.payPeriod,
         ]);
-        const csv = [header, ...rows].map((row) => row.map((cell) => `"${String(cell).replaceAll('"', '""')}"`).join(",")).join("\n");
+        if (activeTab === "Bank Accounts") {
+            header = ["Employee", "Employee ID", "Bank", "Account Name", "Account Number"];
+            rows = filteredBankEmployees.map(employee => [employee.name, employee.employeeCode, employee.bankName, employee.bankAccountName, employee.bankAccountNumber]);
+        } else if (itemCategory) {
+            header = [itemLabels!.name, itemLabels!.second, itemLabels!.third, itemLabels!.fourth, "Status"];
+            rows = filteredPayrollItems.map(item => [item.name, item.second, item.third, item.fourth, item.status]);
+        } else if (activeTab === "Archived") {
+            header = ["Type", "Name", "Employee ID / Category", "Period / Detail", "Net Pay / Amount", "Status"];
+            rows = [...employees.map(employee => ["Employee payroll", employee.employeeName, employee.employeeId, employee.payPeriod, employee.netPay, employee.status]),
+                ...filteredArchivedItems.map(item => ["Payroll item", item.name, item.category, item.second, item.third, item.status])];
+        }
+        const csv = payrollCsv([header, ...rows]);
         const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
         const url = URL.createObjectURL(blob);
         const link = document.createElement("a");
         link.href = url;
-        link.download = "payroll.csv";
+        link.download = `payroll-${activeTab.toLowerCase().replaceAll(" ", "-")}.csv`;
         link.click();
         URL.revokeObjectURL(url);
     };
@@ -929,6 +981,7 @@ export default function PayrollPage() {
     };
 
     const printPayslip = () => {
+        if (!isPayslipOutputReady) return;
         window.print();
     };
 
@@ -1024,7 +1077,8 @@ export default function PayrollPage() {
                         <label className="flex h-11 w-[20rem] max-w-full items-center gap-3 rounded-lg border border-white/10 bg-[#090b13]/80 px-3 text-white/45 transition focus-within:border-[#842cff] focus-within:ring-2 focus-within:ring-[#842cff]/20">
                             <input
                                 className="h-full min-w-0 flex-1 bg-transparent text-sm text-white outline-none placeholder:text-white/35"
-                                placeholder="Search employees..."
+                                placeholder={itemCategory || activeTab === "Archived" ? "Search payroll records..." : "Search employees..."}
+                                aria-label="Search payroll section"
                                 type="search"
                                 value={search}
                                 onChange={(event) => {
@@ -1034,7 +1088,7 @@ export default function PayrollPage() {
                             />
                             <FiSearch className="size-4 shrink-0" aria-hidden="true" />
                         </label>
-                        <div className="relative">
+                        <div className={activeTab === "Bank Accounts" ? "hidden" : "relative"}>
                             <button
                                 className="flex h-11 min-w-[10rem] items-center justify-between gap-2 rounded-lg border border-white/10 bg-[#090b13]/80 px-4 text-sm font-semibold text-white/75 transition hover:bg-white/10"
                                 type="button"
@@ -1062,7 +1116,7 @@ export default function PayrollPage() {
                                 </div>
                             )}
                         </div>
-                        <button className="flex h-11 items-center gap-2 rounded-lg border border-white/10 bg-[#090b13]/80 px-4 text-sm font-semibold text-white/75 transition hover:bg-white/10" type="button" onClick={exportCsv}>
+                        <button className="flex h-11 items-center gap-2 rounded-lg border border-white/10 bg-[#090b13]/80 px-4 text-sm font-semibold text-white/75 transition hover:bg-white/10 disabled:opacity-50" type="button" onClick={exportCsv} disabled={isExportUnavailable}>
                             <FiDownload className="size-4" aria-hidden="true" />
                             Export
                         </button>
@@ -1081,6 +1135,7 @@ export default function PayrollPage() {
                 </div>
 
                 {runPayrollMutation.error && <p role="alert" className="mt-3 rounded-md border border-red-200 bg-red-50 p-3 text-sm !text-red-800">{payrollErrorMessage(runPayrollMutation.error)}</p>}
+                {(restoreRecordMutation.error || restoreItemMutation.error) && <p role="alert" className="mt-3 rounded-md border border-red-200 bg-red-50 p-3 text-sm !text-red-800">{payrollErrorMessage(restoreRecordMutation.error || restoreItemMutation.error)}</p>}
                 <div className="mt-5 grid gap-4 xl:h-[calc(100vh-15.5rem)] xl:min-h-[34rem] xl:grid-cols-[minmax(14.5rem,16.5rem)_1fr]">
                     <aside className="relative z-20 flex min-h-0 flex-col overflow-hidden rounded-lg border border-violet-200/80 bg-white/82 shadow-xl shadow-violet-200/35 backdrop-blur">
                         <div className="border-b border-violet-200/80 px-4 py-4">
@@ -1331,7 +1386,9 @@ export default function PayrollPage() {
                                 </thead>
                                 <tbody className="divide-y divide-white/10">
                                     {areBankEmployeesLoading && <tr><td className="px-4 py-5 text-sm text-white/45" colSpan={5}>Loading bank accounts...</td></tr>}
-                                    {!areBankEmployeesLoading && bankEmployees.map((employee) => (
+                                    {areBankEmployeesError && <tr><td role="alert" className="px-4 py-5 text-sm !text-red-700" colSpan={5}>Unable to load bank accounts.</td></tr>}
+                                    {!areBankEmployeesLoading && !areBankEmployeesError && !filteredBankEmployees.length && <tr><td className="px-4 py-5 text-sm text-white/45" colSpan={5}>No bank accounts found.</td></tr>}
+                                    {!areBankEmployeesLoading && !areBankEmployeesError && filteredBankEmployees.map((employee) => (
                                         <tr key={employee._id} className="text-sm text-white/75 transition hover:bg-white/[0.035]">
                                             <td className="px-4 py-3">
                                                 <p className="font-semibold text-white">{employee.name}</p>
@@ -1375,7 +1432,7 @@ export default function PayrollPage() {
                             isLoading={areArchivedItemsLoading}
                             isError={areArchivedItemsError}
                             emptyText="No archived payroll items."
-                            rows={archivedPayrollItems.map((item) => ({
+                            rows={filteredArchivedItems.map((item) => ({
                                 id: item._id,
                                 primary: item.name,
                                 secondary: item.category,
@@ -1417,8 +1474,8 @@ export default function PayrollPage() {
                                 <tbody className="divide-y divide-white/10">
                                     {areItemsLoading && <tr><td className="px-4 py-5 text-sm text-white/45" colSpan={5}>Loading {activeTab.toLowerCase()}...</td></tr>}
                                     {areItemsError && <tr><td className="px-4 py-5 text-sm text-red-200" colSpan={5}>Unable to load {activeTab.toLowerCase()}.</td></tr>}
-                                    {!areItemsLoading && !areItemsError && payrollItems.length === 0 && <tr><td className="px-4 py-5 text-sm text-white/45" colSpan={5}>No records yet.</td></tr>}
-                                    {payrollItems.map((item) => (
+                                    {!areItemsLoading && !areItemsError && filteredPayrollItems.length === 0 && <tr><td className="px-4 py-5 text-sm text-white/45" colSpan={5}>No records found.</td></tr>}
+                                    {filteredPayrollItems.map((item) => (
                                         <tr key={item._id} className="text-sm text-white/80 transition hover:bg-white/[0.035]">
                                             <td className="px-4 py-4 font-semibold text-white">{item.name}</td>
                                             <td className="px-4 py-4 text-white/65">{item.second}</td>
@@ -1592,7 +1649,7 @@ export default function PayrollPage() {
                     <div
                         className="modal-backdrop-enter fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4 py-6 backdrop-blur-sm"
                         onMouseDown={(event) => {
-                            if (event.target === event.currentTarget) {
+                            if (event.target === event.currentTarget && !sendPayslipMutation.isPending) {
                                 setPayslipRecord(null);
                             }
                         }}
@@ -1613,6 +1670,7 @@ export default function PayrollPage() {
                                                 aria-expanded={isPayslipCutoffOpen}
                                                 aria-haspopup="listbox"
                                                 aria-label="Select payslip cutoff"
+                                                disabled={sendPayslipMutation.isPending}
                                                 onClick={() => setIsPayslipCutoffOpen((current) => !current)}
                                             >
                                                 <span className="shrink-0 text-[0.65rem] font-bold uppercase tracking-[0.14em] text-slate-400">Cutoff</span>
@@ -1671,7 +1729,7 @@ export default function PayrollPage() {
                                             className="flex h-10 items-center gap-2 rounded-lg bg-emerald-500 px-3 text-sm font-semibold text-white transition hover:bg-emerald-600 disabled:cursor-wait disabled:opacity-60"
                                             type="button"
                                             onClick={() => sendPayslipMutation.mutate()}
-                                            disabled={isPayslipDtrLoading || sendPayslipMutation.isPending || (accuracyConfig?.enabled && !payslipDtr?.storedCutoff)}
+                                            disabled={!isPayslipOutputReady || sendPayslipMutation.isPending}
                                         >
                                             <FiSend className="size-4" aria-hidden="true" />
                                             {sendPayslipMutation.isPending ? "Sending..." : "Send to Messages"}
@@ -1680,6 +1738,7 @@ export default function PayrollPage() {
                                             className="flex h-10 items-center gap-2 rounded-lg border border-white/10 bg-white/[0.06] px-3 text-sm font-semibold text-white/80 transition hover:bg-white/10 hover:text-white"
                                             type="button"
                                             onClick={printPayslip}
+                                            disabled={!isPayslipOutputReady || sendPayslipMutation.isPending}
                                         >
                                             <FiPrinter className="size-4" aria-hidden="true" />
                                             Print / Save PDF
@@ -1689,12 +1748,16 @@ export default function PayrollPage() {
                                             type="button"
                                             onClick={() => setPayslipRecord(null)}
                                             aria-label="Close payslip"
+                                            disabled={sendPayslipMutation.isPending}
                                         >
                                             <FiX className="size-4" />
                                         </button>
                                     </div>
                                 </div>
 
+                                {isPayslipDtrError && <p role="alert" className="mt-3 rounded-md border border-red-200 bg-red-50 p-3 text-sm !text-red-800">{payrollErrorMessage(payslipDtrError)}</p>}
+                                {accuracyConfig?.enabled && payslipDtr?.storedCutoff && <p className="mt-3 text-sm text-white/80">Saved cutoff amounts. Attendance edits require an approved recompute before this payslip changes.</p>}
+                                {accuracyConfig?.enabled && payslipDtr && !payslipDtr.storedCutoff && <p role="alert" className="mt-3 text-sm text-white/80">Preview only. Approve this cutoff before printing or sending its payslip.</p>}
                                 {payslipDeliveryStatus && (
                                     <p className="mt-3 rounded-lg border border-white/10 bg-white/[0.06] px-3 py-2 text-sm font-semibold text-white/80">{payslipDeliveryStatus}</p>
                                 )}
@@ -1713,7 +1776,7 @@ export default function PayrollPage() {
                                 </div>
                             </div>
                             <div className="content-scroll min-h-0 flex-1 overflow-auto bg-slate-200 p-6">
-                                <div ref={payslipImageRef} className="mx-auto w-full max-w-[49rem] overflow-hidden rounded-xl shadow-2xl shadow-black/25">
+                                <div ref={payslipImageRef} className="mx-auto w-[49rem] shrink-0 overflow-hidden rounded-xl shadow-2xl shadow-black/25">
                                     <PayslipDocument record={payslipPreviewRecord} money={money} payrollRunDay={systemSettings?.payrollRunDay} />
                                 </div>
                             </div>
@@ -1753,6 +1816,7 @@ export default function PayrollPage() {
                                             min={itemCategory === "Deductions" && field === "second" ? "0" : undefined}
                                             step={itemCategory === "Deductions" && field === "second" ? "0.01" : undefined}
                                             value={String(itemForm[field as keyof typeof itemForm])}
+                                            required={field !== "fourth"}
                                             placeholder={placeholder}
                                             onChange={(event) => setItemForm((form) => ({ ...form, [field]: event.target.value }))}
                                         />
@@ -1764,6 +1828,7 @@ export default function PayrollPage() {
                                         {statusOptions.map((status) => <option key={status}>{status}</option>)}
                                     </select>
                                 </label>
+                                {createItemMutation.error && <p role="alert" className="text-sm !text-red-700">{payrollErrorMessage(createItemMutation.error)}</p>}
                             </div>
                             <div className="flex justify-end gap-2 border-t border-white/10 px-5 py-3">
                                 <button className="h-10 rounded-lg border border-white/10 bg-white/[0.05] px-4 text-sm font-semibold text-white/60 transition hover:bg-white/10 hover:text-white" type="button" onClick={() => setItemModalOpen(false)}>Cancel</button>
@@ -1805,6 +1870,7 @@ export default function PayrollPage() {
                                         />
                                     </label>
                                 ))}
+                                {updateBankMutation.error && <p role="alert" className="text-sm !text-red-700">{payrollErrorMessage(updateBankMutation.error)}</p>}
                             </div>
                             <div className="flex justify-end gap-2 border-t border-white/10 px-5 py-3">
                                 <button className="h-10 rounded-lg border border-white/10 bg-white/[0.05] px-4 text-sm font-semibold text-white/60 transition hover:bg-white/10 hover:text-white" type="button" onClick={() => setBankEditEmployee(null)}>Cancel</button>
@@ -1982,7 +2048,8 @@ export default function PayrollPage() {
                                     <p className="text-sm font-semibold text-white">{deleteTarget.type === "record" ? deleteTarget.record.employeeName : deleteTarget.item.name}</p>
                                     <p className="mt-1 text-sm text-white/55">{deleteTarget.type === "record" ? deleteTarget.record.employeeId : deleteTarget.item.category}</p>
                                 </div>
-                                <div className="mt-3 rounded-lg border border-yellow-300/20 bg-yellow-300/10 p-3">
+                                    {(archiveRecordMutation.error || archiveItemMutation.error) && <p role="alert" className="mt-3 text-sm !text-red-700">{payrollErrorMessage(archiveRecordMutation.error || archiveItemMutation.error)}</p>}
+                                    <div className="mt-3 rounded-lg border border-yellow-300/20 bg-yellow-300/10 p-3">
                                     <p className="text-sm leading-6 text-yellow-50/75">Are you sure you want to archive this payroll record?</p>
                                 </div>
                             </div>

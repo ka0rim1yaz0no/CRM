@@ -123,10 +123,10 @@ function MessageAttachmentView({ attachment, isMine }: { attachment: MessageAtta
                         }}
                     >
                         <div className="flex h-16 shrink-0 items-center justify-between gap-4 border-b border-white/10 bg-slate-950/90 px-4 sm:px-6">
-                            <p className="min-w-0 truncate text-sm font-semibold text-white">{attachment.name}</p>
+                            <p className="min-w-0 truncate text-sm font-semibold text-[#ffffff]">{attachment.name}</p>
                             <div className="flex shrink-0 items-center gap-2">
                                 <a
-                                    className="grid size-10 place-items-center rounded-lg border border-white/15 bg-white/10 text-white transition hover:bg-white/15"
+                                    className="grid size-10 place-items-center rounded-lg border border-white/15 bg-white/10 text-[#ffffff] transition hover:bg-white/15"
                                     href={objectUrl}
                                     download={attachment.name}
                                     aria-label="Download image"
@@ -135,7 +135,7 @@ function MessageAttachmentView({ attachment, isMine }: { attachment: MessageAtta
                                     <FiDownload className="size-4" aria-hidden="true" />
                                 </a>
                                 <button
-                                    className="grid size-10 place-items-center rounded-lg border border-white/15 bg-white/10 text-white transition hover:bg-white/15"
+                                    className="grid size-10 place-items-center rounded-lg border border-white/15 bg-white/10 text-[#ffffff] transition hover:bg-white/15"
                                     type="button"
                                     onClick={() => setIsImagePreviewOpen(false)}
                                     aria-label="Close image preview"

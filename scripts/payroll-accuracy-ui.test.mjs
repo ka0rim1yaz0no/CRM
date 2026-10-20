@@ -31,7 +31,7 @@ test("payroll uses saved backend rates and a preview, never a frontend eight-hou
     const page = readFileSync(new URL("../src/pages/admin/payroll/index.tsx", import.meta.url), "utf8");
     assert.match(page, /getPayrollAccuracyConfig/); assert.match(page, /PayrollRecomputeDialog/);
     assert.doesNotMatch(page, /Paid day not snapshotted/);
-    assert.match(page, /paidHoursPerDay/); assert.match(page, /!payslipDtr\?\.storedCutoff/);
+    assert.match(page, /paidHoursPerDay/); assert.match(page, /accuracyEnabled && !dtr\.storedCutoff/);
     assert.match(page, /employeeDtr\.currentAttendanceWarning && <p role="alert"/);
     assert.match(page, /Saved pay has not changed/);
     assert.match(page, /employeeDtr\.potentialOvertimeHours \?\? employeeDtr\.summary\.overtimeHours/);

@@ -156,6 +156,45 @@ test("HTTP edit, fresh reads, explicit recompute approval and payment stay consi
   }
 });
 
+test("remaining payroll controls preserve approved totals and bank details refresh in every assigned business", async () => {
+  const first = await preview(); assert.equal((await confirm(first.data)).status, 200);
+  const before = await runWithBusiness("pay-a", () => PayrollRecord.findOne().lean()); assert.ok(before);
+  const amounts = ({ grossPay, deductions, netPay }: { grossPay: number; deductions: number; netPay: number }) => ({ grossPay, deductions, netPay });
+  for (const business of ["pay-a", "pay-b"]) {
+    const saved = await runWithBusiness(business, () => PayrollRecord.findOne().lean()); assert.ok(saved);
+    for (const [route, body, method] of [[`/payroll/records/${saved._id}/worked-minutes`, { workedMinutes: 1 }, "PATCH"],
+      [`/payroll/records/${saved._id}/overtime`, { overtimeHours: 2 }, "PATCH"],
+      ["/payroll/run", { payPeriod: period }, "POST"]] as const) {
+      assert.equal((await request(route, body, business, token, method)).status, 422);
+    }
+    const item = await request("/payroll/items", { category: "Deductions", name: "Synthetic metadata only", second: "10", third: "Synthetic description", status: "Applied" }, business);
+    assert.equal(item.status, 201, JSON.stringify(item.data));
+    assert.equal((await request(`/payroll/items/${item.data._id}/archive`, {}, business, token, "PATCH")).data.isArchived, true);
+    assert.equal((await request(`/payroll/items/${item.data._id}/restore`, {}, business, token, "PATCH")).data.isArchived, false);
+    assert.equal((await request(`/payroll/records/${saved._id}/archive`, {}, business, token, "PATCH")).data.isArchived, true);
+    const archived = await request(`/payroll/records?archived=true&payPeriod=${encodeURIComponent(period)}`, undefined, business);
+    assert.equal(archived.data.length, 1);
+    assert.equal((await request(`/payroll/records/${saved._id}/restore`, {}, business, token, "PATCH")).data.isArchived, false);
+    const fresh = await request(`/payroll/records?payPeriod=${encodeURIComponent(period)}`, undefined, business);
+    assert.equal(fresh.data.length, 1); assert.deepEqual(amounts(fresh.data[0]), amounts(before));
+  }
+  const bank = { bankName: "Synthetic Test Bank", bankAccountName: "Synthetic Payroll Employee", bankAccountNumber: "000000001" };
+  assert.equal((await request(`/employees/${ids[1]}/bank`, bank, "pay-b", token, "PATCH")).status, 200);
+  assert.equal((await request("/payroll/employees/90000003/basic-pay", { basicPay: 32000 }, "pay-b", token, "PATCH")).status, 200);
+  for (const business of ["pay-a", "pay-b"]) {
+    const employee = await runWithBusiness(business, () => Employee.findOne({ employeeCode: "90000003" }).lean());
+    assert.equal(employee?.salary, 32000); assert.equal(employee?.bankAccountNumber, bank.bankAccountNumber);
+    const dtr = await request(`/payroll/dtr/90000003?payPeriod=${encodeURIComponent(period)}`, undefined, business);
+    assert.equal(dtr.status, 200); assert.deepEqual(amounts(dtr.data.summary), amounts(before), "salary/item metadata cannot rewrite a saved cutoff");
+  }
+  assert.equal((await request(`/payroll/records/${before._id}/paid`, {}, "pay-a", token, "PATCH")).status, 200);
+  assert.equal((await request(`/payroll/records/${before._id}/unpaid`, {}, "pay-a", token, "PATCH")).status, 200);
+  for (const business of ["pay-a", "pay-b"]) {
+    const fresh = await request(`/payroll/records?payPeriod=${encodeURIComponent(period)}`, undefined, business);
+    assert.equal(fresh.data[0].status, "Pending"); assert.deepEqual(amounts(fresh.data[0]), amounts(before));
+  }
+});
+
 test("approval holds every business attendance fence until its complete payroll transaction commits", { timeout: 25000 }, async () => {
   const first = await preview();
   const payrollEntered = gate(), resumePayroll = gate(), editingAtFence = gate();
