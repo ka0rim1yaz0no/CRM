@@ -16,6 +16,8 @@ const schema = new Schema<CallBridgeObservationDocument>({
   durationMs: { type: Number, required: true },
   businessIds: { type: [String], default: [] },
 }, { timestamps: true });
+schema.index({ businessIds: 1, startedAt: 1 });
+schema.index({ businessIds: 1, endedAt: 1 });
 if (callTimingV2Enabled()) {
   schema.index({ employeeCode: 1, startedAt: 1 }, { unique: true });
   schema.index({ employeeCode: 1, endedAt: -1 });

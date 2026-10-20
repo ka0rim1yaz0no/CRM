@@ -381,7 +381,7 @@ test("real API: bulk notice read uses the literal route, signed owner scope and 
     });
   }
   assert.equal((await request(path, token, "PATCH")).status, 200, "Repeat must be idempotent");
-  const switched = await fetch(`${base}/employees/${owner.employees[1]._id}/notices`, { headers: { "X-Business-Id": "test-b" } });
+  const switched = await fetch(`${base}/employees/${owner.employees[1]._id}/notices`, { headers: { "X-Business-Id": "test-b", "X-CRM-Attendance-Session": token } });
   assert.equal(switched.status, 200);
   assert.ok((await switched.json()).every((row: { isRead: boolean }) => row.isRead), "Reload in another business must not resurrect unread notices");
 
@@ -391,7 +391,7 @@ test("real API: bulk notice read uses the literal route, signed owner scope and 
   assert.equal((await request(`/employees/${broken.employees[0]._id}/notices/read`, brokenToken, "PATCH")).status, 503);
   assert.equal(await runWithBusiness("test-a", () => Notice.countDocuments({ employee: broken.employees[0]._id, isRead: false })), 1, "Second-business failure must roll back first-business writes");
   await setBusinessAccessForEmployeeCode(broken.actor.code, ["test-b"]);
-  assert.equal((await request(`/employees/${broken.employees[0]._id}/notices/read`, brokenToken, "PATCH")).status, 409, "Matching employee code alone must not grant membership");
+  assert.equal((await request(`/employees/${broken.employees[0]._id}/notices/read`, brokenToken, "PATCH")).status, 403, "Matching employee code alone must not grant membership");
 });
 
 test("real Mongo: invalid batch writes no fields; two tabs cannot double clock in", async () => {
@@ -753,10 +753,11 @@ test("real API: legacy migration preview is read-only and unreviewed historical 
 test("real API: settings reads do not create a document; forged role headers cannot change thresholds", async () => {
   const { SystemSettings } = await import("../models/SystemSettings");
   const count = await runWithBusiness("test-a", () => SystemSettings.countDocuments({}));
-  const response = await request("/system-settings", ""); assert.equal(response.status, 200);
+  assert.equal((await request("/system-settings", "")).status, 401);
+  const response = await request("/system-settings", createAdminDashboardSession(admin.code)!, "GET", undefined, true); assert.equal(response.status, 200);
   assert.equal(await runWithBusiness("test-a", () => SystemSettings.countDocuments({})), count);
   const forged = await fetch(`${base}/system-settings`, { method: "PUT", headers: { "Content-Type": "application/json", "X-Business-Id": "test-a", "X-CRM-User-Type": "admin", "X-CRM-User-Code": admin.code }, body: JSON.stringify({ lateGraceMinutes: 15 }) });
-  assert.equal(forged.status, 403);
+  assert.equal(forged.status, 401);
 });
 test("legacy HR characterization: parallel same-employee handlers self-conflict after one field persisted", async () => {
   const { withAttendanceActionLock } = await import("../middleware/attendanceActionLock");

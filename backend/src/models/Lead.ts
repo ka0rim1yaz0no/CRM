@@ -633,6 +633,7 @@ const leadSchema = new Schema<LeadDocument>(
 );
 
 leadSchema.index({ status: 1 });
+leadSchema.index({ createdAt: 1 });
 leadSchema.index({ status: 1, createdAt: -1 });
 leadSchema.index({ source: 1, createdAt: -1 });
 leadSchema.index({ email: 1 });

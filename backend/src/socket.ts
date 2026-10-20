@@ -6,6 +6,8 @@ import { Conversation } from "./models/Conversation";
 import { Employee } from "./models/Employee";
 import { LiveViewAudit } from "./models/LiveViewAudit";
 import { Message } from "./models/Message";
+import { securityLegacyAuthEnabled } from "./config/rolloutFlags";
+import { signedCrmIdentity, signedEmployeeInBusiness } from "./middleware/legacyAuthentication";
 
 let socketServer: Server | null = null;
 
@@ -143,12 +145,19 @@ export function createSocketServer(httpServer: HttpServer) {
   socketServer = io;
 
   io.use(async (socket, next) => {
+    try {
     const business = resolveSocketBusiness(socket);
-    const userType = String(socket.handshake.auth?.userType || "").trim().toLowerCase();
-    const userCode = String(socket.handshake.auth?.userCode || "").trim();
+    let userType = String(socket.handshake.auth?.userType || "").trim().toLowerCase();
+    let userCode = String(socket.handshake.auth?.userCode || "").trim();
 
     if (!business) {
       return next(new Error("Unknown socket business."));
+    }
+    if (securityLegacyAuthEnabled()) {
+      const identity = signedCrmIdentity(socket.handshake.auth?.adminSession, socket.handshake.auth?.attendanceSession);
+      if (!identity) return next(new Error("Signed CRM socket session required."));
+      userType = identity.type; userCode = identity.code; socket.data.verifiedAccess = identity.access;
+      if (identity.type === "employee" && !await runWithBusiness(business.id, () => signedEmployeeInBusiness(identity.code, business.id))) return next(new Error("Socket business access denied."));
     }
 
     if (userType === "admin") {
@@ -173,6 +182,7 @@ export function createSocketServer(httpServer: HttpServer) {
     }
 
     next(new Error("Authenticated CRM session required."));
+    } catch { next(new Error("Socket authentication is temporarily unavailable.")); }
   });
 
   io.on("connection", (socket) => {
@@ -182,20 +192,56 @@ export function createSocketServer(httpServer: HttpServer) {
       return;
     }
     socket.data.businessId = business.id;
-    socket.join(businessRoom(business.id));
-    if (socket.data.authUserType === "admin") {
+    const tracker = securityLegacyAuthEnabled() && socket.data.verifiedAccess === "tracker";
+    if (!tracker) socket.join(businessRoom(business.id));
+    if (socket.data.authUserType === "admin" && !tracker) {
       socket.join(`business:${business.id}:admins`);
     } else if (socket.data.authUserType === "employee" && socket.data.authEmployeeId) {
       socket.join(employeeRoom(business.id, socket.data.authEmployeeId));
     }
 
     const runForSocketBusiness = <T>(callback: () => T) => runWithBusiness(socket.data.businessId, callback);
+    let expiryTimer: ReturnType<typeof setTimeout> | undefined;
+    let membershipTimer: ReturnType<typeof setInterval> | undefined;
+    let verifying = false;
+    const verifyCurrentAccess = async () => {
+      const identity = signedCrmIdentity(socket.handshake.auth?.adminSession, socket.handshake.auth?.attendanceSession);
+      if (!identity) return false;
+      if (identity.type !== "employee") return true;
+      let deadline: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return Boolean(await Promise.race([runForSocketBusiness(() => signedEmployeeInBusiness(identity.code, socket.data.businessId)),
+          new Promise<null>(resolve => { deadline = setTimeout(() => resolve(null), 3500); })]));
+      } finally { clearTimeout(deadline); }
+    };
+    if (securityLegacyAuthEnabled()) {
+      const identity = signedCrmIdentity(socket.handshake.auth?.adminSession, socket.handshake.auth?.attendanceSession);
+      if (!identity) { socket.disconnect(true); return; }
+      expiryTimer = setTimeout(() => socket.disconnect(true), Math.max(1, identity.expiresAt - Date.now()));
+      expiryTimer.unref();
+      if (identity.type === "employee") {
+        membershipTimer = setInterval(() => {
+          if (verifying || !securityLegacyAuthEnabled()) return;
+          verifying = true;
+          void verifyCurrentAccess().then(allowed => { if (!allowed) socket.disconnect(true); }, () => socket.disconnect(true)).finally(() => { verifying = false; });
+        }, 30_000);
+        membershipTimer.unref();
+      }
+    }
+
+    socket.use(async ([event], next) => {
+      if (!securityLegacyAuthEnabled()) return next();
+      try { if (!await verifyCurrentAccess()) { socket.disconnect(true); return next(new Error("CRM session expired or business access changed.")); } }
+      catch { socket.disconnect(true); return next(new Error("CRM access could not be verified.")); }
+      if (tracker && !["presence:register", "live-share:request", "live-share:stop", "live-share:signal"].includes(event)) return next(new Error("Tracker socket action denied."));
+      next();
+    });
 
     socket.on(
       "presence:register",
       () => {
         if (socket.data.authUserType === "admin") {
-          socket.join(`business:${socket.data.businessId}:admins`);
+          if (!tracker) socket.join(`business:${socket.data.businessId}:admins`);
           return;
         }
 
@@ -463,6 +509,7 @@ export function createSocketServer(httpServer: HttpServer) {
     );
 
     socket.on("disconnect", () => {
+      clearTimeout(expiryTimer); clearInterval(membershipTimer);
       const party = socketParty(socket);
       const callId = employeeVoiceCalls.get(voicePartyKey(socket.data.businessId, party.type, party.id));
       if (!callId) return;

@@ -32,6 +32,7 @@ import { getEmployeeSummaries } from "../../../api/employees";
 import { getAuthUser } from "../../../api/authStorage";
 import { getSystemSettings } from "../../../api/systemSettings";
 import { backendOrigin } from "../../../lib/backendUrl";
+import { fileBusinessUrl } from "../../../lib/fileBusinessUrl";
 import { parsePhDateTimeInput, formatPhDateTime } from "../../../lib/dateTime";
 import { connectAuthenticatedSocket, socket } from "../../../lib/socket";
 
@@ -241,7 +242,7 @@ function buildSyntheticSiteVisits(events: BrowserActivityEvent[]) {
 
 function imageUrl(fileUrl: string) {
     if (/^https?:\/\//i.test(fileUrl)) {
-        return fileUrl;
+        return fileBusinessUrl(fileUrl);
     }
 
     const normalizedFileUrl = fileUrl.startsWith("/") ? fileUrl : `/${fileUrl}`;
@@ -253,10 +254,10 @@ function imageUrl(fileUrl: string) {
             .split("/")
             .map((segment) => encodeURIComponent(segment))
             .join("/");
-        return `${backendOrigin}/api/browser-activity/screenshots/file/${relativePath}`;
+        return fileBusinessUrl(`${backendOrigin}/api/browser-activity/screenshots/file/${relativePath}`);
     }
 
-    return `${backendOrigin}${normalizedFileUrl}`;
+    return fileBusinessUrl(`${backendOrigin}${normalizedFileUrl}`);
 }
 
 function matchesSearch(event: BrowserActivityEvent, search: string) {
@@ -298,7 +299,7 @@ export default function AdminTracker() {
     const startIso = startDateTime ? parsePhDateTimeInput(startDateTime)?.toISOString() : undefined;
     const endIso = endDateTime ? parsePhDateTimeInput(endDateTime)?.toISOString() : undefined;
     const authUser = getAuthUser();
-    const isTrackerOnlyAdmin = authUser?.userType === "admin" && authUser.user.employeeCode === "2132123000";
+    const isTrackerOnlyAdmin = authUser?.userType === "admin" && authUser.access === "tracker";
     const activityParams = {
         employeeId: employeeFilter === "ALL" ? undefined : employeeFilter,
         classification: classificationFilter === "ALL" ? undefined : classificationFilter,
@@ -313,7 +314,7 @@ export default function AdminTracker() {
         ? employees.filter((employee) => String(employee.team || "").trim().toLowerCase() === "internal")
         : employees;
     const { data: systemSettings } = useQuery({ queryKey: ["system-settings"], queryFn: getSystemSettings });
-    const clearDataEnabled = systemSettings?.trackerClearDataEnabled !== false;
+    const clearDataEnabled = !isTrackerOnlyAdmin && systemSettings?.trackerClearDataEnabled !== false;
     const eventsQuery = useQuery({
         queryKey: ["browser-activity-events", activityParams],
         queryFn: () => getBrowserActivityEvents(activityParams),

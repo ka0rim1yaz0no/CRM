@@ -1,46 +1,12 @@
 import { api } from "../lib/api";
+import { createCredentialRequests } from "../lib/credentialVault";
 
-export type CredentialStatus = "Active" | "Review" | "Archived";
+export type { Credential, CredentialInput, CredentialStatus } from "../lib/credentialVault";
 
-export type Credential = {
-    _id: string;
-    accountName: string;
-    username: string;
-    password: string;
-    platform: string;
-    company: string;
-    team: string;
-    status: CredentialStatus;
-    createdAt?: string;
-    updatedAt?: string;
-};
-
-export type CredentialInput = {
-    accountName: string;
-    username: string;
-    password: string;
-    platform: string;
-    company: string;
-    team: string;
-    status?: CredentialStatus;
-};
-
-export async function getCredentials() {
-    const response = await api.get<Credential[]>("/credentials");
-    return response.data;
-}
-
-export async function createCredential(credential: CredentialInput) {
-    const response = await api.post<Credential>("/credentials", credential);
-    return response.data;
-}
-
-export async function updateCredential(id: string, credential: CredentialInput) {
-    const response = await api.put<Credential>(`/credentials/${id}`, credential);
-    return response.data;
-}
-
-export async function archiveCredential(id: string) {
-    const response = await api.patch<Credential>(`/credentials/${id}/archive`);
-    return response.data;
-}
+// Use the central client so business and signed admin session headers remain covered.
+const requests = createCredentialRequests(api);
+export const getCredentials = requests.getCredentials;
+export const createCredential = requests.createCredential;
+export const updateCredential = requests.updateCredential;
+export const archiveCredential = requests.archiveCredential;
+export const revealCredential = requests.revealCredential;

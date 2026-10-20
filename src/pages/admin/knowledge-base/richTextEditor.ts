@@ -25,6 +25,7 @@ import {
 } from "ckeditor5";
 import { uploadKnowledgeBasePhoto } from "../../../api/knowledgeBase";
 import { backendOrigin } from "../../../lib/backendUrl";
+import { fileBusinessUrl } from "../../../lib/fileBusinessUrl";
 
 export { ClassicEditor };
 
@@ -33,12 +34,12 @@ function getUploadedImageUrl(url: string) {
     const uploadPrefix = "/uploads/knowledge-base/";
 
     if (!cleanUrl) return "";
-    if (/^(https?:|data:|blob:)/i.test(cleanUrl)) return cleanUrl;
+    if (/^(https?:|data:|blob:)/i.test(cleanUrl)) return fileBusinessUrl(cleanUrl);
     if (cleanUrl.startsWith(uploadPrefix)) {
-        return `${backendOrigin}/api/knowledge-base/photos/file/${encodeURIComponent(cleanUrl.slice(uploadPrefix.length))}`;
+        return fileBusinessUrl(`${backendOrigin}/api/knowledge-base/photos/file/${encodeURIComponent(cleanUrl.slice(uploadPrefix.length))}`);
     }
 
-    return `${backendOrigin}${cleanUrl.startsWith("/") ? cleanUrl : `/${cleanUrl}`}`;
+    return fileBusinessUrl(`${backendOrigin}${cleanUrl.startsWith("/") ? cleanUrl : `/${cleanUrl}`}`);
 }
 
 function dataUrlToImageFile(dataUrl: string, index: number) {

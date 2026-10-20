@@ -43,14 +43,26 @@ jobs:
       - name: Typecheck backend
         run: npm run typecheck --prefix backend
 
+      - name: Compile backend for native Node
+        run: npm run build:production --prefix backend
+
+      - name: Check compiled application imports
+        working-directory: backend
+        run: node --input-type=module -e "await import('./dist/backend/src/app.js')"
+
+      - name: Test compiled backend with synthetic data
+        run: npm run test:production --prefix backend
+
       - name: Run backend tests
         working-directory: backend
         shell: bash
         run: npx tsx --test $(find src -type f -name '*.test.ts' -print)
 
-      - name: Run lint report
+      - name: Run frontend attendance and security regressions
+        run: node --test scripts/attendance-duration-ui.test.mjs scripts/credential-vault-ui.test.mjs scripts/security-auth-ui.test.mjs scripts/data-check-ui.test.mjs
+
+      - name: Run blocking lint
         run: npm run lint
-        continue-on-error: true
 
   secrets:
     name: Secret scan
@@ -63,6 +75,6 @@ jobs:
           fetch-depth: 0
 
       - name: Scan repository for secrets
-        uses: trufflesecurity/trufflehog@main
+        uses: trufflesecurity/trufflehog@e63326d6545de8f425d93ce24078c6e68d83f70e # v3.99.3
         with:
           extra_args: --results=verified,unknown

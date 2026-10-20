@@ -8,6 +8,7 @@ import {
     type KnowledgeBaseEntry,
 } from "../../api/knowledgeBase";
 import { backendOrigin } from "../../lib/backendUrl";
+import { fileBusinessUrl } from "../../lib/fileBusinessUrl";
 import { getPlainTextFromRichText } from "../../lib/richText";
 import MainLayout from "../layout";
 
@@ -17,15 +18,15 @@ function getFileUrl(url: string) {
     const legacyPhotoPrefix = "/uploads/knowledge-base/";
 
     if (!cleanUrl) return "";
-    if (/^(https?:|data:|blob:)/i.test(cleanUrl)) return cleanUrl;
+    if (/^(https?:|data:|blob:)/i.test(cleanUrl)) return fileBusinessUrl(cleanUrl);
     if (cleanUrl.startsWith(legacyDocumentPrefix)) {
-        return `${backendOrigin}/api/knowledge-base/documents/file/${encodeURIComponent(cleanUrl.slice(legacyDocumentPrefix.length))}`;
+        return fileBusinessUrl(`${backendOrigin}/api/knowledge-base/documents/file/${encodeURIComponent(cleanUrl.slice(legacyDocumentPrefix.length))}`);
     }
     if (cleanUrl.startsWith(legacyPhotoPrefix)) {
-        return `${backendOrigin}/api/knowledge-base/photos/file/${encodeURIComponent(cleanUrl.slice(legacyPhotoPrefix.length))}`;
+        return fileBusinessUrl(`${backendOrigin}/api/knowledge-base/photos/file/${encodeURIComponent(cleanUrl.slice(legacyPhotoPrefix.length))}`);
     }
 
-    return `${backendOrigin}${cleanUrl.startsWith("/") ? cleanUrl : `/${cleanUrl}`}`;
+    return fileBusinessUrl(`${backendOrigin}${cleanUrl.startsWith("/") ? cleanUrl : `/${cleanUrl}`}`);
 }
 
 function getProductPath(entry: KnowledgeBaseEntry) {

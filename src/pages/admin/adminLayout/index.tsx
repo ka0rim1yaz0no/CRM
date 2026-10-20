@@ -10,6 +10,7 @@ import { getLeaveRequests } from "../../../api/leaveRequests";
 import { getRecentNotices } from "../../../api/notices";
 import { getEmployeeSummaries } from "../../../api/employees";
 import { getEvaluations } from "../../../api/evaluations";
+import { getDataCheckConfig } from "../../../api/dataCheck";
 import { getAdminLeads } from "../../../api/leads";
 import { useFeatureFlags } from "../../../hooks/useFeatureFlags";
 import { useClickOutside } from "../../../hooks/useClickOutside";
@@ -95,6 +96,7 @@ const adminNavSections: AdminNavSection[] = [
         items: [
             { label: "Dashboard", path: "/admin/dashboard", icon: FiBarChart2, feature: "dashboard" },
             { label: "Reports", path: "/admin/reports", icon: FiPieChart, feature: "tracking" },
+            { label: "Data Check", path: "/admin/data-check", icon: FiShield, feature: "dashboard" },
             { label: "Tracker", path: "/admin/tracker", icon: FiMonitor, feature: "tracking" },
         ],
     },
@@ -179,6 +181,8 @@ export default function AdminLayout({ children }: Props) {
     const queryClient = useQueryClient();
     const authUser = getAuthUser();
     const isTrackerOnlyAdmin = authUser?.userType === "admin" && authUser.access === "tracker";
+    const fullAdmin = authUser?.userType === "admin" && !isTrackerOnlyAdmin;
+    const { data: dataCheckConfig } = useQuery({ queryKey: ["data-check-config", getActiveBusinessId()], queryFn: ({ signal }) => getDataCheckConfig(signal), enabled: fullAdmin, staleTime: 60_000, retry: false });
     const isPocOperations = isPocOperationsUser(authUser);
     const { isEnabled } = useFeatureFlags();
     const { unreadMessageCount } = useMessageNotifications();
@@ -190,25 +194,27 @@ export default function AdminLayout({ children }: Props) {
     const { data: notices = [] } = useQuery({
         queryKey: ["recent-notices"],
         queryFn: getRecentNotices,
-        enabled: authUser?.userType === "admin",
+        enabled: fullAdmin,
         staleTime: 60_000,
     });
     const { data: pendingLeaveRequests = [] } = useQuery({
         queryKey: ["leave-requests", "Pending", "admin-notifications"],
         queryFn: () => getLeaveRequests({ status: "Pending" }),
+        enabled: fullAdmin,
         refetchInterval: 30_000,
         staleTime: 10_000,
     });
     const { data: evaluationEmployees = [] } = useQuery({
         queryKey: ["employees", "summary", "evaluation-reminders"],
         queryFn: getEmployeeSummaries,
-        enabled: authUser?.userType === "admin",
+        enabled: fullAdmin,
         refetchInterval: 15 * 60_000,
         staleTime: 5 * 60_000,
     });
     const { data: completedEvaluations = [] } = useQuery({
         queryKey: ["evaluations", "notification-status"],
         queryFn: getEvaluations,
+        enabled: fullAdmin,
         staleTime: 60_000,
     });
     const completedEvaluationKeys = new Set(
@@ -223,7 +229,7 @@ export default function AdminLayout({ children }: Props) {
     const { data: adminLeadSearchData, isFetching: isAdminLeadSearchFetching } = useQuery({
         queryKey: ["admin-header-lead-search", normalizedAdminSearch],
         queryFn: () => getAdminLeads({ search: normalizedAdminSearch, tab: "all", page: 1, limit: 8 }),
-        enabled: normalizedAdminSearch.length >= 2,
+        enabled: fullAdmin && normalizedAdminSearch.length >= 2,
         staleTime: 15_000,
     });
     const matchingEmployees = useMemo(() => {
@@ -247,7 +253,7 @@ export default function AdminLayout({ children }: Props) {
         .map((section) => ({
             ...section,
             items: section.items.map((item) => ({ ...item, path: roleWorkspacePath(item.path, authUser) })).filter((item) =>
-                isEnabled(item.feature, "admin") && (!isPocOperations || isPocOperationsPath(item.path))
+                isEnabled(item.feature, "admin") && (!isPocOperations || isPocOperationsPath(item.path)) && (item.path !== "/admin/data-check" || dataCheckConfig?.enabled)
             ),
         }))
         .map((section) => isTrackerOnlyAdmin

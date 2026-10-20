@@ -9,6 +9,8 @@ function socketAuth() {
         businessId: getActiveBusinessId(),
         userType: authUser?.userType || "",
         userCode: authUser?.user.employeeCode || "",
+        adminSession: authUser?.userType === "admin" ? authUser.sessionToken || "" : "",
+        attendanceSession: authUser?.attendanceHubSession || "",
     };
 }
 
@@ -22,7 +24,9 @@ export const socket = io(import.meta.env.VITE_SOCKET_URL || backendOrigin, {
 function sameSocketAuth(first: ReturnType<typeof socketAuth>, second: ReturnType<typeof socketAuth>) {
     return first.businessId === second.businessId
         && first.userType === second.userType
-        && first.userCode === second.userCode;
+        && first.userCode === second.userCode
+        && first.adminSession === second.adminSession
+        && first.attendanceSession === second.attendanceSession;
 }
 
 export function refreshSocketBusinessContext() {

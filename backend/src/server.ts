@@ -9,11 +9,13 @@ import { createSocketServer } from "./socket";
 import { startHempSurveyLeadQueueWorker } from "./services/hempSurveyLeadQueue";
 import { startAttendanceReconciliationWorker } from "./services/attendanceReconciliationWorker";
 import { startAttendanceIntegrityWorker } from "./services/attendanceRecoveryWorker";
+import { assertCredentialEncryptionConfiguration } from "./services/credentialEncryption";
 
 const port = Number(process.env.PORT || 4000);
 const host = process.env.HOST || "127.0.0.1";
 const mongoUri = process.env.MONGODB_URI || "";
 
+assertCredentialEncryptionConfiguration();
 await connectDatabase(mongoUri);
 await refreshConfiguredBusinessesFromStore();
 await ensureEmployeeIndexes();

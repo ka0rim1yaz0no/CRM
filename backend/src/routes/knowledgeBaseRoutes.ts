@@ -1,4 +1,5 @@
 import { Router, raw } from "express";
+import { securityHardeningEnabled } from "../config/rolloutFlags";
 import {
   archiveKnowledgeBaseEntry,
   approveKnowledgeBaseSuggestion,
@@ -25,7 +26,7 @@ knowledgeBaseRouter.post("/", createKnowledgeBaseEntry);
 knowledgeBaseRouter.post("/documents", uploadKnowledgeBaseDocument);
 knowledgeBaseRouter.post(
   "/photos",
-  raw({ type: ["image/*", "application/octet-stream"], limit: imageUploadLimit }),
+  (request, response, next) => raw({ type: ["image/*", "application/octet-stream"], limit: securityHardeningEnabled() ? "20mb" : imageUploadLimit })(request, response, next),
   uploadKnowledgeBasePhoto
 );
 knowledgeBaseRouter.post("/suggestions", createKnowledgeBaseSuggestion);

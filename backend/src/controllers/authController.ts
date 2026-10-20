@@ -4,8 +4,11 @@ import { getBusinessAccessForEmployeeCode, normalizeBusinessAccessIds } from "..
 import { getBusinessById, getCurrentBusinessId, getPublicBusinesses, type PublicBusinessConfig, runWithBusiness } from "../config/tenancy";
 import { syncEmployeeAvailabilityAcrossBusinesses } from "../services/employeeAvailabilityService";
 import { syncActiveAttendanceForBusinessSwitch } from "../services/employeeAttendanceSyncService";
-import { findConfiguredAdmin } from "../config/adminUsers";
-import { attendanceIntegrityEnabled, attendanceV2Enabled } from "../config/rolloutFlags";
+import { findConfiguredAdmin, isDeniedEmployeeCode } from "../config/adminUsers";
+import { verifyAttendanceHubSession } from "../config/attendanceHubSession";
+import { attendanceIntegrityEnabled, attendanceV2Enabled, securityDataMinimizationEnabled, securityHardeningEnabled } from "../config/rolloutFlags";
+import { employeeResponse } from "../services/employeePrivacy";
+import { setFileSession, clearFileSession } from "../middleware/securityFileSession";
 import { createAdminDashboardSession } from "../config/adminDashboardSession";
 import { createAttendanceHubSession } from "../config/attendanceHubSession";
 import { syncRecentAttendanceEventsForBusinessSwitch } from "../services/attendanceEventSyncService";
@@ -45,19 +48,23 @@ export async function loginWithEmployeeCode(request: Request, response: Response
 
   if (configuredAdmin) {
     const publicBusinesses = await getPublicBusinesses();
+    const sessionToken = createAdminDashboardSession(employeeCode);
+    const fileToken = sessionToken || createAttendanceHubSession(employeeCode);
+    if (fileToken) setFileSession(response, { type: configuredAdmin.access === "full" ? "admin" : "tracker", token: fileToken });
 
     response.json({
       user: { id: "admin", name: configuredAdmin.name, role: "Admin", employeeCode },
       userType: "admin",
       access: configuredAdmin.access,
-      sessionToken: createAdminDashboardSession(employeeCode),
+      sessionToken,
+      ...(configuredAdmin.access === "tracker" ? { attendanceHubSession: fileToken } : {}),
       business: responseBusiness(request, publicBusinesses),
       allowedBusinesses: publicBusinesses,
     });
     return;
   }
 
-  if (["00000003", "00000001"].includes(employeeCode)) {
+  if (isDeniedEmployeeCode(employeeCode)) {
     response.status(401).json({ message: "Invalid employee code" });
     return;
   }
@@ -77,10 +84,12 @@ export async function loginWithEmployeeCode(request: Request, response: Response
     return;
   }
 
+  const attendanceHubSession = createAttendanceHubSession(employee.employeeCode);
+  if (attendanceHubSession) setFileSession(response, { type: "employee", token: attendanceHubSession });
   response.json({
-    user: employee,
+    user: securityDataMinimizationEnabled() ? employeeResponse(employee.toObject()) : employee,
     userType: "employee",
-    attendanceHubSession: createAttendanceHubSession(employee.employeeCode),
+    attendanceHubSession,
     business: responseBusiness(request, allowedBusinesses),
     allowedBusinesses,
   });
@@ -108,6 +117,10 @@ export async function switchEmployeeBusiness(request: Request, response: Respons
   const employeeCode = String(request.body.employeeCode || "").trim();
   const currentBusinessId = String(request.body.currentBusinessId || getCurrentBusinessId()).trim();
   const targetBusinessId = String(request.body.targetBusinessId || "").trim();
+  if (securityHardeningEnabled() && verifyAttendanceHubSession(request.header("x-crm-attendance-session")) !== employeeCode) {
+    response.status(403).json({ message: "A signed employee session is required to switch businesses." });
+    return;
+  }
 
   if (!employeeCode || !targetBusinessId) {
     response.status(400).json({ message: "Employee code and target business are required" });
@@ -176,16 +189,19 @@ export async function switchEmployeeBusiness(request: Request, response: Respons
   }
   targetEmployee.availabilityStatus = currentAvailabilityStatus;
 
+  const attendanceHubSession = createAttendanceHubSession(targetEmployee.employeeCode);
+  if (attendanceHubSession) setFileSession(response, { type: "employee", token: attendanceHubSession });
   response.json({
-    user: targetEmployee,
+    user: securityDataMinimizationEnabled() ? employeeResponse(targetEmployee.toObject()) : targetEmployee,
     userType: "employee",
-    attendanceHubSession: createAttendanceHubSession(targetEmployee.employeeCode),
+    attendanceHubSession,
     business: allowedBusinesses.find((business) => business.id === targetBusiness.id) || { id: targetBusiness.id, name: targetBusiness.name },
     allowedBusinesses,
   });
 }
 
 export async function logoutEmployee(request: Request, response: Response) {
+  clearFileSession(response);
   const employeeId = String(request.body.employeeId || "").trim();
 
   if (!employeeId) {

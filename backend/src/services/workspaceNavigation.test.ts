@@ -41,7 +41,7 @@ walk(source("src/App.tsx"), (node) => {
 });
 
 for (const [file, expectedCount] of [
-  ["src/pages/admin/adminLayout/index.tsx", 15],
+  ["src/pages/admin/adminLayout/index.tsx", 16],
   ["src/pages/layout/sidebar.tsx", 12],
 ] as const) {
   test(`${file}: every sidebar destination exists and uses the same feature and role gate`, () => {

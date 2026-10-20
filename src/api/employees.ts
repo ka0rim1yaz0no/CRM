@@ -67,15 +67,17 @@ export type EmployeeBankInput = Pick<
 
 type EmployeeListParams = {
     includeArchived?: boolean;
+    details?: boolean;
 };
 
 function hasEmployeeListParams(params: unknown): params is EmployeeListParams {
-    return Boolean(params && typeof params === "object" && "includeArchived" in params);
+    return Boolean(params && typeof params === "object" && ("includeArchived" in params || "details" in params));
 }
 
 function employeeListParams(params?: unknown) {
     return {
         includeArchived: hasEmployeeListParams(params) && params.includeArchived ? "true" : undefined,
+        summary: hasEmployeeListParams(params) && params.details ? "false" : undefined,
     };
 }
 
@@ -85,7 +87,7 @@ export async function getEmployees(params?: EmployeeListParams | unknown, option
 }
 
 export async function getEmployeeSummaries(params?: EmployeeListParams | unknown) {
-    const response = await api.get<Employee[]>("/employees", { params: { summary: true, ...employeeListParams(params) } });
+    const response = await api.get<Employee[]>("/employees", { params: { ...employeeListParams(params), summary: true } });
     return response.data;
 }
 

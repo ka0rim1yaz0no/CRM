@@ -3,6 +3,7 @@ import { findConfiguredAdmin } from "../config/adminUsers";
 import { getBusinessAccessForEmployeeCode } from "../models/BusinessUserAccess";
 import { Employee } from "../models/Employee";
 import { verifyAdminDashboardSession } from "../config/adminDashboardSession";
+import { securityLegacyAuthEnabled } from "../config/rolloutFlags";
 
 export function verifiedAdminOnly(request: Request, response: Response, next: NextFunction) {
   if (!verifyAdminDashboardSession(request.header("x-crm-admin-session"))) {
@@ -60,6 +61,7 @@ export async function businessAccessMiddleware(request: Request, response: Respo
 }
 
 export function configuredAdminOnly(request: Request, response: Response, next: NextFunction) {
+  if (securityLegacyAuthEnabled()) return verifiedAdminOnly(request, response, next);
   const userType = String(request.header("x-crm-user-type") || "").trim().toLowerCase();
   const userCode = String(request.header("x-crm-user-code") || "").trim();
 

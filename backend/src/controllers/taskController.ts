@@ -1,7 +1,8 @@
 import type { Request, Response } from "express";
 import { Task, type TaskPriority, type TaskStatus } from "../models/Task";
+import { securityLegacyAuthEnabled } from "../config/rolloutFlags";
 
-const populateTask = ["assignedTo", "relatedLead"];
+const populateTask = () => securityLegacyAuthEnabled() ? [{ path: "assignedTo", select: "name employeeCode role team email" }, { path: "relatedLead" }] : ["assignedTo", "relatedLead"];
 const statuses: TaskStatus[] = ["Todo", "In Progress", "Done", "Blocked"];
 const priorities: TaskPriority[] = ["Low", "Medium", "High", "Urgent"];
 
@@ -34,12 +35,12 @@ export async function listTasks(request: Request, response: Response) {
     ];
   }
 
-  const tasks = await Task.find(filter).populate(populateTask).sort({ dueAt: 1, createdAt: -1 });
+  const tasks = await Task.find(filter).populate(populateTask()).sort({ dueAt: 1, createdAt: -1 });
   response.json(tasks);
 }
 
 export async function getTask(request: Request, response: Response) {
-  const task = await Task.findOne({ _id: request.params.id, isArchived: false }).populate(populateTask);
+  const task = await Task.findOne({ _id: request.params.id, isArchived: false }).populate(populateTask());
 
   if (!task) {
     response.status(404).json({ message: "Task not found" });
@@ -61,7 +62,7 @@ export async function createTask(request: Request, response: Response) {
     completedAt: request.body.status === "Done" ? new Date() : null,
   });
 
-  response.status(201).json(await Task.findById(task._id).populate(populateTask));
+  response.status(201).json(await Task.findById(task._id).populate(populateTask()));
 }
 
 export async function updateTask(request: Request, response: Response) {
@@ -79,7 +80,7 @@ export async function updateTask(request: Request, response: Response) {
       completedAt: status === "Done" ? new Date() : null,
     },
     { returnDocument: "after", runValidators: true }
-  ).populate(populateTask);
+  ).populate(populateTask());
 
   if (!task) {
     response.status(404).json({ message: "Task not found" });
@@ -95,7 +96,7 @@ export async function updateTaskStatus(request: Request, response: Response) {
     request.params.id,
     { status, completedAt: status === "Done" ? new Date() : null },
     { returnDocument: "after", runValidators: true }
-  ).populate(populateTask);
+  ).populate(populateTask());
 
   if (!task) {
     response.status(404).json({ message: "Task not found" });
@@ -128,7 +129,7 @@ export async function addTaskComment(request: Request, response: Response) {
       },
     },
     { returnDocument: "after", runValidators: true }
-  ).populate(populateTask);
+  ).populate(populateTask());
 
   if (!task) {
     response.status(404).json({ message: "Task not found" });
@@ -143,7 +144,7 @@ export async function archiveTask(request: Request, response: Response) {
     request.params.id,
     { isArchived: true },
     { returnDocument: "after", runValidators: true }
-  ).populate(populateTask);
+  ).populate(populateTask());
 
   if (!task) {
     response.status(404).json({ message: "Task not found" });

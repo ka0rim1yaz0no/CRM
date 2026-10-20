@@ -6,10 +6,14 @@ import { KnowledgeBaseEntry, type KnowledgeBaseEntryType } from "../models/Knowl
 import { KnowledgeBaseSuggestion } from "../models/KnowledgeBaseSuggestion";
 import { Employee } from "../models/Employee";
 import { Notice } from "../models/Notice";
+import { configuredUploadRoot, uploadRoot } from "../config/uploadPaths";
+import { securityUploadsEnabled } from "../config/rolloutFlags";
+import { knowledgeBaseUploads } from "../models/KnowledgeBaseUpload";
+import { randomUUID } from "node:crypto";
 
 const controllerDirectory = path.dirname(fileURLToPath(import.meta.url));
 const backendRootDirectory = path.resolve(controllerDirectory, "..", "..");
-const knowledgeBaseUploadRoot = path.resolve(backendRootDirectory, "public", "uploads", "knowledge-base");
+const knowledgeBaseUploadRoot = configuredUploadRoot ? path.join(uploadRoot, "knowledge-base") : path.resolve(process.cwd(), "public", "uploads", "knowledge-base");
 
 type AnnouncementNoticeEntry = {
   _id: { toString(): string };
@@ -20,7 +24,7 @@ type AnnouncementNoticeEntry = {
 };
 
 function knowledgeBasePhotoUrl(fileName: string) {
-  return `/uploads/knowledge-base/${fileName}`;
+  return securityUploadsEnabled() ? `/api/knowledge-base/photos/file/${fileName}` : `/uploads/knowledge-base/${fileName}`;
 }
 
 function knowledgeBaseDocumentUrl(fileName: string) {
@@ -32,6 +36,7 @@ function isSafeKnowledgeBaseFileName(value: string) {
 }
 
 function knowledgeBaseUploadCandidates(subdirectory = "") {
+  if (configuredUploadRoot) return [path.resolve(knowledgeBaseUploadRoot, subdirectory)];
   const segments = subdirectory ? ["knowledge-base", subdirectory] : ["knowledge-base"];
 
   return Array.from(
@@ -54,6 +59,20 @@ async function serveKnowledgeBaseFile(request: Request, response: Response, subd
     return;
   }
 
+  if (securityUploadsEnabled()) {
+    const owner = await knowledgeBaseUploads().findOne({ fileName, directory: subdirectory || "photos" }).lean();
+    const escapedName = fileName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const location = subdirectory ? "(?:api/knowledge-base/documents/file|uploads/knowledge-base/documents)" : "(?:api/knowledge-base/photos/file|uploads/knowledge-base)";
+    const reference = new RegExp(`/${location}/${escapedName}(?=[?\\s"'<>#]|$)`);
+    const legacyReference = !owner && await KnowledgeBaseEntry.exists({ $or: [
+      { photoUrls: reference }, { "documents.url": reference }, { description: reference }, { answer: reference },
+    ] });
+    if (owner ? owner.businessId !== request.business?.id : !legacyReference) {
+      response.status(404).json({ message: "Knowledge base file not found" });
+      return;
+    }
+  }
+
   for (const uploadDirectory of knowledgeBaseUploadCandidates(subdirectory)) {
     const root = path.resolve(uploadDirectory);
     const filePath = path.resolve(root, fileName);
@@ -68,7 +87,11 @@ async function serveKnowledgeBaseFile(request: Request, response: Response, subd
         continue;
       }
 
-      response.setHeader("Cache-Control", "private, max-age=3600");
+      response.setHeader("Cache-Control", securityUploadsEnabled() ? "private, no-store" : "private, max-age=3600");
+      if (securityUploadsEnabled() && subdirectory === "documents") {
+        response.attachment(fileName);
+        response.setHeader("Content-Type", "application/octet-stream");
+      }
       response.sendFile(filePath);
       return;
     } catch {
@@ -332,7 +355,9 @@ export async function uploadKnowledgeBasePhoto(request: Request, response: Respo
 
   const uploadDir = knowledgeBaseUploadRoot;
   const baseName = path.basename(payload.originalName, path.extname(payload.originalName)) || "image";
-  const fileName = `${Date.now()}-${Math.random().toString(16).slice(2)}-${baseName}.${extension}`;
+  const fileName = `${Date.now()}-${randomUUID()}-${baseName}.${extension}`;
+
+  if (securityUploadsEnabled()) await knowledgeBaseUploads().create({ fileName, directory: "photos", businessId: request.business!.id });
 
   await mkdir(uploadDir, { recursive: true });
   await writeFile(path.join(uploadDir, fileName), payload.bytes);
@@ -374,7 +399,9 @@ export async function uploadKnowledgeBaseDocument(request: Request, response: Re
   }
 
   const uploadDir = path.resolve(knowledgeBaseUploadRoot, "documents");
-  const fileName = `${Date.now()}-${Math.random().toString(16).slice(2)}-${originalName}`;
+  const fileName = `${Date.now()}-${randomUUID()}-${originalName}`;
+
+  if (securityUploadsEnabled()) await knowledgeBaseUploads().create({ fileName, directory: "documents", businessId: request.business!.id });
 
   await mkdir(uploadDir, { recursive: true });
   await writeFile(path.join(uploadDir, fileName), Buffer.from(base64, "base64"));

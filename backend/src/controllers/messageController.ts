@@ -12,6 +12,7 @@ import { Team } from "../models/Team";
 import { emitMessageEvents, emitMessageMutationEvent, emitMessagesRefresh } from "../socket";
 import { emitMirroredDirectMessage, syncDirectMessagesToBusiness } from "../services/directMessageSyncService";
 import { uploadRoot } from "../config/uploadPaths";
+import { securityUploadsEnabled } from "../config/rolloutFlags";
 
 const messageUploadRoot = path.join(uploadRoot, "messages");
 const maxAttachmentBytes = 50 * 1024 * 1024;
@@ -303,7 +304,16 @@ export async function serveMessageAttachment(request: Request, response: Respons
   if (!filePath.startsWith(`${messageUploadRoot}${path.sep}`)) return void response.status(400).json({ message: "Invalid attachment path." });
   try {
     if (!(await stat(filePath)).isFile()) throw new Error("not a file");
-    response.setHeader("Cache-Control", "private, max-age=3600");
+    response.setHeader("Cache-Control", securityUploadsEnabled() ? "private, no-store" : "private, max-age=3600");
+    if (securityUploadsEnabled()) {
+      const attachment = message.attachments.find(item => item.url === url);
+      if (attachment && allowedMimeTypes.has(attachment.mimeType) && /^(image|audio|video)\//.test(attachment.mimeType)) {
+        response.type(attachment.mimeType);
+      } else {
+        response.attachment(fileName);
+        response.type("application/octet-stream");
+      }
+    }
     response.sendFile(filePath);
   } catch {
     response.status(404).json({ message: "Attachment file is unavailable." });

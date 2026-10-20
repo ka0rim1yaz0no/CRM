@@ -666,7 +666,7 @@ export default function PayrollPage() {
 
     const { data: bankEmployees = EMPTY_QUERY_ROWS, isLoading: areBankEmployeesLoading } = useQuery({
         queryKey: ["employees", "payroll-bank"],
-        queryFn: getEmployees,
+        queryFn: () => getEmployees({ details: true }),
         enabled: activeTab === "Bank Accounts",
     });
 

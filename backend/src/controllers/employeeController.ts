@@ -1,5 +1,6 @@
 import type { Request, Response } from "express";
-import { attendanceIntegrityEnabled } from "../config/rolloutFlags";
+import { attendanceIntegrityEnabled, securityDataMinimizationEnabled } from "../config/rolloutFlags";
+import { canReadPrivateEmployee, employeeResponse } from "../services/employeePrivacy";
 import { verifyAdminDashboardSession } from "../config/adminDashboardSession";
 import { Employee, normalizeEmployeeAvailabilityStatus, type EmployeeAvailabilityStatus, type EmployeeStatus } from "../models/Employee";
 import { Lead } from "../models/Lead";
@@ -158,6 +159,7 @@ function actorCode(request: Request) {
 }
 
 function employeeCanAccessRecord(request: Request, employeeCode: string) {
+  if (securityDataMinimizationEnabled()) return canReadPrivateEmployee(request, employeeCode);
   return actorType(request) !== "employee" || actorCode(request) === String(employeeCode || "").trim();
 }
 
@@ -318,7 +320,10 @@ async function syncSharedEmployeeFields(
 }
 
 export async function listEmployees(request: Request, response: Response) {
-  const isSummary = actorType(request) === "employee" || String(request.query.summary || "").toLowerCase() === "true";
+  const secure = securityDataMinimizationEnabled();
+  const admin = Boolean(verifyAdminDashboardSession(request.header("x-crm-admin-session")));
+  const isSummary = secure ? !(admin && String(request.query.summary).toLowerCase() === "false")
+    : actorType(request) === "employee" || String(request.query.summary || "").toLowerCase() === "true";
   const includeArchived = String(request.query.includeArchived || "").toLowerCase() === "true";
   const actorCode = String(request.header("x-crm-user-code") || "").trim();
   const employeeFilter: Record<string, unknown> = includeArchived ? {} : { status: { $ne: "Archived" as EmployeeStatus } };
@@ -341,7 +346,9 @@ export async function listEmployees(request: Request, response: Response) {
     }))
   );
 
-  response.json(employeesWithAccess.filter(({ hasAccess }) => hasAccess).map(({ employee }) => withNormalizedAvailability(employee)));
+  response.set("Cache-Control", "no-store");
+  response.json(employeesWithAccess.filter(({ hasAccess }) => hasAccess).map(({ employee }) => secure
+    ? employeeResponse(employee, { private: !isSummary && admin, adminSummary: admin }) : withNormalizedAvailability(employee)));
 }
 
 export async function getEmployee(request: Request, response: Response) {
@@ -364,6 +371,15 @@ export async function getEmployee(request: Request, response: Response) {
     return;
   }
 
+  if (securityDataMinimizationEnabled()) {
+    if (!isSummary && !canReadPrivateEmployee(request, employee.employeeCode)) {
+      response.status(403).json({ message: "A signed owner or administrator session is required." });
+      return;
+    }
+    response.set("Cache-Control", "no-store");
+    response.json(employeeResponse(employee.toObject(), { private: !isSummary, adminSummary: Boolean(verifyAdminDashboardSession(request.header("x-crm-admin-session"))) }));
+    return;
+  }
   if (!isSummary && respondIfEmployeeCannotAccess(request, response, employee.employeeCode)) return;
 
   response.json(withNormalizedAvailability(employee.toObject()));

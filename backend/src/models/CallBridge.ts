@@ -223,6 +223,7 @@ const attemptSchema = new Schema<CallBridgeAttemptDocument>(
 attemptSchema.index({ employeeCode: 1, providerSessionId: 1 });
 attemptSchema.index({ employeeCode: 1, classifiedAt: 1, reservedAt: -1 });
 attemptSchema.index({ businessId: 1, leadId: 1, reservedAt: -1 });
+attemptSchema.index({ businessId: 1, reservedAt: 1 });
 
 function getControlConnection() {
   const databaseName = process.env.CONTROL_DATABASE_NAME || "crm_control";

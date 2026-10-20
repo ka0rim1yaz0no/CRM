@@ -1,7 +1,9 @@
 import { api } from "../lib/api";
 import type { AuthBusiness, AuthUser } from "./authStorage";
+import { waitForFileLogout } from "./authStorage";
 
 export async function loginWithEmployeeCode(employeeCode: string, businessId?: string) {
+    await waitForFileLogout();
     const response = await api.post<AuthUser>(
         "/auth/login",
         { employeeCode },

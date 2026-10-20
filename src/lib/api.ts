@@ -6,6 +6,7 @@ import { getAuthUser } from "../api/authStorage";
 
 export const api = axios.create({
     baseURL: import.meta.env.VITE_API_URL || `${backendOrigin}/api`,
+    withCredentials: true,
 });
 
 const writeMethods = new Set(["post", "put", "patch", "delete"]);
@@ -21,6 +22,7 @@ api.interceptors.request.use((config) => {
 
     if (authUser) {
         if (authUser.userType === "admin" && authUser.sessionToken && !config.headers["X-CRM-Admin-Session"]) config.headers["X-CRM-Admin-Session"] = authUser.sessionToken;
+        if (authUser.attendanceHubSession && !config.headers["X-CRM-Attendance-Session"]) config.headers["X-CRM-Attendance-Session"] = authUser.attendanceHubSession;
         config.headers["X-CRM-User-Code"] = authUser.user.employeeCode;
         config.headers["X-CRM-User-Name"] = authUser.user.name;
         config.headers["X-CRM-User-Type"] = authUser.userType;

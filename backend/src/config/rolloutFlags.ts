@@ -21,3 +21,10 @@ export const attendanceBreakGapEnabled = () => {
   return value === undefined ? !attendanceDurationModelEnabled() : !["false", "0"].includes(value.toLowerCase());
 };
 export const attendanceAutoTimeOutEnabled = () => String(process.env.CRM_ATTENDANCE_AUTO_TIMEOUT || "").trim().toLowerCase() === "true";
+export const securityCredentialVaultEnabled = () => enabled("CRM_SECURITY_CREDENTIAL_VAULT");
+export const securityDataMinimizationEnabled = () => enabled("CRM_SECURITY_DATA_MINIMIZATION");
+export const securityHardeningEnabled = () => enabled("CRM_SECURITY_HARDENING");
+export const securityUploadsEnabled = () => enabled("CRM_SECURITY_UPLOAD_AUTH");
+export const securityEnvironmentCodesEnabled = () => enabled("CRM_SECURITY_ENV_CODES");
+export const securityLegacyAuthEnabled = () => enabled("CRM_SECURITY_LEGACY_AUTH");
+export const dataCheckEnabled = () => enabled("CRM_DATA_CHECK");

@@ -19,6 +19,8 @@ process.env.CRM_ADMIN_ONE_CODE = "90000001";
 process.env.CRM_ADMIN_TWO_CODE = "";
 process.env.CRM_ADMIN_THREE_CODE = "";
 process.env.CRM_ADMIN_SESSION_SECRET = crypto.randomBytes(48).toString("hex");
+// This launcher always creates a fresh disposable database, never a persistent vault.
+process.env.CRM_CREDENTIAL_KEY = crypto.randomBytes(48).toString("base64");
 process.env.CRM_ATTENDANCE_INTEGRITY = "true";
 process.env.CRM_ATTENDANCE_ACTIVE_SESSION = "true";
 process.env.CRM_ATTENDANCE_HUB = "true";

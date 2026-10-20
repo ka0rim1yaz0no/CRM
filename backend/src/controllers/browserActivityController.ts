@@ -1,4 +1,7 @@
 import type { Request, Response } from "express";
+import { securityUploadsEnabled, securityLegacyAuthEnabled } from "../config/rolloutFlags";
+import { verifyAttendanceHubSession } from "../config/attendanceHubSession";
+import crypto from "node:crypto";
 import { isTrackerOnlyAdminCode } from "../config/adminUsers";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -45,6 +48,14 @@ function extensionKey() {
 }
 
 function isExtensionAuthorized(request: Request) {
+  if (securityLegacyAuthEnabled()) {
+    const code = verifyAttendanceHubSession(request.header("x-crm-attendance-session"));
+    const claimedCode = String(request.body?.employeeCode || request.query.employeeCode || "");
+    if (code && code === claimedCode) return true;
+    const configured = process.env.CRM_EXTENSION_KEY || "";
+    const supplied = String(request.header("x-crm-extension-key") || "");
+    return configured.length >= 32 && Buffer.byteLength(configured) === Buffer.byteLength(supplied) && crypto.timingSafeEqual(Buffer.from(configured), Buffer.from(supplied));
+  }
   return String(request.header("x-crm-extension-key") || "") === extensionKey();
 }
 
@@ -377,7 +388,7 @@ export async function serveBrowserActivityScreenshotFile(request: Request, respo
 
   if (screenshot?.data && Buffer.isBuffer(screenshot.data)) {
     response.type(screenshot.mimeType || "image/jpeg");
-    response.setHeader("Cache-Control", "private, max-age=3600");
+    response.setHeader("Cache-Control", securityUploadsEnabled() ? "private, no-store" : "private, max-age=3600");
     response.send(screenshot.data);
     return;
   }

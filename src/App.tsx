@@ -26,6 +26,7 @@ const Announcements = lazy(() => import('./pages/announcements'))
 const Tasks = lazy(() => import('./pages/tasks'))
 const TaskDetail = lazy(() => import('./pages/tasks/detail'))
 const AdminDashboard = lazy(() => import('./pages/admin/dashboard'))
+const AdminDataCheck = lazy(() => import('./pages/admin/data-check'))
 const AdminTeams = lazy(() => import('./pages/admin/teams'))
 const AdminEmployees = lazy(() => import('./pages/admin/employees'))
 const AdminEmployeeNew = lazy(() => import('./pages/admin/employees/new'))
@@ -126,6 +127,7 @@ function RoutedApp() {
           <Route path="/settings" element={<ProtectedRoute type="employee"><FeatureRoute feature="settings" scope="employee"><Settings /></FeatureRoute></ProtectedRoute>} />
           <Route path="/messages" element={<ProtectedRoute type="employee"><FeatureRoute feature="messages" scope="employee"><Messages /></FeatureRoute></ProtectedRoute>} />
           <Route path="/admin/dashboard" element={<ProtectedRoute type="admin"><FeatureRoute feature="dashboard" scope="admin"><AdminDashboard /></FeatureRoute></ProtectedRoute>} />
+          <Route path="/admin/data-check" element={<ProtectedRoute type="admin"><FeatureRoute feature="dashboard" scope="admin"><AdminDataCheck /></FeatureRoute></ProtectedRoute>} />
           <Route path="/admin/teams" element={<ProtectedRoute type="admin"><FeatureRoute feature="teams" scope="admin"><AdminTeams /></FeatureRoute></ProtectedRoute>} />
           <Route path="/admin/employees" element={<ProtectedRoute type="admin"><FeatureRoute feature="employees" scope="admin"><AdminEmployees /></FeatureRoute></ProtectedRoute>} />
           <Route path="/admin/employees/new" element={<ProtectedRoute type="admin"><FeatureRoute feature="employees" scope="admin"><AdminEmployeeNew /></FeatureRoute></ProtectedRoute>} />

@@ -93,11 +93,11 @@ function getActor(request: Request): Actor | null {
   const code = verifyAttendanceHubSession(request.header("x-crm-attendance-session"));
   return code ? { role: "employee", code } : null;
 }
-function denyIfDisabled(request: Request, response: Response): Actor | null {
+function denyIfDisabled(request: Request, response: Response, employeeLive = false): Actor | null {
   if (!attendanceHubEnabled()) { response.status(404).json({ message: "Attendance hub is disabled." }); return null; }
   const actor = getActor(request);
   if (!actor) response.status(401).json({ message: "Sign in again to view attendance." });
-  if (actor && actor.role !== "admin") { response.status(403).json({ message: "The Attendance hub is restricted to administrators. Use your employee attendance controls." }); return null; }
+  if (actor && actor.role !== "admin" && !employeeLive) { response.status(403).json({ message: "The Attendance hub is restricted to administrators. Use your employee attendance controls." }); return null; }
   return actor;
 }
 function dayKeys(from: string, to: string) {
@@ -393,7 +393,7 @@ export const getHubDay = (request: Request, response: Response) => handleHubRead
 export const exportHubDays = (request: Request, response: Response) => handleHubRead(request, response, "export");
 
 export async function getHubLive(request: Request, response: Response) {
-  const actor = denyIfDisabled(request, response);
+  const actor = denyIfDisabled(request, response, true);
   if (!actor) return;
   if (actor.role !== "employee") { response.status(403).json({ message: "Employee access required." }); return; }
   try {

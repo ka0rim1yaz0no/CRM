@@ -379,7 +379,7 @@ export default function AdminHr() {
     });
     const { data: employees = EMPTY_QUERY_ROWS, isLoading: employeesLoading, isError: employeesError } = useQuery({
         queryKey: ["employees", "hr", "includeArchived"],
-        queryFn: () => getEmployees({ includeArchived: true }),
+        queryFn: () => getEmployees({ includeArchived: true, details: true }),
     });
     const { data: systemSettings } = useQuery({
         queryKey: ["system-settings"],

@@ -4,6 +4,7 @@ import path from "node:path";
 import { Employee } from "../models/Employee";
 import { MediaAsset, type MediaAssetType } from "../models/MediaAsset";
 import { configuredUploadRoot, uploadRoot } from "../config/uploadPaths";
+import { securityUploadsEnabled } from "../config/rolloutFlags";
 
 const mediaUploadRoot = path.join(uploadRoot, "media");
 const maxStoredMediaBytes = 12 * 1024 * 1024;
@@ -178,7 +179,7 @@ export async function serveMediaAssetFile(request: Request, response: Response) 
 
   if (stored?.data && Buffer.isBuffer(stored.data)) {
     response.type(stored.mimeType || "application/octet-stream");
-    response.setHeader("Cache-Control", "private, max-age=3600");
+    response.setHeader("Cache-Control", securityUploadsEnabled() ? "private, no-store" : "private, max-age=3600");
     response.send(stored.data);
     return;
   }

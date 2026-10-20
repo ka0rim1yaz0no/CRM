@@ -39,6 +39,12 @@ import { publicSurveyRouter } from "./routes/publicSurveyRoutes";
 import { employeeEvaluationRouter } from "./routes/employeeEvaluationRoutes";
 import { businessAccessMiddleware, configuredAdminOnly } from "./middleware/businessAccess";
 import { configuredUploadRoot, uploadRoot } from "./config/uploadPaths";
+import { assertCredentialEncryptionConfiguration } from "./services/credentialEncryption";
+import { securityBodyParser, securityMiddleware } from "./middleware/securityHardening";
+import { requireFileSession } from "./middleware/securityFileSession";
+import { securityUploadsEnabled, securityHardeningEnabled } from "./config/rolloutFlags";
+import { legacyAuthentication } from "./middleware/legacyAuthentication";
+import { dataCheckRouter } from "./routes/dataCheckRoutes";
 
 const appDirectory = path.dirname(fileURLToPath(import.meta.url));
 const backendRootDirectory = path.resolve(appDirectory, "..");
@@ -52,7 +58,6 @@ const uploadDirectories = configuredUploadRoot ? [uploadRoot] : Array.from(
     path.resolve(process.cwd(), "backend", "uploads"),
   ])
 );
-const requestBodyLimit = process.env.REQUEST_BODY_LIMIT || "500mb";
 const defaultClientOrigins = [
   "http://localhost:5173",
   "http://localhost:5174",
@@ -90,7 +95,12 @@ function isAllowedExtensionOrigin(origin: string) {
 }
 
 export function createApp() {
+  assertCredentialEncryptionConfiguration();
   const app = express();
+  const security = securityMiddleware();
+  const proxyHops = Number(process.env.CRM_SECURITY_TRUST_PROXY_HOPS || 0);
+  if (securityHardeningEnabled() && Number.isInteger(proxyHops) && proxyHops >= 0 && proxyHops <= 2) app.set("trust proxy", proxyHops);
+  app.use(security.headers);
 
   app.use(
     cors({
@@ -112,6 +122,7 @@ export function createApp() {
       methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
       allowedHeaders: [
         "Content-Type",
+        "X-File-Name",
         "Authorization",
         "X-Requested-With",
         "Accept",
@@ -131,12 +142,21 @@ export function createApp() {
     })
   );
 
-  app.use(express.json({ limit: requestBodyLimit }));
-  app.use(express.urlencoded({ extended: true, limit: requestBodyLimit }));
+  app.use("/api", security.apiLimit);
+  app.post("/api/auth/login", security.loginIpLimit);
+  app.use(securityBodyParser());
+  app.post("/api/auth/login", security.loginCodeLimit);
 
 
   uploadDirectories.forEach((uploadDirectory) => {
-    app.use("/uploads", express.static(uploadDirectory));
+    app.use("/uploads", (request, response, next) => securityUploadsEnabled() ? businessContextMiddleware(request, response, next) : next(), requireFileSession(true, false), express.static(uploadDirectory, {
+      setHeaders(response) {
+        if (securityUploadsEnabled()) {
+          response.setHeader("Cache-Control", "private, no-store");
+          response.setHeader("Content-Disposition", "attachment");
+        }
+      },
+    }));
   });
 
   app.get("/api/health", (_request, response) => {
@@ -189,7 +209,20 @@ export function createApp() {
   app.use("/api", businessContextMiddleware);
 
   app.use("/api/auth", authRouter);
+  app.post("/api/knowledge-base/photos", requireFileSession());
+  app.post("/api/knowledge-base/documents", requireFileSession());
+  app.post("/api/messages/conversations/:conversationId/attachments", requireFileSession());
+  app.use("/api/media/file", requireFileSession());
+  app.use("/api/knowledge-base/photos/file", requireFileSession());
+  app.use("/api/knowledge-base/documents/file", requireFileSession());
+  app.use("/api/messages/attachments", requireFileSession());
+  app.use("/api/browser-activity/screenshots/file", requireFileSession(true));
+  app.get("/api/browser-activity/extension-package", requireFileSession(true));
+  app.get("/api/browser-activity/live-view-agent-package", requireFileSession(true));
+  app.get("/api/call-bridge/package", requireFileSession(false, false));
+  app.use("/api", legacyAuthentication);
   app.use("/api", businessAccessMiddleware);
+  app.use("/api/admin/data-check", dataCheckRouter);
   app.use("/api/employees", employeeRouter);
   app.use("/api/roles", roleRouter);
   app.use("/api/branches", branchRouter);

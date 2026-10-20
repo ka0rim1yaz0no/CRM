@@ -1,6 +1,6 @@
 import { Fragment, type FormEvent } from "react";
-import { useMemo, useRef, useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
     FiCopy,
     FiChevronDown,
@@ -22,6 +22,7 @@ import {
     archiveCredential as archiveCredentialRequest,
     createCredential,
     getCredentials,
+    revealCredential,
     updateCredential,
     type Credential as SavedCredential,
 } from "../../../api/credentials";
@@ -34,6 +35,9 @@ import { getBranches } from "../../../api/branches";
 import { getBusinesses } from "../../../api/businesses";
 import { getTeams } from "../../../api/teams";
 import { useClickOutside } from "../../../hooks/useClickOutside";
+import { getActiveBusinessId } from "../../../api/businessStorage";
+import { CredentialRequestError, createCredentialRevealState, credentialErrorMessage } from "../../../lib/credentialVault";
+import { getCredentialContextRevision, subscribeCredentialContext } from "../../../lib/credentialContext";
 
 const ALL_COMPANIES = "All companies";
 const SHARED_COMPANY_VALUE = "All branches";
@@ -68,7 +72,6 @@ function normalizeCredential(credential: SavedCredential): SavedCredential {
         _id: toDisplayText(credential._id),
         accountName: toDisplayText(credential.accountName),
         username: toDisplayText(credential.username),
-        password: toDisplayText(credential.password),
         platform: toDisplayText(credential.platform, "Credential"),
         company: toDisplayText(credential.company, SHARED_COMPANY_VALUE),
         team: toDisplayText(credential.team, ALL_TEAMS),
@@ -147,10 +150,30 @@ type CredentialStat = {
     icon: IconType;
 };
 
-type CredentialSortField = "platform" | "accountName" | "username" | "password" | "team";
+type CredentialSortField = "platform" | "accountName" | "username" | "team";
 
 export default function Credentials() {
+    const contextRevision = useSyncExternalStore(subscribeCredentialContext, getCredentialContextRevision);
+    return <CredentialWorkspace key={contextRevision} contextRevision={contextRevision} />;
+}
+
+function CredentialWorkspace({ contextRevision }: { contextRevision: number }) {
     const queryClient = useQueryClient();
+    const [workspaceId] = useState(() => crypto.randomUUID());
+    const mounted = useRef(false);
+    const [reveal] = useState(() => createCredentialRevealState(revealCredential,
+        () => getCredentialContextRevision() === contextRevision));
+    const revealed = useSyncExternalStore(reveal.subscribe, reveal.getSnapshot);
+    useEffect(() => {
+        mounted.current = true;
+        return () => {
+            mounted.current = false;
+            reveal.clear();
+        };
+    }, [reveal]);
+    const [isSaving, setIsSaving] = useState(false);
+    const [isArchiving, setIsArchiving] = useState(false);
+    const [actionError, setActionError] = useState<string | null>(null);
     const [search, setSearch] = useState("");
     const [branchFilter, setBranchFilter] = useState(ALL_COMPANIES);
     const [teamFilter, setTeamFilter] = useState(ALL_TEAMS);
@@ -161,17 +184,18 @@ export default function Credentials() {
     const [isAddModalOpen, setIsAddModalOpen] = useState(false);
     const [editingCredential, setEditingCredential] = useState<SavedCredential | null>(null);
     const [deleteTarget, setDeleteTarget] = useState<SavedCredential | null>(null);
-    const [visiblePasswords, setVisiblePasswords] = useState<Set<string>>(new Set());
-    const [isFormPasswordVisible, setIsFormPasswordVisible] = useState(true);
+    const [isFormPasswordVisible, setIsFormPasswordVisible] = useState(false);
     const [credentialForm, setCredentialForm] = useState(emptyCredential);
     const [sortBy, setSortBy] = useState<CredentialSortField>("platform");
     const [sortDir, setSortDir] = useState<SortDirection>("asc");
     const [page, setPage] = useState(1);
     const [pageSize, setPageSize] = useState(10);
 
-    const { data: credentials = EMPTY_QUERY_ROWS, isLoading, isError } = useQuery({
-        queryKey: ["credentials"],
-        queryFn: getCredentials,
+    const { data: credentials = EMPTY_QUERY_ROWS, isLoading, isError, error: loadError } = useQuery({
+        queryKey: ["credentials", getActiveBusinessId(), contextRevision, workspaceId],
+        queryFn: ({ signal }) => getCredentials(signal),
+        retry: false,
+        gcTime: 0,
     });
     const { data: businesses = EMPTY_QUERY_ROWS } = useQuery({
         queryKey: ["businesses"],
@@ -184,26 +208,6 @@ export default function Credentials() {
     const { data: teams = EMPTY_QUERY_ROWS } = useQuery({
         queryKey: ["teams"],
         queryFn: getTeams,
-    });
-
-    const createCredentialMutation = useMutation({
-        mutationFn: createCredential,
-        onSuccess: () => {
-            queryClient.invalidateQueries({ queryKey: ["credentials"] });
-            closeModal();
-        },
-    });
-
-    const archiveCredentialMutation = useMutation({
-        mutationFn: archiveCredentialRequest,
-        onSuccess: () => queryClient.invalidateQueries({ queryKey: ["credentials"] }),
-    });
-    const updateCredentialMutation = useMutation({
-        mutationFn: ({ id, credential }: { id: string; credential: typeof emptyCredential }) => updateCredential(id, { ...credential, status: "Active" }),
-        onSuccess: () => {
-            queryClient.invalidateQueries({ queryKey: ["credentials"] });
-            closeModal();
-        },
     });
 
     const normalizedCredentials = useMemo(() => credentials.map(normalizeCredential), [credentials]);
@@ -317,23 +321,27 @@ export default function Credentials() {
     ];
 
     const closeModal = () => {
+        reveal.clear();
         setIsAddModalOpen(false);
         setEditingCredential(null);
         setCredentialForm(emptyCredential);
-        setIsFormPasswordVisible(true);
+        setIsFormPasswordVisible(false);
+        setActionError(null);
     };
 
     const openEditModal = (credential: SavedCredential) => {
+        reveal.clear();
+        setActionError(null);
         setEditingCredential(credential);
         setCredentialForm({
             accountName: credential.accountName || "",
             username: credential.username,
-            password: credential.password,
+            password: "",
             platform: credential.platform,
             company: credential.company === SHARED_COMPANY_VALUE ? ALL_COMPANIES : credential.company,
             team: credential.team || ALL_TEAMS,
         });
-        setIsFormPasswordVisible(true);
+        setIsFormPasswordVisible(false);
         setIsAddModalOpen(true);
     };
 
@@ -349,10 +357,12 @@ export default function Credentials() {
         setSortDir("asc");
     };
 
-    const addCredential = (event: FormEvent<HTMLFormElement>) => {
+    const addCredential = async (event: FormEvent<HTMLFormElement>) => {
         event.preventDefault();
 
-        if (!credentialForm.username.trim() || !credentialForm.password.trim() || !credentialForm.platform.trim()) {
+        if (isSaving) return;
+        if (!credentialForm.username.trim() || (!editingCredential && !credentialForm.password.trim()) || !credentialForm.platform.trim()) {
+            setActionError(editingCredential ? "Username and platform are required." : "Username, password and platform are required.");
             return;
         }
 
@@ -366,26 +376,27 @@ export default function Credentials() {
             company: selectedCompany,
             team: credentialForm.team || ALL_TEAMS,
         };
-        if (editingCredential) {
-            updateCredentialMutation.mutate({ id: editingCredential._id, credential: payload });
-            return;
+        setIsSaving(true);
+        setActionError(null);
+        reveal.clear();
+        try {
+            if (editingCredential) await updateCredential(editingCredential._id, { ...payload, status: "Active" });
+            else await createCredential(payload);
+            if (!mounted.current || getCredentialContextRevision() !== contextRevision) return;
+            void queryClient.invalidateQueries({ queryKey: ["credentials"] });
+            closeModal();
+        } catch (error) {
+            if (mounted.current && getCredentialContextRevision() === contextRevision) {
+                setActionError(error instanceof CredentialRequestError ? error.message : credentialErrorMessage());
+            }
+        } finally {
+            if (mounted.current && getCredentialContextRevision() === contextRevision) setIsSaving(false);
         }
-
-        createCredentialMutation.mutate(payload);
     };
 
-    const togglePassword = (id: string) => {
-        setVisiblePasswords((current) => {
-            const next = new Set(current);
-
-            if (next.has(id)) {
-                next.delete(id);
-            } else {
-                next.add(id);
-            }
-
-            return next;
-        });
+    const togglePassword = (credential: SavedCredential) => {
+        if (revealed.id === credential._id && (revealed.password !== null || revealed.loading)) reveal.clear();
+        else void reveal.show(credential);
     };
 
     const openDeletePrompt = (credential: SavedCredential) => {
@@ -396,12 +407,26 @@ export default function Credentials() {
         setDeleteTarget(null);
     };
 
-    const confirmDelete = () => {
-        if (!deleteTarget) {
+    const confirmDelete = async () => {
+        if (!deleteTarget || isArchiving) {
             return;
         }
 
-        archiveCredentialMutation.mutate(deleteTarget._id, { onSuccess: closeDeletePrompt });
+        setIsArchiving(true);
+        setActionError(null);
+        reveal.clear();
+        try {
+            await archiveCredentialRequest(deleteTarget._id);
+            if (!mounted.current || getCredentialContextRevision() !== contextRevision) return;
+            void queryClient.invalidateQueries({ queryKey: ["credentials"] });
+            closeDeletePrompt();
+        } catch (error) {
+            if (mounted.current && getCredentialContextRevision() === contextRevision) {
+                setActionError(error instanceof CredentialRequestError ? error.message : credentialErrorMessage());
+            }
+        } finally {
+            if (mounted.current && getCredentialContextRevision() === contextRevision) setIsArchiving(false);
+        }
     };
 
     const [previousCredentialPageFilters, setPreviousCredentialPageFilters] = useState<readonly unknown[] | null>(null);
@@ -457,7 +482,11 @@ export default function Credentials() {
 
     return (
         <AdminLayout>
-            <section className="min-h-[calc(100vh-8.5rem)]">
+            <section className="min-h-[calc(100vh-8.5rem)]"
+                onChangeCapture={() => reveal.clear()}
+                onClickCapture={(event) => {
+                    if (!(event.target instanceof Element) || !event.target.closest("[data-credential-secret-control]")) reveal.clear();
+                }}>
                 <div className="flex flex-wrap items-start justify-between gap-4">
                     <div>
                         <h2 className="text-2xl font-semibold text-white">Credentials</h2>
@@ -500,6 +529,8 @@ export default function Credentials() {
                         </button>
                     </div>
                 </div>
+
+                {(actionError || revealed.error) && <p className="mt-4 text-sm text-red-200" role="alert">{actionError || revealed.error}</p>}
 
                 <div className="mt-7 grid gap-3 md:grid-cols-3">
                     {credentialStats.map((stat) => {
@@ -591,7 +622,7 @@ export default function Credentials() {
                                     <th className="w-[18%] px-3 py-3"><DataTableSortHeader field="accountName" sortBy={sortBy} sortDir={sortDir} onSort={changeSort}>Account User</DataTableSortHeader></th>
                                     <th className="w-[16%] px-3 py-3"><DataTableSortHeader field="team" sortBy={sortBy} sortDir={sortDir} onSort={changeSort}>Team</DataTableSortHeader></th>
                                     <th className="w-[20%] px-3 py-3"><DataTableSortHeader field="username" sortBy={sortBy} sortDir={sortDir} onSort={changeSort}>Username</DataTableSortHeader></th>
-                                    <th className="w-[20%] px-3 py-3"><DataTableSortHeader field="password" sortBy={sortBy} sortDir={sortDir} onSort={changeSort}>Password</DataTableSortHeader></th>
+                                    <th className="w-[20%] px-3 py-3">Password</th>
                                     <th className="w-[6%] px-3 py-3 text-center">Actions</th>
                                 </tr>
                             </thead>
@@ -603,7 +634,7 @@ export default function Credentials() {
                                 )}
                                 {isError && (
                                     <tr>
-                                        <td className="px-4 py-5 text-sm text-red-200" colSpan={7}>Unable to load credentials.</td>
+                                        <td className="px-4 py-5 text-sm text-red-200" colSpan={7} role="alert">{loadError instanceof CredentialRequestError ? loadError.message : "Unable to load credentials."}</td>
                                     </tr>
                                 )}
                                 {groupedCredentials.map((group) => (
@@ -621,7 +652,8 @@ export default function Credentials() {
                                             </td>
                                         </tr>
                                         {group.credentials.map(({ credential, displayBranch }) => {
-                                            const isPasswordVisible = visiblePasswords.has(credential._id);
+                                            const isPasswordVisible = revealed.id === credential._id && revealed.password !== null;
+                                            const isPasswordLoading = revealed.id === credential._id && revealed.loading;
 
                                             return (
                                                 <tr key={`${displayBranch}-${credential._id}`} className="text-sm text-white/80 transition hover:bg-white/[0.035]">
@@ -645,21 +677,28 @@ export default function Credentials() {
                                                     <td className="px-3 py-2.5">
                                                         <div className="flex items-center gap-2">
                                                             <span className="min-w-0 truncate font-mono text-white/75">
-                                                                {isPasswordVisible ? credential.password : "••••••••••••"}
+                                                                {isPasswordVisible ? revealed.password : isPasswordLoading ? "Loading..." : credential.hasPassword ? "••••••••••••" : "Not set"}
                                                             </span>
                                                             <button
                                                                 className="flex size-7 shrink-0 items-center justify-center rounded-md text-white/50 transition hover:bg-white/10 hover:text-white"
                                                                 type="button"
-                                                                onClick={() => togglePassword(credential._id)}
-                                                                aria-label={isPasswordVisible ? "Hide password" : "Show password"}
+                                                                data-credential-secret-control
+                                                                disabled={!credential.hasPassword}
+                                                                onClick={() => togglePassword(credential)}
+                                                                aria-label={isPasswordVisible || isPasswordLoading ? "Hide password" : "Show password"}
+                                                                title={isPasswordVisible || isPasswordLoading ? "Hide password" : "Show password"}
+                                                                aria-busy={isPasswordLoading}
                                                             >
-                                                                {isPasswordVisible ? <FiEyeOff className="size-4" /> : <FiEye className="size-4" />}
+                                                                {isPasswordVisible || isPasswordLoading ? <FiEyeOff className="size-4" /> : <FiEye className="size-4" />}
                                                             </button>
                                                             <button
                                                                 className="flex size-7 shrink-0 items-center justify-center rounded-md text-white/50 transition hover:bg-white/10 hover:text-white"
                                                                 type="button"
+                                                                data-credential-secret-control
+                                                                disabled={!isPasswordVisible}
                                                                 aria-label="Copy password"
-                                                                onClick={() => navigator.clipboard?.writeText(credential.password)}
+                                                                title={isPasswordVisible ? "Copy password" : "Show password before copying"}
+                                                                onClick={() => void reveal.copy((password) => navigator.clipboard.writeText(password))}
                                                             >
                                                                 <FiCopy className="size-4" aria-hidden="true" />
                                                             </button>
@@ -764,7 +803,9 @@ export default function Credentials() {
                                             type={isFormPasswordVisible ? "text" : "password"}
                                             value={credentialForm.password}
                                             onChange={(event) => setCredentialForm((form) => ({ ...form, password: event.target.value }))}
-                                            placeholder="password"
+                                            placeholder={editingCredential ? "Leave blank to keep existing password" : "Password"}
+                                            autoComplete="new-password"
+                                            required={!editingCredential}
                                         />
                                         <button
                                             className="mr-2 flex size-8 shrink-0 items-center justify-center rounded-md text-white/50 transition hover:bg-white/10 hover:text-white"
@@ -793,11 +834,12 @@ export default function Credentials() {
                                     </select>
                                 </label>
                             </div>
+                            {actionError && <p className="px-5 pb-3 text-sm text-red-200" role="alert">{actionError}</p>}
                             <div className="flex justify-end gap-2 border-t border-white/10 px-5 py-3">
                                 <button className="h-10 rounded-lg border border-white/10 bg-white/[0.05] px-4 text-sm font-semibold text-white/60 transition hover:bg-white/10 hover:text-white" type="button" onClick={closeModal}>
                                     Cancel
                                 </button>
-                                <button className="flex h-10 items-center gap-2 rounded-lg bg-[linear-gradient(135deg,#842cff,#4a0ebd)] px-4 text-sm font-semibold text-white transition hover:brightness-110 disabled:opacity-60" type="submit" disabled={createCredentialMutation.isPending || updateCredentialMutation.isPending}>
+                                <button className="flex h-10 items-center gap-2 rounded-lg bg-[linear-gradient(135deg,#842cff,#4a0ebd)] px-4 text-sm font-semibold text-white transition hover:brightness-110 disabled:opacity-60" type="submit" disabled={isSaving}>
                                     <FiPlus className="size-4" aria-hidden="true" />
                                     {editingCredential ? "Save Credential" : "Add Credential"}
                                 </button>
@@ -843,6 +885,7 @@ export default function Credentials() {
                                         <FiX className="size-4" aria-hidden="true" />
                                     </button>
                                 </div>
+                                {actionError && <p className="mt-3 text-sm text-red-200" role="alert">{actionError}</p>}
                             </div>
                             <div className="p-5">
                                 <div className="grid gap-3 rounded-lg border border-white/10 bg-white/[0.035] p-4">
@@ -885,7 +928,7 @@ export default function Credentials() {
                                     className="h-10 rounded-lg bg-red-500 px-4 text-sm font-semibold text-white transition hover:bg-red-400 disabled:opacity-60"
                                     type="button"
                                     onClick={confirmDelete}
-                                    disabled={archiveCredentialMutation.isPending}
+                                    disabled={isArchiving}
                                 >
                                     Delete Credential
                                 </button>
