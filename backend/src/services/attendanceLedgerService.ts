@@ -6,12 +6,13 @@ import { Employee } from "../models/Employee";
 import { getAttendanceBusinessIdentity } from "../models/BusinessUserAccess";
 import { getBusinessById, getCurrentBusinessId, runWithBusiness } from "../config/tenancy";
 import { SystemSettings } from "../models/SystemSettings";
-import { attendanceAutoTimeOutEnabled, attendanceDurationModelEnabled, attendanceIntegrityEnabled, attendanceRecoveryEnvironmentEnabled } from "../config/rolloutFlags";
+import { attendanceAutoTimeOutEnabled, attendanceDurationModelEnabled, attendanceIntegrityEnabled, attendanceRecoveryEnvironmentEnabled, payrollAccuracyEnabled } from "../config/rolloutFlags";
 import { assignAttendanceShift } from "./attendanceShift";
 import { projectAttendance, sessionTime, type SessionEvent } from "./attendanceSessionState";
 import { attendanceAutoTimeOutCutoff } from "./attendanceAutoTimeOut";
 import { attendanceDerivedDaysDueForRefresh, deriveAttendanceDays } from "./attendanceDerived";
 import { attendanceDerivedAuditDelta, replayAttendanceDerived, sameAttendanceDerivedValues, type AttendanceDerivedAuditDelta } from "./attendanceDerivedAudit";
+import { attendancePayrollTransaction, lockPayrollAttendance } from "./payrollAttendanceFence";
 
 export class AttendanceCommandError extends Error {
   constructor(public status: number, public code: string, message: string, public details?: unknown) { super(message); }
@@ -143,8 +144,15 @@ export async function acquireAttendanceLease(id: string, token: string, now = ne
 }
 export async function commitAttendanceRevision(id: string, token: string, fence: number, revision: number,
   update: Record<string, unknown>, now = new Date(), session?: ClientSession) {
-  return AttendanceLedger.findOneAndUpdate({ _id: id, revision, lockToken: token, fence, lockUntil: { $gt: now } }, update,
-    { returnDocument: "after", runValidators: true, ...(session ? { session } : {}) }).lean();
+  const commit = (activeSession?: ClientSession) => AttendanceLedger.findOneAndUpdate({ _id: id, revision, lockToken: token, fence, lockUntil: { $gt: now } }, update,
+    { returnDocument: "after", runValidators: true, ...(activeSession ? { session: activeSession } : {}) }).lean();
+  if (!payrollAccuracyEnabled()) return commit(session);
+  return attendancePayrollTransaction(async activeSession => {
+    const ledger = await AttendanceLedger.findById(id, null, { session: activeSession }).select("employeeCode businessIds").lean();
+    if (!ledger) return null;
+    await lockPayrollAttendance(ledger.businessIds.map(businessId => ({ businessId, employeeCode: ledger.employeeCode })), activeSession);
+    return commit(activeSession);
+  }, session);
 }
 
 function applyAttendanceCommand(ledger: AttendanceLedgerDocument, input: AttendanceCommand, actor: AttendanceActor,

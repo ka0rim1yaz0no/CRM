@@ -11,7 +11,7 @@ import { runAttendanceAutoTimeOut, runAttendanceAutoTimeOutCycle } from "./atten
 import { runAttendanceRecovery } from "./attendanceRecoveryWorker";
 import { attendanceError, validateAttendanceAutoTimeOutTime } from "../controllers/attendanceSessionController";
 
-const flagNames = ["CRM_ATTENDANCE_INTEGRITY", "CRM_ATTENDANCE_AUTO_TIMEOUT", "CRM_ATTENDANCE_DURATION_MODEL", "CRM_ATTENDANCE_RECOVERY_CUTOFF", "CRM_ATTENDANCE_BREAK_GAP"] as const;
+const flagNames = ["CRM_ATTENDANCE_INTEGRITY", "CRM_ATTENDANCE_AUTO_TIMEOUT", "CRM_ATTENDANCE_DURATION_MODEL", "CRM_ATTENDANCE_RECOVERY_CUTOFF", "CRM_ATTENDANCE_BREAK_GAP", "CRM_PAYROLL_ACCURACY"] as const;
 let savedFlags: Array<string | undefined>;
 let store: AttendanceLedgerDocument;
 let leaseLost = false;
@@ -42,6 +42,8 @@ const noDelivery = async () => undefined;
 
 beforeEach(() => {
   savedFlags = flagNames.map((name) => process.env[name]);
+  // This in-memory worker suite exercises the legacy commit adapter; real fences use Mongo integration fixtures.
+  process.env.CRM_PAYROLL_ACCURACY = "false";
   process.env.CRM_ATTENDANCE_INTEGRITY = "true";
   process.env.CRM_ATTENDANCE_AUTO_TIMEOUT = "true";
   process.env.CRM_ATTENDANCE_DURATION_MODEL = "true";

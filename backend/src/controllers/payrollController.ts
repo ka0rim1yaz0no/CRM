@@ -10,7 +10,7 @@ import { projectAttendance } from "../services/attendanceSessionState";
 import { serverReadTime } from "../services/readSnapshot";
 import { attendancePolicy } from "../services/attendanceLedgerService";
 import { hubShiftBounds } from "../services/attendanceHubMath";
-import type { SortOrder } from "mongoose";
+import type { ClientSession, SortOrder } from "mongoose";
 import { Types } from "mongoose";
 import { getBusinessById, getCurrentBusinessId, runWithBusiness } from "../config/tenancy";
 import { Attendance } from "../models/Attendance";
@@ -608,8 +608,8 @@ function lastRecord<TRecord extends { source: string; timeIn: Date }>(records: T
   return [...records].reverse().find((record) => sources.includes(record.source));
 }
 
-export async function attendancePayrollDtr(employeeId: Types.ObjectId, payPeriod: string) {
-  if (payrollAccuracyEnabled()) return accurateAttendancePayrollDtr(employeeId, payPeriod);
+export async function attendancePayrollDtr(employeeId: Types.ObjectId, payPeriod: string, session?: ClientSession) {
+  if (payrollAccuracyEnabled()) return accurateAttendancePayrollDtr(employeeId, payPeriod, session);
   const settings = await getSystemSettings();
   const { start, end } = periodRange(payPeriod);
   const durationModel = attendanceDurationModelEnabled();
@@ -771,19 +771,19 @@ async function attendancePayrollSummary(employeeId: Types.ObjectId, payPeriod: s
   return (await attendancePayrollDtr(employeeId, payPeriod)).summary;
 }
 
-export async function payrollCalculationContext() {
-  const settings = await getSystemSettings();
-  const policy = await attendancePolicy();
+export async function payrollCalculationContext(session?: ClientSession) {
+  const settings = await getSystemSettings(session);
+  const policy = await attendancePolicy(undefined, session);
   if (payrollAccuracyEnabled()) {
-    const storedPolicy = await AttendancePolicy.findById("global-attendance").lean();
-    const storedSettings = await SystemSettings.findOne({ key: "system" }).lean();
+    const storedPolicy = await AttendancePolicy.findById("global-attendance", null, session ? { session } : undefined).lean();
+    const storedSettings = await SystemSettings.findOne({ key: "system" }, null, session ? { session } : undefined).lean();
     paidHoursPerDay(storedPolicy ? { officialShiftStartTime: storedPolicy.shiftStart, officialShiftEndTime: storedPolicy.shiftEnd } : storedSettings || {}, policy);
   }
   return { settings, policy };
 }
 
-async function accurateAttendancePayrollDtr(employeeId: Types.ObjectId, payPeriod: string) {
-  const { settings, policy } = await payrollCalculationContext();
+async function accurateAttendancePayrollDtr(employeeId: Types.ObjectId, payPeriod: string, session?: ClientSession) {
+  const { settings, policy } = await payrollCalculationContext(session);
   const paidHours = paidHoursPerDay(settings, policy);
   const { start, end } = periodRange(payPeriod);
   const length = (end.getTime() - start.getTime()) / 86_400_000;
@@ -791,14 +791,14 @@ async function accurateAttendancePayrollDtr(employeeId: Types.ObjectId, payPerio
   const keys = periodDateKeys(start, end);
   if (!keys.length || keys.length > 93) throw new PayrollValidationError("Payroll range must contain between 1 and 93 shift days");
   const now = serverReadTime();
-  const employee = await Employee.findById(employeeId).select("employeeCode").lean();
+  const employee = await Employee.findById(employeeId, null, session ? { session } : undefined).select("employeeCode").lean();
   if (!employee) throw new PayrollValidationError("Employee not found");
   const firstBound = new Date(hubShiftBounds(keys[0], settings).start.getTime() - 86_400_000);
   const lastBound = new Date(hubShiftBounds(keys.at(-1)!, settings).end.getTime() + 86_400_000);
   const readCopy = async (id: Types.ObjectId) => Attendance.find({ employee: id, isArchived: false,
-    timeIn: { $gte: firstBound, $lt: lastBound } }).sort({ timeIn: 1, sequence: 1, _id: 1 }).lean();
+    timeIn: { $gte: firstBound, $lt: lastBound } }, null, session ? { session } : undefined).sort({ timeIn: 1, sequence: 1, _id: 1 }).lean();
   const local = await readCopy(employeeId);
-  const ledger = await AttendanceLedger.findOne({ employeeCode: employee.employeeCode, businessIds: getCurrentBusinessId() }).select("events corrections closures businessIds migrationRequired").lean();
+  const ledger = await AttendanceLedger.findOne({ employeeCode: employee.employeeCode, businessIds: getCurrentBusinessId() }, null, session ? { session } : undefined).select("events corrections closures businessIds migrationRequired").lean();
   let grouped = groupPayrollAttendanceBySlot(local, settings);
   const mismatches = new Set<string>();
   if (ledger && !ledger.migrationRequired) {
@@ -810,7 +810,7 @@ async function accurateAttendancePayrollDtr(employeeId: Types.ObjectId, payPerio
     }
     const fingerprint = (items: Array<{ source: string; timeIn: Date }>) => JSON.stringify(items.map(item => [item.source, item.timeIn.toISOString()]));
     for (const businessId of ledger.businessIds) await runWithBusiness(businessId, async () => {
-      const copyEmployee = await Employee.findOne({ employeeCode: employee.employeeCode }).select("_id").lean();
+      const copyEmployee = await Employee.findOne({ employeeCode: employee.employeeCode }, null, session ? { session } : undefined).select("_id").lean();
       if (!copyEmployee) { keys.forEach(key => mismatches.add(key)); return; }
       const replica = groupPayrollAttendanceBySlot(await readCopy(copyEmployee._id), settings);
       for (const key of keys) if (fingerprint(replica[key] || []) !== fingerprint(canonical[key] || [])) mismatches.add(key);

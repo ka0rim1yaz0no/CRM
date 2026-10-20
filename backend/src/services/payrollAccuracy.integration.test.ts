@@ -27,11 +27,14 @@ const { Employee } = await import("../models/Employee");
 const { Attendance } = await import("../models/Attendance");
 const { AttendanceLedger, AttendancePolicy } = await import("../models/AttendanceLedger");
 const { PayrollRecord } = await import("../models/Payroll");
+const { PayrollAttendanceFence } = await import("../models/PayrollAttendanceFence");
 const { SystemSettings } = await import("../models/SystemSettings");
 const { runWithBusiness, getBusinessConnection } = await import("../config/tenancy");
 const { setBusinessAccessForEmployeeCode } = await import("../models/BusinessUserAccess");
 const { createAdminDashboardSession } = await import("../config/adminDashboardSession");
 const { assignAttendanceShift } = await import("./attendanceShift");
+const { executeAttendanceCommand, autoTimeOutCommandId } = await import("./attendanceLedgerService");
+const { deliverAttendanceLedger } = await import("./attendanceLedgerOutbox");
 const { syncEmployeePayrollRecords } = await import("../controllers/payrollController");
 const period = "Oct 15, 2026 - Oct 15, 2026";
 const start = Date.parse("2026-10-15T15:00:00Z");
@@ -52,6 +55,7 @@ after(async () => {
 });
 beforeEach(async () => {
   ids = [];
+  await PayrollAttendanceFence.deleteMany({});
   await AttendanceLedger.deleteMany({}); await AttendancePolicy.deleteMany({});
   await AttendancePolicy.create({ _id: "global-attendance", revision: 1, shiftStart: "23:00", shiftEnd: "08:00", breakMinutes: 15, lunchMinutes: 60, graceMinutes: 0 });
   events = [["Time In", 5], ["Break Out", 60], ["Break In", 76], ["Break Out", 120], ["Break In", 135], ["Lunch Break Out", 200], ["Lunch Break In", 261], ["Time Out", 530]]
@@ -64,7 +68,8 @@ beforeEach(async () => {
     const employee = await Employee.create({ employeeCode: "90000003", name: "Synthetic Payroll Employee", email: "payroll@example.invalid", salary: 30000,
       status: "Active", role: "Sales", team: "Synthetic", businessAccessIds: ["pay-a", "pay-b"] });
     ids.push(employee._id);
-    await Attendance.insertMany(events.map(item => ({ employee: employee._id, source: item.source, timeIn: new Date(item.at), eventId: item.id, sequence: item.sequence })));
+    await Attendance.insertMany(events.map(item => ({ employee: employee._id, source: item.source, timeIn: new Date(item.at), eventId: item.id, sequence: item.sequence,
+      ledgerIdentity: "synthetic-payroll", ledgerRevision: 1, isEffective: true })));
     await PayrollRecord.init();
   });
   await setBusinessAccessForEmployeeCode("90000003", ["pay-a", "pay-b"]);
@@ -77,6 +82,132 @@ async function request(route: string, body?: unknown, business = "pay-a", auth =
 }
 const preview = (overtimeApprovals = {}) => request("/payroll/recompute/preview", { payPeriod: period, overtimeApprovals });
 const confirm = (value: { token: string }, extra = {}) => request("/payroll/recompute/confirm", { payPeriod: period, token: value.token, confirm: true, reason: "Synthetic verification", ...extra });
+async function correctSyntheticBreak(business = "pay-b") {
+  const identity = { key: "synthetic-payroll", code: "90000003", businessIds: ["pay-a", "pay-b"], canonicalBusinessId: "pay-a", employeeId: String(ids[business === "pay-a" ? 0 : 1]) };
+  const result = await runWithBusiness(business, () => executeAttendanceCommand(identity, { operation: "correct", commandId: crypto.randomUUID(), expectedRevision: 1,
+    reason: "Synthetic concurrent correction", changes: [{ targetId: "e2", at: new Date(start + 77 * 60_000).toISOString() }] }, { role: "admin", code: "90000001" }));
+  await deliverAttendanceLedger(identity.key);
+  return result;
+}
+
+test("an attendance correction after initial validation but before the approval transaction rejects stale pay in every business", async () => {
+  const first = await preview(); assert.equal(first.status, 200);
+  const startSession = mongoose.startSession.bind(mongoose);
+  let corrected = false;
+  const stub = mock.method(mongoose, "startSession", async (...args: Parameters<typeof mongoose.startSession>) => {
+    if (!corrected) { corrected = true; await correctSyntheticBreak(); }
+    return startSession(...args);
+  });
+  let result;
+  try { result = await confirm(first.data); } finally { stub.mock.restore(); }
+  assert.equal(result.status, 409, JSON.stringify(result.data));
+  assert.equal((await AttendanceLedger.findById("synthetic-payroll").lean())?.revision, 2);
+  for (const business of ["pay-a", "pay-b"]) assert.equal(await runWithBusiness(business, () => PayrollRecord.countDocuments()), 0);
+});
+
+function gate() {
+  let resolve!: () => void;
+  const promise = new Promise<void>(done => { resolve = done; });
+  return { promise, resolve };
+}
+
+test("approval holds every business attendance fence until its complete payroll transaction commits", { timeout: 25000 }, async () => {
+  const first = await preview();
+  const payrollEntered = gate(), resumePayroll = gate(), editingAtFence = gate();
+  const model = getBusinessConnection("pay-a").model("PayrollRecord");
+  const originalWrite = model.updateOne.bind(model), originalFence = PayrollAttendanceFence.updateOne.bind(PayrollAttendanceFence);
+  let paused = false, observeEdit = false, editComplete = false;
+  const writeStub = mock.method(model, "updateOne", async (...args: Parameters<typeof model.updateOne>) => {
+    if (!paused) { paused = true; payrollEntered.resolve(); await resumePayroll.promise; }
+    return originalWrite(...args);
+  });
+  const fenceStub = mock.method(PayrollAttendanceFence, "updateOne", (...args: Parameters<typeof PayrollAttendanceFence.updateOne>) => {
+    if (observeEdit) editingAtFence.resolve();
+    return originalFence(...args);
+  });
+  const approving = confirm(first.data);
+  let editing: Promise<unknown> | undefined;
+  try {
+    await payrollEntered.promise; observeEdit = true;
+    editing = correctSyntheticBreak("pay-b").then(value => { editComplete = true; return value; });
+    await editingAtFence.promise; assert.equal(editComplete, false);
+    resumePayroll.resolve();
+    const approved = await approving; assert.equal(approved.status, 200, JSON.stringify(approved.data));
+    await editing;
+    for (const business of ["pay-a", "pay-b"]) {
+      const record = await runWithBusiness(business, () => PayrollRecord.findOne().lean());
+      assert.equal(record?.deductibleMinutes, 17); assert.equal(record?.calculationAudit?.length, 1);
+    }
+    assert.equal((await AttendanceLedger.findById("synthetic-payroll").lean())?.revision, 2);
+    const changed = await preview(); assert.equal(changed.status, 200); assert.equal(changed.data.rows[0].after.deductions, 48.91);
+  } finally { resumePayroll.resolve(); writeStub.mock.restore(); fenceStub.mock.restore(); await Promise.allSettled([approving, ...(editing ? [editing] : [])]); }
+});
+
+test("an attendance save winning the shared fence makes a simultaneous payroll approval stale", { timeout: 25000 }, async () => {
+  const first = await preview();
+  const editingAtCommit = gate(), resumeEdit = gate(), approvalAtFence = gate();
+  const originalCommit = AttendanceLedger.findOneAndUpdate.bind(AttendanceLedger), originalFence = PayrollAttendanceFence.updateOne.bind(PayrollAttendanceFence);
+  let paused = false, observeApproval = false;
+  const editStub = mock.method(AttendanceLedger, "findOneAndUpdate", (...args: Parameters<typeof AttendanceLedger.findOneAndUpdate>) => {
+    const update = args[1] as { $set?: { revision?: number } };
+    if (!paused && update.$set?.revision === 2) {
+      paused = true; editingAtCommit.resolve();
+      return { lean: async () => { await resumeEdit.promise; return originalCommit(...args).lean(); } } as ReturnType<typeof AttendanceLedger.findOneAndUpdate>;
+    }
+    return originalCommit(...args);
+  });
+  const fenceStub = mock.method(PayrollAttendanceFence, "updateOne", (...args: Parameters<typeof PayrollAttendanceFence.updateOne>) => {
+    if (observeApproval) approvalAtFence.resolve();
+    return originalFence(...args);
+  });
+  const editing = correctSyntheticBreak("pay-a");
+  let approving: ReturnType<typeof confirm> | undefined;
+  try {
+    await editingAtCommit.promise; observeApproval = true;
+    approving = confirm(first.data); await approvalAtFence.promise; resumeEdit.resolve();
+    await editing; const result = await approving;
+    assert.equal(result.status, 409, JSON.stringify(result.data));
+    for (const business of ["pay-a", "pay-b"]) assert.equal(await runWithBusiness(business, () => PayrollRecord.countDocuments()), 0);
+  } finally { resumeEdit.resolve(); editStub.mock.restore(); fenceStub.mock.restore(); await Promise.allSettled([editing, ...(approving ? [approving] : [])]); }
+});
+
+test("fence failures roll back approval without modifying either business or attendance evidence", async () => {
+  const first = await preview();
+  const before = JSON.stringify(await AttendanceLedger.findById("synthetic-payroll").lean());
+  const stub = mock.method(PayrollAttendanceFence, "updateOne", () => { throw new Error("Synthetic coordination unavailable"); });
+  try { assert.equal((await confirm(first.data)).status, 500); } finally { stub.mock.restore(); }
+  assert.equal(await PayrollAttendanceFence.countDocuments(), 0);
+  assert.equal(JSON.stringify(await AttendanceLedger.findById("synthetic-payroll").lean()), before);
+  for (const business of ["pay-a", "pay-b"]) assert.equal(await runWithBusiness(business, () => PayrollRecord.countDocuments()), 0);
+});
+
+test("automatic timeout uses the same atomic fence and a coordination failure cannot create a checkout", async () => {
+  const open = events.slice(0, -1);
+  await AttendanceLedger.updateOne({ _id: "synthetic-payroll" }, { events: open });
+  const identity = { key: "synthetic-payroll", code: "90000003", businessIds: ["pay-a", "pay-b"], canonicalBusinessId: "pay-a", employeeId: String(ids[0]) };
+  const input = { operation: "auto-time-out" as const, commandId: autoTimeOutCommandId("e0"), expectedRevision: 1, sessionId: "e0" };
+  process.env.CRM_ATTENDANCE_AUTO_TIMEOUT = "true";
+  const stub = mock.method(PayrollAttendanceFence, "updateOne", () => { throw new Error("Synthetic fence unavailable"); });
+  try {
+    await assert.rejects(executeAttendanceCommand(identity, input, { role: "system", code: "attendance-auto-time-out" }, new Date("2026-10-16T00:05:00Z")), /Synthetic fence unavailable/);
+    const unchanged = await AttendanceLedger.findById("synthetic-payroll").lean();
+    assert.equal(unchanged?.revision, 1); assert.deepEqual(unchanged?.events.map(item => item.id), open.map(item => item.id));
+    assert.equal(await PayrollAttendanceFence.countDocuments(), 0);
+    stub.mock.restore();
+    const completed = await executeAttendanceCommand(identity, input, { role: "system", code: "attendance-auto-time-out" }, new Date("2026-10-16T00:05:00Z"));
+    assert.equal(completed.revision, 2); assert.equal(completed.state, "OFFLINE");
+    assert.equal(await PayrollAttendanceFence.countDocuments(), 2);
+    const replay = await executeAttendanceCommand(identity, input, { role: "system", code: "attendance-auto-time-out" }, new Date("2026-10-16T00:06:00Z"));
+    assert.equal(replay.revision, 2); assert.equal((await AttendanceLedger.findById("synthetic-payroll").lean())?.events.filter(item => item.autoTimeOut).length, 1);
+  } finally { stub.mock.restore(); process.env.CRM_ATTENDANCE_AUTO_TIMEOUT = "false"; }
+});
+
+test("unguarded legacy attendance cannot silently downgrade payroll approval safety", async () => {
+  const first = await preview(); process.env.CRM_ATTENDANCE_INTEGRITY = "false";
+  try { const result = await confirm(first.data); assert.equal(result.status, 503); assert.match(result.data.message, /revision-checked/); }
+  finally { process.env.CRM_ATTENDANCE_INTEGRITY = "true"; }
+  for (const business of ["pay-a", "pay-b"]) assert.equal(await runWithBusiness(business, () => PayrollRecord.countDocuments()), 0);
+});
 test("preview reads only; explicit confirmation stores identical business mirrors and an audit, once per employee", async () => {
   const before = JSON.stringify(await AttendanceLedger.findById("synthetic-payroll").lean());
   const result = await preview(); assert.equal(result.status, 200, JSON.stringify(result.data));
@@ -266,6 +397,7 @@ test("a failure in the second business rolls back all mirrors and audit entries"
   const stub = mock.method(getBusinessConnection("pay-b").model("PayrollRecord"), "updateOne", () => { throw new Error("Synthetic transaction failure"); });
   try { assert.equal((await confirm(first.data)).status, 500); } finally { stub.mock.restore(); }
   for (const business of ["pay-a", "pay-b"]) assert.equal(await runWithBusiness(business, () => PayrollRecord.countDocuments()), 0);
+  assert.equal(await PayrollAttendanceFence.countDocuments(), 0);
 });
 test("open lunch is never deducted or silently closed at cutoff", async () => {
   events = events.slice(0, 6);

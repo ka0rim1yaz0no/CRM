@@ -1237,9 +1237,7 @@ export default function PayrollPage() {
                                                         </div>
                                                     </td>
                                                     <td className="truncate px-3 py-2.5 !text-slate-700">{employee.employeeId}</td>
-                                                    <td className="px-3 py-2.5 font-semibold !text-slate-950">{money(employee.basicPay ?? employee.grossPay)}
-                                                        {accuracyConfig?.enabled && <small className="mt-1 block whitespace-normal text-xs font-normal !text-slate-600">{employee.paidHoursPerDay != null ? `${employee.paidHoursPerDay}h/day` : "Paid day not snapshotted"} · {money(employee.hourlyRate ?? (employee.minuteRate || 0) * 60)}/h · {money(employee.minuteRate || 0)}/min</small>}
-                                                    </td>
+                                                    <td className="px-3 py-2.5 font-semibold !text-slate-950">{money(employee.basicPay ?? employee.grossPay)}</td>
                                                     <td className="px-3 py-2.5 !text-slate-700">{employee.attendanceDays ?? 0}</td>
                                                     <td className="px-3 py-2.5 !text-slate-700">{employee.workedHours ?? 0}h</td>
                                                     <td className="px-3 py-2.5 font-semibold !text-slate-950">{money(employee.netPay)}</td>

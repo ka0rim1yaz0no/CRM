@@ -8,6 +8,8 @@ import { AttendanceLedger } from "../models/AttendanceLedger";
 import { getBusinessById, runWithBusiness } from "../config/tenancy";
 import { attendancePolicy, type AttendanceIdentity } from "./attendanceLedgerService";
 import { prepareLegacyAttendanceAdoption, type LegacyAttendanceReplica } from "./legacyAttendanceAdoptionPlan";
+import { payrollAccuracyEnabled } from "../config/rolloutFlags";
+import { lockPayrollAttendance } from "./payrollAttendanceFence";
 
 export type LocalAdoptionBackup = { id: string; target: "127.0.0.1:27119"; createdAt: string;
   fingerprints: Record<string, string>; databases: string[]; files: Array<{ path: string; sha256: string }> };
@@ -58,6 +60,7 @@ export async function adoptLocalLegacyAttendance(identity: AttendanceIdentity, m
   const session = await mongoose.startSession();
   try {
     return await session.withTransaction(async () => {
+      if (payrollAccuracyEnabled()) await lockPayrollAttendance(identity.businessIds.map(businessId => ({ businessId, employeeCode: identity.code })), session);
       const existing = await AttendanceLedger.findById(identity.key).session(session).lean();
       if (existing) return { status: "already-adopted" as const, historyReviewRequired: Boolean(existing.legacyAdoption?.historicalIssues) };
       const plan = await readLocalLegacyAdoptionPlan(identity, session);

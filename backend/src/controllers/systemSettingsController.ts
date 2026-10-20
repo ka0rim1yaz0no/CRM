@@ -1,4 +1,5 @@
 import type { Request, Response } from "express";
+import type { ClientSession } from "mongoose";
 import { SystemSettings, type CurrencyCode, type PayrollBillingCycle, type ThemeKey } from "../models/SystemSettings";
 import { AttendancePolicy } from "../models/AttendanceLedger";
 import { attendanceIntegrityEnabled } from "../config/rolloutFlags";
@@ -69,9 +70,9 @@ function isValidTimeZone(value: string) {
   }
 }
 
-export async function getSystemSettings() {
+export async function getSystemSettings(session?: ClientSession) {
   // Defaults and legacy normalization are projections. Only the explicit update endpoint persists settings.
-  const settings = await SystemSettings.findOne({ key: "system" }) || new SystemSettings(defaultSystemSettings);
+  const settings = await SystemSettings.findOne({ key: "system" }, null, session ? { session } : undefined) || new SystemSettings(defaultSystemSettings);
 
   if (settings.payrollRunDay > 30) {
     settings.payrollRunDay = 30;
@@ -96,7 +97,7 @@ export async function getSystemSettings() {
     settings.payrollSecondCutoffStartDay = defaultSystemSettings.payrollSecondCutoffStartDay;
     settings.payrollSecondCutoffEndDay = defaultSystemSettings.payrollSecondCutoffEndDay;
     settings.payrollSecondCutoffPayDay = defaultSystemSettings.payrollSecondCutoffPayDay;
-    return projectAttendancePolicy(settings);
+    return projectAttendancePolicy(settings, session);
   }
 
   const hasReversedDefaultCutoffs =
@@ -114,7 +115,7 @@ export async function getSystemSettings() {
     settings.payrollSecondCutoffStartDay = defaultSystemSettings.payrollSecondCutoffStartDay;
     settings.payrollSecondCutoffEndDay = defaultSystemSettings.payrollSecondCutoffEndDay;
     settings.payrollSecondCutoffPayDay = defaultSystemSettings.payrollSecondCutoffPayDay;
-    return projectAttendancePolicy(settings);
+    return projectAttendancePolicy(settings, session);
   }
 
   const usesLegacyAttendanceDefaults =
@@ -129,7 +130,7 @@ export async function getSystemSettings() {
     settings.officialSecondBreakEndTime === "16:30";
 
   if (!usesLegacyAttendanceDefaults) {
-    return projectAttendancePolicy(settings);
+    return projectAttendancePolicy(settings, session);
   }
 
   settings.officialShiftStartTime = defaultSystemSettings.officialShiftStartTime;
@@ -141,14 +142,14 @@ export async function getSystemSettings() {
   settings.officialSecondBreakStartTime = defaultSystemSettings.officialSecondBreakStartTime;
   settings.officialSecondBreakEndTime = defaultSystemSettings.officialSecondBreakEndTime;
   settings.attendanceTimeZone = defaultSystemSettings.attendanceTimeZone;
-  return projectAttendancePolicy(settings);
+  return projectAttendancePolicy(settings, session);
 }
 
 async function projectAttendancePolicy<T extends { lateGraceMinutes: number; officialShiftStartTime: string; officialShiftEndTime: string;
   officialFirstBreakStartTime: string; officialFirstBreakEndTime: string; officialSecondBreakStartTime: string; officialSecondBreakEndTime: string;
-  officialLunchBreakStartTime: string; officialLunchBreakEndTime: string }>(settings: T) {
+  officialLunchBreakStartTime: string; officialLunchBreakEndTime: string }>(settings: T, session?: ClientSession) {
   if (!attendanceIntegrityEnabled()) return settings;
-  const policy = await AttendancePolicy.findById("global-attendance").lean();
+  const policy = await AttendancePolicy.findById("global-attendance", null, session ? { session } : undefined).lean();
   if (!policy) return settings;
   const endAfter = (start: string, minutes: number) => {
     const [hour, minute] = start.split(":").map(Number);

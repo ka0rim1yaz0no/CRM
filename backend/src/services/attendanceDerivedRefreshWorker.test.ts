@@ -16,6 +16,7 @@ const identity = { key: "fake-derived", code: "fake-code", employeeId: "", canon
 const end = new Date("2026-10-16T00:00:00Z");
 const checkout = new Date("2026-10-15T23:00:00Z");
 const clone = <T>(value: T): T => structuredClone(value);
+let payrollAccuracyFlag: string | undefined;
 let store: AttendanceLedgerDocument;
 let failCas = false;
 let onLease: (() => void) | undefined;
@@ -36,6 +37,8 @@ function command(): AttendanceCommand {
     expectedRevision: store.revision, reason: "Finalize closed attendance deductions at shift end" };
 }
 beforeEach(() => {
+  payrollAccuracyFlag = process.env.CRM_PAYROLL_ACCURACY;
+  process.env.CRM_PAYROLL_ACCURACY = "false";
   process.env.CRM_ATTENDANCE_INTEGRITY = "true"; process.env.CRM_ATTENDANCE_DURATION_MODEL = "true";
   process.env.CRM_ATTENDANCE_AUTO_TIMEOUT = "false"; process.env.CRM_ATTENDANCE_RECOVERY_CUTOFF = "false";
   fixture(); failCas = false; onLease = undefined; commits.length = 0;
@@ -61,7 +64,11 @@ beforeEach(() => {
     return clone(store);
   } }));
 });
-afterEach(() => { mock.restoreAll(); });
+afterEach(() => {
+  mock.restoreAll();
+  if (payrollAccuracyFlag === undefined) delete process.env.CRM_PAYROLL_ACCURACY;
+  else process.env.CRM_PAYROLL_ACCURACY = payrollAccuracyFlag;
+});
 
 test("early checkout stays zero before end, durably finalizes at end without attendance writes and never repeats", async () => {
   const evidence = clone({ events: store.events, corrections: store.corrections, closures: store.closures });

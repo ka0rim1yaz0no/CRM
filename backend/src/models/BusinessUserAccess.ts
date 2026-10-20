@@ -1,4 +1,4 @@
-import mongoose, { Schema } from "mongoose";
+import mongoose, { Schema, type ClientSession } from "mongoose";
 
 export type BusinessUserAccessDocument = {
   employeeCode: string;
@@ -35,14 +35,14 @@ export function normalizeBusinessAccessIds(value: unknown) {
   );
 }
 
-export async function getBusinessAccessForEmployeeCode(employeeCode: string) {
+export async function getBusinessAccessForEmployeeCode(employeeCode: string, session?: ClientSession) {
   const normalizedEmployeeCode = String(employeeCode || "").trim();
 
   if (!normalizedEmployeeCode) {
     return [];
   }
 
-  const access = await getBusinessUserAccessModel().findOne({ employeeCode: normalizedEmployeeCode }).lean();
+  const access = await getBusinessUserAccessModel().findOne({ employeeCode: normalizedEmployeeCode }, null, session ? { session } : undefined).lean();
   return normalizeBusinessAccessIds(access?.businessIds);
 }
 

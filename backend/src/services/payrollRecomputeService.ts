@@ -1,4 +1,4 @@
-import mongoose, { Types } from "mongoose";
+import mongoose, { Types, type ClientSession } from "mongoose";
 import { createHash } from "node:crypto";
 import type { Request } from "express";
 import { getBusinessById, getCurrentBusinessId, runWithBusiness } from "../config/tenancy";
@@ -12,16 +12,18 @@ import { getBusinessAccessForEmployeeCode } from "../models/BusinessUserAccess";
 import { attendancePayrollDtr, payrollCalculationContext, payrollRatesForCutoff, periodRange, isConfiguredPayrollPeriod, scheduledPayDateForPeriod } from "../controllers/payrollController";
 import { roundMoney, PayrollValidationError } from "./payrollAccuracy";
 import { serverReadTime, withReadSnapshot } from "./readSnapshot";
+import { attendanceIntegrityEnabled } from "../config/rolloutFlags";
+import { lockPayrollAttendance, payrollAttendanceFenceKeys } from "./payrollAttendanceFence";
 
 const fail = (statusCode: number, message: string) => Object.assign(new Error(message), { statusCode });
 const fingerprint = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 const moneyFields = (value?: { grossPay: number; deductions: number; netPay: number } | null) => ({ grossPay: value?.grossPay ?? 0, deductions: value?.deductions ?? 0, netPay: value?.netPay ?? 0 });
 
-export async function calculatePayrollCandidate(employee: { _id: Types.ObjectId; employeeCode: string; name: string; email?: string; team?: string; role?: string; salary: number }, payPeriod: string, overtimeOverride?: number) {
-  const { settings, policy } = await payrollCalculationContext();
+export async function calculatePayrollCandidate(employee: { _id: Types.ObjectId; employeeCode: string; name: string; email?: string; team?: string; role?: string; salary: number }, payPeriod: string, overtimeOverride?: number, session?: ClientSession) {
+  const { settings, policy } = await payrollCalculationContext(session);
   const rates = payrollRatesForCutoff(employee.salary, payPeriod, settings, policy);
-  const dtr = await attendancePayrollDtr(employee._id, payPeriod);
-  const record = await PayrollRecord.findOne({ employeeId: employee.employeeCode, payPeriod, isArchived: false }).lean();
+  const dtr = await attendancePayrollDtr(employee._id, payPeriod, session);
+  const record = await PayrollRecord.findOne({ employeeId: employee.employeeCode, payPeriod, isArchived: false }, null, session ? { session } : undefined).lean();
   const approvedOvertimeHours = overtimeOverride ?? (record?.overtimeApproved ? record.overtimeHours : 0);
   if (!Number.isFinite(approvedOvertimeHours) || approvedOvertimeHours < 0 || approvedOvertimeHours > dtr.summary.overtimeHours) {
     throw new PayrollValidationError("Approved overtime exceeds verified completed weekend work; review the cutoff");
@@ -29,10 +31,10 @@ export async function calculatePayrollCandidate(employee: { _id: Types.ObjectId;
   const grossPay = roundMoney(rates.cutoffBasePay + approvedOvertimeHours * rates.hourlyRate);
   const deductions = Math.min(grossPay, roundMoney(dtr.summary.deductibleMinutes * rates.minuteRate));
   const payDate = scheduledPayDateForPeriod(payPeriod, settings);
-  const ledger = await AttendanceLedger.findOne({ employeeCode: employee.employeeCode, businessIds: getCurrentBusinessId() }).select("revision events corrections closures businessIds migrationRequired").lean();
+  const ledger = await AttendanceLedger.findOne({ employeeCode: employee.employeeCode, businessIds: getCurrentBusinessId() }, null, session ? { session } : undefined).select("revision events corrections closures businessIds migrationRequired").lean();
   const evidence = ledger && !ledger.migrationRequired ? projectAttendance(ledger.events, ledger.corrections, ledger.closures).sessions.flatMap(item => item.events)
     .map(item => ({ id: item.id, source: item.source, at: item.at, shift: item.shift })) :
-    (await Attendance.find({ employee: employee._id, isArchived: false }).select("source timeIn").lean())
+    (await Attendance.find({ employee: employee._id, isArchived: false }, null, session ? { session } : undefined).select("source timeIn").lean())
       .map(item => ({ id: String(item._id), source: item.source, at: item.timeIn.toISOString() }));
   const firstDay = dtr.rows[0]!.dateKey, lastDay = dtr.rows.at(-1)!.dateKey;
   const evidenceStart = Date.parse(firstDay) - 86_400_000, evidenceEnd = Date.parse(lastDay) + 2 * 86_400_000;
@@ -98,16 +100,16 @@ export async function previewPayrollCutoff(payPeriod: string, overtimeApprovals:
   return withReadSnapshot(serverReadTime(), () => buildPayrollCutoff(payPeriod, overtimeApprovals));
 }
 
-async function buildPayrollCutoff(payPeriod: string, overtimeApprovals: unknown) {
+async function buildPayrollCutoff(payPeriod: string, overtimeApprovals: unknown, session?: ClientSession) {
   if (!/^[A-Za-z]+ \d{1,2}, \d{4} - [A-Za-z]+ \d{1,2}, \d{4}$/.test(payPeriod)) throw new PayrollValidationError("Choose an explicit cutoff date range");
-  const context = await payrollCalculationContext();
+  const context = await payrollCalculationContext(session);
   if (context.settings.payrollBillingCycle !== "Semi-monthly" || !isConfiguredPayrollPeriod(payPeriod, context.settings)) {
     throw new PayrollValidationError("Choose a complete configured semi-monthly cutoff; partial or unsupported payroll cycles require HR review");
   }
   const business = getCurrentBusinessId();
   if (!overtimeApprovals || typeof overtimeApprovals !== "object" || Array.isArray(overtimeApprovals)) throw new PayrollValidationError("Overtime approvals must be employee-code keyed hours");
   const approvals = overtimeApprovals as Record<string, unknown>;
-  const employees = await Employee.find({ status: { $ne: "Archived" } }).select("employeeCode name email role team salary").sort({ employeeCode: 1 }).lean();
+  const employees = await Employee.find({ status: { $ne: "Archived" } }, null, session ? { session } : undefined).select("employeeCode name email role team salary").sort({ employeeCode: 1 }).lean();
   for (const [code, hours] of Object.entries(approvals)) {
     if (!employees.some(employee => employee.employeeCode === code) || typeof hours !== "number" || !Number.isFinite(hours) || hours < 0) {
       throw new PayrollValidationError("Overtime approvals require a listed employee code and non-negative numeric hours");
@@ -118,33 +120,33 @@ async function buildPayrollCutoff(payPeriod: string, overtimeApprovals: unknown)
   for (const employee of employees) {
     if (seen.has(employee.employeeCode)) throw new PayrollValidationError("Duplicate employee code requires review before payroll");
     seen.add(employee.employeeCode);
-    const access = await getBusinessAccessForEmployeeCode(employee.employeeCode);
-    const ledger = await AttendanceLedger.findOne({ employeeCode: employee.employeeCode, businessIds: business }).select("canonicalBusinessId businessIds").lean();
+    const access = await getBusinessAccessForEmployeeCode(employee.employeeCode, session);
+    const ledger = await AttendanceLedger.findOne({ employeeCode: employee.employeeCode, businessIds: business }, null, session ? { session } : undefined).select("canonicalBusinessId businessIds").lean();
     const businessIds = [...new Set([...(access.length ? access : ledger?.businessIds || []), business])].sort();
     const ownerBusinessId = ledger?.canonicalBusinessId || businessIds[0];
     if (!businessIds.includes(ownerBusinessId)) throw new PayrollValidationError("Payroll owner is outside the employee's businesses; review membership before recomputing");
     const override = Object.hasOwn(approvals, employee.employeeCode) ? approvals[employee.employeeCode] as number : undefined;
-    const candidate = await calculatePayrollCandidate(employee, payPeriod, override);
+    const candidate = await calculatePayrollCandidate(employee, payPeriod, override, session);
     let reviewDays = candidate.dtr.summary.incompleteShiftDays;
     for (const businessId of businessIds) {
       if (!getBusinessById(businessId)) throw new PayrollValidationError("A payroll business is unavailable; no changes applied");
       await runWithBusiness(businessId, async () => {
-        const other = await Employee.findOne({ employeeCode: employee.employeeCode, status: { $ne: "Archived" } }).select("employeeCode name email role team salary").lean();
+        const other = await Employee.findOne({ employeeCode: employee.employeeCode, status: { $ne: "Archived" } }, null, session ? { session } : undefined).select("employeeCode name email role team salary").lean();
         if (!other) throw new PayrollValidationError("Employee membership mismatch across businesses; no changes applied");
-        const counterpart = businessId === business ? candidate : await calculatePayrollCandidate(other, payPeriod, override);
+        const counterpart = businessId === business ? candidate : await calculatePayrollCandidate(other, payPeriod, override, session);
         if (calculationFingerprint(counterpart) !== calculationFingerprint(candidate)) throw new PayrollValidationError("Payroll settings, salary or attendance differ across businesses; resolve the mismatch before recomputing");
         const old = counterpart.record;
         const otherPeriods = await PayrollRecord.find({ employeeId: employee.employeeCode,
-          ...(old ? { _id: { $ne: old._id } } : {}), $or: [{ isArchived: false }, { status: { $in: ["Paid", "Completed"] } }] }).select("payPeriod").lean();
+          ...(old ? { _id: { $ne: old._id } } : {}), $or: [{ isArchived: false }, { status: { $in: ["Paid", "Completed"] } }] }, null, session ? { session } : undefined).select("payPeriod").lean();
         const selectedRange = periodRange(payPeriod);
         if (otherPeriods.some(item => { const range = periodRange(item.payPeriod); return range.start < selectedRange.end && range.end > selectedRange.start; })) {
           throw new PayrollValidationError("An existing cutoff overlaps these shift days. Review it instead of generating duplicate pay");
         }
-        const duplicates = await PayrollRecord.countDocuments({ employeeId: employee.employeeCode, payPeriod, isArchived: false });
+        const duplicates = await PayrollRecord.countDocuments({ employeeId: employee.employeeCode, payPeriod, isArchived: false }).session(session || null);
         if (duplicates > 1) throw new PayrollValidationError("Duplicate cutoff records require review; no records were removed");
         if (old && ["Paid", "Completed"].includes(old.status)) throw new PayrollValidationError("Paid or completed payroll is locked; no changes applied");
         reviewDays = Math.max(reviewDays, counterpart.dtr.summary.incompleteShiftDays);
-        const archived = old ? null : await PayrollRecord.findOne({ employeeId: employee.employeeCode, payPeriod, isArchived: true }).sort({ updatedAt: -1 }).select("_id").lean();
+        const archived = old ? null : await PayrollRecord.findOne({ employeeId: employee.employeeCode, payPeriod, isArchived: true }, null, session ? { session } : undefined).sort({ updatedAt: -1 }).select("_id").lean();
         const id = old?._id.toString() || createHash("sha256").update(`${businessId}:${employee.employeeCode}:${payPeriod}:duration-payroll-v1:${archived?._id || "initial"}`).digest("hex").slice(0, 24);
         targets.push({ businessId, id, beforeHash: fingerprint(old || null), before: old as Record<string, unknown> | null,
           value: { ...counterpart.value, payrollOwnerBusinessId: ownerBusinessId,
@@ -163,6 +165,7 @@ export async function applyPayrollCutoff(request: Request) {
   const actor = verifyAdminDashboardSession(request.header("x-crm-admin-session"));
   if (!actor) throw fail(403, "A verified administrator session is required");
   if (request.body.confirm !== true || !String(request.body.reason || "").trim()) throw fail(400, "Explicit confirmation and a reason are required");
+  if (!attendanceIntegrityEnabled()) throw fail(503, "Payroll approval requires revision-checked attendance. No payroll was changed.");
   const plan = await previewPayrollCutoff(String(request.body.payPeriod || ""), request.body.overtimeApprovals);
   if (!plan.canApply) throw new PayrollValidationError("Cutoff contains Needs Review rows. Resolve open or inconsistent attendance before generating payroll.");
   if (request.body.token !== plan.token) throw fail(409, "Payroll or attendance changed. Preview the cutoff again before confirming.");
@@ -170,7 +173,15 @@ export async function applyPayrollCutoff(request: Request) {
   const session = await mongoose.startSession();
   try {
     await session.withTransaction(async () => {
-      for (const target of plan.targets) await runWithBusiness(target.businessId, async () => {
+      const scopes = plan.targets.map(target => ({ businessId: target.businessId, employeeCode: String(target.value.employeeId) }));
+      await lockPayrollAttendance(scopes, session);
+      const verified = await withReadSnapshot(serverReadTime(), () => buildPayrollCutoff(plan.payPeriod, request.body.overtimeApprovals ?? {}, session));
+      const verifiedScopes = verified.targets.map(target => ({ businessId: target.businessId, employeeCode: String(target.value.employeeId) }));
+      if (verified.token !== request.body.token || fingerprint(payrollAttendanceFenceKeys(scopes)) !== fingerprint(payrollAttendanceFenceKeys(verifiedScopes))) {
+        throw fail(409, "Payroll or attendance changed during approval. Preview the cutoff again.");
+      }
+      if (!verified.canApply) throw new PayrollValidationError("Cutoff contains Needs Review rows. No payroll was changed.");
+      for (const target of verified.targets) await runWithBusiness(target.businessId, async () => {
         const current = await PayrollRecord.findById(target.id).session(session).lean();
         if (fingerprint(current || null) !== target.beforeHash) throw fail(409, "Payroll changed during confirmation. Preview again.");
         const audit = { at: new Date().toISOString(), actor: actor.employeeCode, reason: String(request.body.reason).trim().slice(0, 1000),
@@ -178,7 +189,10 @@ export async function applyPayrollCutoff(request: Request) {
         await PayrollRecord.updateOne({ _id: new Types.ObjectId(target.id) }, { $set: target.value, $push: { calculationAudit: audit } },
           { session, upsert: !current, runValidators: true, setDefaultsOnInsert: true });
       });
-    });
+    }, { readConcern: { level: "snapshot" }, writeConcern: { w: "majority" } });
+  } catch (error) {
+    if ((error as { code?: number }).code === 11000) throw fail(409, "Another attendance save or payroll approval completed first. Preview again.");
+    throw error;
   } finally { await session.endSession(); }
   return { applied: plan.rows.length, mirrors: plan.targets.length, payPeriod: plan.payPeriod };
 }
