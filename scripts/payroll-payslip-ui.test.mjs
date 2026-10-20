@@ -64,8 +64,8 @@ test("payslip output rejects loading, failed, mismatched, unsaved or inconsisten
         { dtr: { ...dtr, payPeriod: "Other cutoff" } }, { dtr: { ...dtr, employee: { employeeCode: "other" } } },
         { dtr: { ...dtr, storedCutoff: false } }, { record: { ...record, netPay: 1 } }]) assert.equal(exports.ready({ ...input, ...patch }), false);
     assert.equal(exports.ready({ ...input, accuracyEnabled: false, dtr: { ...dtr, storedCutoff: false } }), true);
-    assert.match(source, /disabled=\{!isPayslipOutputReady \|\| sendPayslipMutation\.isPending\}/);
-    assert.match(source, /if \(!isPayslipOutputReady\) return;/);
+    assert.match(source, /disabled=\{!isPayslipOutputReady \|\| sendPayslipMutation\.isPending \|\| payslipPdfMutation\.isPending\}/);
+    assert.match(source, /if \(!isPayslipOutputReady \|\| payslipPdfMutation\.isPending\) return;/);
 });
 
 function pageAction(name, inputs) {
@@ -94,12 +94,27 @@ test("export action downloads the currently filtered section, not stale payroll 
     }
     assert.doesNotThrow(() => pageAction("exportCsv", { isExportUnavailable: true })());
 });
-test("print action invokes printing only for a verified loaded payslip", () => {
-    for (const ready of [false, true]) {
-        let printed = 0;
-        pageAction("printPayslip", { isPayslipOutputReady: ready, window: { print() { printed++; } } })();
-        assert.equal(printed, Number(ready));
+test("print/save actions prepare only a verified payslip and never print the live CRM page", () => {
+    assert.doesNotMatch(source, /window\.print\(/);
+    for (const ready of [false, true]) for (const pending of [false, true]) for (const mode of ["open", "save"]) {
+        let requested = 0, opened = 0;
+        const target = { opener: {}, document: { title: "", body: { textContent: "" } } };
+        pageAction("printPayslip", { isPayslipOutputReady: ready, payslipPdfMutation: { isPending: pending, mutate(value) { requested++; assert.equal(value.mode, mode); } },
+            window: { open() { opened++; return target; } } })(mode);
+        assert.equal(requested, Number(ready && !pending)); assert.equal(opened, Number(ready && !pending && mode === "open"));
+        if (opened) assert.equal(target.opener, null);
     }
+});
+test("PDF failure closes its preparing tab and popup blocking falls back to a download", () => {
+    let closed = 0, downloaded = 0, opened = 0, status = "";
+    const config = pageAction("payslipPdfMutation", { useMutation: config => config, setPayslipDeliveryStatus: value => { status = value; },
+        openPayslipPdf() { opened++; }, downloadPayslipPdf() { downloaded++; } });
+    config.onError(new Error("Synthetic timeout"), { target: { close() { closed++; } } });
+    assert.equal(closed, 1); assert.equal(status, "Synthetic timeout");
+    config.onSuccess({ blob: {}, fileName: "fake.pdf" }, { mode: "open", target: null });
+    assert.equal(downloaded, 1); assert.equal(opened, 0);
+    config.onSuccess({ blob: {}, fileName: "fake.pdf" }, { mode: "open", target: { closed: false } });
+    assert.equal(opened, 1);
 });
 test("print sheet reuses the payslip document outside the clipping modal with bounded paper layout", () => {
     const css = readFileSync(new URL("../src/pages/admin/payroll/payslip-print.css", import.meta.url), "utf8");

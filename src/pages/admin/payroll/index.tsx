@@ -2,6 +2,7 @@ import type { FormEvent } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import "./payslip-print.css";
+import { capturePayslipPdf, downloadPayslipPdf, openPayslipPdf } from "../../../lib/payslipPdf";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toPng } from "html-to-image";
 import {
@@ -639,6 +640,7 @@ export default function PayrollPage() {
     const [dtrRecord, setDtrRecord] = useState<PayrollRecord | null>(null);
     const [payslipRecord, setPayslipRecord] = useState<PayrollRecord | null>(null);
     const payslipImageRef = useRef<HTMLDivElement>(null);
+    const payslipPrintRef = useRef<HTMLDivElement>(null);
     const [payslipCutoffPeriod, setPayslipCutoffPeriod] = useState("");
     const [isPayslipCutoffOpen, setIsPayslipCutoffOpen] = useState(false);
     const payslipCutoffPickerRef = useRef<HTMLDivElement | null>(null);
@@ -848,6 +850,28 @@ export default function PayrollPage() {
         onSuccess: () => setPayslipDeliveryStatus("Payslip image sent in CRM Messages."),
         onError: (error: { response?: { data?: { message?: string } }; message?: string }) => setPayslipDeliveryStatus(error.response?.data?.message || error.message || "Unable to send the payslip."),
     });
+    const payslipPdfMutation = useMutation<{ blob: Blob; fileName: string }, Error, { mode: "open" | "save"; target: Window | null }>({
+        mutationFn: async () => {
+            if (!isPayslipOutputReady || !payslipPreviewRecord || !payslipPrintRef.current) throw new Error("Load a saved, verified cutoff before preparing its PDF.");
+            const record = payslipPreviewRecord;
+            const bytes = await capturePayslipPdf(payslipPrintRef.current, `Payslip - ${record.employeeName} - ${record.payPeriod}`);
+            const name = `Payslip-${record.employeeId}-${record.payPeriod}`.replace(/[^a-z0-9-]+/gi, "-");
+            return { blob: new Blob([bytes], { type: "application/pdf" }), fileName: `${name}.pdf` };
+        },
+        onSuccess: ({ blob, fileName }, { mode, target }) => {
+            if (mode === "open" && target && !target.closed) {
+                openPayslipPdf(blob, target);
+                setPayslipDeliveryStatus("Payslip PDF opened for printing.");
+            } else {
+                downloadPayslipPdf(blob, fileName);
+                setPayslipDeliveryStatus("Payslip PDF download started.");
+            }
+        },
+        onError: (error: Error, { target }) => {
+            target?.close();
+            setPayslipDeliveryStatus(error.message || "Unable to prepare the payslip PDF.");
+        },
+    });
     const money = (value = 0) => formatCurrency(value, systemSettings?.currencyCode || "PHP");
     const itemLabels = itemCategory ? payrollItemFieldLabels(itemCategory) : null;
 
@@ -982,9 +1006,15 @@ export default function PayrollPage() {
         );
     };
 
-    const printPayslip = () => {
-        if (!isPayslipOutputReady) return;
-        window.print();
+    const printPayslip = (mode: "open" | "save" = "open") => {
+        if (!isPayslipOutputReady || payslipPdfMutation.isPending) return;
+        const target = mode === "open" ? window.open("about:blank", "_blank") : null;
+        if (target) {
+            target.opener = null;
+            target.document.title = "Payslip PDF";
+            target.document.body.textContent = "Preparing payslip PDF...";
+        }
+        payslipPdfMutation.mutate({ mode, target });
     };
 
     const approvePotentialOvertime = () => {
@@ -1648,7 +1678,7 @@ export default function PayrollPage() {
                 )}
 
                 {payslipRecord && payslipPreviewRecord && createPortal(
-                    <div className="payroll-print-root" aria-hidden="true" data-payroll-print-sheet>
+                    <div ref={payslipPrintRef} className="payroll-print-root" aria-hidden="true" data-payroll-print-sheet>
                         <PayslipDocument record={payslipPreviewRecord} money={money} payrollRunDay={systemSettings?.payrollRunDay} />
                     </div>, document.body
                 )}
@@ -1656,7 +1686,7 @@ export default function PayrollPage() {
                     <div
                         className="modal-backdrop-enter fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4 py-6 backdrop-blur-sm"
                         onMouseDown={(event) => {
-                            if (event.target === event.currentTarget && !sendPayslipMutation.isPending) {
+                            if (event.target === event.currentTarget && !sendPayslipMutation.isPending && !payslipPdfMutation.isPending) {
                                 setPayslipRecord(null);
                             }
                         }}
@@ -1677,7 +1707,7 @@ export default function PayrollPage() {
                                                 aria-expanded={isPayslipCutoffOpen}
                                                 aria-haspopup="listbox"
                                                 aria-label="Select payslip cutoff"
-                                                disabled={sendPayslipMutation.isPending}
+                                                disabled={sendPayslipMutation.isPending || payslipPdfMutation.isPending}
                                                 onClick={() => setIsPayslipCutoffOpen((current) => !current)}
                                             >
                                                 <span className="shrink-0 text-[0.65rem] font-bold uppercase tracking-[0.14em] text-slate-400">Cutoff</span>
@@ -1707,6 +1737,7 @@ export default function PayrollPage() {
                                                                     aria-selected={isSelected}
                                                                     onClick={() => {
                                                                         setPayslipCutoffPeriod(option.value);
+                                                                        setPayslipDeliveryStatus("");
                                                                         setIsPayslipCutoffOpen(false);
                                                                     }}
                                                                 >
@@ -1736,7 +1767,7 @@ export default function PayrollPage() {
                                             className="flex h-10 items-center gap-2 rounded-lg bg-emerald-500 px-3 text-sm font-semibold text-white transition hover:bg-emerald-600 disabled:cursor-wait disabled:opacity-60"
                                             type="button"
                                             onClick={() => sendPayslipMutation.mutate()}
-                                            disabled={!isPayslipOutputReady || sendPayslipMutation.isPending}
+                                            disabled={!isPayslipOutputReady || sendPayslipMutation.isPending || payslipPdfMutation.isPending}
                                         >
                                             <FiSend className="size-4" aria-hidden="true" />
                                             {sendPayslipMutation.isPending ? "Sending..." : "Send to Messages"}
@@ -1744,18 +1775,27 @@ export default function PayrollPage() {
                                         <button
                                             className="flex h-10 items-center gap-2 rounded-lg border border-white/10 bg-white/[0.06] px-3 text-sm font-semibold text-white/80 transition hover:bg-white/10 hover:text-white"
                                             type="button"
-                                            onClick={printPayslip}
-                                            disabled={!isPayslipOutputReady || sendPayslipMutation.isPending}
+                                            onClick={() => printPayslip("open")}
+                                            disabled={!isPayslipOutputReady || sendPayslipMutation.isPending || payslipPdfMutation.isPending}
                                         >
                                             <FiPrinter className="size-4" aria-hidden="true" />
-                                            Print / Save PDF
+                                            {payslipPdfMutation.isPending && payslipPdfMutation.variables?.mode === "open" ? "Preparing..." : "Print"}
+                                        </button>
+                                        <button
+                                            className="flex h-10 items-center gap-2 rounded-lg border border-white/10 bg-white/[0.06] px-3 text-sm font-semibold text-white/80 transition hover:bg-white/10 hover:text-white disabled:opacity-60"
+                                            type="button"
+                                            onClick={() => printPayslip("save")}
+                                            disabled={!isPayslipOutputReady || sendPayslipMutation.isPending || payslipPdfMutation.isPending}
+                                        >
+                                            <FiDownload className="size-4" aria-hidden="true" />
+                                            {payslipPdfMutation.isPending && payslipPdfMutation.variables?.mode === "save" ? "Preparing..." : "Save PDF"}
                                         </button>
                                         <button
                                             className="flex size-10 shrink-0 items-center justify-center rounded-lg border border-white/10 bg-white/[0.05] text-white/65 transition hover:bg-white/10 hover:text-white"
                                             type="button"
                                             onClick={() => setPayslipRecord(null)}
                                             aria-label="Close payslip"
-                                            disabled={sendPayslipMutation.isPending}
+                                            disabled={sendPayslipMutation.isPending || payslipPdfMutation.isPending}
                                         >
                                             <FiX className="size-4" />
                                         </button>
