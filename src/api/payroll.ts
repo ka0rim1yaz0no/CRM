@@ -91,6 +91,7 @@ export type PayrollDtrRow = {
 
 export type PayrollDtr = {
     storedCutoff?: boolean;
+    currentAttendanceWarning?: string;
     potentialOvertimeHours?: number;
     employee: {
         _id: string;
@@ -107,7 +108,7 @@ export type PayrollDtr = {
         absentHours: number;
         lateDays: number;
         lateHours: number;
-        workingDays: number;
+        workingDays: number | null;
         monthlyWorkingDays: number;
         workedHours: number;
         overtimeHours: number;

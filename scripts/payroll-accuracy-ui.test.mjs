@@ -31,6 +31,10 @@ test("payroll uses saved backend rates and a preview, never a frontend eight-hou
     const page = readFileSync(new URL("../src/pages/admin/payroll/index.tsx", import.meta.url), "utf8");
     assert.match(page, /getPayrollAccuracyConfig/); assert.match(page, /PayrollRecomputeDialog/);
     assert.match(page, /paidHoursPerDay/); assert.match(page, /!payslipDtr\?\.storedCutoff/);
+    assert.match(page, /employeeDtr\.currentAttendanceWarning && <p role="alert"/);
+    assert.match(page, /Saved pay has not changed/);
+    assert.match(page, /employeeDtr\.potentialOvertimeHours \?\? employeeDtr\.summary\.overtimeHours/);
+    for (const field of ["grossHours", "lunchHours", "regularHours", "overtimeHours"]) assert.ok(page.includes(`formatHoursMinutes(row.${field})`));
     assert.doesNotMatch(page, /\/\s*8\b/);
     const hub = readFileSync(new URL("../src/components/AttendanceHub.tsx", import.meta.url), "utf8");
     assert.doesNotMatch(hub, /<h3>Breaks<\/h3>/); assert.match(hub, /firstBreak: "1st Break", secondBreak: "2nd Break"/);

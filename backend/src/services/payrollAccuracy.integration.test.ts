@@ -105,6 +105,7 @@ test("stored cutoff survives settings changes, attendance sync and repeated GETs
     assert.equal((await request("/payroll/stats", undefined, business)).status, 200);
     const dtr = await request(`/payroll/dtr/90000003?payPeriod=${encodeURIComponent(period)}`, undefined, business);
     assert.equal(dtr.status, 200); assert.equal(dtr.data.summary.paidHoursPerDay, 8); assert.equal(dtr.data.summary.deductions, 46.20);
+    assert.equal(dtr.data.summary.workingDays, 1); assert.equal(dtr.data.summary.monthlyWorkingDays, 23);
     await runWithBusiness(business, () => syncEmployeePayrollRecords(period));
   }
   assert.equal(await runWithBusiness("pay-a", async () => JSON.stringify(await PayrollRecord.findOne().lean())), before);
@@ -114,6 +115,33 @@ test("invalid/missing shift configuration returns 422 instead of inventing rates
   for (const business of ["pay-a", "pay-b"]) await runWithBusiness(business, () => SystemSettings.deleteMany({}));
   const result = await preview(); assert.equal(result.status, 422); assert.match(result.data.message, /Shift settings are required for payroll/);
   assert.equal(await runWithBusiness("pay-a", () => PayrollRecord.countDocuments()), 0);
+});
+
+test("saved payslips remain readable when current settings are missing, without inventing attendance rows", async () => {
+  const first = await preview(); assert.equal((await confirm(first.data)).status, 200);
+  const before = await runWithBusiness("pay-a", async () => JSON.stringify(await PayrollRecord.findOne().lean()));
+  await AttendancePolicy.deleteMany({});
+  for (const business of ["pay-a", "pay-b"]) await runWithBusiness(business, () => SystemSettings.deleteMany({}));
+  for (const business of ["pay-a", "pay-b"]) {
+    const result = await request(`/payroll/dtr/90000003?payPeriod=${encodeURIComponent(period)}`, undefined, business);
+    assert.equal(result.status, 200, JSON.stringify(result.data));
+    assert.equal(result.data.storedCutoff, true); assert.equal(result.data.summary.netPay, 14953.80);
+    assert.equal(result.data.summary.paidHoursPerDay, 8); assert.deepEqual(result.data.rows, []);
+    assert.equal(result.data.summary.workingDays, null); assert.equal(result.data.summary.monthlyWorkingDays, 23);
+    assert.match(result.data.currentAttendanceWarning, /Shift settings are required/);
+  }
+  assert.equal((await preview()).status, 422);
+  assert.equal(await runWithBusiness("pay-a", async () => JSON.stringify(await PayrollRecord.findOne().lean())), before);
+});
+
+test("overtime approvals reject coerced values and unknown employee codes", async () => {
+  for (const value of [null, true, false, "", "0", [], {}]) {
+    const result = await preview({ "90000003": value });
+    assert.equal(result.status, 422, JSON.stringify({ value, result }));
+  }
+  assert.equal((await preview({ "missing-synthetic-employee": 0 })).status, 422);
+  assert.equal((await preview({ "90000003": 0 })).status, 200);
+  for (const business of ["pay-a", "pay-b"]) assert.equal(await runWithBusiness(business, () => PayrollRecord.countDocuments()), 0);
 });
 test("partial or overlapping cutoff ranges cannot generate another half-salary payment", async () => {
   assert.equal((await request("/payroll/recompute/preview", { payPeriod: "Oct 14, 2026 - Oct 15, 2026" })).status, 422);
@@ -158,6 +186,71 @@ test("owner business settles a shared cutoff once and paid cutoffs cannot be rec
   assert.equal((await preview()).status, 422);
   assert.equal((await runWithBusiness("pay-b", () => PayrollRecord.findOne().lean()))?.status, "Paid");
 });
+
+test("payment retains original cutoff mirrors after an employee's current business membership changes", async () => {
+  const first = await preview(); assert.equal((await confirm(first.data)).status, 200);
+  await setBusinessAccessForEmployeeCode("90000003", ["pay-a"]);
+  await AttendanceLedger.updateOne({ _id: "synthetic-payroll" }, { businessIds: ["pay-a"] });
+  const a = await runWithBusiness("pay-a", () => PayrollRecord.findOne().lean());
+  assert.equal((await request(`/payroll/records/${a!._id}/paid`, {}, "pay-a", token, "PATCH")).status, 200);
+  for (const business of ["pay-a", "pay-b"]) assert.equal((await runWithBusiness(business, () => PayrollRecord.findOne().lean()))?.status, "Paid");
+});
+
+test("payment rejects differing mirror ownership and changes neither business", async () => {
+  const first = await preview(); assert.equal((await confirm(first.data)).status, 200);
+  await runWithBusiness("pay-b", () => PayrollRecord.updateOne({}, { payrollOwnerBusinessId: "pay-b" }));
+  const a = await runWithBusiness("pay-a", () => PayrollRecord.findOne().lean());
+  const result = await request(`/payroll/records/${a!._id}/paid`, {}, "pay-a", token, "PATCH");
+  assert.equal(result.status, 422, JSON.stringify(result.data));
+  for (const business of ["pay-a", "pay-b"]) assert.equal((await runWithBusiness(business, () => PayrollRecord.findOne().lean()))?.status, "Pending");
+});
+
+test("equivalent legacy attendance copies do not conflict over database IDs or business display details", async () => {
+  await AttendanceLedger.deleteMany({});
+  await runWithBusiness("pay-b", () => Employee.updateOne({ employeeCode: "90000003" }, { name: "Synthetic Payroll B", team: "Synthetic B", email: "pay-b@example.invalid" }));
+  const result = await preview(); assert.equal(result.status, 200, JSON.stringify(result.data));
+  assert.equal(result.data.canApply, true); assert.equal((await confirm(result.data)).status, 200);
+  const a = await runWithBusiness("pay-a", () => PayrollRecord.findOne().lean()), b = await runWithBusiness("pay-b", () => PayrollRecord.findOne().lean());
+  assert.equal(a?.netPay, b?.netPay); assert.equal(b?.employeeName, "Synthetic Payroll B"); assert.equal(b?.department, "Synthetic B");
+  assert.notEqual((a?.calculationSnapshot?.evidence as Array<{ id: string }>)[0].id, (b?.calculationSnapshot?.evidence as Array<{ id: string }>)[0].id);
+  await runWithBusiness("pay-b", () => Attendance.updateOne({ eventId: "e2" }, { timeIn: new Date(start + 78 * 60_000) }));
+  assert.equal((await preview()).status, 422);
+});
+
+test("live business comparisons use one server timestamp even while the clock advances", async () => {
+  events = events.slice(0, 5);
+  await AttendanceLedger.updateOne({ _id: "synthetic-payroll" }, { events });
+  for (const business of ["pay-a", "pay-b"]) await runWithBusiness(business, () => Attendance.deleteMany({ eventId: { $in: ["e5", "e6", "e7"] } }));
+  const originalToken = token;
+  mock.timers.enable({ apis: ["Date"], now: new Date("2026-10-15T19:00:00Z") });
+  token = createAdminDashboardSession("90000001")!;
+  let now = Date.now();
+  const clock = mock.method(Date, "now", () => ++now);
+  try {
+    const result = await preview(); assert.equal(result.status, 200, JSON.stringify(result.data));
+    assert.equal(result.data.canApply, false); assert.equal(result.data.rows[0].reviewDays, 1);
+    assert.equal(result.data.rows[0].after.deductions, 0);
+  } finally { clock.mock.restore(); mock.timers.reset(); token = originalToken; }
+});
+
+test("legacy payment uses known ledger mirrors even when current access only lists the owner", async () => {
+  const first = await preview(); assert.equal((await confirm(first.data)).status, 200);
+  for (const business of ["pay-a", "pay-b"]) await runWithBusiness(business, () => PayrollRecord.updateOne({}, { $unset: { "calculationSnapshot.businessIds": 1 } }));
+  await setBusinessAccessForEmployeeCode("90000003", ["pay-a"]);
+  const a = await runWithBusiness("pay-a", () => PayrollRecord.findOne().lean());
+  assert.equal((await request(`/payroll/records/${a!._id}/paid`, {}, "pay-a", token, "PATCH")).status, 200);
+  const before = await runWithBusiness("pay-a", async () => JSON.stringify(await PayrollRecord.findOne().lean()));
+  assert.equal((await request(`/payroll/records/${a!._id}/paid`, {}, "pay-a", token, "PATCH")).status, 200);
+  assert.equal(await runWithBusiness("pay-a", async () => JSON.stringify(await PayrollRecord.findOne().lean())), before);
+  assert.equal((await runWithBusiness("pay-b", () => PayrollRecord.findOne().lean()))?.status, "Paid");
+});
+
+test("a stored cutoff does not mask database failures as an empty attendance result", async () => {
+  const first = await preview(); assert.equal((await confirm(first.data)).status, 200);
+  const stub = mock.method(getBusinessConnection("pay-a").model("Attendance"), "find", () => { throw new Error("Synthetic attendance database failure"); });
+  try { assert.equal((await request(`/payroll/dtr/90000003?payPeriod=${encodeURIComponent(period)}`)).status, 500); }
+  finally { stub.mock.restore(); }
+});
 test("signed login, attendance reads, and both dashboards remain available in every business", async () => {
   const employee = await request("/auth/login", { employeeCode: "90000003" }); assert.equal(employee.status, 200);
   const admin = await request("/auth/login", { employeeCode: "90000001" }); assert.equal(admin.status, 200);
@@ -199,6 +292,15 @@ test("weekend work is paid only after an explicit bounded overtime approval in t
   const approved = await request("/payroll/recompute/preview", { payPeriod: weekendPeriod, overtimeApprovals: { "90000003": 2 } });
   assert.equal(approved.status, 200); assert.equal(approved.data.rows[0].after.grossPay, 15326.09);
   assert.equal((await request("/payroll/recompute/confirm", { payPeriod: weekendPeriod, token: approved.data.token, overtimeApprovals: { "90000003": 2 }, confirm: true, reason: "Synthetic OT approval" })).status, 200);
+  const saved = await runWithBusiness("pay-a", async () => JSON.stringify(await PayrollRecord.findOne().lean()));
+  await AttendanceLedger.updateOne({ _id: "synthetic-payroll" }, { events: [] });
+  for (const business of ["pay-a", "pay-b"]) await runWithBusiness(business, () => Attendance.deleteMany({}));
+  const dtr = await request(`/payroll/dtr/90000003?payPeriod=${encodeURIComponent(weekendPeriod)}`);
+  assert.equal(dtr.status, 200, JSON.stringify(dtr.data));
+  assert.equal(dtr.data.summary.grossPay, 15326.09); assert.equal(dtr.data.summary.overtimeHours, 2);
+  assert.equal(dtr.data.potentialOvertimeHours, 0);
+  assert.equal((await request("/payroll/recompute/preview", { payPeriod: weekendPeriod })).status, 422);
+  assert.equal(await runWithBusiness("pay-a", async () => JSON.stringify(await PayrollRecord.findOne().lean())), saved);
 });
 test("a matching code in an unrelated business never borrows another business ledger or salary", async () => {
   await AttendanceLedger.updateOne({ _id: "synthetic-payroll" }, { businessIds: ["pay-a"] });

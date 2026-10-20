@@ -38,6 +38,19 @@ The shared boundary calculation could charge time outside the shift on malformed
 - Admin screen and DTR expose paid hours/day, hourly and minute rates. Old un-snapshotted hours are explicitly identified. DTR distinguishes saved monetary totals from current event rows. Unconfirmed cutoffs cannot be sent as finalized payslips through the updated UI.
 - The duplicate **Breaks / Break 1 / Break 2 detail-card panel** requested in the latest screenshot was removed. Shift-record columns, event timeline, totals and source events remain intact.
 
+### Follow-Up Bug Review
+
+Eight additional isolated integration tests and an extended weekend-OT regression cover the continued local review. The following failures were reproduced before fixing them:
+
+- Saved DTR/payslip reads used new-calculation validation, so missing current shift settings or reduced current OT evidence could make a valid saved cutoff unreadable. Saved money/rates/approved OT now come directly from the existing record. Current attendance is calculated separately; a settings validation failure returns an explicit warning and no invented event rows. Actual database failures still return an error. Generation/recomputation still rejects invalid settings and unsupported OT.
+- Payment could omit a historical mirror after business membership changed. New recompute snapshots retain their original sorted business IDs. Payment uses that frozen list; older snapshots fall back to the known scoped ledger/access list. Mismatching owners or snapshot membership reject the entire transaction. The source record is rechecked inside the transaction; repeated already-paid requests add no audit or timestamp changes. No historical record was backfilled. For old records without either a frozen list or surviving membership/ledger evidence, the complete historical mirror set remains unverifiable.
+- OT approval values such as `null`, booleans, arrays or numeric strings were silently converted to numbers, and unknown employee codes were ignored. The server now requires finite non-negative numeric hours for a listed employee; excessive verified hours remain blocked.
+- Equivalent legacy attendance copies conflicted over their unrelated Mongo IDs or business display labels. Financial comparison now includes settings, rates, allowance policy, event types/timestamps, shift information, DTR rows and monetary totals, not replica IDs/names. Each business retains its own labels and evidence IDs. A real event-time difference still blocks confirmation.
+- Comparing live business copies at separate server instants introduced a false mismatch in the first localhost recheck. Every preview now uses the existing shared server-read snapshot. A deliberately advancing-clock regression reproduces the old failure and passes with the fix; the actual localhost preview was rerun successfully afterward.
+- The browser exposed a monthly/cutoff weekday display mix-up and unformatted decimal-hour cells. DTR now separates current cutoff weekday count from the saved monthly rate denominator, labels an unavailable count explicitly, and displays durations with the existing hours/minutes formatter. Stored amounts/rates are unchanged.
+
+No rounding or attendance-action rules changed in this follow-up. Confirmation still requires a fresh matching preview, resolved evidence, an administrator and an audit reason. Calculation inputs are read before the payroll-write transaction; simultaneous attendance/policy edits during final confirmation are not fully fenced by this change. Resolve/freeze the selected cutoff operationally before approval; this is not a claim of production concurrency certification.
+
 ## Rechecked Data Check Findings
 
 Before changes, localhost returned 132 matches, four review flags and two unverifiable checks. Read-only independent queries again confirmed one unassigned NEW sample lead and one present-without-selected-shift-call condition in each of two synthetic businesses. They are legitimate workflow review signals, not evidence that a lead should be assigned to an arbitrary employee or that a call should be invented. No assignment, call, attendance or stored payroll was changed to clear them. The two historical disconnect checks still lack immutable disconnect history; that evidence cannot be recreated honestly.
@@ -72,7 +85,7 @@ Future rollout, not performed here: publish with flag OFF; back up the selected 
 
 ## Additive Storage / Recovery
 
-`PayrollRecord` gains optional paidHoursPerDay, hourlyRate, missingHours, calculationVersion, payrollOwnerBusinessId, calculationSnapshot and calculationAudit. No backfill/migration rewrites old records. The additional unique partial index applies only to unarchived `duration-payroll-v1` records. Existing legacy duplicates are neither removed nor silently merged; preview requires review.
+`PayrollRecord` gains optional paidHoursPerDay, hourlyRate, missingHours, calculationVersion, payrollOwnerBusinessId, calculationSnapshot and calculationAudit. New snapshots also retain their original businessIds; this is an additive key within the existing Mixed snapshot, not a migration. No backfill/migration rewrites old records. The additional unique partial index applies only to unarchived `duration-payroll-v1` records. Existing legacy duplicates are neither removed nor silently merged; preview requires review.
 
 Before restarting the local fixture, BSON dumps were taken of all four isolated databases and collection counts/attendance evidence were checked. The backup directory stays under ignored `outputs/`; it is not uploaded. General local backup/restore pattern:
 
@@ -85,7 +98,7 @@ Restore into a separate local copy and verify counts/evidence before selecting i
 
 ## Verification
 
-- Backend: `node --import tsx --test --test-reporter=spec "src/**/*.test.ts"` in backend: **481 total, 479 passed, 2 optional external-Mongo tests skipped, 0 failures**, 91.53 seconds. This includes real Mongo transactions, two-business payroll, three-business manual attendance and full-cutoff golden fixtures.
+- Backend: `node --import tsx --test --test-reporter=spec "src/**/*.test.ts"` in backend, final follow-up run: **489 total, 487 passed, 2 optional external-Mongo tests skipped, 0 failures**, 75.56 seconds. This includes all 24 payroll integration cases, real Mongo transactions, two-business payroll, three-business manual attendance and full-cutoff golden fixtures.
 - Frontend: `node --test --test-reporter=spec scripts/*.test.mjs`: **50 passed**, including disabled/explicit confirmation, displayed before/after amounts and removal of the duplicate break panel.
 - Backend `npm run typecheck`: passed. A timestamp typing gap caught during the check was fixed by accurately declaring the existing Mongoose timestamp fields; no stored data changed.
 - Root `npm run lint` and `npm run build`: passed. The existing 904 KB rich-text-editor bundle warning remains; it is not a new payroll failure.
@@ -95,6 +108,7 @@ Restore into a separate local copy and verify counts/evidence before selecting i
 - `outputs/verify-local-data-check.mts` and the independent flag investigation: passed their read-only/privacy assertions; actual findings are disclosed above rather than hidden.
 - The real local dry-run inspected both available cutoffs without applying differences. The separate CLI test seeds four available cutoffs and proves only the latest three are inspected, with unchanged payroll/attendance documents and auto-create/index disabled.
 - Browser: signed in to the final local backend; opened Payroll in Sample Operations, switched to Sample Studio, refreshed and opened the actual configured-range preview. Both employees' old/new figures and one review day each were visible. Confirm was disabled; no valid persistent record was changed. Saved proof: ignored `outputs/payroll-accuracy-local.png`. Data Check navigation stayed hidden. Desktop viewport was inspected; a full mobile/device matrix and production call timing were not tested.
+- Follow-up browser proof: normal login and the admin dashboard opened on the restarted localhost server; the saved DTR showed **11 cutoff weekdays / 23 monthly rate days** with its original money intact. Event duration cells displayed hours/minutes instead of long decimal fractions. Saved screenshot: ignored `outputs/payroll-followup-local.png`. Warning/error cases were exercised in isolated integration fixtures, not by damaging the persistent sample configuration.
 
 All fixtures are synthetic. No production behavior, remote GitHub CI result or zero-bug guarantee is implied.
 
@@ -113,6 +127,8 @@ Frontend: `api/payroll.ts`; new `components/admin/PayrollRecomputeDialog.tsx`; `
 5. On a disposable resolved fixture only, enter an audit reason, check confirmation and apply. Refresh/switch businesses: identical mirrored values, one logical payroll, and an audit entry. Repeat the old preview: stale confirmation must reject, not duplicate.
 6. Approve only verified weekend OT in the preview, re-preview changed inputs and explicitly confirm. Try excessive hours and an overlapping/partial cutoff: both must reject. In a disposable fixture, mark paid from the owner only; paid cutoffs cannot be recomputed.
 7. Login as the synthetic employee and check attendance status/buttons; new HTTP regression fixtures separately execute both breaks/lunch and verify three-business refresh behavior. No real employee's punches need to be changed for this check.
+8. In an isolated disposable fixture, remove current shift settings after saving a resolved cutoff: its DTR must still open with saved totals and a visible warning, while a new preview rejects with 422. A changed current OT history must not rewrite or prevent reading the existing OT payment. Automated integration tests exercise these changes without modifying the persistent localhost data.
+9. In the same disposable fixture, move an employee after cutoff generation and mark paid from the original owner. All frozen mirrors must update together. Conflicting ownership or a failed mirror must leave every business unchanged. Matching legacy copies with different internal IDs must preview normally; genuinely different event times must still reject.
 
 ## Limits / Open Questions
 

@@ -1496,10 +1496,11 @@ export default function PayrollPage() {
                                 {isDtrError && <p className="rounded-lg border border-rose-300 bg-rose-50 p-4 text-sm font-semibold text-rose-700">{(dtrError as { response?: { data?: { message?: string } } })?.response?.data?.message || "Unable to load DTR."}</p>}
                                 {employeeDtr && (
                                     <div className="space-y-4">
-                                        {accuracyConfig?.enabled && employeeDtr.storedCutoff && <p className="rounded-md border border-sky-200 bg-sky-50 p-3 text-sm !text-sky-900">Totals are the saved cutoff. Attendance rows reflect current evidence; preview a recompute to compare changes.</p>}
+                                        {accuracyConfig?.enabled && employeeDtr.storedCutoff && <p className="rounded-md border border-sky-200 bg-sky-50 p-3 text-sm !text-sky-900">Totals are the saved cutoff. {employeeDtr.currentAttendanceWarning ? "Current attendance is unavailable." : "Attendance rows reflect current evidence; preview a recompute to compare changes."}</p>}
+                                        {employeeDtr.currentAttendanceWarning && <p role="alert" className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm !text-amber-900">{employeeDtr.currentAttendanceWarning}. Saved pay has not changed.</p>}
                                         <div className="grid gap-3 md:grid-cols-4">
                                             {[
-                                                ["Cutoff Working Days", employeeDtr.summary.workingDays],
+                                                ["Cutoff Working Days", employeeDtr.summary.workingDays ?? "Unavailable"],
                                                 ["Monthly Rate Days", employeeDtr.summary.monthlyWorkingDays],
                                                 ["Paid hours / day", employeeDtr.summary.paidHoursPerDay ?? "Not snapshotted"],
                                                 ["Basic Pay", money(employeeDtr.summary.basicPay)],
@@ -1512,7 +1513,7 @@ export default function PayrollPage() {
                                                 ["Early Time Out", `${employeeDtr.summary.earlyTimeOutMinutes} min`],
                                                 ["Needs Review", employeeDtr.summary.incompleteShiftDays],
                                                 ["Regular Hours", formatHoursMinutes(employeeDtr.summary.workedHours)],
-                                                ["Potential OT", formatHoursMinutes(employeeDtr.summary.overtimeHours)],
+                                                ["Potential OT", employeeDtr.currentAttendanceWarning ? "Unavailable" : formatHoursMinutes(employeeDtr.potentialOvertimeHours ?? employeeDtr.summary.overtimeHours)],
                                                 ["Approved OT", formatHoursMinutes(dtrRecord.overtimeHours || 0)],
                                                 ["Hourly Rate", money(employeeDtr.summary.hourlyRate)],
                                                 ["Per Minute", money(employeeDtr.summary.minuteRate)],
@@ -1558,10 +1559,10 @@ export default function PayrollPage() {
                                                                 </td>
                                                                 <td className="px-3 py-3 !text-black">{row.timeIn}</td>
                                                                 <td className="px-3 py-3 !text-black">{row.timeOut}</td>
-                                                                <td className="px-3 py-3 text-right !text-black">{row.grossHours}h</td>
-                                                                <td className="px-3 py-3 text-right !text-black">{row.lunchHours}h</td>
-                                                                <td className="px-3 py-3 text-right !text-black">{row.regularHours}h</td>
-                                                                <td className="px-3 py-3 text-right font-semibold text-violet-700">{row.overtimeHours}h</td>
+                                                                <td className="px-3 py-3 text-right !text-black">{formatHoursMinutes(row.grossHours)}</td>
+                                                                <td className="px-3 py-3 text-right !text-black">{formatHoursMinutes(row.lunchHours)}</td>
+                                                                <td className="px-3 py-3 text-right !text-black">{formatHoursMinutes(row.regularHours)}</td>
+                                                                <td className="px-3 py-3 text-right font-semibold text-violet-700">{formatHoursMinutes(row.overtimeHours)}</td>
                                                                 <td className="px-3 py-3 text-right font-semibold text-rose-700">{formatHoursMinutes(row.lateHours)}</td>
                                                                 <td className="px-3 py-3 text-right font-semibold text-amber-700">{row.excessLunchMinutes} min</td>
                                                                 <td className="px-3 py-3 text-right font-semibold text-amber-700">{row.excessBreakMinutes} min</td>

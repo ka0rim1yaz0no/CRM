@@ -11,6 +11,7 @@ import { projectAttendance } from "./attendanceSessionState";
 import { getBusinessAccessForEmployeeCode } from "../models/BusinessUserAccess";
 import { attendancePayrollDtr, payrollCalculationContext, payrollRatesForCutoff, periodRange, isConfiguredPayrollPeriod, scheduledPayDateForPeriod } from "../controllers/payrollController";
 import { roundMoney, PayrollValidationError } from "./payrollAccuracy";
+import { serverReadTime, withReadSnapshot } from "./readSnapshot";
 
 const fail = (statusCode: number, message: string) => Object.assign(new Error(message), { statusCode });
 const fingerprint = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -54,17 +55,39 @@ export async function calculatePayrollCandidate(employee: { _id: Types.ObjectId;
   return { record, value, dtr, rates };
 }
 
+function calculationFingerprint(candidate: Awaited<ReturnType<typeof calculatePayrollCandidate>>) {
+  const { value, dtr, rates } = candidate;
+  const snapshot = value.calculationSnapshot;
+  // Replica ObjectIds and business-specific labels are not payroll inputs.
+  return fingerprint({ summary: dtr.summary, rows: dtr.rows, rates, ...moneyFields(value),
+    approvedOvertimeHours: value.overtimeHours, payType: value.payType, payPeriod: value.payPeriod, paidOn: value.paidOn,
+    settings: snapshot.settings, policy: snapshot.policy, rounding: snapshot.rounding,
+    evidence: snapshot.evidence.map(event => ({ source: event.source, at: event.at, shift: "shift" in event ? event.shift ?? null : null })) });
+}
+
 export async function getAccuratePayrollDtr(employee: Parameters<typeof calculatePayrollCandidate>[0], payPeriod: string) {
+  const saved = await PayrollRecord.findOne({ employeeId: employee.employeeCode, payPeriod, isArchived: false }).lean();
+  // Viewing an existing cutoff must not depend on approval of a new calculation.
+  if (saved) {
+    let current: Awaited<ReturnType<typeof attendancePayrollDtr>> | undefined;
+    let currentAttendanceWarning: string | undefined;
+    try { current = await attendancePayrollDtr(employee._id, payPeriod); }
+    catch (error) {
+      if (!(error instanceof PayrollValidationError)) throw error;
+      currentAttendanceWarning = error.message;
+    }
+    return { employee: { _id: employee._id, name: saved.employeeName, employeeCode: saved.employeeId, department: saved.department },
+      payPeriod, payDate: saved.paidOn, payType: saved.payType, storedCutoff: true, currentAttendanceWarning,
+      potentialOvertimeHours: current?.summary.overtimeHours ?? 0,
+      summary: { ...saved, paidHoursPerDay: saved.paidHoursPerDay ?? null, hourlyRate: saved.hourlyRate ?? saved.minuteRate * 60,
+        workingDays: current?.summary.workingDays ?? null, monthlyWorkingDays: saved.workingDays, missingHours: saved.missingHours ?? saved.deductibleMinutes / 60 },
+      rows: current?.rows.filter(row => row.status !== "Scheduled") || [] };
+  }
   const candidate = await calculatePayrollCandidate(employee, payPeriod);
-  const saved = candidate.record;
   return { employee: { _id: employee._id, name: employee.name, employeeCode: employee.employeeCode, department: employee.team || employee.role || "General" },
-    payPeriod, payDate: saved?.paidOn || "-", payType: saved?.payType || "Semi-monthly",
-    storedCutoff: Boolean(saved), potentialOvertimeHours: candidate.dtr.summary.overtimeHours,
-    summary: { ...candidate.dtr.summary, ...candidate.rates,
-      ...candidate.value, ...(saved ? saved : {}),
-      // Old records have no paid-day snapshot; do not invent one from today's settings.
-      ...(saved ? { paidHoursPerDay: saved.paidHoursPerDay ?? null, hourlyRate: saved.hourlyRate ?? saved.minuteRate * 60,
-        monthlyWorkingDays: saved.workingDays, missingHours: saved.missingHours ?? saved.deductibleMinutes / 60 } : {}) },
+    payPeriod, payDate: candidate.value.paidOn, payType: candidate.value.payType,
+    storedCutoff: false, potentialOvertimeHours: candidate.dtr.summary.overtimeHours,
+    summary: { ...candidate.dtr.summary, ...candidate.rates, ...candidate.value, workingDays: candidate.dtr.summary.workingDays },
     rows: candidate.dtr.rows.filter(row => row.status !== "Scheduled") };
 }
 
@@ -72,6 +95,10 @@ type PlanRow = { employeeCode: string; employeeName: string; ownerBusinessId: st
   before: ReturnType<typeof moneyFields>; after: ReturnType<typeof moneyFields>; difference: number; reviewDays: number; potentialOvertimeHours: number; approvedOvertimeHours: number };
 type Target = { businessId: string; id: string; beforeHash: string; before: Record<string, unknown> | null; value: Record<string, unknown> };
 export async function previewPayrollCutoff(payPeriod: string, overtimeApprovals: unknown = {}) {
+  return withReadSnapshot(serverReadTime(), () => buildPayrollCutoff(payPeriod, overtimeApprovals));
+}
+
+async function buildPayrollCutoff(payPeriod: string, overtimeApprovals: unknown) {
   if (!/^[A-Za-z]+ \d{1,2}, \d{4} - [A-Za-z]+ \d{1,2}, \d{4}$/.test(payPeriod)) throw new PayrollValidationError("Choose an explicit cutoff date range");
   const context = await payrollCalculationContext();
   if (context.settings.payrollBillingCycle !== "Semi-monthly" || !isConfiguredPayrollPeriod(payPeriod, context.settings)) {
@@ -81,6 +108,11 @@ export async function previewPayrollCutoff(payPeriod: string, overtimeApprovals:
   if (!overtimeApprovals || typeof overtimeApprovals !== "object" || Array.isArray(overtimeApprovals)) throw new PayrollValidationError("Overtime approvals must be employee-code keyed hours");
   const approvals = overtimeApprovals as Record<string, unknown>;
   const employees = await Employee.find({ status: { $ne: "Archived" } }).select("employeeCode name email role team salary").sort({ employeeCode: 1 }).lean();
+  for (const [code, hours] of Object.entries(approvals)) {
+    if (!employees.some(employee => employee.employeeCode === code) || typeof hours !== "number" || !Number.isFinite(hours) || hours < 0) {
+      throw new PayrollValidationError("Overtime approvals require a listed employee code and non-negative numeric hours");
+    }
+  }
   const seen = new Set<string>();
   const rows: PlanRow[] = [], targets: Target[] = [];
   for (const employee of employees) {
@@ -90,7 +122,8 @@ export async function previewPayrollCutoff(payPeriod: string, overtimeApprovals:
     const ledger = await AttendanceLedger.findOne({ employeeCode: employee.employeeCode, businessIds: business }).select("canonicalBusinessId businessIds").lean();
     const businessIds = [...new Set([...(access.length ? access : ledger?.businessIds || []), business])].sort();
     const ownerBusinessId = ledger?.canonicalBusinessId || businessIds[0];
-    const override = Object.hasOwn(approvals, employee.employeeCode) ? Number(approvals[employee.employeeCode]) : undefined;
+    if (!businessIds.includes(ownerBusinessId)) throw new PayrollValidationError("Payroll owner is outside the employee's businesses; review membership before recomputing");
+    const override = Object.hasOwn(approvals, employee.employeeCode) ? approvals[employee.employeeCode] as number : undefined;
     const candidate = await calculatePayrollCandidate(employee, payPeriod, override);
     let reviewDays = candidate.dtr.summary.incompleteShiftDays;
     for (const businessId of businessIds) {
@@ -99,7 +132,7 @@ export async function previewPayrollCutoff(payPeriod: string, overtimeApprovals:
         const other = await Employee.findOne({ employeeCode: employee.employeeCode, status: { $ne: "Archived" } }).select("employeeCode name email role team salary").lean();
         if (!other) throw new PayrollValidationError("Employee membership mismatch across businesses; no changes applied");
         const counterpart = businessId === business ? candidate : await calculatePayrollCandidate(other, payPeriod, override);
-        if (fingerprint(counterpart.value) !== fingerprint(candidate.value)) throw new PayrollValidationError("Payroll settings, salary or attendance differ across businesses; resolve the mismatch before recomputing");
+        if (calculationFingerprint(counterpart) !== calculationFingerprint(candidate)) throw new PayrollValidationError("Payroll settings, salary or attendance differ across businesses; resolve the mismatch before recomputing");
         const old = counterpart.record;
         const otherPeriods = await PayrollRecord.find({ employeeId: employee.employeeCode,
           ...(old ? { _id: { $ne: old._id } } : {}), $or: [{ isArchived: false }, { status: { $in: ["Paid", "Completed"] } }] }).select("payPeriod").lean();
@@ -114,7 +147,8 @@ export async function previewPayrollCutoff(payPeriod: string, overtimeApprovals:
         const archived = old ? null : await PayrollRecord.findOne({ employeeId: employee.employeeCode, payPeriod, isArchived: true }).sort({ updatedAt: -1 }).select("_id").lean();
         const id = old?._id.toString() || createHash("sha256").update(`${businessId}:${employee.employeeCode}:${payPeriod}:duration-payroll-v1:${archived?._id || "initial"}`).digest("hex").slice(0, 24);
         targets.push({ businessId, id, beforeHash: fingerprint(old || null), before: old as Record<string, unknown> | null,
-          value: { ...candidate.value, payrollOwnerBusinessId: ownerBusinessId } });
+          value: { ...counterpart.value, payrollOwnerBusinessId: ownerBusinessId,
+            calculationSnapshot: { ...counterpart.value.calculationSnapshot, businessIds } } });
       });
     }
     rows.push({ employeeCode: employee.employeeCode, employeeName: employee.name, ownerBusinessId, businessIds,
@@ -159,23 +193,40 @@ export async function updateAccurateOvertime(request: Request) {
 }
 
 export async function setAccuratePayrollPaid(request: Request, paid: boolean) {
+  const actor = verifyAdminDashboardSession(request.header("x-crm-admin-session"));
+  if (!actor) throw fail(403, "A verified administrator session is required");
   const source = await PayrollRecord.findById(request.params.id).lean();
   if (!source || source.isArchived) throw fail(404, "Payroll record not found");
   if (source.payrollOwnerBusinessId && source.payrollOwnerBusinessId !== getCurrentBusinessId()) throw new PayrollValidationError("Change payment status in the cutoff's owning business");
   if (paid && (source.incompleteShiftDays || source.status === "Review")) throw new PayrollValidationError("Resolve attendance review before marking payroll paid");
   const access = await getBusinessAccessForEmployeeCode(source.employeeId);
-  const businessIds = [...new Set([...access, getCurrentBusinessId()])];
+  const ledger = await AttendanceLedger.findOne({ employeeCode: source.employeeId, businessIds: getCurrentBusinessId() }).select("businessIds").lean();
+  const frozenBusinessIds = source.calculationSnapshot?.businessIds;
+  if (frozenBusinessIds !== undefined && (!Array.isArray(frozenBusinessIds) || !frozenBusinessIds.length ||
+    frozenBusinessIds.some(id => typeof id !== "string" || !getBusinessById(id)))) {
+    throw new PayrollValidationError("Invalid cutoff business snapshot; payment status was not changed");
+  }
+  // Existing cutoffs retain their original mirrors even after staff move businesses.
+  const businessIds = [...new Set<string>(frozenBusinessIds === undefined ? [...access, ...(ledger?.businessIds || []), getCurrentBusinessId()] : frozenBusinessIds as string[])].sort();
+  if (!businessIds.includes(getCurrentBusinessId()) || (source.payrollOwnerBusinessId && !businessIds.includes(source.payrollOwnerBusinessId)) || businessIds.some(id => !getBusinessById(id))) {
+    throw new PayrollValidationError("Payroll business membership mismatch; payment status was not changed");
+  }
   const session = await mongoose.startSession();
   const paidOn = paid ? new Date().toLocaleDateString("en-US", { timeZone: "Asia/Manila", month: "short", day: "numeric", year: "numeric" }) : "-";
   try {
     await session.withTransaction(async () => {
+      const currentSource = await PayrollRecord.findById(source._id).session(session).lean();
+      if (fingerprint(currentSource) !== fingerprint(source)) throw fail(409, "Payroll changed during payment confirmation. Refresh and try again.");
       for (const businessId of businessIds) await runWithBusiness(businessId, async () => {
         const records = await PayrollRecord.find({ employeeId: source.employeeId, payPeriod: source.payPeriod, isArchived: false }).session(session).lean();
         if (records.length !== 1 || fingerprint(moneyFields(records[0])) !== fingerprint(moneyFields(source))) throw new PayrollValidationError("Payroll mirror mismatch; payment status was not changed");
+        if (records[0].payrollOwnerBusinessId !== source.payrollOwnerBusinessId || fingerprint(records[0].calculationSnapshot?.businessIds ?? null) !== fingerprint(frozenBusinessIds ?? null)) {
+          throw new PayrollValidationError("Payroll mirror ownership or business snapshot differs; payment status was not changed");
+        }
         if (paid && (records[0].incompleteShiftDays || records[0].status === "Review")) throw new PayrollValidationError("A business has unresolved payroll review");
         if (records[0].status === (paid ? "Paid" : "Pending")) return;
         await PayrollRecord.updateOne({ _id: records[0]._id }, { $set: { status: paid ? "Paid" : "Pending", paidOn }, $push: { calculationAudit: {
-          at: new Date().toISOString(), actor: verifyAdminDashboardSession(request.header("x-crm-admin-session"))!.employeeCode,
+          at: new Date().toISOString(), actor: actor.employeeCode,
           reason: paid ? "Administrator marked shared cutoff paid" : "Administrator marked shared cutoff unpaid",
           before: { status: records[0].status, paidOn: records[0].paidOn }, after: { status: paid ? "Paid" : "Pending", paidOn } } } }, { session, runValidators: true });
       });
