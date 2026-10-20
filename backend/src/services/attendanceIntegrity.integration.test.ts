@@ -8,6 +8,8 @@ import mongoose from "mongoose";
 import { MongoMemoryReplSet } from "mongodb-memory-server";
 
 process.env.NODE_ENV = "test";
+// Characterize rollback, including its automatic draft-payroll refresh.
+process.env.CRM_PAYROLL_ACCURACY = "false";
 const prefix = `att_test_${crypto.randomUUID().replaceAll("-", "").slice(0, 16)}`;
 process.env.BUSINESS_DATABASES = JSON.stringify([{ id: "test-a", name: "Synthetic A", databaseName: `${prefix}_a` }, { id: "test-b", name: "Synthetic B", databaseName: `${prefix}_b` }, { id: "test-c", name: "Synthetic C", databaseName: `${prefix}_c` }]);
 process.env.DEFAULT_BUSINESS_ID = "test-a";

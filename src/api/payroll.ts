@@ -15,6 +15,11 @@ export type PayrollRecord = {
     basicPay?: number;
     workingDays?: number;
     minuteRate?: number;
+    paidHoursPerDay?: number | null;
+    hourlyRate?: number;
+    calculationVersion?: string;
+    payrollOwnerBusinessId?: string;
+    calculationSnapshot?: { monthlySalary?: number };
     lateMinutes?: number;
     excessLunchMinutes?: number;
     excessBreakMinutes?: number;
@@ -85,6 +90,8 @@ export type PayrollDtrRow = {
 };
 
 export type PayrollDtr = {
+    storedCutoff?: boolean;
+    potentialOvertimeHours?: number;
     employee: {
         _id: string;
         name: string;
@@ -110,6 +117,7 @@ export type PayrollDtr = {
         basicPay: number;
         hourlyRate: number;
         minuteRate: number;
+        paidHoursPerDay?: number | null;
         lateMinutes: number;
         excessLunchMinutes: number;
         excessBreakMinutes: number;
@@ -122,6 +130,18 @@ export type PayrollDtr = {
     };
     rows: PayrollDtrRow[];
 };
+
+export type PayrollPreview = { payPeriod: string; token: string; totalDifference: number; canApply: boolean;
+    rows: Array<{ employeeCode: string; employeeName: string; ownerBusinessId: string; businessIds: string[]; reviewDays: number;
+        before: { grossPay: number; deductions: number; netPay: number }; after: { grossPay: number; deductions: number; netPay: number };
+        difference: number; potentialOvertimeHours: number; approvedOvertimeHours: number }> };
+export async function getPayrollAccuracyConfig() { return (await api.get<{ enabled: boolean }>("/payroll/accuracy-config")).data; }
+export async function previewPayrollCutoff(payPeriod: string, overtimeApprovals: Record<string, number>) {
+    return (await api.post<PayrollPreview>("/payroll/recompute/preview", { payPeriod, overtimeApprovals })).data;
+}
+export async function confirmPayrollCutoff(preview: PayrollPreview, reason: string, overtimeApprovals: Record<string, number>) {
+    return (await api.post<{ applied: number; mirrors: number }>("/payroll/recompute/confirm", { payPeriod: preview.payPeriod, token: preview.token, reason, overtimeApprovals, confirm: true })).data;
+}
 
 export type PayrollRecordInput = Omit<PayrollRecord, "_id" | "netPay" | "createdAt" | "updatedAt">;
 export type PayrollItemInput = Omit<PayrollListItem, "_id">;

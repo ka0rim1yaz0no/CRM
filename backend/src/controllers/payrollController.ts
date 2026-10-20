@@ -1,7 +1,13 @@
 import type { Request, Response } from "express";
 import { createHash } from "node:crypto";
 import { excessClickedSessionMinutes, calculateSlotAttendance, accountTime, bucketForAttendanceSource } from "../services/timeAccounting";
-import { attendanceDurationModelEnabled } from "../config/rolloutFlags";
+import { attendanceDurationModelEnabled, payrollAccuracyEnabled } from "../config/rolloutFlags";
+import { accuratePayrollRates, accuratePayrollDay, paidHoursPerDay, PayrollValidationError, type PayrollShiftSettings } from "../services/payrollAccuracy";
+import { legacyPayrollPolicy } from "../services/payrollLegacyPolicy";
+import { AttendanceLedger, AttendancePolicy } from "../models/AttendanceLedger";
+import { SystemSettings } from "../models/SystemSettings";
+import { projectAttendance } from "../services/attendanceSessionState";
+import { serverReadTime } from "../services/readSnapshot";
 import { attendancePolicy } from "../services/attendanceLedgerService";
 import { hubShiftBounds } from "../services/attendanceHubMath";
 import type { SortOrder } from "mongoose";
@@ -41,6 +47,7 @@ type PayrollCutoffPeriod = {
 };
 
 type PayrollAttendanceSummary = {
+  paidHoursPerDay?: number;
   attendanceDays: number;
   absentDays: number;
   absentHours: number;
@@ -65,6 +72,7 @@ type PayrollCalculatedAttendance = PayrollAttendanceSummary & {
 };
 
 type PayrollDtrRow = {
+  deductibleMinutes?: number;
   dateKey: string;
   date: string;
   day: string;
@@ -149,6 +157,12 @@ function cutoffPeriodsNear(referenceDate: Date, settings?: PayrollCutoffSettings
   }
 
   return periods.sort((first, second) => first.payDate.getTime() - second.payDate.getTime());
+}
+
+export function isConfiguredPayrollPeriod(payPeriod: string, settings: PayrollCutoffSettings) {
+  const range = periodRange(payPeriod);
+  const final = new Date(range.end); final.setDate(final.getDate() - 1);
+  return cutoffPeriodsNear(range.start, settings).some(period => +period.start === +range.start && +period.end === +final);
 }
 
 function formatPeriodDate(date: Date) {
@@ -528,17 +542,19 @@ export function monthlyWorkingDaysForPayPeriod(payPeriod: string) {
   return countWorkingDays(cycle.start, cycle.end);
 }
 
-export function payrollRatesForCutoff(monthlySalaryValue: number, payPeriod: string) {
+export function payrollRatesForCutoff(monthlySalaryValue: number, payPeriod: string, settings?: PayrollShiftSettings, policy?: { lunchMinutes: number }) {
+  if (payrollAccuracyEnabled()) return accuratePayrollRates(monthlySalaryValue, monthlyWorkingDaysForPayPeriod(payPeriod), settings || {}, policy || { lunchMinutes: NaN });
   const monthlySalary = roundMoney(Math.max(Number(monthlySalaryValue) || 0, 0));
   const monthlyWorkingDays = monthlyWorkingDaysForPayPeriod(payPeriod);
   const cutoffBasePay = roundMoney(monthlySalary / 2);
-  const hourlyRate = monthlyWorkingDays > 0 ? monthlySalary / monthlyWorkingDays / 8 : 0;
+  const hourlyRate = monthlyWorkingDays > 0 ? monthlySalary / monthlyWorkingDays / legacyPayrollPolicy.paidHoursPerDay : 0;
   return {
     monthlySalary,
     monthlyWorkingDays,
     cutoffBasePay,
     hourlyRate,
     minuteRate: hourlyRate / 60,
+    paidHoursPerDay: legacyPayrollPolicy.paidHoursPerDay,
   };
 }
 
@@ -593,6 +609,7 @@ function lastRecord<TRecord extends { source: string; timeIn: Date }>(records: T
 }
 
 export async function attendancePayrollDtr(employeeId: Types.ObjectId, payPeriod: string) {
+  if (payrollAccuracyEnabled()) return accurateAttendancePayrollDtr(employeeId, payPeriod);
   const settings = await getSystemSettings();
   const { start, end } = periodRange(payPeriod);
   const durationModel = attendanceDurationModelEnabled();
@@ -603,7 +620,7 @@ export async function attendancePayrollDtr(employeeId: Types.ObjectId, payPeriod
     allowedSessionMinutes(settings.officialSecondBreakStartTime, settings.officialSecondBreakEndTime, 15)
   );
   const officialLunchHours = allowedLunchMinutes / 60;
-  const scheduledGrossHours = hoursFromTimeRange(settings.officialShiftStartTime || "23:00", settings.officialShiftEndTime || "08:00") || 9;
+  const scheduledGrossHours = hoursFromTimeRange(settings.officialShiftStartTime || "23:00", settings.officialShiftEndTime || "08:00") || legacyPayrollPolicy.grossHoursPerDay;
   const scheduledDailyHours = Math.max(1, scheduledGrossHours - officialLunchHours);
   const workingDays = countWorkingDays(start, end);
   const queryEnd = new Date(end);
@@ -754,6 +771,80 @@ async function attendancePayrollSummary(employeeId: Types.ObjectId, payPeriod: s
   return (await attendancePayrollDtr(employeeId, payPeriod)).summary;
 }
 
+export async function payrollCalculationContext() {
+  const settings = await getSystemSettings();
+  const policy = await attendancePolicy();
+  if (payrollAccuracyEnabled()) {
+    const storedPolicy = await AttendancePolicy.findById("global-attendance").lean();
+    const storedSettings = await SystemSettings.findOne({ key: "system" }).lean();
+    paidHoursPerDay(storedPolicy ? { officialShiftStartTime: storedPolicy.shiftStart, officialShiftEndTime: storedPolicy.shiftEnd } : storedSettings || {}, policy);
+  }
+  return { settings, policy };
+}
+
+async function accurateAttendancePayrollDtr(employeeId: Types.ObjectId, payPeriod: string) {
+  const { settings, policy } = await payrollCalculationContext();
+  const paidHours = paidHoursPerDay(settings, policy);
+  const { start, end } = periodRange(payPeriod);
+  const length = (end.getTime() - start.getTime()) / 86_400_000;
+  if (!Number.isFinite(length) || length < 1 || length > 93) throw new PayrollValidationError("Payroll range must contain between 1 and 93 shift days");
+  const keys = periodDateKeys(start, end);
+  if (!keys.length || keys.length > 93) throw new PayrollValidationError("Payroll range must contain between 1 and 93 shift days");
+  const now = serverReadTime();
+  const employee = await Employee.findById(employeeId).select("employeeCode").lean();
+  if (!employee) throw new PayrollValidationError("Employee not found");
+  const firstBound = new Date(hubShiftBounds(keys[0], settings).start.getTime() - 86_400_000);
+  const lastBound = new Date(hubShiftBounds(keys.at(-1)!, settings).end.getTime() + 86_400_000);
+  const readCopy = async (id: Types.ObjectId) => Attendance.find({ employee: id, isArchived: false,
+    timeIn: { $gte: firstBound, $lt: lastBound } }).sort({ timeIn: 1, sequence: 1, _id: 1 }).lean();
+  const local = await readCopy(employeeId);
+  const ledger = await AttendanceLedger.findOne({ employeeCode: employee.employeeCode, businessIds: getCurrentBusinessId() }).select("events corrections closures businessIds migrationRequired").lean();
+  let grouped = groupPayrollAttendanceBySlot(local, settings);
+  const mismatches = new Set<string>();
+  if (ledger && !ledger.migrationRequired) {
+    const projected = projectAttendance(ledger.events, ledger.corrections, ledger.closures);
+    const canonical: Record<string, Array<{ source: typeof local[number]["source"]; timeIn: Date; sequence?: number }>> = {};
+    for (const session of projected.sessions) {
+      const key = session.shift?.dayKey || attendanceSlotKey(session.startedAt, settings);
+      canonical[key] = [...(canonical[key] || []), ...session.events.map(event => ({ source: event.source, timeIn: new Date(event.at), sequence: event.sequence }))];
+    }
+    const fingerprint = (items: Array<{ source: string; timeIn: Date }>) => JSON.stringify(items.map(item => [item.source, item.timeIn.toISOString()]));
+    for (const businessId of ledger.businessIds) await runWithBusiness(businessId, async () => {
+      const copyEmployee = await Employee.findOne({ employeeCode: employee.employeeCode }).select("_id").lean();
+      if (!copyEmployee) { keys.forEach(key => mismatches.add(key)); return; }
+      const replica = groupPayrollAttendanceBySlot(await readCopy(copyEmployee._id), settings);
+      for (const key of keys) if (fingerprint(replica[key] || []) !== fingerprint(canonical[key] || [])) mismatches.add(key);
+    });
+    for (const issue of projected.blockingIssues) {
+      const event = ledger.events.find(event => event.id === issue.eventId);
+      const key = event ? attendanceSlotKey(event.at, settings) : "";
+      if (keys.includes(key)) mismatches.add(key);
+    }
+    grouped = canonical as typeof grouped;
+  } else if (ledger?.migrationRequired) keys.forEach(key => mismatches.add(key));
+  const rows = keys.map<PayrollDtrRow>(key => {
+    const records = (grouped[key] || []).sort((a, b) => a.timeIn.getTime() - b.timeIn.getTime() || (a.sequence ?? 0) - (b.sequence ?? 0));
+    const bounds = hubShiftBounds(key, settings);
+    const weekend = isWeekendDateKey(key);
+    const day = accuratePayrollDay(records, { ...policy, shiftStart: bounds.start, shiftEnd: bounds.end }, now, paidHours, weekend, mismatches.has(key));
+    const timeIn = firstRecord(records, ["Time In", "Login"]), timeOut = lastRecord(records, ["Time Out", "Logout"]);
+    return { dateKey: key, date: formatDtrDate(key), day: formatDtrDay(key), status: day.status as PayrollDtrRow["status"], isWeekend: weekend,
+      timeIn: formatDtrTime(timeIn?.timeIn), timeOut: formatDtrTime(day.calculated.hasOpenSession ? null : timeOut?.timeIn),
+      lunchHours: day.lunchHours, ...day.components, grossHours: day.grossHours, lateHours: day.components.lateMinutes / 60,
+      regularHours: day.regularHours, overtimeHours: day.overtimeHours, missingHours: day.missingHours,
+      scheduledHours: weekend ? 0 : paidHours, recordCount: records.length };
+  });
+  const sum = (field: keyof PayrollDtrRow) => rows.reduce((total, row) => total + Number(row[field] || 0), 0);
+  const absent = rows.filter(row => row.status === "Absent"), late = rows.filter(row => row.status === "Late");
+  const summary: PayrollAttendanceSummary = { paidHoursPerDay: paidHours, attendanceDays: rows.filter(row => ["Present", "Late"].includes(row.status)).length,
+    absentDays: absent.length, absentHours: absent.length * paidHours, lateDays: late.length, lateHours: sum("lateHours"),
+    workingDays: countWorkingDays(start, end), workedHours: sum("regularHours"), overtimeHours: sum("overtimeHours"), missingHours: sum("missingHours"),
+    scheduledHours: sum("scheduledHours"), lateMinutes: sum("lateMinutes"), excessBreakMinutes: sum("excessBreakMinutes"), excessLunchMinutes: sum("excessLunchMinutes"),
+    absenceMinutes: sum("absenceMinutes"), earlyTimeOutMinutes: sum("earlyTimeOutMinutes"), deductibleMinutes: sum("deductibleMinutes"),
+    incompleteShiftDays: rows.filter(row => row.status === "Needs Review").length };
+  return { rows, summary };
+}
+
 async function formatMoney(value: number) {
   return value.toLocaleString("en-US", { style: "currency", currency: await getCurrencyCode() });
 }
@@ -790,6 +881,9 @@ async function seedPayroll() {
 export async function syncEmployeePayrollRecords(payPeriod = "", payDate = "", employeeCodes: string[] = []) {
   const settings = await getSystemSettings();
   const resolvedPayPeriod = payPeriod || currentPeriod(settings.payrollBillingCycle, settings);
+  // A read or attendance sync must never silently rewrite a generated cutoff.
+  if (payrollAccuracyEnabled()) return PayrollRecord.find({ payPeriod: resolvedPayPeriod, isArchived: false,
+    ...(employeeCodes.length ? { employeeId: { $in: employeeCodes } } : {}) }).sort({ employeeId: 1 });
   const resolvedPayType: PayrollPayType = payTypeForCycle(settings.payrollBillingCycle);
   const resolvedPayDate = selectedPayDateLabel(payDate) || scheduledPayDateLabel(settings.payrollBillingCycle, settings, resolvedPayPeriod);
   const employeeFilter: Record<string, unknown> = { status: { $ne: "Archived" } };
@@ -801,6 +895,7 @@ export async function syncEmployeePayrollRecords(payPeriod = "", payDate = "", e
     const { monthlyWorkingDays, cutoffBasePay, hourlyRate, minuteRate } = payrollRatesForCutoff(toMoney(employee.salary), resolvedPayPeriod);
     const existingRecords = await PayrollRecord.find({ employeeId: employee.employeeCode, payPeriod: resolvedPayPeriod, isArchived: false }).sort({ updatedAt: -1, createdAt: -1 });
     const existingRecord = existingRecords[0];
+    if (existingRecord?.calculationVersion) { records.push(existingRecord); continue; }
     const rawAttendance = await attendancePayrollSummary(employee._id, resolvedPayPeriod);
     const attendance = payrollAttendanceWithWorkedMinutes(rawAttendance, existingRecord?.workedMinutesOverride);
     const approvedOvertimeHours = existingRecord?.overtimeApproved ? toMoney(existingRecord.overtimeHours) : 0;
@@ -991,6 +1086,11 @@ export async function getPayrollDtr(request: Request, response: Response) {
     return;
   }
 
+  if (payrollAccuracyEnabled()) {
+    const { getAccuratePayrollDtr } = await import("../services/payrollRecomputeService");
+    response.json(await getAccuratePayrollDtr(employee, payPeriod));
+    return;
+  }
   const { monthlyWorkingDays, cutoffBasePay, hourlyRate, minuteRate } = payrollRatesForCutoff(toMoney(employee.salary), payPeriod);
   const dtr = await attendancePayrollDtr(employee._id, payPeriod);
   const payrollRecord = await PayrollRecord.findOne({ employeeId: employee.employeeCode, payPeriod, isArchived: false }).sort({ updatedAt: -1, createdAt: -1 }).lean();
@@ -1026,6 +1126,9 @@ export async function getPayrollDtr(request: Request, response: Response) {
 
 export async function updateEmployeeBasicPay(request: Request, response: Response) {
   const employeeId = String(request.params.employeeId || "").trim();
+  if (payrollAccuracyEnabled() && (request.body.basicPay === undefined || request.body.basicPay === "" || !Number.isFinite(Number(request.body.basicPay)) || Number(request.body.basicPay) < 0)) {
+    response.status(422).json({ message: "A valid non-negative monthly salary is required" }); return;
+  }
   const basicPay = toMoney(request.body.basicPay, -1);
   if (basicPay < 0) {
     response.status(400).json({ message: "Basic pay must be zero or greater" });
@@ -1065,6 +1168,10 @@ export async function updateEmployeeBasicPay(request: Request, response: Respons
 }
 
 export async function updatePayrollWorkedMinutes(request: Request, response: Response) {
+  if (payrollAccuracyEnabled()) {
+    response.status(422).json({ message: "Correct attendance events, then use Recompute cutoff with a preview. Stored payroll is not changed by a worked-hours override." });
+    return;
+  }
   if (String(request.header("x-crm-user-type") || "").trim().toLowerCase() !== "admin") {
     response.status(403).json({ message: "Only administrators can edit payroll worked minutes." });
     return;
@@ -1136,6 +1243,11 @@ export async function updatePayrollWorkedMinutes(request: Request, response: Res
 }
 
 export async function updatePayrollOvertime(request: Request, response: Response) {
+  if (payrollAccuracyEnabled()) {
+    const { updateAccurateOvertime } = await import("../services/payrollRecomputeService");
+    response.json(await updateAccurateOvertime(request));
+    return;
+  }
   const overtimeHours = toMoney(request.body.overtimeHours);
   const sourceRecord = await PayrollRecord.findById(request.params.id).lean();
 
@@ -1198,7 +1310,7 @@ export async function updatePayrollOvertime(request: Request, response: Response
 }
 
 export async function listPayrollStats(_request: Request, response: Response) {
-  await seedPayroll();
+  if (!payrollAccuracyEnabled()) await seedPayroll();
   const settings = await getSystemSettings();
   const payPeriod = currentPeriod(settings.payrollBillingCycle, settings);
   await syncEmployeePayrollRecords(payPeriod);
@@ -1220,7 +1332,7 @@ export async function listPayrollStats(_request: Request, response: Response) {
 }
 
 export async function listPayrollRecords(request: Request, response: Response) {
-  await seedPayroll();
+  if (!payrollAccuracyEnabled()) await seedPayroll();
   const settings = await getSystemSettings();
   const showArchived = String(request.query.archived || "") === "true";
   const requestedPayPeriod = String(request.query.payPeriod || (showArchived ? "" : currentPeriod(settings.payrollBillingCycle, settings))).trim();
@@ -1261,6 +1373,10 @@ export async function listPayrollRecords(request: Request, response: Response) {
 }
 
 export async function createPayrollRecord(request: Request, response: Response) {
+  if (payrollAccuracyEnabled()) {
+    response.status(422).json({ message: "Use Generate or Recompute cutoff so pay is derived from attendance events." });
+    return;
+  }
   const settings = await getSystemSettings();
   const grossPay = toMoney(request.body.grossPay);
   const deductions = toMoney(request.body.deductions);
@@ -1292,6 +1408,10 @@ export async function createPayrollRecord(request: Request, response: Response) 
 }
 
 export async function updatePayrollRecord(request: Request, response: Response) {
+  if (payrollAccuracyEnabled()) {
+    response.status(422).json({ message: "Use Recompute cutoff with a preview to change calculated payroll." });
+    return;
+  }
   const settings = await getSystemSettings();
   const grossPay = toMoney(request.body.grossPay);
   const deductions = toMoney(request.body.deductions);
@@ -1332,6 +1452,10 @@ export async function updatePayrollRecord(request: Request, response: Response) 
 }
 
 export async function markPayrollRecordPaid(request: Request, response: Response) {
+  if (payrollAccuracyEnabled()) {
+    const { setAccuratePayrollPaid } = await import("../services/payrollRecomputeService");
+    response.json(await setAccuratePayrollPaid(request, true)); return;
+  }
   const sourceRecord = await PayrollRecord.findById(request.params.id).lean();
 
   if (!sourceRecord || sourceRecord.isArchived) {
@@ -1359,6 +1483,10 @@ export async function markPayrollRecordPaid(request: Request, response: Response
 }
 
 export async function markPayrollRecordUnpaid(request: Request, response: Response) {
+  if (payrollAccuracyEnabled()) {
+    const { setAccuratePayrollPaid } = await import("../services/payrollRecomputeService");
+    response.json(await setAccuratePayrollPaid(request, false)); return;
+  }
   const sourceRecord = await PayrollRecord.findById(request.params.id).lean();
 
   if (!sourceRecord || sourceRecord.isArchived) {
@@ -1418,6 +1546,10 @@ export async function restorePayrollRecord(request: Request, response: Response)
 export async function runPayroll(request: Request, response: Response) {
   const settings = await getSystemSettings();
   const payPeriod = String(request.body.payPeriod || currentPeriod(settings.payrollBillingCycle, settings)).trim();
+  if (payrollAccuracyEnabled()) {
+    response.status(422).json({ message: "Preview the cutoff and explicitly confirm before generating or recomputing payroll.", payPeriod });
+    return;
+  }
   const payDate = String(request.body.payDate || "").trim();
   const records = await syncEmployeePayrollRecords(payPeriod, payDate);
   const created = records.filter((record) => record.payPeriod === payPeriod && record.status !== "Paid");
@@ -1436,7 +1568,7 @@ export async function runPayroll(request: Request, response: Response) {
 }
 
 export async function listPayrollItems(request: Request, response: Response) {
-  await seedPayroll();
+  if (!payrollAccuracyEnabled()) await seedPayroll();
   const category = String(request.query.category || "");
   const showArchived = String(request.query.archived || "") === "true";
   const filter: Partial<Pick<PayrollListItemDocument, "category" | "isArchived">> = { isArchived: showArchived };

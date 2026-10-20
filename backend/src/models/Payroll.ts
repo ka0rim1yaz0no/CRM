@@ -6,6 +6,8 @@ export type PayrollPayType = "Monthly" | "Semi-monthly" | "Weekly" | "Hourly" | 
 export type PayrollItemCategory = "Payroll Runs" | "Payouts" | "Deductions" | "Tax Settings";
 
 export type PayrollRecordDocument = {
+  createdAt?: Date;
+  updatedAt?: Date;
   employeeName: string;
   email: string;
   employeeId: string;
@@ -15,6 +17,12 @@ export type PayrollRecordDocument = {
   basicPay: number;
   workingDays: number;
   minuteRate: number;
+  paidHoursPerDay?: number;
+  hourlyRate?: number;
+  calculationVersion?: string;
+  payrollOwnerBusinessId?: string;
+  calculationSnapshot?: Record<string, unknown>;
+  calculationAudit?: Array<{ at: string; actor: string; reason: string; before: Record<string, unknown>; after: Record<string, unknown> }>;
   lateMinutes: number;
   excessLunchMinutes: number;
   excessBreakMinutes: number;
@@ -34,6 +42,7 @@ export type PayrollRecordDocument = {
   overtimeHours: number;
   overtimeApproved: boolean;
   scheduledHours: number;
+  missingHours?: number;
   status: PayrollStatus;
   paidOn: string;
   payPeriod: string;
@@ -61,6 +70,12 @@ const payrollRecordSchema = new Schema<PayrollRecordDocument>(
     basicPay: { type: Number, min: 0, default: 0 },
     workingDays: { type: Number, min: 0, default: 0 },
     minuteRate: { type: Number, min: 0, default: 0 },
+    paidHoursPerDay: { type: Number, min: 0 },
+    hourlyRate: { type: Number, min: 0 },
+    calculationVersion: String,
+    payrollOwnerBusinessId: String,
+    calculationSnapshot: Schema.Types.Mixed,
+    calculationAudit: { type: [Schema.Types.Mixed], default: undefined },
     lateMinutes: { type: Number, min: 0, default: 0 },
     excessLunchMinutes: { type: Number, min: 0, default: 0 },
     excessBreakMinutes: { type: Number, min: 0, default: 0 },
@@ -80,6 +95,7 @@ const payrollRecordSchema = new Schema<PayrollRecordDocument>(
     overtimeHours: { type: Number, min: 0, default: 0 },
     overtimeApproved: { type: Boolean, default: false },
     scheduledHours: { type: Number, min: 0, default: 0 },
+    missingHours: { type: Number, min: 0 },
     status: { type: String, enum: ["Paid", "Pending", "Failed", "Completed", "Review", "Applied", "Enabled"], default: "Pending" },
     paidOn: { type: String, required: true, trim: true, default: "-" },
     payPeriod: { type: String, required: true, trim: true, default: "Current Month" },
@@ -102,6 +118,9 @@ const payrollListItemSchema = new Schema<PayrollListItemDocument>(
 );
 
 payrollRecordSchema.index({ employeeId: 1, payPeriod: 1, isArchived: 1 });
+payrollRecordSchema.index({ employeeId: 1, payPeriod: 1, calculationVersion: 1 }, {
+  unique: true, partialFilterExpression: { calculationVersion: "duration-payroll-v1", isArchived: false },
+});
 payrollListItemSchema.index({ category: 1, isArchived: 1 });
 
 export const PayrollRecord = tenantModel<PayrollRecordDocument>("PayrollRecord", payrollRecordSchema);

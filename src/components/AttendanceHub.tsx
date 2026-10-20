@@ -160,10 +160,6 @@ function DayDrawer({ selected, onClose, admin }: { selected: { dayKey: string; e
                         style={{ flexGrow: Date.parse(interval.end) - Date.parse(interval.start) }} title={`${interval.bucket}: ${localTime(interval.start)} - ${localTime(interval.end)}`} />)}
                 </div>
                 <div className="attendance-hub-legend">Online · Break · Lunch · Off phone · Offline</div>
-                <h3>Breaks</h3>
-                {day.breakSessions?.length ? <dl className="attendance-hub-breakdown">{day.breakSessions.map((entry, index) => <div key={`${entry.startedAt}:${index}`}>
-                    <dt>Break {index + 1} · {day.breakMinutes}m allowance</dt><dd><BreakRecord entry={entry} label={`Break ${index + 1}`} /></dd>
-                </div>)}</dl> : <p>{day.breakSessions ? "No recorded breaks." : "Break detail unavailable."}</p>}
                 <table><thead><tr><th>Event</th><th>PH time</th><th>Source</th></tr></thead><tbody>
                     {timeline.map((event) => <tr key={event.id}><td>{event.source} {event.autoTimeOut === true && autoBadge}</td><td>{detailTime(event.at)}</td><td>Attendance</td></tr>)}
                 </tbody></table>

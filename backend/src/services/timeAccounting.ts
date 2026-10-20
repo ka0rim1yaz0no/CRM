@@ -1,4 +1,15 @@
 import type { AttendanceSource } from "../models/Attendance";
+import { payrollAccuracyEnabled } from "../config/rolloutFlags";
+
+export function deductionComponents(values: { lateMinutes?: number; earlyTimeOutMinutes?: number; excessBreakMinutes?: number; excessLunchMinutes?: number; absenceMinutes?: number }, excluded = false) {
+  const clean = (value?: number) => excluded ? 0 : Math.max(0, Number.isFinite(value) ? value! : 0);
+  const result = { lateMinutes: clean(values.lateMinutes), earlyTimeOutMinutes: clean(values.earlyTimeOutMinutes),
+    excessBreakMinutes: clean(values.excessBreakMinutes), excessLunchMinutes: clean(values.excessLunchMinutes), absenceMinutes: clean(values.absenceMinutes) };
+  return { ...result, deductibleMinutes: Object.values(result).reduce((sum, value) => sum + value, 0) };
+}
+// Accuracy rollout: charge each completed excess interval up to the next minute, then sum once.
+export const completedRestMinutes = (milliseconds: number) => payrollAccuracyEnabled()
+  ? Math.ceil(milliseconds / 60_000) : Math.round(milliseconds / 60_000);
 
 export type TimeBucket = "online" | "break" | "lunch" | "offPhone" | "offline";
 export type TimeEvent = { at: Date; bucket: TimeBucket };
@@ -13,7 +24,7 @@ export function calculateSlotAttendance(records: Array<{ source: string; timeIn:
   const asOf = new Date(Math.min(now.getTime(), policy.shiftEnd.getTime()));
   const intervals = (out: string, back: string, allowance: number) => clickedSessionIntervals(ordered, out, back, asOf)
     .map((interval) => {
-      const minutes = Math.round(interval.milliseconds / 60_000);
+      const minutes = completedRestMinutes(interval.milliseconds);
       return { ...interval, minutes, excessMinutes: interval.open ? 0 : Math.max(0, minutes - allowance),
         overdueMs: Math.max(0, interval.milliseconds - allowance * 60_000) };
     });
@@ -24,9 +35,10 @@ export function calculateSlotAttendance(records: Array<{ source: string; timeIn:
   const hasOpenSession = Boolean(first && final && final.source !== "Time Out" && final.source !== "Logout");
   const timeOut = !hasOpenSession ? [...ordered].reverse().find((record) => record.source === "Time Out" || record.source === "Logout") : undefined;
   // Lateness keeps the existing minute-boundary grace rule; rounding applies to clicked rest durations.
-  const lateMinutes = first ? Math.max(0, Math.floor((first.timeIn.getTime() - policy.shiftStart.getTime()) / 60_000) - policy.graceMinutes) : 0;
+  const lateEnd = payrollAccuracyEnabled() && first ? Math.min(first.timeIn.getTime(), policy.shiftEnd.getTime()) : first?.timeIn.getTime();
+  const lateMinutes = first ? Math.max(0, Math.floor((lateEnd! - policy.shiftStart.getTime()) / 60_000) - policy.graceMinutes) : 0;
   const earlyTimeOutMinutes = first && timeOut && now >= policy.shiftEnd
-    ? Math.max(0, Math.ceil((policy.shiftEnd.getTime() - timeOut.timeIn.getTime()) / 60_000)) : 0;
+    ? Math.max(0, Math.ceil((policy.shiftEnd.getTime() - (payrollAccuracyEnabled() ? Math.max(timeOut.timeIn.getTime(), first.timeIn.getTime(), policy.shiftStart.getTime()) : timeOut.timeIn.getTime())) / 60_000)) : 0;
   const excessBreakMinutes = breakSessions.reduce((total, interval) => total + interval.excessMinutes, 0);
   const excessLunchMinutes = lunchSessions.reduce((total, interval) => total + interval.excessMinutes, 0);
   const issues: string[] = [];
@@ -36,7 +48,7 @@ export function calculateSlotAttendance(records: Array<{ source: string; timeIn:
   if (earlyTimeOutMinutes) issues.push("UNDER TIME");
   if (hasOpenSession) issues.push("OPEN SESSION");
   return { breakSessions, lunchSessions, lateMinutes, excessBreakMinutes, excessLunchMinutes, earlyTimeOutMinutes,
-    deductibleMinutes: lateMinutes + excessBreakMinutes + excessLunchMinutes + earlyTimeOutMinutes, hasOpenSession, issues };
+    deductibleMinutes: deductionComponents({ lateMinutes, excessBreakMinutes, excessLunchMinutes, earlyTimeOutMinutes }).deductibleMinutes, hasOpenSession, issues };
 }
 
 export function clickedSessionIntervals<T extends { source: string; timeIn: Date }>(records: T[], outSource: string, inSource: string, asOf?: Date) {
@@ -61,7 +73,7 @@ export function clickedSessionIntervals<T extends { source: string; timeIn: Date
 }
 // Preserve the existing payroll rule: round each completed clicked interval to minutes first.
 export function excessClickedSessionMinutes<T extends { source: string; timeIn: Date }>(records: T[], outSource: string, inSource: string, allowanceMinutes: number) {
-  return clickedSessionIntervals(records, outSource, inSource).reduce((total, interval) => total + (interval.open ? 0 : Math.max(0, Math.round(interval.milliseconds / 60_000) - allowanceMinutes)), 0);
+  return clickedSessionIntervals(records, outSource, inSource).reduce((total, interval) => total + (interval.open ? 0 : Math.max(0, completedRestMinutes(interval.milliseconds) - allowanceMinutes)), 0);
 }
 export function excessClickedSessionMilliseconds<T extends { source: string; timeIn: Date }>(records: T[], outSource: string, inSource: string, allowanceMs: number, asOf: Date) {
   return clickedSessionIntervals(records, outSource, inSource, asOf).reduce((total, interval) => total + Math.max(0, interval.milliseconds - allowanceMs), 0);

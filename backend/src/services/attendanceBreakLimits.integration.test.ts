@@ -173,8 +173,8 @@ test("HTTP: two back-to-back 15-minute breaks, one 60-minute lunch, and atomic r
   }
 });
 
-test("HTTP: completed break rounding is 15:00 = 0, 15:01 = 0, and 15:30 = 1 minute after refresh", async () => {
-  for (const [duration, expected] of [[900, 0], [901, 0], [930, 1]]) {
+test("HTTP: accuracy rounding is 15:00 = 0, 15:01 = 1, and 15:30 = 1 minute after refresh", async () => {
+  for (const [duration, expected] of [[900, 0], [901, 1], [930, 1]]) {
     mock.timers.setTime(start);
     const person = await fixture();
     await action(person, "Time In", 0);

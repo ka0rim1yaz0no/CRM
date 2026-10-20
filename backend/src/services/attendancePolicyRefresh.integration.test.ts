@@ -8,6 +8,8 @@ import type { AttendanceDerivedDay } from "./attendanceDerived";
 import type { AttendanceCommand } from "./attendanceLedgerService";
 
 process.env.NODE_ENV = "test";
+// Legacy policy-refresh/payroll coupling remains available with explicit rollback.
+process.env.CRM_PAYROLL_ACCURACY = "false";
 const prefix = `att_policy_${crypto.randomUUID().replaceAll("-", "").slice(0, 16)}`;
 const businesses = ["policy-a", "policy-b", "policy-c"];
 process.env.BUSINESS_DATABASES = JSON.stringify(businesses.map((id, index) => ({ id, name: `Synthetic policy ${index}`, databaseName: `${prefix}_${index}` })));

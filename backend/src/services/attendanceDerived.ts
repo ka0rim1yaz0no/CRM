@@ -1,7 +1,7 @@
 import type { AttendanceStatus } from "../models/Attendance";
 import { assignAttendanceShift } from "./attendanceShift";
 import { projectAttendance, type AttendanceSession, type SessionCorrection, type SessionEvent, type SystemClosure } from "./attendanceSessionState";
-import { calculateSlotAttendance } from "./timeAccounting";
+import { calculateSlotAttendance, deductionComponents } from "./timeAccounting";
 
 export type AttendanceDerivedPolicy = {
   breakMinutes: number; lunchMinutes: number; graceMinutes: number;
@@ -62,7 +62,7 @@ export function deriveAttendanceDays(ledger: AttendanceDerivedLedger, policy: At
     if (sessions.some((session) => session.lifecycle === "system-closed")) issues.push("SYSTEM CLOSED");
     if (projection.issues.some((issue) => events.some((event) => event.id === issue.eventId))) issues.push("TIMELINE REVIEW");
     return { ...summary, breakSessions, lunchSessions, excessBreakMinutes, excessLunchMinutes, hasOpenSession, issues,
-      deductibleMinutes: summary.lateMinutes + summary.earlyTimeOutMinutes + excessBreakMinutes + excessLunchMinutes,
+      deductibleMinutes: deductionComponents({ ...summary, excessBreakMinutes, excessLunchMinutes }).deductibleMinutes,
       dayKey, shiftStart: shift.start, shiftEnd: shift.end, sessionIds: sessions.map((session) => session.id),
       eventIds: [...new Set(events.map((event) => event.id))],
       status: summary.lateMinutes ? "Late" : summary.earlyTimeOutMinutes ? "Undertime" : "On time",

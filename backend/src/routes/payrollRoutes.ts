@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { verifiedAdminOnly } from "../middleware/businessAccess";
+import { payrollAccuracyConfig, previewPayroll, confirmPayroll } from "../controllers/payrollAccuracyController";
 import {
   archivePayrollItem,
   archivePayrollRecord,
@@ -22,6 +23,9 @@ import {
 
 export const payrollRouter = Router();
 payrollRouter.use(verifiedAdminOnly);
+payrollRouter.get("/accuracy-config", payrollAccuracyConfig);
+payrollRouter.post("/recompute/preview", previewPayroll);
+payrollRouter.post("/recompute/confirm", confirmPayroll);
 
 payrollRouter.get("/stats", listPayrollStats);
 payrollRouter.get("/dtr/:employeeId", getPayrollDtr);

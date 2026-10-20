@@ -1,6 +1,7 @@
 import type { DataCheckRow, DataCheckSample, DataCheckSection } from "../../../shared/dataCheck";
 import { attendanceSlotKey } from "./attendanceShift";
 import { hubShiftBounds } from "./attendanceHubMath";
+import { payrollAccuracyEnabled } from "../config/rolloutFlags";
 
 export type CheckPolicy = { shiftStart: string; shiftEnd: string; graceMinutes: number; breakMinutes: number; lunchMinutes: number; autoTimeOutTime?: string };
 export type AuditPunch = { id: string; code: string; source: string; at: string; sequence?: number; eventId?: string; slotKey?: string; storedSlotKey?: string; autoTimeOut?: boolean };
@@ -102,7 +103,7 @@ export function auditAttendance(events: AuditPunch[], date: string, policy: Chec
         const outgoing = open[rest];
         if (!outgoing || mode !== rest) { issues.push(event); continue; }
         const duration = Math.max(0, at - Date.parse(outgoing.at));
-        intervals[rest].push({ start: outgoing.at, end: event.at, milliseconds: duration, excess: Math.max(0, Math.round(duration / 60_000) - (rest === "break" ? policy.breakMinutes : policy.lunchMinutes)) });
+        intervals[rest].push({ start: outgoing.at, end: event.at, milliseconds: duration, excess: Math.max(0, (payrollAccuracyEnabled() ? Math.ceil(duration / 60_000) : Math.round(duration / 60_000)) - (rest === "break" ? policy.breakMinutes : policy.lunchMinutes)) });
         delete open[rest]; mode = "online";
       }
     }

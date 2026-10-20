@@ -2,8 +2,6 @@ import { useQuery } from "@tanstack/react-query";
 import AdminLayout from "../adminLayout";
 import { getPayrollDtr, getPayrollRecords, type PayrollDtr, type PayrollRecord } from "../../../api/payroll";
 
-const regularHoursPerDay = 8;
-
 type PayrollComputeRow = {
     record: PayrollRecord;
     dtr: PayrollDtr | null;
@@ -34,15 +32,12 @@ function computePayroll(record: PayrollRecord) {
     const deductions = Number(record.deductions || 0);
     const basePay = Number(record.basicPay ?? grossPay);
     const workingDays = Number(record.workingDays || 0);
-    const hourlyRate = Number(record.minuteRate || 0) > 0
-        ? Number(record.minuteRate) * 60
-        : workingDays > 0
-            ? (basePay * 2) / workingDays / regularHoursPerDay
-            : 0;
-    const dailyRate = hourlyRate * regularHoursPerDay;
-    const approvedOtPay = hourlyRate * approvedOtHours;
+    const regularHoursPerDay = record.paidHoursPerDay;
+    const hourlyRate = record.hourlyRate ?? Number(record.minuteRate || 0) * 60;
+    const dailyRate = regularHoursPerDay != null ? hourlyRate * regularHoursPerDay : null;
+    const approvedOtPay = grossPay - basePay;
     const deductionHours = hourlyRate > 0 ? deductions / hourlyRate : 0;
-    const netPay = grossPay - deductions;
+    const netPay = record.netPay;
 
     return {
         scheduledHours,
@@ -56,6 +51,7 @@ function computePayroll(record: PayrollRecord) {
         approvedOtPay,
         deductionHours,
         netPay,
+        regularHoursPerDay,
     };
 }
 
@@ -75,8 +71,9 @@ function renderRecord({ record, dtr }: PayrollComputeRow) {
         `Monthly-cycle working days = ${round(computed.workingDays)} days`,
         `Cutoff basic pay = ${money(computed.basePay)}`,
         `Monthly salary = ${money(computed.basePay)} x 2 = ${money(computed.basePay * 2)}`,
-        `Daily rate = ${money(computed.basePay * 2)} / ${round(computed.workingDays)} days = ${money(computed.dailyRate)}`,
-        `Hourly rate = ${money(computed.dailyRate)} / ${regularHoursPerDay}h = ${money(computed.hourlyRate)}`,
+        computed.dailyRate == null ? "Daily paid hours/rate: not snapshotted on this stored cutoff" :
+            `Daily rate = ${money(computed.basePay * 2)} / ${round(computed.workingDays)} days = ${money(computed.dailyRate)}`,
+        `Stored hourly rate = ${money(computed.hourlyRate)}${computed.regularHoursPerDay != null ? `; paid day ${computed.regularHoursPerDay}h` : ""}`,
         "",
         "EARNINGS",
         `Basic pay = ${money(computed.basePay)}`,

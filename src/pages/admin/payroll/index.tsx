@@ -27,6 +27,7 @@ import {
     FiX,
 } from "react-icons/fi";
 import AdminLayout from "../adminLayout";
+import PayrollRecomputeDialog from "../../../components/admin/PayrollRecomputeDialog";
 import {
     archivePayrollItem,
     archivePayrollRecord,
@@ -35,6 +36,7 @@ import {
     getPayrollItems,
     getPayrollRecords,
     getPayrollStats,
+    getPayrollAccuracyConfig,
     markPayrollRecordPaid,
     markPayrollRecordUnpaid,
     restorePayrollItem,
@@ -66,6 +68,7 @@ const payrollNavigation = [
     { tab: "Archived", icon: FiArchive, description: "Restorable records" },
 ] as const;
 const statusOptions: PayrollStatus[] = ["Pending", "Paid", "Failed", "Completed", "Review", "Applied", "Enabled"];
+const payrollErrorMessage = (error: unknown) => (error as { response?: { data?: { message?: string } } })?.response?.data?.message || "Unable to save payroll. Please refresh and try again.";
 
 const emptyBankForm = {
     bankName: "",
@@ -379,7 +382,7 @@ function PayslipDocument({
     const lateHours = record.lateHours ?? 0;
     const overtimeHours = record.overtimeHours ?? 0;
     const basePay = record.basicPay ?? record.grossPay;
-    const minuteRate = record.minuteRate ?? (workingDays > 0 ? (basePay * 2) / workingDays / 8 / 60 : 0);
+    const minuteRate = record.minuteRate ?? (record.hourlyRate !== undefined ? record.hourlyRate / 60 : 0);
     const hourlyRate = minuteRate * 60;
     const overtimePay = Math.max(0, Math.round((record.grossPay - basePay) * 100) / 100);
     const deductionMinutes = [
@@ -619,6 +622,8 @@ export default function PayrollPage() {
     const [workedMinutesTarget, setWorkedMinutesTarget] = useState<PayrollRecord | null>(null);
     const [workedMinutesInput, setWorkedMinutesInput] = useState("");
     const [workedMinutesError, setWorkedMinutesError] = useState("");
+    const [recomputeOpen, setRecomputeOpen] = useState(false);
+    const { data: accuracyConfig } = useQuery({ queryKey: ["payroll-accuracy-config"], queryFn: getPayrollAccuracyConfig });
 
     const itemCategory = activeTab === "Employee Payroll" || activeTab === "Bank Accounts" || activeTab === "Archived" ? undefined : (activeTab as PayrollItemCategory);
 
@@ -632,12 +637,12 @@ export default function PayrollPage() {
 
     const { data: stats } = useQuery({ queryKey: ["payroll-stats"], queryFn: getPayrollStats });
     const { data: systemSettings } = useQuery({ queryKey: ["system-settings"], queryFn: getSystemSettings });
-    const { data: employees = EMPTY_QUERY_ROWS, isLoading: isPayrollLoading, isError: isPayrollError } = useQuery({
+    const { data: employees = EMPTY_QUERY_ROWS, isLoading: isPayrollLoading, isError: isPayrollError, error: payrollError } = useQuery({
         queryKey: ["payroll-records", recordQueryParams],
         queryFn: () => getPayrollRecords(recordQueryParams),
         enabled: activeTab === "Employee Payroll" || activeTab === "Archived",
     });
-    const { data: employeeDtr, isLoading: isDtrLoading, isError: isDtrError } = useQuery({
+    const { data: employeeDtr, isLoading: isDtrLoading, isError: isDtrError, error: dtrError } = useQuery({
         queryKey: ["payroll-dtr", dtrRecord?.employeeId, dtrRecord?.payPeriod],
         queryFn: () => getPayrollDtr(dtrRecord?.employeeId || "", dtrRecord?.payPeriod),
         enabled: Boolean(dtrRecord?.employeeId),
@@ -697,6 +702,8 @@ export default function PayrollPage() {
             basicPay: payslipDtr.summary.basicPay,
             workingDays: payslipDtr.summary.monthlyWorkingDays,
             minuteRate: payslipDtr.summary.minuteRate,
+            paidHoursPerDay: payslipDtr.summary.paidHoursPerDay,
+            hourlyRate: payslipDtr.summary.hourlyRate,
             lateMinutes: payslipDtr.summary.lateMinutes,
             excessLunchMinutes: payslipDtr.summary.excessLunchMinutes,
             excessBreakMinutes: payslipDtr.summary.excessBreakMinutes,
@@ -926,11 +933,13 @@ export default function PayrollPage() {
     };
 
     const approvePotentialOvertime = () => {
+        if (accuracyConfig?.enabled) { setDtrRecord(null); setRecomputeOpen(true); return; }
         if (!dtrRecord || !employeeDtr) return;
         updateOvertimeMutation.mutate({ id: dtrRecord._id, overtimeHours: employeeDtr.summary.overtimeHours });
     };
 
     const clearApprovedOvertime = () => {
+        if (accuracyConfig?.enabled) { setDtrRecord(null); setRecomputeOpen(true); return; }
         if (!dtrRecord) return;
         updateOvertimeMutation.mutate({ id: dtrRecord._id, overtimeHours: 0 });
     };
@@ -1061,16 +1070,17 @@ export default function PayrollPage() {
                             <button
                                 className="flex h-11 items-center gap-2 rounded-lg bg-[linear-gradient(135deg,#842cff,#4a0ebd)] px-5 text-sm font-semibold text-white transition hover:brightness-110 disabled:opacity-60"
                                 type="button"
-                                disabled={runPayrollMutation.isPending}
-                                onClick={() => runPayrollMutation.mutate(undefined)}
+                                disabled={runPayrollMutation.isPending || !accuracyConfig}
+                                onClick={() => accuracyConfig?.enabled ? setRecomputeOpen(true) : runPayrollMutation.mutate(undefined)}
                             >
                                 <FiPlus className="size-4" aria-hidden="true" />
-                                {runPayrollMutation.isPending ? "Running..." : "Run Payroll"}
+                                {runPayrollMutation.isPending ? "Running..." : accuracyConfig?.enabled ? "Generate / Recompute cutoff" : "Run Payroll"}
                             </button>
                         )}
                     </div>
                 </div>
 
+                {runPayrollMutation.error && <p role="alert" className="mt-3 rounded-md border border-red-200 bg-red-50 p-3 text-sm !text-red-800">{payrollErrorMessage(runPayrollMutation.error)}</p>}
                 <div className="mt-5 grid gap-4 xl:h-[calc(100vh-15.5rem)] xl:min-h-[34rem] xl:grid-cols-[minmax(14.5rem,16.5rem)_1fr]">
                     <aside className="relative z-20 flex min-h-0 flex-col overflow-hidden rounded-lg border border-violet-200/80 bg-white/82 shadow-xl shadow-violet-200/35 backdrop-blur">
                         <div className="border-b border-violet-200/80 px-4 py-4">
@@ -1189,7 +1199,7 @@ export default function PayrollPage() {
                                     </thead>
                                     <tbody className="divide-y divide-slate-200">
                                         {isPayrollLoading && <tr><td className="px-3 py-4 text-sm !text-slate-500" colSpan={9}>Loading payroll...</td></tr>}
-                                        {isPayrollError && <tr><td className="px-3 py-4 text-sm text-red-600" colSpan={9}>Unable to load payroll.</td></tr>}
+                                        {isPayrollError && <tr><td className="px-3 py-4 text-sm text-red-600" colSpan={9}>{(payrollError as { response?: { data?: { message?: string } } })?.response?.data?.message || "Unable to load payroll."}</td></tr>}
                                         {!isPayrollLoading && !isPayrollError && visibleEmployees.length === 0 && <tr><td className="px-3 py-4 text-sm !text-slate-500" colSpan={9}>No payroll records found.</td></tr>}
                                         {visibleEmployees.map((employee) => {
                                             const initials = employee.employeeName.split(" ").map((part) => part[0]).join("").slice(0, 2).toUpperCase();
@@ -1227,14 +1237,16 @@ export default function PayrollPage() {
                                                         </div>
                                                     </td>
                                                     <td className="truncate px-3 py-2.5 !text-slate-700">{employee.employeeId}</td>
-                                                    <td className="px-3 py-2.5 font-semibold !text-slate-950">{money(employee.basicPay ?? employee.grossPay)}</td>
+                                                    <td className="px-3 py-2.5 font-semibold !text-slate-950">{money(employee.basicPay ?? employee.grossPay)}
+                                                        {accuracyConfig?.enabled && <small className="mt-1 block whitespace-normal text-xs font-normal !text-slate-600">{employee.paidHoursPerDay != null ? `${employee.paidHoursPerDay}h/day` : "Paid day not snapshotted"} · {money(employee.hourlyRate ?? (employee.minuteRate || 0) * 60)}/h · {money(employee.minuteRate || 0)}/min</small>}
+                                                    </td>
                                                     <td className="px-3 py-2.5 !text-slate-700">{employee.attendanceDays ?? 0}</td>
                                                     <td className="px-3 py-2.5 !text-slate-700">{employee.workedHours ?? 0}h</td>
                                                     <td className="px-3 py-2.5 font-semibold !text-slate-950">{money(employee.netPay)}</td>
                                                     <td className="px-3 py-2.5"><StatusBadge status={employee.status} /></td>
                                                     <td className="px-3 py-2.5 text-center" onClick={(event) => event.stopPropagation()}>
                                                         <div className="flex flex-nowrap justify-center gap-0.5">
-                                                            <button className="inline-flex size-7 items-center justify-center rounded-md !text-slate-600 transition hover:bg-slate-100 hover:!text-slate-950" type="button" onClick={() => { setBasicPayTarget(employee); setBasicPayInput(String(employee.basicPay ?? employee.grossPay ?? 0)); }} aria-label={`Edit basic pay for ${employee.employeeName}`} title="Edit basic pay">
+                                                            <button className="inline-flex size-7 items-center justify-center rounded-md !text-slate-600 transition hover:bg-slate-100 hover:!text-slate-950" type="button" onClick={() => { setBasicPayTarget(employee); setBasicPayInput(String(employee.calculationSnapshot?.monthlySalary ?? (employee.basicPay ?? employee.grossPay ?? 0) * 2)); }} aria-label={`Edit basic pay for ${employee.employeeName}`} title="Edit monthly salary">
                                                                 <FiEdit2 className="size-3.5" />
                                                             </button>
                                                             <button className="inline-flex size-7 items-center justify-center rounded-md !text-[#2563eb] transition hover:bg-[#2563eb]/10 hover:!text-[#1d4ed8]" type="button" onClick={() => setDtrRecord(employee)} aria-label={`View DTR for ${employee.employeeName}`} title="View DTR">
@@ -1262,11 +1274,12 @@ export default function PayrollPage() {
                                                                 type="button"
                                                                 onClick={() => {
                                                                     setWorkedMinutesError("");
+                                                                    if (accuracyConfig?.enabled) { setRecomputeOpen(true); return; }
                                                                     setWorkedMinutesTarget(employee);
                                                                     setWorkedMinutesInput(String(Math.round((employee.workedMinutesOverride ?? (employee.workedHours || 0) * 60))));
                                                                 }}
-                                                                aria-label={`Edit worked minutes for ${employee.employeeName}`}
-                                                                title="Edit total worked minutes"
+                                                                aria-label={accuracyConfig?.enabled ? `Preview cutoff for ${employee.employeeName}` : `Edit worked minutes for ${employee.employeeName}`}
+                                                                title={accuracyConfig?.enabled ? "Preview / recompute cutoff" : "Edit total worked minutes"}
                                                             >
                                                                 <FiHash className="size-3.5" />
                                                             </button>
@@ -1447,14 +1460,14 @@ export default function PayrollPage() {
                                     <p className="mt-1 text-sm !text-slate-600">{employeeDtr?.payPeriod || dtrRecord.payPeriod} · PH Time</p>
                                 </div>
                                 <div className="flex flex-wrap items-center justify-end gap-2">
-                                    {employeeDtr && employeeDtr.summary.overtimeHours > 0 && (
+                                    {employeeDtr && (employeeDtr.potentialOvertimeHours ?? employeeDtr.summary.overtimeHours) > 0 && (
                                         <button
                                             className="h-9 rounded-lg bg-[linear-gradient(135deg,#842cff,#4a0ebd)] px-3 text-sm font-semibold text-white transition hover:brightness-110 disabled:opacity-60"
                                             type="button"
                                             onClick={approvePotentialOvertime}
                                             disabled={updateOvertimeMutation.isPending}
                                         >
-                                            Approve {employeeDtr.summary.overtimeHours}h OT
+                                            Approve {employeeDtr.potentialOvertimeHours ?? employeeDtr.summary.overtimeHours}h OT
                                         </button>
                                     )}
                                     {(dtrRecord.overtimeHours || 0) > 0 && (
@@ -1480,13 +1493,15 @@ export default function PayrollPage() {
 
                             <div className="content-scroll min-h-0 flex-1 overflow-auto p-5">
                                 {isDtrLoading && <p className="rounded-lg border border-slate-300 bg-slate-50 p-4 text-sm font-semibold !text-black">Loading DTR...</p>}
-                                {isDtrError && <p className="rounded-lg border border-rose-300 bg-rose-50 p-4 text-sm font-semibold text-rose-700">Unable to load DTR.</p>}
+                                {isDtrError && <p className="rounded-lg border border-rose-300 bg-rose-50 p-4 text-sm font-semibold text-rose-700">{(dtrError as { response?: { data?: { message?: string } } })?.response?.data?.message || "Unable to load DTR."}</p>}
                                 {employeeDtr && (
                                     <div className="space-y-4">
+                                        {accuracyConfig?.enabled && employeeDtr.storedCutoff && <p className="rounded-md border border-sky-200 bg-sky-50 p-3 text-sm !text-sky-900">Totals are the saved cutoff. Attendance rows reflect current evidence; preview a recompute to compare changes.</p>}
                                         <div className="grid gap-3 md:grid-cols-4">
                                             {[
                                                 ["Cutoff Working Days", employeeDtr.summary.workingDays],
                                                 ["Monthly Rate Days", employeeDtr.summary.monthlyWorkingDays],
+                                                ["Paid hours / day", employeeDtr.summary.paidHoursPerDay ?? "Not snapshotted"],
                                                 ["Basic Pay", money(employeeDtr.summary.basicPay)],
                                                 ["Days Present", employeeDtr.summary.attendanceDays],
                                                 ["Absent", formatDays(employeeDtr.summary.absentDays)],
@@ -1657,7 +1672,7 @@ export default function PayrollPage() {
                                             className="flex h-10 items-center gap-2 rounded-lg bg-emerald-500 px-3 text-sm font-semibold text-white transition hover:bg-emerald-600 disabled:cursor-wait disabled:opacity-60"
                                             type="button"
                                             onClick={() => sendPayslipMutation.mutate()}
-                                            disabled={isPayslipDtrLoading || sendPayslipMutation.isPending}
+                                            disabled={isPayslipDtrLoading || sendPayslipMutation.isPending || (accuracyConfig?.enabled && !payslipDtr?.storedCutoff)}
                                         >
                                             <FiSend className="size-4" aria-hidden="true" />
                                             {sendPayslipMutation.isPending ? "Sending..." : "Send to Messages"}
@@ -1842,6 +1857,7 @@ export default function PayrollPage() {
                                         {paymentTarget.record.employeeId} · {paymentTarget.record.payPeriod} · {money(paymentTarget.record.netPay)}
                                     </p>
                                 </div>
+                                {(markPaidMutation.error || markUnpaidMutation.error) && <p role="alert" className="mt-3 text-sm !text-red-700">{payrollErrorMessage(markPaidMutation.error || markUnpaidMutation.error)}</p>}
                             </div>
                             <div className="flex justify-end gap-2 border-t border-white/10 px-5 py-3">
                                 <button
@@ -1928,7 +1944,8 @@ export default function PayrollPage() {
                             <div className="p-5">
                                 <label className="text-xs font-semibold uppercase tracking-[0.14em] text-white/45">Monthly salary for each 6th-5th cycle</label>
                                 <input className="mt-2 h-11 w-full rounded-lg border border-white/10 bg-black/20 px-3 text-sm font-semibold text-white outline-none focus:border-[#842cff]" type="number" min="0" step="0.01" required autoFocus value={basicPayInput} onChange={(event) => setBasicPayInput(event.target.value)} />
-                                <p className="mt-2 text-xs leading-5 text-white/45">The system divides this by the period's Monday-Friday working days, then by 8 hours and 60 minutes.</p>
+                                <p className="mt-2 text-xs leading-5 text-white/45">Rates use monthly working days and the configured paid shift hours. Generated cutoffs change only after a confirmed recompute.</p>
+                                {updateBasicPayMutation.error && <p role="alert" className="mt-3 text-sm !text-red-700">{payrollErrorMessage(updateBasicPayMutation.error)}</p>}
                             </div>
                             <div className="flex justify-end gap-2 border-t border-white/10 px-5 py-3">
                                 <button className="h-10 rounded-lg border border-white/10 bg-white/[0.05] px-4 text-sm font-semibold text-white/60" type="button" onClick={() => setBasicPayTarget(null)}>Cancel</button>
@@ -1977,6 +1994,9 @@ export default function PayrollPage() {
                         </div>
                     </div>
                 )}
+                {recomputeOpen && <PayrollRecomputeDialog initialPeriod={employees[0]?.payPeriod} currencyCode={systemSettings?.currencyCode} onClose={() => setRecomputeOpen(false)} onSaved={() => {
+                    refreshPayroll(); queryClient.invalidateQueries({ queryKey: ["payroll-dtr"] }); queryClient.invalidateQueries({ queryKey: ["payroll-payslip-dtr"] });
+                }} />}
             </section>
         </AdminLayout>
     );

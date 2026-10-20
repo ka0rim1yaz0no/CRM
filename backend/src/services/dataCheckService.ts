@@ -19,10 +19,11 @@ import { countAdminLeads } from "../controllers/leadController";
 import { calculateSlotAttendance } from "./timeAccounting";
 import { auditAttendance, badCallTimes, checkBounds, compareCheck, percentChangeCheck, punchDays, type AuditPunch, type CheckPolicy } from "./dataCheckMath";
 import { withReadSnapshot } from "./readSnapshot";
+import { payrollAccuracyEnabled } from "../config/rolloutFlags";
 import { dataCheckVerdict, type DataCheckReport, type DataCheckRow, type DataCheckSample, type DataCheckSection } from "../../../shared/dataCheck";
 
 type WorkspaceView = { dashboard: { summary: Record<string, number> }; attendance: Record<string, number>; calls: Array<{ count: number; seconds: number }>; overdueTotal: number; previous: Record<string, number>; deltas: Record<string, number | null> };
-type HubRow = { employeeCode: string; employeeName: string; milliseconds: Record<string, number>; breakSessions: Array<{ durationMs: number }>; excused: boolean };
+type HubRow = { employeeCode: string; employeeName: string; milliseconds: Record<string, number>; breakSessions: Array<{ durationMs: number }>; excused: boolean; mismatch?: boolean; review?: string[] };
 type HubView = { rows: HubRow[]; total: number; totalRows?: number; totalDays?: number; pages?: number; pageCount?: number };
 type RawCall = { _id: string; employee: Types.ObjectId; at: Date; seconds: number; outcome: string };
 type ScopeSnapshot = { business: string; policy: CheckPolicy; rows: Map<string, AuditPunch[]>; codes: string[] };
@@ -145,8 +146,12 @@ async function inspectAttendance(request: Request, business: BusinessConfig, dat
       const dtr = await bounded(attendancePayrollDtr(person._id, `${label} - ${label}`), 4000);
       const day = dtr.rows.find(row => row.dateKey === date);
       const dtrMinutes = day ? day.lateMinutes + day.excessBreakMinutes + day.excessLunchMinutes + day.earlyTimeOutMinutes : null;
-      checks.push(compareCheck(`${person.employeeCode}-dtr`, "Consistency", business.id, `${prefix}: DTR vs attendance deductible minutes`, dtrMinutes, view ? (view.milliseconds.late + view.milliseconds.overBreak + view.milliseconds.overLunch + view.milliseconds.underTime) / 60_000 : null,
-        "Existing read-only DTR row compared with the attendance hub in identical units. Weekend waivers, excuses, schedules or replica/canonical disagreement can explain a difference; no salary or bank fields are read or returned.", events.map(sample), true));
+      const reviewExcluded = payrollAccuracyEnabled() && (audit.open || audit.unclosedRests > 0 || audit.starts.break > 2 || audit.starts.lunch > 1 ||
+        Boolean(view?.mismatch || view?.review?.length) || Boolean(audit.firstIn && now < end));
+      checks.push(compareCheck(`${person.employeeCode}-dtr`, "Consistency", business.id, `${prefix}: DTR vs attendance deductible minutes`, dtrMinutes,
+        reviewExcluded ? 0 : view ? (view.milliseconds.late + view.milliseconds.overBreak + view.milliseconds.overLunch + view.milliseconds.underTime) / 60_000 : null,
+        reviewExcluded ? "The independent event audit finds an unresolved/in-progress shift, excess rest attempts, or a hub review/mismatch. Accuracy payroll must finalize zero deductible minutes until resolution; observational hub issue minutes remain visible. No past payroll is changed." :
+          "Existing read-only DTR row compared with the attendance hub in identical units. Weekend waivers, excuses, schedules or replica/canonical disagreement can explain a difference; no salary or bank fields are read or returned.", events.map(sample), true));
     } catch { checks.push(compareCheck(`${person.employeeCode}-dtr`, "Consistency", business.id, `${prefix}: DTR`, null, null, "DTR evidence was not available within its read budget.")); }
   }
   const summaryPairs: Array<[string, string, number]> = [["present", "employeesPresent", totals.present], ["late-count", "lateCount", totals.lateCount], ["late-minutes", "late", totals.late * 60_000], ["deductible-minutes", "deductible", totals.deductible]];

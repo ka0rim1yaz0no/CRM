@@ -13,6 +13,8 @@ const prefix = `pay_upload_test_${crypto.randomUUID().replaceAll("-", "")}`;
 const uploadDirectory = await mkdtemp(path.join(os.tmpdir(), "assistly-upload-test-"));
 process.env.CRM_UPLOAD_ROOT = uploadDirectory;
 process.env.NODE_ENV = "test";
+// Legacy direct-edit and first-read generation controls use explicit rollback.
+process.env.CRM_PAYROLL_ACCURACY = "false";
 process.env.BUSINESS_DATABASES = JSON.stringify(["a", "b", "c"].map((id) => ({ id: `test-${id}`, name: `Synthetic ${id}`, databaseName: `${prefix}_${id}` })));
 process.env.DEFAULT_BUSINESS_ID = "test-a";
 process.env.DEFAULT_BUSINESS_DATABASE = `${prefix}_a`;
