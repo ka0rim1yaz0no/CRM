@@ -18,7 +18,7 @@ const returns: Partial<Record<AttendanceSource, AttendanceMode>> = {
 const outgoing: Partial<Record<AttendanceSource, AttendanceMode>> = {
   "Break Out": "BREAK", "Lunch Break Out": "LUNCH", "Off the Phone Out": "OFF THE PHONE",
 };
-export function projectAttendance(events: SessionEvent[], corrections: SessionCorrection[] = [], closures: SystemClosure[] = []) {
+export function projectAttendance(events: SessionEvent[], corrections: SessionCorrection[] = [], closures: SystemClosure[] = [], accounting?: { allowUnreturnedCheckout: boolean }) {
   const reversed = new Set(corrections.flatMap((correction) => correction.targets));
   const effectiveEvents = events.filter((event) => !reversed.has(event.id))
     .sort((a, b) => a.at.localeCompare(b.at) || a.sequence - b.sequence || a.id.localeCompare(b.id));
@@ -53,10 +53,10 @@ export function projectAttendance(events: SessionEvent[], corrections: SessionCo
       continue;
     }
     if (event.source === "Time Out" || event.source === "Logout") {
-      if (active.mode !== "ONLINE" && active.mode !== "OFF THE PHONE" && !event.legacyReviewed) {
+      if (active.mode !== "ONLINE" && active.mode !== "OFF THE PHONE" && !event.legacyReviewed && !accounting?.allowUnreturnedCheckout) {
         issues.push({ eventId: event.id, message: "End the open break or lunch before Time Out." }); continue;
       }
-      if (active.mode !== "ONLINE" && active.mode !== "OFF THE PHONE") issues.push({ eventId: event.id,
+      if (active.mode !== "ONLINE" && active.mode !== "OFF THE PHONE" && !accounting?.allowUnreturnedCheckout) issues.push({ eventId: event.id,
         message: "Legacy manual checkout has no separate break or lunch return; original checkout is retained.", historical: true });
       active.events.push(event); active.endedAt = event.at; active.modeSince = event.at;
       active.lifecycle = "manually-closed"; active.mode = "OFFLINE"; active = null; continue;

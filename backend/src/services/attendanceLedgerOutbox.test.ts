@@ -15,7 +15,7 @@ const { getBusinessConnection } = await import("../config/tenancy");
 const { deliverAttendanceLedger } = await import("./attendanceLedgerOutbox");
 const policy = { breakMinutes: 15, lunchMinutes: 60, graceMinutes: 0, shiftStart: "23:00", shiftEnd: "08:00", revision: 1 };
 const now = new Date("2026-10-16T02:00:00Z");
-afterEach(() => { mock.restoreAll(); process.env.CRM_ATTENDANCE_DURATION_MODEL = "true"; });
+afterEach(() => { mock.restoreAll(); process.env.CRM_ATTENDANCE_DURATION_MODEL = "true"; delete process.env.CRM_ATTENDANCE_ACCURACY_FIXES; });
 
 function fixture(operation = "action", canonical = true) {
   const rows = [["Time In", "2026-10-15T15:00:00Z"], ["Break Out", "2026-10-15T23:45:00Z"],
@@ -32,8 +32,8 @@ function fixture(operation = "action", canonical = true) {
   const writes = new Map<string, Array<{ updateOne: { update: { $set: Record<string, unknown> } } }>>();
   mock.method(AttendanceLedger, "findById", () => ({ lean: async () => ledger }));
   mock.method(AttendancePolicy, "findById", () => ({ lean: async () => policy }));
-  mock.method(AttendanceLedger, "updateOne", async (_filter: unknown, _update: unknown, options: { arrayFilters: Array<{ "job.businessId": string }> }) => {
-    for (const job of ledger.jobs) if (job.businessId === options.arrayFilters[0]["job.businessId"]) job.done = true;
+  mock.method(AttendanceLedger, "updateOne", async (_filter: unknown, update: { $set: Record<string, unknown> }, options: { arrayFilters: Array<{ "job.businessId": string }> }) => {
+    for (const job of ledger.jobs) if (job.businessId === options.arrayFilters[0]["job.businessId"] && update.$set["jobs.$[job].done"] === true) job.done = true;
     return { matchedCount: 1, modifiedCount: 1 };
   });
   for (const businessId of ledger.businessIds) {
@@ -133,11 +133,44 @@ test("derived-only refresh delivers stored deductions, emits updates and recalcu
 });
 
 test("payroll failure still publishes the confirmed attendance state while leaving the business pending", async () => {
+  process.env.CRM_ATTENDANCE_ACCURACY_FIXES = "false";
   const { ledger } = fixture();
   const emitted: string[] = [];
   const result = await deliverAttendanceLedger(ledger._id, { now,
     emitAvailability: (payload) => { emitted.push(payload.employeeId); },
     recalculatePayroll: async (_id, _from, _to, scope) => { if (scope!.businessIds![0] === "fake-b") throw new Error("Synthetic failure"); } });
   assert.deepEqual(emitted, ["employee-fake-a", "employee-fake-b"]);
+  assert.deepEqual(result?.pendingBusinessIds, ["fake-b"]);
+});
+
+test("accuracy: failed payroll is logged, stays pending, and does not emit unfinished availability", async () => {
+  process.env.CRM_ATTENDANCE_ACCURACY_FIXES = "true";
+  const { ledger } = fixture(); const emitted: string[] = []; const errors: unknown[][] = [];
+  mock.method(console, "warn", (...args: unknown[]) => { errors.push(args); });
+  const result = await deliverAttendanceLedger(ledger._id, { now,
+    emitAvailability: payload => { emitted.push(payload.employeeId); },
+    recalculatePayroll: async (_id, _from, _to, scope) => { if (scope!.businessIds![0] === "fake-b") throw Object.assign(new Error("Synthetic failure"), { code: "SYNTHETIC_OUTAGE" }); } });
+  assert.deepEqual(result?.pendingBusinessIds, ["fake-b"]);
+  assert.deepEqual(emitted, ["employee-fake-a"]);
+  assert.ok(errors.length > 0);
+  assert.equal(ledger.jobs.find(job => job.businessId === "fake-b")!.done, false);
+});
+
+test("accuracy: a lost completion marker never emits", async () => {
+  process.env.CRM_ATTENDANCE_ACCURACY_FIXES = "true";
+  const { ledger } = fixture(); const emitted: string[] = [];
+  mock.method(AttendanceLedger, "updateOne", async () => ({ matchedCount: 0, modifiedCount: 0 }));
+  await deliverAttendanceLedger(ledger._id, { now, recalculatePayroll: async () => {}, emitAvailability: payload => { emitted.push(payload.employeeId); } });
+  assert.deepEqual(emitted, []);
+});
+
+test("accuracy: notifications see a completed marker; failed socket delivery remains retryable", async () => {
+  process.env.CRM_ATTENDANCE_ACCURACY_FIXES = "true";
+  const { ledger } = fixture();
+  const result = await deliverAttendanceLedger(ledger._id, { now, recalculatePayroll: async () => {}, emitAvailability: payload => {
+    const business = payload.employeeId.replace("employee-", "");
+    assert.equal(ledger.jobs.find(job => job.businessId === business)!.done, true);
+    if (business === "fake-b") throw new Error("Synthetic socket outage");
+  } });
   assert.deepEqual(result?.pendingBusinessIds, ["fake-b"]);
 });

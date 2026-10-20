@@ -1643,6 +1643,7 @@ export default function PayrollPage() {
                                                                 </td>
                                                                 <td className="px-3 py-3">
                                                                     <span className={`inline-flex rounded-md border px-2 py-1 text-xs font-bold ${dtrStatusClass(row.status)}`}>{row.status === "Overtime" ? "Potential OT" : row.status}</span>
+                                                                    {row.restWarnings?.map(warning => <span key={warning} className="mt-1 block text-xs text-amber-800">{warning}</span>)}
                                                                 </td>
                                                                 <td className="px-3 py-3 !text-black">{row.timeIn}</td>
                                                                 <td className="px-3 py-3 !text-black">{row.timeOut}</td>

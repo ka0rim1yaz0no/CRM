@@ -7,6 +7,7 @@ export type AttendanceBackfillRecord = {
   id: string; eventId?: string; source: SessionEvent["source"]; timeIn: Date; derived?: AttendanceDerivedDay;
 };
 export type AttendanceBackfillEmployee = {
+  employeeCode?: string;
   records: AttendanceBackfillRecord[]; ledger?: AttendanceDerivedLedger & { derived?: AttendanceDerivedDay[] };
 };
 const minuteFields = ["lateMinutes", "excessBreakMinutes", "excessLunchMinutes", "earlyTimeOutMinutes", "deductibleMinutes"] as const;
@@ -23,13 +24,17 @@ export function attendanceDerivedBackfillWindow(now: Date) {
     contextStart: new Date(from.getTime() - 86_400_000) };
 }
 
-export function summarizeAttendanceDerivedBackfill(businessId: string, employees: AttendanceBackfillEmployee[], policy: AttendanceDerivedPolicy, now: Date) {
+export function summarizeAttendanceDerivedBackfill(businessId: string, employees: AttendanceBackfillEmployee[], policy: AttendanceDerivedPolicy, now: Date,
+  options: { accuracyReport?: boolean } = {}) {
   const window = attendanceDerivedBackfillWindow(now);
   const report = { businessId, dryRun: true as const, writes: 0, fromDay: window.fromDay, throughDay: window.throughDay,
     employeesChecked: 0, daysChecked: 0, recordsChecked: 0, differingDays: 0, differingRecords: 0, missingDerivedRecords: 0,
     canonicalDaysDiffering: 0, legacyEmployeesRequiringReview: 0, daysRequiringReview: 0, unmatchedRecords: 0,
     before: totals(), after: totals(), fieldDiffCounts: Object.fromEntries(comparisonFields.map((field) => [field, 0])) };
+  const accuracy = { changedStoredRecords: 0, minutesDifference: 0, unverifiableRecords: 0, unverifiableDays: 0,
+    topEmployees: [] as Array<{ employeeCode: string; changedStoredRecords: number; minutesDifference: number }> };
   for (const employee of employees) {
+    const affected = { employeeCode: employee.employeeCode || "unidentified", changedStoredRecords: 0, minutesDifference: 0 };
     const records = [...employee.records].sort((a, b) => a.timeIn.getTime() - b.timeIn.getTime() || a.id.localeCompare(b.id));
     const ledger = employee.ledger || { events: records.map((record, sequence): SessionEvent => ({
       id: record.eventId || `dry-run:${record.id}`, source: record.source, at: record.timeIn.toISOString(), sequence,
@@ -52,6 +57,15 @@ export function summarizeAttendanceDerivedBackfill(businessId: string, employees
       ]));
       const copies = records.filter((record) => ids.has(record.eventId || `dry-run:${record.id}`) || origins.has(record.id));
       const before = copies.find((record) => record.derived)?.derived;
+      if (options.accuracyReport) {
+        const stored = before || employee.ledger?.derived?.find(item => item.dayKey === day.dayKey);
+        if (stored) affected.minutesDifference += day.deductibleMinutes - stored.deductibleMinutes;
+        else accuracy.unverifiableDays++;
+        for (const record of copies) {
+          if (!record.derived) accuracy.unverifiableRecords++;
+          else if (record.derived.deductibleMinutes !== day.deductibleMinutes) affected.changedStoredRecords++;
+        }
+      }
       for (const field of minuteFields) { report.before[field] += before?.[field] || 0; report.after[field] += day[field]; }
       let dayDiffers = false;
       for (const field of comparisonFields) {
@@ -73,6 +87,10 @@ export function summarizeAttendanceDerivedBackfill(businessId: string, employees
       if (matched.has(record.id) || outsideWindowIds.has(record.eventId || `dry-run:${record.id}`) || record.timeIn > now) return false;
       return assignAttendanceShift(record.timeIn, policy.shiftStart, policy.shiftEnd, policy.recoveryTime).dayKey >= window.fromDay;
     }).length;
+    accuracy.changedStoredRecords += affected.changedStoredRecords; accuracy.minutesDifference += affected.minutesDifference;
+    if (affected.changedStoredRecords || affected.minutesDifference) accuracy.topEmployees.push(affected);
   }
-  return report;
+  accuracy.topEmployees.sort((a, b) => Math.abs(b.minutesDifference) - Math.abs(a.minutesDifference) || b.changedStoredRecords - a.changedStoredRecords || a.employeeCode.localeCompare(b.employeeCode));
+  accuracy.topEmployees = accuracy.topEmployees.slice(0, 20);
+  return { ...report, ...(options.accuracyReport ? { accuracy } : {}) };
 }

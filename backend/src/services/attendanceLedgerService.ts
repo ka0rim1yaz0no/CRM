@@ -6,7 +6,8 @@ import { Employee } from "../models/Employee";
 import { getAttendanceBusinessIdentity } from "../models/BusinessUserAccess";
 import { getBusinessById, getCurrentBusinessId, runWithBusiness } from "../config/tenancy";
 import { SystemSettings } from "../models/SystemSettings";
-import { attendanceAutoTimeOutEnabled, attendanceDurationModelEnabled, attendanceIntegrityEnabled, attendanceRecoveryEnvironmentEnabled, payrollAccuracyEnabled } from "../config/rolloutFlags";
+import { attendanceAutoTimeOutEnabled, attendanceDurationModelEnabled, attendanceIntegrityEnabled, attendanceRecoveryEnvironmentEnabled, payrollAccuracyEnabled, attendanceAccuracyFixesEnabled } from "../config/rolloutFlags";
+import { attendanceMaintenanceState } from "./attendanceWorkerCandidates";
 import { assignAttendanceShift } from "./attendanceShift";
 import { projectAttendance, sessionTime, type SessionEvent } from "./attendanceSessionState";
 import { attendanceAutoTimeOutCutoff } from "./attendanceAutoTimeOut";
@@ -351,16 +352,22 @@ export async function executeAttendanceCommand(identity: AttendanceIdentity, inp
     const plan = applyAttendanceCommand(ledger, input, actor, policy, now);
     const revision = ledger.revision + 1;
     const next = { ...ledger, events: plan.events, corrections: plan.corrections, closures: plan.closures, revision,
-      jobs: [...ledger.jobs, ...identity.businessIds.map((businessId) => ({ businessId, revision, done: false }))] };
+      jobs: [...ledger.jobs, ...identity.businessIds.map((businessId) => ({ businessId, revision, done: false,
+        ...(attendanceAccuracyFixesEnabled() ? { createdAt: now.toISOString() } : {}) }))] };
     let derivedDelta: AttendanceDerivedAuditDelta | undefined;
     if (attendanceDurationModelEnabled()) {
       const beforeDerived = ledger.derived ?? deriveAttendanceDays(ledger, policy, now);
       const previous = new Map(beforeDerived.map((day) => [day.dayKey, day]));
       const calculated = deriveAttendanceDays(next, policy, now);
-      next.derived = input.operation === "recalculate-policy" ? calculated.filter((day) => previous.has(day.dayKey)) : input.operation === "recalculate"
+      next.derived = input.operation === "recalculate-policy" ? calculated.filter((day) => previous.has(day.dayKey))
+        .map(day => attendanceAccuracyFixesEnabled() && previous.get(day.dayKey)?.accuracyVersion !== 1 ? previous.get(day.dayKey)! : day) : input.operation === "recalculate"
         ? beforeDerived.map((day) => day.dayKey === input.dayKey ? calculated.find((item) => item.dayKey === day.dayKey)! : day)
         : calculated.map((day) => {
           const old = previous.get(day.dayKey);
+          const confirmedNoteDay = input.operation === "confirm-note" && input.noteReference?.dayKey === day.dayKey;
+          if (attendanceAccuracyFixesEnabled() && !confirmedNoteDay && old && !old.hasOpenSession && !day.hasOpenSession &&
+            JSON.stringify(old.eventIds) === JSON.stringify(day.eventIds) &&
+            (old.accuracyVersion !== 1 || old.policyRevision === day.policyRevision)) return old;
           return old && old.policyRevision === day.policyRevision && sameAttendanceDerivedValues(old, day) ? old : day;
         });
       derivedDelta = attendanceDerivedAuditDelta(beforeDerived, next.derived);
@@ -383,6 +390,7 @@ export async function executeAttendanceCommand(identity: AttendanceIdentity, inp
     const committed = await commitAttendanceRevision(identity.key, token, ledger.fence, ledger.revision, {
       $set: { ...(["recalculate", "recalculate-policy", "confirm-note"].includes(input.operation) ? {} : { events: plan.events, corrections: plan.corrections, closures: plan.closures }),
         revision, jobs: next.jobs, businessIds: identity.businessIds,
+        ...(attendanceAccuracyFixesEnabled() ? { maintenance: attendanceMaintenanceState(plan.after, next.derived) } : {}),
         ...(derivedDelta ? { derived: next.derived, ...(!ledger.derivedBaseline ? { derivedBaseline: next.derivedBaseline } : {}) } : {}) },
       $push: { audit, commands: { id: input.commandId, actor: `${actor.role}:${actor.code}`, hash: requestHash, revision,
         result: { serverTime: result.serverTime, state: result.state, sessionId: result.sessionId } } },

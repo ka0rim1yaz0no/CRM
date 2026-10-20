@@ -13,8 +13,9 @@ export type AttendanceLedgerDocument = {
   _id: string; employeeCode: string; businessIds: string[]; canonicalBusinessId: string; revision: number; fence: number;
   lockToken?: string; lockUntil?: Date; events: SessionEvent[]; corrections: SessionCorrection[]; closures: SystemClosure[];
   audit: AttendanceAudit[]; commands: Array<{ id: string; actor: string; hash: string; revision: number; result: Record<string, unknown> }>;
-  jobs: Array<{ revision: number; businessId: string; done: boolean }>; migrationRequired?: boolean;
+  jobs: Array<{ revision: number; businessId: string; done: boolean; createdAt?: string; lastErrorCode?: string; lastErrorAt?: string }>; migrationRequired?: boolean;
   derived?: AttendanceDerivedDay[];
+  maintenance?: { active: boolean; derivedRefreshAt?: Date };
   derivedBaseline?: AttendanceDerivedBaseline;
   legacyAdoption?: { backupId: string; fingerprint: string; sourceCount: number; duplicateCount: number;
     businessStreamsDiffer: boolean; historicalIssues: number; adoptedAt: string };
@@ -26,10 +27,15 @@ const schema = new Schema({
   closures: { type: [Schema.Types.Mixed], default: [] }, audit: { type: [Schema.Types.Mixed], default: [] },
   commands: { type: [Schema.Types.Mixed], default: [] }, jobs: { type: [Schema.Types.Mixed], default: [] },
   derived: { type: [Schema.Types.Mixed], default: undefined },
+  maintenance: { type: Schema.Types.Mixed, default: undefined },
   derivedBaseline: { type: Schema.Types.Mixed, default: undefined },
   legacyAdoption: { type: Schema.Types.Mixed, default: undefined },
 }, { timestamps: true, minimize: false });
 schema.index({ employeeCode: 1, businessIds: 1 });
+schema.index({ "maintenance.active": 1, _id: 1 });
+schema.index({ "maintenance.derivedRefreshAt": 1, _id: 1 });
+schema.index({ "jobs.done": 1, _id: 1 });
+schema.index({ "derived.policyRevision": 1, _id: 1 });
 export const AttendanceLedger = mongoose.models.AttendanceLedger as mongoose.Model<AttendanceLedgerDocument> ||
   mongoose.model<AttendanceLedgerDocument>("AttendanceLedger", schema);
 

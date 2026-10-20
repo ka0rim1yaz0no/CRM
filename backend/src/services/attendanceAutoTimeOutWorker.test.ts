@@ -40,6 +40,20 @@ function autoCommand(revision = store.revision): AttendanceCommand {
 }
 const noDelivery = async () => undefined;
 
+test("accuracy: recovery delivery failure counts the pending job after a durable close", async () => {
+  const saved = process.env.CRM_ATTENDANCE_ACCURACY_FIXES;
+  process.env.CRM_ATTENDANCE_ACCURACY_FIXES = "true"; process.env.CRM_ATTENDANCE_AUTO_TIMEOUT = "false";
+  const query = { select() { return query; }, sort() { return query; }, limit() { return query; }, maxTimeMS() { return query; }, async lean() { return [copy(store)]; } };
+  mock.method(AttendanceLedger, "find", () => query as never);
+  try {
+    const { attendanceWorkersSnapshot } = await import("./attendanceWorkerHealth");
+    assert.equal(await runAttendanceRecovery(now("15:00:00"), async () => { throw new Error("Synthetic recovery delivery outage"); }), 0);
+    const report = attendanceWorkersSnapshot().find(item => item.name === "recovery")!;
+    assert.equal(report.counters.closed, 1); assert.equal(report.counters.deliveryPending, 1);
+    assert.equal(store.closures.length, 1);
+  } finally { if (saved === undefined) delete process.env.CRM_ATTENDANCE_ACCURACY_FIXES; else process.env.CRM_ATTENDANCE_ACCURACY_FIXES = saved; }
+});
+
 beforeEach(() => {
   savedFlags = flagNames.map((name) => process.env[name]);
   // This in-memory worker suite exercises the legacy commit adapter; real fences use Mongo integration fixtures.

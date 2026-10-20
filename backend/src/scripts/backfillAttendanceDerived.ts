@@ -25,7 +25,7 @@ export function parseAttendanceDerivedBackfillArguments(args: string[]) {
   return { uri: values.uri, ledgerDatabase: values["ledger-database"], businesses, now };
 }
 
-export async function backfillAttendanceDerivedDryRun(args: string[]) {
+export async function backfillAttendanceDerivedDryRun(args: string[], reportOptions: { accuracyReport?: boolean } = {}) {
   const options = parseAttendanceDerivedBackfillArguments(args);
   // Raw read-only driver calls avoid model auto-index/auto-create side effects.
   const client = new mongo.MongoClient(options.uri);
@@ -44,9 +44,9 @@ export async function backfillAttendanceDerivedDryRun(args: string[]) {
           isArchived: { $ne: true }, isEffective: { $ne: false }, timeIn: { $gte: window.contextStart, $lte: options.now } },
         { projection: { eventId: 1, source: 1, timeIn: 1, derived: 1 } }).toArray();
         const ledger = await canonical.collection<AttendanceLedgerDocument>("attendanceledgers").findOne({ employeeCode: employee.employeeCode, businessIds: business.id });
-        if (records.length || ledger) employees.push({ records: records.map((record) => ({ ...record, id: String(record._id) })), ledger: ledger || undefined });
+        if (records.length || ledger) employees.push({ employeeCode: employee.employeeCode, records: records.map((record) => ({ ...record, id: String(record._id) })), ledger: ledger || undefined });
       }
-      reports.push(summarizeAttendanceDerivedBackfill(business.id, employees, policy, options.now));
+      reports.push(summarizeAttendanceDerivedBackfill(business.id, employees, policy, options.now, reportOptions));
     }
     return { dryRun: true, writes: 0, days: 60, businesses: reports };
   } finally { await client.close(); }

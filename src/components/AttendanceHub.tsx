@@ -11,6 +11,7 @@ import AttendanceCorrections from "./AttendanceCorrections";
 import AttendanceEditDialog from "./AttendanceEditDialog";
 import AttendanceDayNoteForm from "./AttendanceDayNoteForm";
 import AttendancePolicyEditor from "./AttendancePolicyEditor";
+import AttendanceDeliveryHealth from "./AttendanceDeliveryHealth";
 import { getActiveBusinessId } from "../api/businessStorage";
 import { attendanceHubFilters, attendanceHubFilterChange } from "../lib/attendanceHubState";
 import { manilaCalendarDate, type ShiftView } from "../../shared/attendanceView";
@@ -393,6 +394,7 @@ export default function AttendanceHub({ admin = false, actions, message, embedde
                     <span>Page {data.page} of {Math.ceil(data.total / data.pageSize)}</span>
                     <button type="button" disabled={data.page * data.pageSize >= data.total} onClick={() => setFilter("page", String(data.page + 1))}>Next</button></nav>}
             </section>
+            {admin && <AttendanceDeliveryHealth business={activeBusiness} />}
             <section className="attendance-hub-bottom"><div><h2>Trends</h2><p>Worked hours by shift day</p>
                 <div className="attendance-hub-chart">{data.trend.map((item) => <div key={item.dayKey} title={`${item.dayKey}: ${duration(item.online)} worked, ${duration(item.late)} late`}>
                     <span style={{ height: `${Math.max(4, item.online / maxTrend * 100)}%` }} /></div>)}</div>

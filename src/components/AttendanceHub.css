@@ -36,6 +36,14 @@
   border: 1px solid var(--hub-border); border-radius: 6px; color: var(--hub-text); background: var(--hub-soft); font-size: 12px; font-weight: 600;
 }
 .attendance-hub-help { position: relative; }
+.attendance-hub-delivery-health { margin: 12px 0; padding: 10px 24px; border-top: 1px solid var(--hub-border); overflow-x: auto; }
+.attendance-hub-delivery-health p { position: static; width: auto; }
+.attendance-hub-delivery-health table { display: table; width: 100%; min-width: 640px; table-layout: fixed; border-collapse: collapse; margin-top: 12px; font-size: 12px; }
+.attendance-hub-delivery-health th, .attendance-hub-delivery-health td { padding: 8px 12px; border-bottom: 1px solid var(--hub-border); text-align: left; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.attendance-hub-delivery-health th { background: var(--hub-soft); font-weight: 600; }
+.attendance-hub-delivery-health th:first-child { width: 24%; }
+.attendance-hub-delivery-health th:nth-child(2) { width: 20%; }
+.attendance-hub-delivery-health td:nth-child(n+3), .attendance-hub-delivery-health th:nth-child(n+3) { text-align: right; }
 .attendance-hub-help summary { list-style: none; cursor: pointer; }
 .attendance-hub-help summary::-webkit-details-marker { display: none; }
 .attendance-hub-help p { position: absolute; z-index: 20; right: 0; top: 100%; width: min(340px, 80vw); padding: 12px; background: var(--hub-bg);

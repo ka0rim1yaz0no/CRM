@@ -30,3 +30,4 @@ export const securityLegacyAuthEnabled = () => enabled("CRM_SECURITY_LEGACY_AUTH
 export const dataCheckEnabled = () => enabled("CRM_DATA_CHECK");
 export const dataCheckNavigationEnabled = () => ["true", "1"].includes(String(process.env.CRM_DATA_CHECK_NAV || "").trim().toLowerCase());
 export const payrollAccuracyEnabled = () => enabled("CRM_PAYROLL_ACCURACY");
+export const attendanceAccuracyFixesEnabled = () => enabled("CRM_ATTENDANCE_ACCURACY_FIXES");

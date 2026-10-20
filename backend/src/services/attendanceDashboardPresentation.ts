@@ -1,12 +1,12 @@
 import type { AssignedShift, SessionEvent } from "./attendanceSessionState";
 import { calculateHubDay, hubDayKey, type HubSettings } from "./attendanceHubMath";
-import { clickedSessionIntervals, excessClickedSessionMilliseconds, calculateSlotAttendance } from "./timeAccounting";
-import { attendanceDurationModelEnabled } from "../config/rolloutFlags";
+import { clickedSessionIntervals, excessClickedSessionMilliseconds, calculateSlotAttendance, recordsWithClosingBoundaries } from "./timeAccounting";
+import { attendanceDurationModelEnabled, attendanceAccuracyFixesEnabled } from "../config/rolloutFlags";
 
 type Policy = { shiftStart: string; shiftEnd: string; graceMinutes: number; breakMinutes: number; lunchMinutes: number };
 
 export function attendanceDashboardPresentation(snapshot: { records: SessionEvent[];
-  sessions: Array<{ shift: AssignedShift | null; events: SessionEvent[] }> }, policy: Policy, now: Date) {
+  sessions: Array<{ shift: AssignedShift | null; events: SessionEvent[]; lifecycle?: string; endedAt?: string | null }> }, policy: Policy, now: Date) {
   const settings: HubSettings = { officialShiftStartTime: policy.shiftStart, officialShiftEndTime: policy.shiftEnd,
     lateGraceMinutes: policy.graceMinutes, breakMinutes: policy.breakMinutes, lunchMinutes: policy.lunchMinutes, attendanceTimeZone: "Asia/Manila" };
   const assigned = new Map(snapshot.sessions.flatMap((session) => session.events.map((event) => [event.id, session.shift?.dayKey] as const)));
@@ -18,9 +18,10 @@ export function attendanceDashboardPresentation(snapshot: { records: SessionEven
     grouped.set(day, events);
   }
   const dashboardDays = [...grouped].map(([dayKey, events]) => {
-    const day = calculateHubDay(dayKey, events.map((event) => ({ ...event, at: new Date(event.at) })), settings, now);
+    const closingBoundaries = snapshot.sessions.filter(session => session.shift?.dayKey === dayKey && session.lifecycle === "system-closed" && session.endedAt).map(session => new Date(session.endedAt!));
+    const day = calculateHubDay(dayKey, events.map((event) => ({ ...event, at: new Date(event.at) })), settings, now, false, closingBoundaries);
     const records = [...events].sort((a, b) => Date.parse(a.at) - Date.parse(b.at) || a.sequence - b.sequence);
-    const clicked = records.map((event) => ({ source: event.source, timeIn: new Date(event.at) }));
+    const clicked = recordsWithClosingBoundaries(records.map((event) => ({ source: event.source, timeIn: new Date(event.at) })), closingBoundaries);
     const asOf = new Date(Math.min(now.getTime(), Date.parse(day.shiftEnd)));
     const calculated = calculateSlotAttendance(clicked, { ...policy, shiftStart: new Date(day.shiftStart), shiftEnd: new Date(day.shiftEnd) }, now);
     const overBreakRows = ([
@@ -29,7 +30,7 @@ export function attendanceDashboardPresentation(snapshot: { records: SessionEven
     ] as const).flatMap(([out, back, label, minutes]) => clickedSessionIntervals(clicked, out, back, asOf).flatMap((interval) => {
       const pair = [{ source: out, timeIn: interval.start }, { source: back, timeIn: interval.end }];
       const session = (out === "Break Out" ? calculated.breakSessions : calculated.lunchSessions).find((item) => item.start.getTime() === interval.start.getTime());
-      const overMs = attendanceDurationModelEnabled() ? (session?.excessMinutes || 0) * 60_000 : excessClickedSessionMilliseconds(pair, out, back, minutes * 60_000, asOf);
+      const overMs = attendanceDurationModelEnabled() || attendanceAccuracyFixesEnabled() ? (session?.excessMinutes || 0) * 60_000 : excessClickedSessionMilliseconds(pair, out, back, minutes * 60_000, asOf);
       if (!overMs) return [];
       return [{ id: records.find((event) => event.source === out && event.at === interval.start.toISOString())?.id || `${dayKey}:${out}:${interval.start.toISOString()}`,
         label, startedAt: interval.start.toISOString(), endedAt: interval.open ? null : interval.end.toISOString(),

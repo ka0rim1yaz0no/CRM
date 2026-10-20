@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+// Preserve the legacy rollout characterization; new accounting has its own flag-on fixtures.
+process.env.CRM_ATTENDANCE_ACCURACY_FIXES = "false";
 import { after, before, mock, test } from "node:test";
 import crypto from "node:crypto";
 import http from "node:http";

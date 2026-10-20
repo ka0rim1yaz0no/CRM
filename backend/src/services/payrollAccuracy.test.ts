@@ -17,6 +17,11 @@ test("accuracy flag defaults local on, production off, with explicit rollback", 
   } finally { if (env === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = env; if (flag === undefined) delete process.env.CRM_PAYROLL_ACCURACY; else process.env.CRM_PAYROLL_ACCURACY = flag; }
 });
 test("paid day is derived from shift and lunch, including overnight and different lengths", () => {
+  for (const [officialShiftStartTime, officialShiftEndTime] of [["22:00", "07:00"], ["23:00", "08:00"]]) {
+    for (const lunchMinutes of [30, 60]) {
+      assert.equal(paidHoursPerDay({ officialShiftStartTime, officialShiftEndTime }, { lunchMinutes }), 9 - lunchMinutes / 60);
+    }
+  }
   assert.equal(paidHoursPerDay(settings, { lunchMinutes: 60 }), 8);
   assert.equal(paidHoursPerDay({ officialShiftStartTime: "22:00", officialShiftEndTime: "07:00" }, { lunchMinutes: 30 }), 8.5);
   assert.equal(paidHoursPerDay({ officialShiftStartTime: "07:00", officialShiftEndTime: "13:00" }, { lunchMinutes: 60 }), 5);

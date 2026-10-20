@@ -8,13 +8,20 @@ import { recalculateEmployeePayrollAfterAttendanceEdit } from "../controllers/pa
 import { attendanceEventStatus } from "./attendanceShift";
 import { attendancePolicy } from "./attendanceLedgerService";
 import { getAttendanceBusinessIdentities } from "../models/BusinessUserAccess";
-import { attendanceDurationModelEnabled } from "../config/rolloutFlags";
+import { attendanceDurationModelEnabled, attendanceAccuracyFixesEnabled } from "../config/rolloutFlags";
 import { deriveAttendanceDays } from "./attendanceDerived";
+import { attendanceWorkerCounter, attendanceWorkerFailure, trackAttendanceWorker } from "./attendanceWorkerHealth";
+import { attendanceWorkerBatch, attendanceWorkerBudget, markAttendanceWorkerCandidate } from "./attendanceWorkerCandidates";
 
 export async function refreshAttendanceLedgerMemberships(employeeCode?: string) {
-  const ledgers = await AttendanceLedger.find(employeeCode ? { employeeCode } : {}).select("_id employeeCode businessIds revision").lean();
+  const bounded = attendanceAccuracyFixesEnabled() && !employeeCode;
+  const ledgers = bounded ? await attendanceWorkerBatch("membership", {}, "_id employeeCode businessIds revision")
+    : await AttendanceLedger.find(employeeCode ? { employeeCode } : {}).select("_id employeeCode businessIds revision").lean();
   const memberships = await getAttendanceBusinessIdentities(ledgers.map((ledger) => ledger.employeeCode));
+  const budget = attendanceWorkerBudget();
   for (const ledger of ledgers) {
+    if (bounded && !budget()) break;
+    if (bounded) markAttendanceWorkerCandidate("membership", ledger._id);
     const membership = memberships.get(ledger.employeeCode);
     if (!membership || ledger._id !== `access:${membership.id}` || JSON.stringify([...membership.businessIds].sort()) === JSON.stringify([...ledger.businessIds].sort())) continue;
     await AttendanceLedger.updateOne({ _id: ledger._id, revision: ledger.revision, $or: [{ lockUntil: { $lte: new Date() } }, { lockUntil: { $exists: false } }] },
@@ -42,7 +49,9 @@ export async function deliverAttendanceLedger(identityKey: string, options: {
   const emitAvailability = options.emitAvailability || emitEmployeeAvailabilityUpdated;
   const deliveredBusinessIds: string[] = [];
   for (const businessId of pending) {
+    attendanceWorkerCounter("outbox", "scanned");
     let notification: Parameters<typeof emitAvailability>[0] | undefined;
+    let completed = false;
     try {
       await runWithBusiness(businessId, async () => {
         const employee = await Employee.findOne({ employeeCode: ledger.employeeCode, status: { $ne: "Archived" } }).select("_id").lean();
@@ -94,20 +103,47 @@ export async function deliverAttendanceLedger(identityKey: string, options: {
       });
       const completion = await AttendanceLedger.updateOne({ _id: identityKey, revision: ledger.revision },
         { $set: { "jobs.$[job].done": true } }, { arrayFilters: [{ "job.businessId": businessId, "job.revision": { $lte: ledger.revision } }] });
-      if (completion.matchedCount) deliveredBusinessIds.push(businessId);
-    } catch {
-      // The command is already durable. The pending job remains retryable.
+      if (completion.matchedCount) { deliveredBusinessIds.push(businessId); completed = true; attendanceWorkerCounter("outbox", "closed"); }
+      else if (attendanceAccuracyFixesEnabled()) throw Object.assign(new Error("Completion marker changed"), { code: "STALE_REVISION" });
+    } catch (error) {
+      attendanceWorkerCounter("outbox", "failed"); attendanceWorkerCounter("outbox", "deliveryPending");
+      const detail = attendanceWorkerFailure("outbox", "deliver", error, { ledgerId: identityKey, employeeCode: ledger.employeeCode, businessId });
+      if (attendanceAccuracyFixesEnabled()) {
+        try {
+          await AttendanceLedger.updateOne({ _id: identityKey, revision: ledger.revision },
+            { $set: { "jobs.$[job].lastErrorCode": detail.code, "jobs.$[job].lastErrorAt": new Date().toISOString() } },
+            { arrayFilters: [{ "job.businessId": businessId, "job.revision": { $lte: ledger.revision }, "job.done": false }] });
+        } catch (markerError) { attendanceWorkerFailure("outbox", "save-error-marker", markerError, { ledgerId: identityKey, businessId }); }
+      }
     } finally {
       // Publish after payroll and the completion marker so a refreshing tab cannot race the saved totals.
-      if (notification) {
-        try { await runWithBusiness(businessId, () => emitAvailability(notification!)); } catch { /* Reads and durable retries remain available. */ }
+      if (notification && (!attendanceAccuracyFixesEnabled() || completed)) {
+        try { await runWithBusiness(businessId, () => emitAvailability(notification!)); }
+        catch (error) {
+          attendanceWorkerFailure("outbox", "emit-availability", error, { ledgerId: identityKey, employeeCode: ledger.employeeCode, businessId });
+          if (attendanceAccuracyFixesEnabled()) {
+            deliveredBusinessIds.splice(deliveredBusinessIds.indexOf(businessId), 1);
+            attendanceWorkerCounter("outbox", "failed"); attendanceWorkerCounter("outbox", "deliveryPending");
+            try { await AttendanceLedger.updateOne({ _id: identityKey }, { $set: { "jobs.$[job].done": false,
+              "jobs.$[job].lastErrorCode": "AVAILABILITY_EMIT_FAILED", "jobs.$[job].lastErrorAt": new Date().toISOString() } },
+              { arrayFilters: [{ "job.businessId": businessId, "job.revision": { $lte: ledger.revision } }] }); }
+            catch (retryError) { attendanceWorkerFailure("outbox", "restore-pending-marker", retryError, { ledgerId: identityKey, businessId }); }
+          }
+        }
       }
     }
   }
   return { revision: ledger.revision, deliveredBusinessIds, pendingBusinessIds: pending.filter((id) => !deliveredBusinessIds.includes(id)) };
 }
-export async function retryAttendanceLedgers() {
+export async function retryAttendanceLedgers() { return trackAttendanceWorker("outbox", retryAttendanceLedgersInternal); }
+async function retryAttendanceLedgersInternal() {
   await refreshAttendanceLedgerMemberships();
-  const pending = await AttendanceLedger.find({ jobs: { $elemMatch: { done: false } } }).select("_id").limit(100).lean();
-  for (const item of pending) await deliverAttendanceLedger(item._id);
+  const accuracy = attendanceAccuracyFixesEnabled(); const budget = attendanceWorkerBudget();
+  const pending = accuracy ? await attendanceWorkerBatch("outbox", { jobs: { $elemMatch: { done: false } } }, "_id")
+    : await AttendanceLedger.find({ jobs: { $elemMatch: { done: false } } }).select("_id").limit(100).lean();
+  for (const item of pending) {
+    if (accuracy && !budget()) break;
+    if (accuracy) markAttendanceWorkerCandidate("outbox", item._id);
+    await deliverAttendanceLedger(item._id);
+  }
 }

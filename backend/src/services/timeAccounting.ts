@@ -1,5 +1,5 @@
 import type { AttendanceSource } from "../models/Attendance";
-import { payrollAccuracyEnabled } from "../config/rolloutFlags";
+import { payrollAccuracyEnabled, attendanceAccuracyFixesEnabled } from "../config/rolloutFlags";
 
 export function deductionComponents(values: { lateMinutes?: number; earlyTimeOutMinutes?: number; excessBreakMinutes?: number; excessLunchMinutes?: number; absenceMinutes?: number }, excluded = false) {
   const clean = (value?: number) => excluded ? 0 : Math.max(0, Number.isFinite(value) ? value! : 0);
@@ -8,7 +8,7 @@ export function deductionComponents(values: { lateMinutes?: number; earlyTimeOut
   return { ...result, deductibleMinutes: Object.values(result).reduce((sum, value) => sum + value, 0) };
 }
 // Accuracy rollout: charge each completed excess interval up to the next minute, then sum once.
-export const completedRestMinutes = (milliseconds: number) => payrollAccuracyEnabled()
+export const completedRestMinutes = (milliseconds: number) => payrollAccuracyEnabled() || attendanceAccuracyFixesEnabled()
   ? Math.ceil(milliseconds / 60_000) : Math.round(milliseconds / 60_000);
 
 export type TimeBucket = "online" | "break" | "lunch" | "offPhone" | "offline";
@@ -16,13 +16,24 @@ export type TimeEvent = { at: Date; bucket: TimeBucket };
 export const breakAllowanceMs = 15 * 60_000;
 export const lunchAllowanceMs = 60 * 60_000;
 
-export type SlotAttendancePolicy = { breakMinutes: number; lunchMinutes: number; graceMinutes: number; shiftStart: Date; shiftEnd: Date };
+export type SlotAttendancePolicy = { breakMinutes: number; lunchMinutes: number; graceMinutes: number; shiftStart: Date; shiftEnd: Date; closingBoundaries?: Date[] };
+// Administrative closures are calculation boundaries, never additional stored/clicked attendance events.
+export function recordsWithClosingBoundaries(records: Array<{ source: string; timeIn: Date }>, boundaries: Date[] = []) {
+  if (!attendanceAccuracyFixesEnabled() || !boundaries.length) return records;
+  return [...records.map((record, index) => ({ ...record, index, boundary: false })),
+    ...boundaries.filter(date => Number.isFinite(+date)).map((timeIn, index) => ({ source: "Time Out", timeIn, index: records.length + index, boundary: true }))]
+    .sort((a, b) => +a.timeIn - +b.timeIn ||
+      (a.source === "Time In" || a.source === "Login" ? 2 : a.boundary ? 1 : 0) -
+      (b.source === "Time In" || b.source === "Login" ? 2 : b.boundary ? 1 : 0) || a.index - b.index)
+    .map(({ source, timeIn }) => ({ source, timeIn }));
+}
 export function calculateSlotAttendance(records: Array<{ source: string; timeIn: Date }>, policy: SlotAttendancePolicy, now: Date) {
-  const ordered = records.map((record, index) => ({ ...record, index }))
+  const ordered = recordsWithClosingBoundaries(records, policy.closingBoundaries).map((record, index) => ({ ...record, index }))
     .filter((record) => Number.isFinite(record.timeIn.getTime()))
     .sort((a, b) => a.timeIn.getTime() - b.timeIn.getTime() || a.index - b.index);
   const asOf = new Date(Math.min(now.getTime(), policy.shiftEnd.getTime()));
-  const intervals = (out: string, back: string, allowance: number) => clickedSessionIntervals(ordered, out, back, asOf)
+  const intervals = (out: string, back: string, allowance: number) => clickedSessionIntervals(ordered, out, back, asOf,
+    attendanceAccuracyFixesEnabled() && now >= policy.shiftEnd ? policy.shiftEnd : undefined)
     .map((interval) => {
       const minutes = completedRestMinutes(interval.milliseconds);
       return { ...interval, minutes, excessMinutes: interval.open ? 0 : Math.max(0, minutes - allowance),
@@ -35,10 +46,11 @@ export function calculateSlotAttendance(records: Array<{ source: string; timeIn:
   const hasOpenSession = Boolean(first && final && final.source !== "Time Out" && final.source !== "Logout");
   const timeOut = !hasOpenSession ? [...ordered].reverse().find((record) => record.source === "Time Out" || record.source === "Logout") : undefined;
   // Lateness keeps the existing minute-boundary grace rule; rounding applies to clicked rest durations.
-  const lateEnd = payrollAccuracyEnabled() && first ? Math.min(first.timeIn.getTime(), policy.shiftEnd.getTime()) : first?.timeIn.getTime();
+  const accurate = payrollAccuracyEnabled() || attendanceAccuracyFixesEnabled();
+  const lateEnd = accurate && first ? Math.min(first.timeIn.getTime(), policy.shiftEnd.getTime()) : first?.timeIn.getTime();
   const lateMinutes = first ? Math.max(0, Math.floor((lateEnd! - policy.shiftStart.getTime()) / 60_000) - policy.graceMinutes) : 0;
   const earlyTimeOutMinutes = first && timeOut && now >= policy.shiftEnd
-    ? Math.max(0, Math.ceil((policy.shiftEnd.getTime() - (payrollAccuracyEnabled() ? Math.max(timeOut.timeIn.getTime(), first.timeIn.getTime(), policy.shiftStart.getTime()) : timeOut.timeIn.getTime())) / 60_000)) : 0;
+    ? Math.max(0, Math.ceil((policy.shiftEnd.getTime() - (accurate ? Math.max(timeOut.timeIn.getTime(), first.timeIn.getTime(), policy.shiftStart.getTime()) : timeOut.timeIn.getTime())) / 60_000)) : 0;
   const excessBreakMinutes = breakSessions.reduce((total, interval) => total + interval.excessMinutes, 0);
   const excessLunchMinutes = lunchSessions.reduce((total, interval) => total + interval.excessMinutes, 0);
   const issues: string[] = [];
@@ -47,16 +59,29 @@ export function calculateSlotAttendance(records: Array<{ source: string; timeIn:
   if (excessLunchMinutes) issues.push("OVER LUNCH");
   if (earlyTimeOutMinutes) issues.push("UNDER TIME");
   if (hasOpenSession) issues.push("OPEN SESSION");
+  if (attendanceAccuracyFixesEnabled()) {
+    if (breakSessions.some(item => item.notReturned)) issues.push("BREAK NOT RETURNED");
+    if (lunchSessions.some(item => item.notReturned)) issues.push("LUNCH NOT RETURNED");
+  }
+  const restWarnings = ([["Break", breakSessions], ["Lunch", lunchSessions]] as const).flatMap(([label, sessions]) => {
+    const unreturned = sessions.filter(item => item.notReturned);
+    return unreturned.length ? [`${label} not returned: ${unreturned.reduce((sum, item) => sum + item.excessMinutes, 0)} min excess`] : [];
+  });
   return { breakSessions, lunchSessions, lateMinutes, excessBreakMinutes, excessLunchMinutes, earlyTimeOutMinutes,
+    ...(attendanceAccuracyFixesEnabled() ? { restWarnings } : {}),
     deductibleMinutes: deductionComponents({ lateMinutes, excessBreakMinutes, excessLunchMinutes, earlyTimeOutMinutes }).deductibleMinutes, hasOpenSession, issues };
 }
 
-export function clickedSessionIntervals<T extends { source: string; timeIn: Date }>(records: T[], outSource: string, inSource: string, asOf?: Date) {
+export function clickedSessionIntervals<T extends { source: string; timeIn: Date }>(records: T[], outSource: string, inSource: string, asOf?: Date, cutoff?: Date) {
   let open: Date | null = null;
-  const intervals: Array<{ start: Date; end: Date; milliseconds: number; open: boolean }> = [];
+  const intervals: Array<{ start: Date; end: Date; milliseconds: number; open: boolean; notReturned?: boolean }> = [];
   for (const record of records) {
     if (open && ["Time In", "Login", "Time Out", "Logout"].includes(record.source)) {
-      if (asOf) {
+      if (attendanceAccuracyFixesEnabled()) {
+        // A real closing event is evidence, including the configured 08:05 checkout after shift end.
+        const end = record.timeIn;
+        intervals.push({ start: open, end, milliseconds: Math.max(0, +end - +open), open: false, notReturned: true });
+      } else if (asOf) {
         const end = new Date(Math.min(record.timeIn.getTime(), asOf.getTime()));
         intervals.push({ start: open, end, milliseconds: Math.max(0, end.getTime() - open.getTime()), open: true });
       }
@@ -68,7 +93,12 @@ export function clickedSessionIntervals<T extends { source: string; timeIn: Date
       open = null;
     }
   }
-  if (open && asOf) intervals.push({ start: open, end: asOf, milliseconds: Math.max(0, asOf.getTime() - open.getTime()), open: true });
+  if (open && asOf) {
+    const closed = attendanceAccuracyFixesEnabled() && cutoff && asOf >= cutoff;
+    const end = closed ? cutoff : asOf;
+    intervals.push({ start: open, end, milliseconds: Math.max(0, +end - +open), open: !closed,
+      ...(closed ? { notReturned: true } : {}) });
+  }
   return intervals;
 }
 // Preserve the existing payroll rule: round each completed clicked interval to minutes first.

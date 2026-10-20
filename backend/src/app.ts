@@ -45,6 +45,7 @@ import { requireFileSession } from "./middleware/securityFileSession";
 import { securityUploadsEnabled, securityHardeningEnabled } from "./config/rolloutFlags";
 import { legacyAuthentication } from "./middleware/legacyAuthentication";
 import { dataCheckRouter } from "./routes/dataCheckRoutes";
+import { assertAttendanceFlagConfiguration } from "./config/attendanceFlags";
 
 const appDirectory = path.dirname(fileURLToPath(import.meta.url));
 const backendRootDirectory = path.resolve(appDirectory, "..");
@@ -95,6 +96,7 @@ function isAllowedExtensionOrigin(origin: string) {
 }
 
 export function createApp() {
+  assertAttendanceFlagConfiguration();
   assertCredentialEncryptionConfiguration();
   const app = express();
   const security = securityMiddleware();

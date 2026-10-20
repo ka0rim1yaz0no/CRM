@@ -152,6 +152,19 @@ test("one malformed ledger cannot prevent a later eligible ledger finalizing", a
   assert.equal(await runAttendanceDerivedRefresh(end, async () => {}), 1);
 });
 
+test("accuracy: a new day's manual action cannot silently recalculate an unrelated historical day", async () => {
+  const saved = process.env.CRM_ATTENDANCE_ACCURACY_FIXES;
+  process.env.CRM_ATTENDANCE_ACCURACY_FIXES = "false";
+  store.derived = deriveAttendanceDays(store, policy, checkout);
+  const before = clone(store.derived[0]);
+  process.env.CRM_ATTENDANCE_ACCURACY_FIXES = "true";
+  try {
+    await executeAttendanceCommand(identity, { commandId: crypto.randomUUID(), operation: "action", source: "Time In", expectedRevision: store.revision },
+      { role: "employee", code: identity.code }, new Date("2026-10-16T15:00:00Z"));
+    assert.deepEqual(store.derived!.find(day => day.dayKey === before.dayKey), before);
+  } finally { if (saved === undefined) delete process.env.CRM_ATTENDANCE_ACCURACY_FIXES; else process.env.CRM_ATTENDANCE_ACCURACY_FIXES = saved; }
+});
+
 test("audit delta ignores timestamps/revisions, preserves historical values and records day removals", () => {
   const day = store.derived![0];
   const metadataOnly = { ...day, computedAt: end.toISOString(), revision: 99, policyRevision: 2 };

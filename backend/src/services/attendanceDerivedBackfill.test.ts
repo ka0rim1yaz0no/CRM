@@ -89,3 +89,20 @@ test("dry-run entry point only reads fake collections and closes its client, pri
     assert.equal(connect.mock.callCount(), 1); assert.equal(close.mock.callCount(), 1);
   } finally { database.mock.restore(); close.mock.restore(); connect.mock.restore(); }
 });
+
+test("accuracy dry-run counts changed stored records but totals each shift once and ranks employees without writing", () => {
+  const saved = process.env.CRM_ATTENDANCE_ACCURACY_FIXES;
+  try {
+    const employee = fixture(); employee.ledger.events.splice(2, 1); employee.ledger.events.at(-1)!.legacyReviewed = true;
+    process.env.CRM_ATTENDANCE_ACCURACY_FIXES = "false";
+    const old = deriveAttendanceDays(employee.ledger, policy, now)[0];
+    const records = employee.ledger.events.map(event => ({ id: event.id, eventId: event.id, source: event.source, timeIn: new Date(event.at), derived: old }));
+    const data = [{ employeeCode: "synthetic-only", ledger: { ...employee.ledger, derived: [old] }, records }];
+    const before = structuredClone(data); process.env.CRM_ATTENDANCE_ACCURACY_FIXES = "true";
+    const report = summarizeAttendanceDerivedBackfill("fake-a", data, policy, now, { accuracyReport: true });
+    assert.equal(report.accuracy!.changedStoredRecords, 3);
+    assert.equal(report.accuracy!.minutesDifference, 405);
+    assert.deepEqual(report.accuracy!.topEmployees, [{ employeeCode: "synthetic-only", changedStoredRecords: 3, minutesDifference: 405 }]);
+    assert.equal(report.writes, 0); assert.deepEqual(data, before);
+  } finally { if (saved === undefined) delete process.env.CRM_ATTENDANCE_ACCURACY_FIXES; else process.env.CRM_ATTENDANCE_ACCURACY_FIXES = saved; }
+});

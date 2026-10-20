@@ -1,6 +1,7 @@
-import { calculateSlotAttendance, accountTime, bucketForAttendanceSource, deductionComponents } from "./timeAccounting";
+import { calculateSlotAttendance, accountTime, bucketForAttendanceSource, deductionComponents, recordsWithClosingBoundaries } from "./timeAccounting";
 import { projectAttendance, type SessionEvent } from "./attendanceSessionState";
 import type { AttendanceSource } from "../models/Attendance";
+import { attendanceAccuracyFixesEnabled } from "../config/rolloutFlags";
 
 export type PayrollShiftSettings = { officialShiftStartTime?: string | null; officialShiftEndTime?: string | null };
 export class PayrollValidationError extends Error {
@@ -31,23 +32,23 @@ export function accuratePayrollRates(salary: number, monthlyWorkingDays: number,
     paidHoursPerDay: paidHours, hourlyRate, minuteRate: hourlyRate / 60 };
 }
 export function accuratePayrollDay(records: Array<{ source: string; timeIn: Date }>, policy: {
-  breakMinutes: number; lunchMinutes: number; graceMinutes: number; shiftStart: Date; shiftEnd: Date;
+  breakMinutes: number; lunchMinutes: number; graceMinutes: number; shiftStart: Date; shiftEnd: Date; closingBoundaries?: Date[];
 }, now: Date, paidHours: number, weekend: boolean, mismatch = false) {
   const calculated = calculateSlotAttendance(records, policy, now);
   const events = records.map((item, sequence) => ({ id: String(sequence), commandId: String(sequence), sequence,
     source: item.source as AttendanceSource, at: item.timeIn.toISOString(), recordedAt: item.timeIn.toISOString() } as SessionEvent));
-  const projection = projectAttendance(events);
+  const projection = projectAttendance(events, [], [], { allowUnreturnedCheckout: attendanceAccuracyFixesEnabled() });
   const first = records.find(item => ["Time In", "Login"].includes(item.source));
   const final = [...records].reverse().find(item => ["Time Out", "Logout"].includes(item.source));
   const unfinished = calculated.hasOpenSession || calculated.breakSessions.some(item => item.open) || calculated.lunchSessions.some(item => item.open);
-  const review = mismatch || projection.issues.length > 0 || unfinished || Boolean(records.length && !first) ||
+  const review = mismatch || (attendanceAccuracyFixesEnabled() && Boolean(policy.closingBoundaries?.length)) || projection.issues.length > 0 || unfinished || Boolean(records.length && !first) ||
     records.some(item => item.timeIn > now) || calculated.breakSessions.length > 2 || calculated.lunchSessions.length > 1 || Boolean(first && now < policy.shiftEnd);
   const completed = now >= policy.shiftEnd;
   const status = review ? "Needs Review" : first ? weekend ? "Overtime" : calculated.lateMinutes ? "Late" : "Present"
     : weekend ? "Weekend" : completed ? "Absent" : "Scheduled";
   const components = deductionComponents({ ...calculated, absenceMinutes: status === "Absent" ? Math.round(paidHours * 60) : 0 },
     review || weekend || status === "Scheduled");
-  const activity = accountTime(records.flatMap(item => {
+  const activity = accountTime(recordsWithClosingBoundaries(records, policy.closingBoundaries).flatMap(item => {
     const bucket = bucketForAttendanceSource(item.source as AttendanceSource);
     return bucket ? [{ at: item.timeIn, bucket }] : [];
   }), weekend && first ? first.timeIn : policy.shiftStart, weekend && final && !unfinished ? final.timeIn : policy.shiftEnd, now);

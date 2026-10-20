@@ -1,7 +1,7 @@
 import { attendanceSlotKey } from "./attendanceShift";
 import type { AttendanceSource } from "../models/Attendance";
-import { accountTime, breakAllowanceMs, bucketForAttendanceSource, lunchAllowanceMs, excessClickedSessionMilliseconds, clickedSessionIntervals, calculateSlotAttendance } from "./timeAccounting";
-import { attendanceDurationModelEnabled } from "../config/rolloutFlags";
+import { accountTime, breakAllowanceMs, bucketForAttendanceSource, lunchAllowanceMs, excessClickedSessionMilliseconds, clickedSessionIntervals, calculateSlotAttendance, recordsWithClosingBoundaries } from "./timeAccounting";
+import { attendanceDurationModelEnabled, attendanceAccuracyFixesEnabled } from "../config/rolloutFlags";
 import { projectAttendance } from "./attendanceSessionState";
 
 export type HubEvent = { id: string; source: AttendanceSource; at: Date; eventId?: string; createdAt?: Date; sequence?: number; autoTimeOut?: boolean };
@@ -22,7 +22,7 @@ export function hubDayKey(value: Date, settings: HubSettings) {
   return attendanceSlotKey(value, hubTimeZone, settings.officialShiftStartTime, settings.officialShiftEndTime);
 }
 
-export function calculateHubDay(dayKey: string, sourceEvents: HubEvent[], settings: HubSettings, now: Date, excused = false) {
+export function calculateHubDay(dayKey: string, sourceEvents: HubEvent[], settings: HubSettings, now: Date, excused = false, closingBoundaries: Date[] = []) {
   const breakLimit = settings.breakMinutes === undefined ? breakAllowanceMs : settings.breakMinutes * 60_000;
   const lunchLimit = settings.lunchMinutes === undefined ? lunchAllowanceMs : settings.lunchMinutes * 60_000;
   const { start, end } = hubShiftBounds(dayKey, settings);
@@ -31,14 +31,18 @@ export function calculateHubDay(dayKey: string, sourceEvents: HubEvent[], settin
     .sort((a, b) => a.at.getTime() - b.at.getTime()
       || (a.sequence !== undefined && b.sequence !== undefined ? a.sequence - b.sequence : 0)
       || a.id.localeCompare(b.id));
-  const buckets = accountTime(events.flatMap((event) => {
-    const bucket = bucketForAttendanceSource(event.source);
-    return bucket ? [{ at: event.at, bucket }] : [];
+  const clickedRecords = recordsWithClosingBoundaries(events.map(event => ({ source: event.source, timeIn: event.at })), closingBoundaries);
+  const calculated = attendanceDurationModelEnabled() || attendanceAccuracyFixesEnabled()
+    ? calculateSlotAttendance(clickedRecords, { breakMinutes: breakLimit / 60_000, lunchMinutes: lunchLimit / 60_000,
+      graceMinutes: settings.lateGraceMinutes, shiftStart: start, shiftEnd: end }, now) : null;
+  const buckets = accountTime(clickedRecords.flatMap((event) => {
+    const bucket = bucketForAttendanceSource(event.source as AttendanceSource);
+    return bucket ? [{ at: event.timeIn, bucket }] : [];
   }), start, end, now);
   const timeIn = events.find((event) => event.source === "Time In" || event.source === "Login");
   const timeOut = [...events].reverse().find((event) => event.source === "Time Out" || event.source === "Logout");
-  const projection = projectAttendance(events.map((event, index) => ({ id: event.id, source: event.source, at: event.at.toISOString(), sequence: event.sequence ?? index, commandId: event.eventId || event.id, recordedAt: event.at.toISOString() })));
-  const hasOpenSession = Boolean(projection.active);
+  const projection = projectAttendance(events.map((event, index) => ({ id: event.id, source: event.source, at: event.at.toISOString(), sequence: event.sequence ?? index, commandId: event.eventId || event.id, recordedAt: event.at.toISOString() })), [], [], { allowUnreturnedCheckout: attendanceAccuracyFixesEnabled() });
+  const hasOpenSession = attendanceAccuracyFixesEnabled() && calculated ? calculated.hasOpenSession : Boolean(projection.active);
   const isInProgress = hasOpenSession && now < end;
   const rawLateMs = timeIn ? Math.max(0, timeIn.at.getTime() - start.getTime() - Math.max(0, settings.lateGraceMinutes) * 60_000) : 0;
   let lateMs = rawLateMs >= 60_000 ? rawLateMs : 0;
@@ -50,7 +54,6 @@ export function calculateHubDay(dayKey: string, sourceEvents: HubEvent[], settin
       return bucket ? [{ at: event.at, bucket }] : [];
     }), end, timeOut.at, timeOut.at).milliseconds.online : 0;
 
-  const clickedRecords = events.map((event) => ({ source: event.source, timeIn: event.at }));
   const asOf = new Date(Math.min(now.getTime(), end.getTime()));
   const breakSessions = clickedSessionIntervals(clickedRecords, "Break Out", "Break In", asOf).map((interval) => ({
     startedAt: interval.start.toISOString(), endedAt: interval.open ? null : interval.end.toISOString(),
@@ -58,9 +61,8 @@ export function calculateHubDay(dayKey: string, sourceEvents: HubEvent[], settin
   }));
   let breakOverMs = excessClickedSessionMilliseconds(clickedRecords, "Break Out", "Break In", breakLimit, asOf);
   let lunchOverMs = excessClickedSessionMilliseconds(clickedRecords, "Lunch Break Out", "Lunch Break In", lunchLimit, asOf);
-  if (attendanceDurationModelEnabled()) {
-    const calculated = calculateSlotAttendance(clickedRecords, { breakMinutes: breakLimit / 60_000, lunchMinutes: lunchLimit / 60_000,
-      graceMinutes: settings.lateGraceMinutes, shiftStart: start, shiftEnd: end }, now);
+  const accuracy = attendanceAccuracyFixesEnabled();
+  if (calculated) {
     lateMs = calculated.lateMinutes * 60_000;
     underTimeMs = calculated.earlyTimeOutMinutes * 60_000;
     breakOverMs = calculated.excessBreakMinutes * 60_000;
@@ -107,6 +109,12 @@ export function calculateHubDay(dayKey: string, sourceEvents: HubEvent[], settin
   if (events.length && !timeIn) review.push("Missing Time In");
   if (hasOpenSession && now >= end) review.push("Open session");
   const issues = [] as string[];
+  if (accuracy && calculated) {
+    for (const [label, sessions] of [["BREAK", calculated.breakSessions], ["LUNCH", calculated.lunchSessions]] as const) {
+      const unreturned = sessions.filter(item => item.notReturned);
+      if (unreturned.length) issues.push(`${label} NOT RETURNED (${excused ? 0 : unreturned.reduce((sum, item) => sum + item.excessMinutes, 0)} MIN)`);
+    }
+  }
   if (lateMs >= 60_000) issues.push("LATE");
   if (breakOverMs > 0) issues.push("OVER BREAK");
   if (lunchOverMs > 0) issues.push("OVER LUNCH");
@@ -115,7 +123,10 @@ export function calculateHubDay(dayKey: string, sourceEvents: HubEvent[], settin
   if (excused) issues.push("EXCUSED");
   return {
     dayKey, shiftStart: start.toISOString(), shiftEnd: end.toISOString(), autoTimeOut: events.some((event) => event.autoTimeOut),
-    breakMinutes: breakLimit / 60_000, lunchMinutes: lunchLimit / 60_000, breakSessions,
+    breakMinutes: breakLimit / 60_000, lunchMinutes: lunchLimit / 60_000,
+    breakSessions: accuracy && calculated ? calculated.breakSessions.map(item => ({ startedAt: item.start.toISOString(),
+      endedAt: item.open ? null : item.end.toISOString(), durationMs: item.milliseconds, isOpen: item.open,
+      ...(item.notReturned ? { notReturned: true, chargedMinutes: excused ? 0 : item.excessMinutes } : {}) })) : breakSessions,
     timeline: buckets.intervals.map((interval) => ({ bucket: interval.bucket, start: interval.start.toISOString(), end: interval.end.toISOString() })),
     timeIn: timeIn?.at.toISOString() || null, timeOut: hasOpenSession ? null : timeOut?.at.toISOString() || null,
     inProgress: isInProgress, excused, issues: excused ? issues.filter((issue) => issue === "EXCUSED" || issue === "OPEN SESSION") : issues,

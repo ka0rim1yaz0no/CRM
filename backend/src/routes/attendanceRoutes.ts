@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { archiveEmployeeAttendance, breakInEmployee, breakOutEmployee, createEmployeeAttendance, lunchBreakInEmployee, lunchBreakOutEmployee, recordEmployeeActivity, timeInEmployee, timeOutEmployee, updateEmployeeAttendance, updateEmployeeWorkedMinutes } from "../controllers/attendanceController";
 import { withAttendanceActionLock } from "../middleware/attendanceActionLock";
-import { exportHubDays, getHubDay, getHubLive, getHubSummary, listHubDays, saveHubDayNote } from "../controllers/attendanceHubController";
+import { exportHubDays, getHubDay, getHubLive, getHubSummary, listHubDays, saveHubDayNote, getHubDeliveryHealth } from "../controllers/attendanceHubController";
 import { getActiveAttendanceSession, getAttendanceHistory, getScopedAttendanceList, getAttendancePolicy, getAttendanceMigrationPreview, previewAttendanceCorrection, requireCurrentAttendanceClient, saveAttendancePolicy, submitAttendanceCommand } from "../controllers/attendanceSessionController";
 
 export const attendanceRouter = Router();
@@ -14,6 +14,7 @@ attendanceRouter.get("/attendance-policy", getAttendancePolicy);
 attendanceRouter.put("/attendance-policy", saveAttendancePolicy);
 
 attendanceRouter.get("/attendance-hub/summary", getHubSummary);
+attendanceRouter.get("/attendance-hub/delivery-health", getHubDeliveryHealth);
 attendanceRouter.get("/attendance-hub/live", getHubLive);
 attendanceRouter.get("/attendance-hub/days", listHubDays);
 attendanceRouter.get("/attendance-hub/export", exportHubDays);

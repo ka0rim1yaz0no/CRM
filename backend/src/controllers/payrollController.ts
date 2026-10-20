@@ -1,7 +1,7 @@
 import type { Request, Response } from "express";
 import { createHash } from "node:crypto";
 import { excessClickedSessionMinutes, calculateSlotAttendance, accountTime, bucketForAttendanceSource } from "../services/timeAccounting";
-import { attendanceDurationModelEnabled, payrollAccuracyEnabled } from "../config/rolloutFlags";
+import { attendanceDurationModelEnabled, payrollAccuracyEnabled, attendanceAccuracyFixesEnabled } from "../config/rolloutFlags";
 import { accuratePayrollRates, accuratePayrollDay, paidHoursPerDay, PayrollValidationError, type PayrollShiftSettings } from "../services/payrollAccuracy";
 import { legacyPayrollPolicy } from "../services/payrollLegacyPolicy";
 import { AttendanceLedger, AttendancePolicy } from "../models/AttendanceLedger";
@@ -72,6 +72,7 @@ type PayrollCalculatedAttendance = PayrollAttendanceSummary & {
 };
 
 type PayrollDtrRow = {
+  restWarnings?: string[];
   deductibleMinutes?: number;
   dateKey: string;
   date: string;
@@ -800,6 +801,7 @@ async function accurateAttendancePayrollDtr(employeeId: Types.ObjectId, payPerio
   const local = await readCopy(employeeId);
   const ledger = await AttendanceLedger.findOne({ employeeCode: employee.employeeCode, businessIds: getCurrentBusinessId() }, null, session ? { session } : undefined).select("events corrections closures businessIds migrationRequired").lean();
   let grouped = groupPayrollAttendanceBySlot(local, settings);
+  const closingBoundariesByDay = new Map<string, Date[]>();
   const mismatches = new Set<string>();
   if (ledger && !ledger.migrationRequired) {
     const projected = projectAttendance(ledger.events, ledger.corrections, ledger.closures);
@@ -807,6 +809,7 @@ async function accurateAttendancePayrollDtr(employeeId: Types.ObjectId, payPerio
     for (const session of projected.sessions) {
       const key = session.shift?.dayKey || attendanceSlotKey(session.startedAt, settings);
       canonical[key] = [...(canonical[key] || []), ...session.events.map(event => ({ source: event.source, timeIn: new Date(event.at), sequence: event.sequence }))];
+      if (session.lifecycle === "system-closed" && session.endedAt) closingBoundariesByDay.set(key, [...(closingBoundariesByDay.get(key) || []), new Date(session.endedAt)]);
     }
     const fingerprint = (items: Array<{ source: string; timeIn: Date }>) => JSON.stringify(items.map(item => [item.source, item.timeIn.toISOString()]));
     for (const businessId of ledger.businessIds) await runWithBusiness(businessId, async () => {
@@ -826,12 +829,14 @@ async function accurateAttendancePayrollDtr(employeeId: Types.ObjectId, payPerio
     const records = (grouped[key] || []).sort((a, b) => a.timeIn.getTime() - b.timeIn.getTime() || (a.sequence ?? 0) - (b.sequence ?? 0));
     const bounds = hubShiftBounds(key, settings);
     const weekend = isWeekendDateKey(key);
-    const day = accuratePayrollDay(records, { ...policy, shiftStart: bounds.start, shiftEnd: bounds.end }, now, paidHours, weekend, mismatches.has(key));
+    const day = accuratePayrollDay(records, { ...policy, shiftStart: bounds.start, shiftEnd: bounds.end,
+      closingBoundaries: closingBoundariesByDay.get(key) }, now, paidHours, weekend, mismatches.has(key));
     const timeIn = firstRecord(records, ["Time In", "Login"]), timeOut = lastRecord(records, ["Time Out", "Logout"]);
     return { dateKey: key, date: formatDtrDate(key), day: formatDtrDay(key), status: day.status as PayrollDtrRow["status"], isWeekend: weekend,
       timeIn: formatDtrTime(timeIn?.timeIn), timeOut: formatDtrTime(day.calculated.hasOpenSession ? null : timeOut?.timeIn),
       lunchHours: day.lunchHours, ...day.components, grossHours: day.grossHours, lateHours: day.components.lateMinutes / 60,
       regularHours: day.regularHours, overtimeHours: day.overtimeHours, missingHours: day.missingHours,
+      ...(attendanceAccuracyFixesEnabled() ? { restWarnings: day.calculated.restWarnings || [] } : {}),
       scheduledHours: weekend ? 0 : paidHours, recordCount: records.length };
   });
   const sum = (field: keyof PayrollDtrRow) => rows.reduce((total, row) => total + Number(row[field] || 0), 0);

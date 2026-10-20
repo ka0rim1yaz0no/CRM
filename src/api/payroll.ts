@@ -67,6 +67,7 @@ export type PayrollStats = {
 };
 
 export type PayrollDtrRow = {
+    restWarnings?: string[];
     dateKey: string;
     date: string;
     day: string;

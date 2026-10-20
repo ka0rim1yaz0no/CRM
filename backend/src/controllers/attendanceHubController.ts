@@ -1,9 +1,9 @@
 import type { Request, Response } from "express";
 import { verifyAdminDashboardSession } from "../config/adminDashboardSession";
 import { verifyAttendanceHubSession } from "../config/attendanceHubSession";
-import { attendanceDurationModelEnabled, attendanceHubEnabled } from "../config/rolloutFlags";
+import { attendanceDurationModelEnabled, attendanceHubEnabled, attendanceAccuracyFixesEnabled } from "../config/rolloutFlags";
 import { getAttendanceBusinessIdentities, getBusinessAccessForEmployeeCode } from "../models/BusinessUserAccess";
-import { getBusinessById, runForEachBusiness, runWithBusiness, type BusinessConfig } from "../config/tenancy";
+import { getBusinessById, getPublicBusinesses, runForEachBusiness, runWithBusiness, type BusinessConfig } from "../config/tenancy";
 import { defaultSystemSettings } from "./systemSettingsController";
 import { Attendance } from "../models/Attendance";
 import { AttendanceDayNote } from "../models/AttendanceDayNote";
@@ -19,6 +19,7 @@ import { attendanceNoteRevision, confirmAttendanceNote } from "../services/atten
 import { projectAttendance } from "../services/attendanceSessionState";
 import { attendanceViewRange, manilaCalendarDate, type ShiftView } from "../../../shared/attendanceView";
 import { serverReadTime } from "../services/readSnapshot";
+import { attendanceWorkersSnapshot, attendanceWorkerFailure } from "../services/attendanceWorkerHealth";
 
 type Actor = { role: "admin" | "employee"; code: string };
 type HubDay = ReturnType<typeof calculateHubDay> & {
@@ -204,7 +205,8 @@ async function loadHub(actor: Actor, filters: ReturnType<typeof assertQuery>, no
             : item.startDate.toISOString().slice(0, 10) <= key && item.endDate.toISOString().slice(0, 10) >= key));
         const excused = Boolean(note?.excused || leave);
         const session = projection?.sessions.filter((item) => item.shift?.dayKey === key).at(-1);
-        const day = calculateHubDay(key, eventsForDay, settings, session?.lifecycle === "system-closed" ? new Date(session.events.at(-1)!.at) : now, excused);
+        const closingBoundaries = projection?.sessions.filter(item => item.shift?.dayKey === key && item.lifecycle === "system-closed" && item.endedAt).map(item => new Date(item.endedAt!)) || [];
+        const day = calculateHubDay(key, eventsForDay, settings, !attendanceAccuracyFixesEnabled() && session?.lifecycle === "system-closed" ? new Date(session.events.at(-1)!.at) : now, excused, closingBoundaries);
         if (session?.lifecycle === "system-closed") {
           day.status = "System closed - needs review"; day.inProgress = false;
           day.issues = day.issues.filter((issue) => issue !== "OPEN SESSION"); day.issues.push("SYSTEM CLOSED");
@@ -391,6 +393,37 @@ export async function readDashboardAttendanceSummary(business: string, from: str
   return totals(loaded.rows);
 }
 export const getHubDay = (request: Request, response: Response) => handleHubRead(request, response, "day");
+
+export async function getHubDeliveryHealth(request: Request, response: Response) {
+  const actor = denyIfDisabled(request, response);
+  if (!actor) return;
+  if (!attendanceAccuracyFixesEnabled()) { response.status(404).json({ message: "Attendance diagnostics are disabled." }); return; }
+  const business = scalar(request.query.business);
+  try {
+    const allowed = await getPublicBusinesses();
+    if (business && business !== "all" && !allowed.some(item => item.id === business)) {
+      response.status(400).json({ message: "Invalid business." }); return;
+    }
+    const ids = allowed.filter(item => !business || business === "all" || item.id === business).map(item => item.id);
+    const pending = await AttendanceLedger.aggregate<{ _id: string; pending: number; oldest: Date | null; lastErrorCode: string | null }>([
+      { $match: { jobs: { $elemMatch: { done: false, businessId: { $in: ids } } } } },
+      { $unwind: "$jobs" }, { $match: { "jobs.done": false, "jobs.businessId": { $in: ids } } },
+      { $set: { queuedAt: { $convert: { input: { $ifNull: ["$jobs.createdAt", { $let: {
+        vars: { entry: { $arrayElemAt: [{ $filter: { input: "$audit", as: "entry", cond: { $eq: ["$$entry.afterRevision", "$jobs.revision"] } } }, 0] } },
+        in: "$$entry.at" } }] }, to: "date", onError: null, onNull: "$createdAt" } } } },
+      { $sort: { "jobs.lastErrorAt": -1 } },
+      { $group: { _id: "$jobs.businessId", pending: { $sum: 1 }, oldest: { $min: "$queuedAt" }, lastErrorCode: { $first: "$jobs.lastErrorCode" } } },
+    ]);
+    const now = serverReadTime();
+    response.set("Cache-Control", "no-store").json({ serverTime: now.toISOString(),
+      businesses: ids.map(businessId => { const row = pending.find(item => item._id === businessId); return {
+        businessId, pending: row?.pending || 0, oldestAgeSeconds: row?.oldest ? Math.max(0, Math.floor((+now - +new Date(row.oldest)) / 1000)) : null,
+        lastErrorCode: row?.lastErrorCode || null }; }), workers: attendanceWorkersSnapshot() });
+  } catch (error) {
+    attendanceWorkerFailure("outbox", "read-health", error);
+    response.status(503).json({ message: "Attendance delivery health is temporarily unavailable." });
+  }
+}
 export const exportHubDays = (request: Request, response: Response) => handleHubRead(request, response, "export");
 
 export async function getHubLive(request: Request, response: Response) {

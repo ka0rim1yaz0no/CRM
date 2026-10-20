@@ -47,6 +47,14 @@ function sessionHeaders() {
     return auth?.userType === "admin" ? { "X-CRM-Admin-Session": auth.sessionToken || "" } :
         { "X-CRM-Attendance-Session": auth?.attendanceHubSession || "" };
 }
+export type AttendanceDeliveryHealth = { serverTime: string;
+    businesses: Array<{ businessId: string; pending: number; oldestAgeSeconds: number | null; lastErrorCode: string | null }>;
+    workers: Array<{ name: string; lastRunAt: string | null; running: boolean;
+        counters: { scanned: number; closed: number; failed: number; deliveryPending: number }; lastErrorCode: string | null }> };
+export async function getAttendanceDeliveryHealth(business: string) {
+    const response = await api.get<AttendanceDeliveryHealth>("/attendance-hub/delivery-health", { params: { business }, headers: sessionHeaders() });
+    return response.data;
+}
 export async function getAttendanceHubDays(filters: HubFilters) {
     const response = await api.get<HubResponse>("/attendance-hub/days", { params: filters, headers: sessionHeaders() });
     return response.data;

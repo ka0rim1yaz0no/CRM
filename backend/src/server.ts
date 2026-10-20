@@ -10,7 +10,9 @@ import { startHempSurveyLeadQueueWorker } from "./services/hempSurveyLeadQueue";
 import { startAttendanceReconciliationWorker } from "./services/attendanceReconciliationWorker";
 import { startAttendanceIntegrityWorker } from "./services/attendanceRecoveryWorker";
 import { assertCredentialEncryptionConfiguration } from "./services/credentialEncryption";
+import { assertAttendanceFlagConfiguration } from "./config/attendanceFlags";
 
+assertAttendanceFlagConfiguration();
 const port = Number(process.env.PORT || 4000);
 const host = process.env.HOST || "127.0.0.1";
 const mongoUri = process.env.MONGODB_URI || "";

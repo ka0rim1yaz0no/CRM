@@ -139,6 +139,45 @@ async function rejectAction(person: Person, source: AttendanceSource, seconds: n
   assert.equal(await core(person), before, `${source} rejection must not write attendance, revision, audit, outbox, payroll, or availability`);
 }
 
+test("HTTP: delivery health is admin-only, business-scoped and read-only", async () => {
+  const person = await fixture();
+  const before = await core(person);
+  await request(person, 0, "/attendance-hub/delivery-health", { expected: 403 });
+  for (const [index, businessId] of businesses.entries()) {
+    const health = await request<{ businesses: Array<{ businessId: string; pending: number }>; workers: unknown[] }>(person, index,
+      `/attendance-hub/delivery-health?business=${businessId}`, { admin: true });
+    assert.deepEqual(health.businesses.map(item => item.businessId), [businessId]);
+    assert.equal(health.businesses[0].pending, 0); assert.ok(Array.isArray(health.workers));
+  }
+  assert.equal(await core(person), before);
+});
+
+test("HTTP: bounded worker still auto-closes at 08:05 and delivers the same rest deductions to all businesses", async () => {
+  const { runAttendanceAutoTimeOutCycle } = await import("./attendanceAutoTimeOutWorker");
+  const { resetAttendanceWorkerCursors } = await import("./attendanceWorkerCandidates");
+  const old = process.env.CRM_ATTENDANCE_AUTO_TIMEOUT;
+  process.env.CRM_ATTENDANCE_AUTO_TIMEOUT = "true"; resetAttendanceWorkerCursors();
+  try {
+    const person = await fixture();
+    await action(person, "Time In", 0); await action(person, "Break Out", 8.75 * 3600);
+    mock.timers.setTime(start + 9 * 3_600_000 + 6 * 60_000);
+    const report = await runAttendanceAutoTimeOutCycle(new Date());
+    assert.ok(report.closed >= 1); assert.equal(report.failed, 0); assert.equal(report.deliveryPending, 0);
+    const canonical = await AttendanceLedger.findOne({ employeeCode: person.code }).lean();
+    assert.ok(canonical!.events.at(-1)!.autoTimeOut);
+    assert.equal(canonical!.events.at(-1)!.at, new Date(start + 9 * 3_600_000 + 5 * 60_000).toISOString());
+    assert.equal(canonical!.derived![0].excessBreakMinutes, 5);
+    for (const [index] of businesses.entries()) {
+      const refreshed = await session(person, index);
+      assert.equal(refreshed.state, "OFFLINE"); assert.equal(refreshed.derived[0].excessBreakMinutes, 5);
+      const hub = await request<{ rows: Array<{ milliseconds: { overBreak: number } }> }>(person, index,
+        `/attendance-hub/days?preset=custom&from=${shiftDay}&to=${shiftDay}&employee=${person.code}`, { admin: true });
+      assert.equal(hub.rows[0].milliseconds.overBreak, 5 * 60_000);
+    }
+    assert.equal((await runAttendanceAutoTimeOutCycle(new Date())).closed, 0);
+  } finally { if (old === undefined) delete process.env.CRM_ATTENDANCE_AUTO_TIMEOUT; else process.env.CRM_ATTENDANCE_AUTO_TIMEOUT = old; resetAttendanceWorkerCursors(); }
+});
+
 test("HTTP: two back-to-back 15-minute breaks, one 60-minute lunch, and atomic rejections", async () => {
   const person = await fixture();
   await action(person, "Time In", 0);
