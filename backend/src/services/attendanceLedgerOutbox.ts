@@ -8,6 +8,8 @@ import { recalculateEmployeePayrollAfterAttendanceEdit } from "../controllers/pa
 import { attendanceEventStatus } from "./attendanceShift";
 import { attendancePolicy } from "./attendanceLedgerService";
 import { getAttendanceBusinessIdentities } from "../models/BusinessUserAccess";
+import { attendanceDurationModelEnabled } from "../config/rolloutFlags";
+import { deriveAttendanceDays } from "./attendanceDerived";
 
 export async function refreshAttendanceLedgerMemberships(employeeCode?: string) {
   const ledgers = await AttendanceLedger.find(employeeCode ? { employeeCode } : {}).select("_id employeeCode businessIds revision").lean();
@@ -21,13 +23,24 @@ export async function refreshAttendanceLedgerMemberships(employeeCode?: string) 
   return ledgers.map((ledger) => ledger._id);
 }
 
-export async function deliverAttendanceLedger(identityKey: string) {
+export async function deliverAttendanceLedger(identityKey: string, options: {
+  now?: Date; recalculatePayroll?: typeof recalculateEmployeePayrollAfterAttendanceEdit;
+  emitAvailability?: typeof emitEmployeeAvailabilityUpdated;
+} = {}) {
   const ledger = await AttendanceLedger.findById(identityKey).lean();
   if (!ledger) return;
   const projection = projectAttendance(ledger.events, ledger.corrections, ledger.closures);
   const shifts = new Map(projection.sessions.flatMap((session) => session.events.map((event) => [event.id, session.shift] as const)));
   const policy = await attendancePolicy(ledger.canonicalBusinessId);
   const pending = [...new Set(ledger.jobs.filter((job) => !job.done).map((job) => job.businessId))];
+  const durationModel = attendanceDurationModelEnabled();
+  // Retry the committed snapshot's clock, not a later delivery-time clock.
+  const computedAt = ledger.derived?.[0]?.computedAt || ledger.audit.at(-1)?.at;
+  const days = durationModel ? ledger.derived ?? deriveAttendanceDays(ledger, policy, computedAt ? new Date(computedAt) : options.now || new Date()) : undefined;
+  const derivedByEvent = new Map(days?.flatMap((day) => day.eventIds.map((id) => [id, day] as const)));
+  const recalculatePayroll = options.recalculatePayroll || recalculateEmployeePayrollAfterAttendanceEdit;
+  const emitAvailability = options.emitAvailability || emitEmployeeAvailabilityUpdated;
+  const deliveredBusinessIds: string[] = [];
   for (const businessId of pending) {
     try {
       await runWithBusiness(businessId, async () => {
@@ -43,6 +56,8 @@ export async function deliverAttendanceLedger(identityKey: string) {
               : { employee: employee._id, eventId: event.id, $or: [{ ledgerRevision: { $lte: ledger.revision } }, { ledgerRevision: { $exists: false } }] },
             update: { $set: { employee: employee._id, eventId: event.id, source: event.source, timeIn: new Date(event.at),
               isEffective: true, ledgerIdentity: ledger._id, ledgerRevision: ledger.revision,
+              ...(event.autoTimeOut === undefined ? {} : { autoTimeOut: event.autoTimeOut }),
+              ...(durationModel && derivedByEvent.has(event.id) ? { derived: derivedByEvent.get(event.id) } : {}),
               attendanceStatus: attendanceEventStatus(event.source, new Date(event.at), shifts.get(event.id) || null, policy.graceMinutes) },
               $setOnInsert: { isArchived: false } }, upsert: true,
           } }; }));
@@ -60,21 +75,30 @@ export async function deliverAttendanceLedger(identityKey: string) {
           { $set: { availabilityStatus: state, availabilityStatusReason: "manual-attendance-ledger", attendanceRevision: ledger.revision,
             activeAttendanceSessionId: projection.active?.id || "" } });
         const firstPendingRevision = Math.min(...ledger.jobs.filter((job) => !job.done && job.businessId === businessId).map((job) => job.revision));
-        const affected = ledger.audit.filter((audit) => audit.afterRevision >= firstPendingRevision && audit.afterRevision <= ledger.revision && ["correct", "undo", "recover"].includes(audit.operation));
-        if (affected.length) {
+        const affected = ledger.audit.filter((audit) => audit.afterRevision >= firstPendingRevision && audit.afterRevision <= ledger.revision &&
+          (durationModel || ["correct", "undo", "recover", "auto-time-out"].includes(audit.operation)));
+        emitAvailability({ employeeId: String(employee._id), availabilityStatus: state });
+        if (affected.length || durationModel) {
           const targets = new Set(affected.flatMap((audit) => audit.targetIds));
           const commands = new Set(affected.map((audit) => audit.commandId));
-          const dates = ledger.events.filter((event) => targets.has(event.id) || commands.has(event.commandId)).map((event) => new Date(event.at)).sort((a, b) => a.getTime() - b.getTime());
-          if (dates.length) await recalculateEmployeePayrollAfterAttendanceEdit(String(employee._id), dates[0], dates.at(-1)!, { businessIds: [businessId], attendanceDates: dates });
+          const closedSessions = new Set(ledger.closures.filter((closure) => commands.has(closure.commandId)).map((closure) => closure.sessionId));
+          const closedEventIds = new Set(projection.sessions.filter((session) => closedSessions.has(session.id)).flatMap((session) => session.events.map((event) => event.id)));
+          const events = ledger.events.filter((event) => targets.has(event.id) || commands.has(event.commandId) || closedEventIds.has(event.id) || !affected.length);
+          const derivedDates = affected.flatMap((audit) => [...(audit.beforeDerived || []), ...(audit.afterDerived || [])]
+            .flatMap((day) => [day.shiftStart, day.shiftEnd]));
+          const dates = [...new Set([...derivedDates, ...events.flatMap((event) => [event.at, shifts.get(event.id)?.start].filter((at): at is string => Boolean(at)))])]
+            .map((at) => new Date(at)).sort((a, b) => a.getTime() - b.getTime());
+          if (dates.length) await recalculatePayroll(String(employee._id), dates[0], dates.at(-1)!, { businessIds: [businessId], attendanceDates: dates });
         }
-        emitEmployeeAvailabilityUpdated({ employeeId: String(employee._id), availabilityStatus: state });
       });
-      await AttendanceLedger.updateOne({ _id: identityKey, revision: ledger.revision },
+      const completion = await AttendanceLedger.updateOne({ _id: identityKey, revision: ledger.revision },
         { $set: { "jobs.$[job].done": true } }, { arrayFilters: [{ "job.businessId": businessId, "job.revision": { $lte: ledger.revision } }] });
+      if (completion.matchedCount) deliveredBusinessIds.push(businessId);
     } catch {
       // The command is already durable. The pending job remains retryable.
     }
   }
+  return { revision: ledger.revision, deliveredBusinessIds, pendingBusinessIds: pending.filter((id) => !deliveredBusinessIds.includes(id)) };
 }
 export async function retryAttendanceLedgers() {
   await refreshAttendanceLedgerMemberships();

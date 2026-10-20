@@ -2,10 +2,11 @@ import { api } from "../lib/api";
 import { getAuthUser } from "./authStorage";
 
 export type HubStatus = "ONLINE" | "BREAK" | "LUNCH" | "OFF THE PHONE" | "OFFLINE";
-export type HubEvent = { id: string; source: string; at: string; eventId: string | null };
+export type HubEvent = { id: string; source: string; at: string; eventId: string | null; autoTimeOut?: boolean };
 export type HubBreakSession = { startedAt: string; endedAt: string | null; durationMs: number; isOpen: boolean };
 export type HubDay = {
     dayKey: string; shiftStart: string; shiftEnd: string; timeIn: string | null; timeOut: string | null;
+    autoTimeOut?: boolean;
     employeeCode: string; employeeId: string; employeeName: string; role: string; team: string; scopeKey: string;
     businessId: string; businessName: string; status: string; inProgress: boolean; excused: boolean; absent: boolean;
     mismatch: boolean; issues: string[]; review: string[]; note: string; leave: string | null;
@@ -28,6 +29,7 @@ export type HubResponse = {
     employees?: Array<Pick<HubDay, "scopeKey" | "employeeCode" | "employeeName" | "employeeId" | "team" | "role" | "businessId">>;
     history?: { page: number; hasOlder: boolean; hasNewer: boolean; today: string };
     range: { from: string; to: string }; serverTime: string;
+    autoTimeOutEnabled?: boolean;
     summary: { daysWorked: number; employeesPresent: number; online: number; break: number; lunch: number;
         offPhone: number; lateCount: number; late: number; overBreakCount: number; overBreak: number;
         overLunchCount: number; overLunch: number; underTimeCount: number; underTime: number;

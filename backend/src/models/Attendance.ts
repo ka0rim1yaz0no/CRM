@@ -1,6 +1,7 @@
 import { Schema, Types } from "mongoose";
 import { tenantModel } from "../config/tenancy";
 import { attendanceIntegrityEnabled, attendanceV2Enabled } from "../config/rolloutFlags";
+import type { AttendanceDerivedDay } from "../services/attendanceDerived";
 
 export type AttendanceSource =
   | "Login"
@@ -26,6 +27,8 @@ export type AttendanceDocument = {
   isEffective?: boolean;
   ledgerIdentity?: string;
   ledgerRevision?: number;
+  autoTimeOut?: boolean;
+  derived?: AttendanceDerivedDay;
 };
 
 const attendanceSchema = new Schema<AttendanceDocument>(
@@ -55,6 +58,8 @@ const attendanceSchema = new Schema<AttendanceDocument>(
     isEffective: { type: Boolean, default: undefined },
     ledgerIdentity: String,
     ledgerRevision: Number,
+    autoTimeOut: { type: Boolean, default: undefined },
+    derived: { type: Schema.Types.Mixed, default: undefined },
   },
   { timestamps: true }
 );

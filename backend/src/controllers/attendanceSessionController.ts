@@ -2,7 +2,7 @@ import type { Request, Response } from "express";
 import { Types } from "mongoose";
 import { verifyAdminDashboardSession } from "../config/adminDashboardSession";
 import { verifyAttendanceHubSession } from "../config/attendanceHubSession";
-import { attendanceActiveSessionEnabled, attendanceIntegrityEnabled, attendanceRecoveryEnvironmentEnabled } from "../config/rolloutFlags";
+import { attendanceActiveSessionEnabled, attendanceAutoTimeOutEnabled, attendanceIntegrityEnabled, attendanceRecoveryEnvironmentEnabled } from "../config/rolloutFlags";
 import { AttendanceLedger, AttendancePolicy, type AttendanceActor } from "../models/AttendanceLedger";
 import { Attendance } from "../models/Attendance";
 import { Employee } from "../models/Employee";
@@ -39,6 +39,7 @@ export async function getActiveAttendanceSession(request: Request, response: Res
     const snapshot = withAttendanceStatuses(attendanceSnapshot(ledger), policy.graceMinutes);
     response.set("Cache-Control", "no-store").json({ ...snapshot, ...attendanceDashboardPresentation(snapshot, policy, new Date(snapshot.serverTime)), ...(actor.role === "admin" ? { policy } : {}),
       allowances: { breakMinutes: policy.breakMinutes, lunchMinutes: policy.lunchMinutes },
+      autoTimeOutEnabled: attendanceIntegrityEnabled() && attendanceAutoTimeOutEnabled(),
       recoveryEnabled: policy.recoveryEnabled || attendanceRecoveryEnvironmentEnabled(),
       resetDeadline: policy.recoveryEnabled || attendanceRecoveryEnvironmentEnabled() ? snapshot.assignedShift?.resetDeadline || null : null });
   } catch (error) { attendanceError(response, error); }
@@ -70,7 +71,8 @@ export async function submitAttendanceCommand(request: Request, response: Respon
     let syncPending = true;
     try { await deliverAttendanceLedger(identity.key); syncPending = attendanceSnapshot(await readAttendanceLedger(identity)).syncPending; } catch { /* Durable retry worker owns delivery. */ }
     response.json({ ...result, ...attendanceDashboardPresentation(result, policy, new Date(result.serverTime)),
-      allowances: { breakMinutes: policy.breakMinutes, lunchMinutes: policy.lunchMinutes }, syncPending });
+      allowances: { breakMinutes: policy.breakMinutes, lunchMinutes: policy.lunchMinutes },
+      autoTimeOutEnabled: attendanceAutoTimeOutEnabled(), syncPending });
   } catch (error) { attendanceError(response, error); }
 }
 export async function previewAttendanceCorrection(request: Request, response: Response) {
@@ -86,8 +88,16 @@ export async function getAttendancePolicy(request: Request, response: Response) 
   if (!attendanceIntegrityEnabled()) { response.status(404).json({ message: "Attendance configuration is disabled." }); return; }
   try {
     if (verifiedAttendanceActor(request).role !== "admin") throw new AttendanceCommandError(403, "ADMIN_ONLY", "Attendance configuration is restricted to administrators.");
-    response.set("Cache-Control", "no-store").json(await attendancePolicy());
+    response.set("Cache-Control", "no-store").json({ ...await attendancePolicy(), autoTimeOutEnabled: attendanceAutoTimeOutEnabled() });
   } catch (error) { attendanceError(response, error); }
+}
+export function validateAttendanceAutoTimeOutTime(value: unknown, shiftEnd = "08:00") {
+  if (typeof value !== "string" || !/^([01]\d|2[0-3]):[0-5]\d$/.test(value)) {
+    throw new AttendanceCommandError(422, "INVALID_POLICY", "Automatic time-out must use HH:MM.");
+  }
+  if (value < shiftEnd) {
+    throw new AttendanceCommandError(422, "AUTO_TIME_OUT_BEFORE_SHIFT_END", "Automatic time-out cannot be before the scheduled shift end.");
+  }
 }
 export async function saveAttendancePolicy(request: Request, response: Response) {
   if (!attendanceIntegrityEnabled()) { response.status(404).json({ message: "Attendance configuration is disabled." }); return; }
@@ -97,20 +107,23 @@ export async function saveAttendancePolicy(request: Request, response: Response)
     const before = await attendancePolicy();
     const body = request.body as Record<string, unknown>;
     const after = { graceMinutes: Number(body.graceMinutes), breakMinutes: Number(body.breakMinutes), lunchMinutes: Number(body.lunchMinutes),
-      shiftStart: String(body.shiftStart), shiftEnd: String(body.shiftEnd), recoveryEnabled: body.recoveryEnabled === true, recoveryTime: String(body.recoveryTime) };
+      shiftStart: String(body.shiftStart), shiftEnd: String(body.shiftEnd), recoveryEnabled: body.recoveryEnabled === true, recoveryTime: String(body.recoveryTime),
+      autoTimeOutTime: body.autoTimeOutTime === undefined ? before.autoTimeOutTime : body.autoTimeOutTime };
     if (![after.graceMinutes, after.breakMinutes, after.lunchMinutes].every((value) => Number.isInteger(value) && value >= 0 && value <= 240) ||
-      ![after.shiftStart, after.shiftEnd, after.recoveryTime].every((value) => /^([01]\d|2[0-3]):[0-5]\d$/.test(value))) throw new AttendanceCommandError(422, "INVALID_POLICY", "Check the attendance thresholds and times.");
+      ![after.shiftStart, after.shiftEnd, after.recoveryTime, after.autoTimeOutTime].every((value) => typeof value === "string" && /^([01]\d|2[0-3]):[0-5]\d$/.test(value))) throw new AttendanceCommandError(422, "INVALID_POLICY", "Check the attendance thresholds and times.");
     if (after.breakMinutes < 1 || after.lunchMinutes < 1) throw new AttendanceCommandError(422, "INVALID_POLICY", "Break and lunch allowances must be at least one minute.");
     if (Number(body.expectedRevision) !== before.revision) throw new AttendanceCommandError(409, "STALE_REVISION", "Configuration changed. Refresh it before saving.");
     if (after.shiftStart !== "23:00" || after.shiftEnd !== "08:00") throw new AttendanceCommandError(422, "OFFICIAL_SHIFT_FIXED", "The official schedule remains 23:00 to 08:00 Asia/Manila.");
+    validateAttendanceAutoTimeOutTime(after.autoTimeOutTime, after.shiftEnd);
     try {
       const saved = await AttendancePolicy.updateOne({ _id: "global-attendance", revision: before.revision },
         { $set: { ...after, revision: before.revision + 1 }, $push: { audit: { actor: actor.code, at: new Date().toISOString(), before: {
           revision: before.revision, graceMinutes: before.graceMinutes, breakMinutes: before.breakMinutes, lunchMinutes: before.lunchMinutes,
-          shiftStart: before.shiftStart, shiftEnd: before.shiftEnd, recoveryEnabled: before.recoveryEnabled, recoveryTime: before.recoveryTime }, after } } }, { upsert: before.revision === 0 });
+          shiftStart: before.shiftStart, shiftEnd: before.shiftEnd, recoveryEnabled: before.recoveryEnabled, recoveryTime: before.recoveryTime,
+          autoTimeOutTime: before.autoTimeOutTime }, after } } }, { upsert: before.revision === 0 });
       if (!saved.modifiedCount && !saved.upsertedCount) throw new AttendanceCommandError(409, "STALE_REVISION", "Configuration changed.");
     } catch (error) { if ((error as { code?: number }).code === 11000) throw new AttendanceCommandError(409, "STALE_REVISION", "Configuration changed."); throw error; }
-    response.json({ _id: "global-attendance", ...after, revision: before.revision + 1 });
+    response.json({ _id: "global-attendance", ...after, revision: before.revision + 1, autoTimeOutEnabled: attendanceAutoTimeOutEnabled() });
   } catch (error) { attendanceError(response, error); }
 }
 
@@ -122,7 +135,8 @@ export async function getAttendanceHistory(request: Request, response: Response)
     const policy = await attendancePolicy(identity.canonicalBusinessId);
     const snapshot = withAttendanceStatuses(attendanceSnapshot(await readAttendanceLedger(identity)), policy.graceMinutes);
     let records = snapshot.records.map((event) => ({ _id: event.id, employee: identity.employeeId, source: event.source,
-      timeIn: event.at, createdAt: event.recordedAt, eventId: event.id, attendanceStatus: event.attendanceStatus } )).reverse();
+      timeIn: event.at, createdAt: event.recordedAt, eventId: event.id, attendanceStatus: event.attendanceStatus,
+      ...(event.autoTimeOut ? { autoTimeOut: true } : {}) } )).reverse();
     if (request.query.from) records = records.filter((event) => event.timeIn >= String(request.query.from));
     if (request.query.to) records = records.filter((event) => event.timeIn <= String(request.query.to));
     const limit = Math.min(1000, Math.max(1, Number(request.query.limit) || 300));
@@ -152,7 +166,8 @@ export async function getScopedAttendanceList(request: Request, response: Respon
       let policy = policies.get(ledger.canonicalBusinessId);
       if (!policy) { policy = await attendancePolicy(ledger.canonicalBusinessId); policies.set(ledger.canonicalBusinessId, policy); }
       const projection = projectAttendance(ledger.events, ledger.corrections, ledger.closures);
-      records.push(...withAttendanceStatuses({ records: projection.effectiveEvents, sessions: projection.sessions }, policy.graceMinutes).records.map((event) => ({ _id: event.id, employee: String(scope.employee._id), eventId: event.id, source: event.source, timeIn: event.at, createdAt: event.recordedAt, attendanceStatus: event.attendanceStatus })));
+      records.push(...withAttendanceStatuses({ records: projection.effectiveEvents, sessions: projection.sessions }, policy.graceMinutes).records.map((event) => ({ _id: event.id, employee: String(scope.employee._id), eventId: event.id, source: event.source, timeIn: event.at, createdAt: event.recordedAt, attendanceStatus: event.attendanceStatus,
+        ...(event.autoTimeOut ? { autoTimeOut: true } : {}) })));
     }
     const from = request.query.from ? new Date(String(request.query.from)) : request.query.all === "true" ? null : new Date(Date.now() - 72 * 3_600_000);
     const to = request.query.to ? new Date(String(request.query.to)) : null;

@@ -4,6 +4,7 @@ import crypto from "node:crypto";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import mongoose from "mongoose";
 import { MongoMemoryReplSet } from "mongodb-memory-server";
@@ -136,9 +137,16 @@ test("real API: media, message attachment and profile uploads work with fake fil
   await json(`/messages/conversations/${conversation._id}/messages`, "POST", { body: "Synthetic payslip attachment", attachments: [attachment] });
   const downloaded = await request(attachment.url.replace(/^\/api/, ""));
   assert.equal(downloaded.status, 200); assert.equal(Buffer.from(await downloaded.arrayBuffer()).toString("base64"), png);
-  const mirrored = await json("/messages/conversations", "GET", undefined, "test-b");
+  // Message replication is asynchronous; assert its result, not the HTTP response timing.
+  const deadline = Date.now() + 5000;
+  let mirrored = await json("/messages/conversations", "GET", undefined, "test-b");
+  let messages = mirrored.length ? await json(`/messages/conversations/${mirrored[0]._id}/messages`, "GET", undefined, "test-b") : [];
+  while ((!mirrored.length || !messages.some((message: { attachments?: Array<{ url: string }> }) => message.attachments?.some((item) => item.url === attachment.url))) && Date.now() < deadline) {
+    await delay(50);
+    mirrored = await json("/messages/conversations", "GET", undefined, "test-b");
+    messages = mirrored.length ? await json(`/messages/conversations/${mirrored[0]._id}/messages`, "GET", undefined, "test-b") : [];
+  }
   assert.equal(mirrored.length, 1);
-  const messages = await json(`/messages/conversations/${mirrored[0]._id}/messages`, "GET", undefined, "test-b");
   assert.equal(messages[0].attachments[0].url, attachment.url);
   assert.equal((await request(attachment.url.replace(/^\/api/, ""), "GET", undefined, "test-b", "employee")).status, 200);
   assert.equal((await request(`/messages/conversations/${conversation._id}/attachments`, "POST", { dataUrl: "data:text/html;base64,SGVsbG8=", fileName: "bad.html" })).status, 400);

@@ -157,7 +157,7 @@ async function loadHub(actor: Actor, filters: ReturnType<typeof assertQuery>, no
     }
     const [events, notes, leaves, edits] = await Promise.all([
       Attendance.find({ employee: { $in: employeeIds }, isArchived: { $ne: true }, timeIn: { $gte: new Date(first.getTime() - 12 * 3_600_000), $lte: new Date(last.getTime() + 12 * 3_600_000) } })
-        .select("_id employee source timeIn eventId createdAt").sort({ employee: 1, timeIn: 1 }).lean(),
+        .select("_id employee source timeIn eventId createdAt autoTimeOut").sort({ employee: 1, timeIn: 1 }).lean(),
       AttendanceDayNote.find({ employeeCode: { $in: visible.map((employee) => employee.employeeCode) }, dayKey: { $gte: filters.from, $lte: filters.to } }).lean(),
       LeaveRequest.find({ employee: { $in: employeeIds }, status: "Approved", startDate: { $lte: last }, endDate: { $gte: first } })
         .select("employee startDate endDate selectedDates leaveType").lean(),
@@ -168,7 +168,7 @@ async function loadHub(actor: Actor, filters: ReturnType<typeof assertQuery>, no
     for (const event of events) {
       const key = `${event.employee}:${hubDayKey(event.timeIn, settings)}`;
       const group = eventMap.get(key) || [];
-      group.push({ id: String(event._id), source: event.source, at: event.timeIn, eventId: event.eventId });
+      group.push({ id: String(event._id), source: event.source, at: event.timeIn, eventId: event.eventId, autoTimeOut: event.autoTimeOut });
       eventMap.set(key, group);
     }
     const noteMap = new Map(notes.map((note) => [`${note.employeeCode}:${note.dayKey}`, note]));
@@ -191,7 +191,7 @@ async function loadHub(actor: Actor, filters: ReturnType<typeof assertQuery>, no
       if (projection) {
         for (const key of dayKeys(filters.from, filters.to)) {
           const effective = projection.sessions.filter((item) => item.shift?.dayKey === key).flatMap((session) => session.events);
-          eventMap.set(`${employee._id}:${key}`, effective.map((event) => ({ id: event.id, eventId: event.id, source: event.source, at: new Date(event.at), sequence: event.sequence })));
+          eventMap.set(`${employee._id}:${key}`, effective.map((event) => ({ id: event.id, eventId: event.id, source: event.source, at: new Date(event.at), sequence: event.sequence, autoTimeOut: event.autoTimeOut })));
         }
       }
       for (const key of dayKeys(filters.from, filters.to)) {
@@ -410,9 +410,10 @@ export async function getHubLive(request: Request, response: Response) {
       lateGraceMinutes: defaultSystemSettings.lateGraceMinutes, attendanceTimeZone: hubTimeZone,
     };
     const shift = hubShiftBounds(current, settings);
+    const policy = await attendancePolicy();
     response.set("Cache-Control", "no-store").json({ status, since: latest?.event.at || null, serverTime: now.toISOString(),
       day: latest?.row || null, shiftStart: shift.start.toISOString(), shiftEnd: shift.end.toISOString(),
-      thresholds: { breakMinutes: 15, lunchMinutes: 60, timezone: hubTimeZone, graceMinutes: settings.lateGraceMinutes } });
+      thresholds: { breakMinutes: policy.breakMinutes, lunchMinutes: policy.lunchMinutes, timezone: hubTimeZone, graceMinutes: settings.lateGraceMinutes } });
   } catch { response.status(503).json({ message: "Live attendance is temporarily unavailable." }); }
 }
 

@@ -1,9 +1,10 @@
 import { attendanceSlotKey } from "./attendanceShift";
 import type { AttendanceSource } from "../models/Attendance";
-import { accountTime, breakAllowanceMs, bucketForAttendanceSource, lunchAllowanceMs, excessClickedSessionMilliseconds, clickedSessionIntervals } from "./timeAccounting";
+import { accountTime, breakAllowanceMs, bucketForAttendanceSource, lunchAllowanceMs, excessClickedSessionMilliseconds, clickedSessionIntervals, calculateSlotAttendance } from "./timeAccounting";
+import { attendanceDurationModelEnabled } from "../config/rolloutFlags";
 import { projectAttendance } from "./attendanceSessionState";
 
-export type HubEvent = { id: string; source: AttendanceSource; at: Date; eventId?: string; createdAt?: Date; sequence?: number };
+export type HubEvent = { id: string; source: AttendanceSource; at: Date; eventId?: string; createdAt?: Date; sequence?: number; autoTimeOut?: boolean };
 export type HubSettings = { officialShiftStartTime: string; officialShiftEndTime: string; lateGraceMinutes: number; attendanceTimeZone: string; breakMinutes?: number; lunchMinutes?: number };
 export const hubTimeZone = "Asia/Manila";
 
@@ -40,8 +41,8 @@ export function calculateHubDay(dayKey: string, sourceEvents: HubEvent[], settin
   const hasOpenSession = Boolean(projection.active);
   const isInProgress = hasOpenSession && now < end;
   const rawLateMs = timeIn ? Math.max(0, timeIn.at.getTime() - start.getTime() - Math.max(0, settings.lateGraceMinutes) * 60_000) : 0;
-  const lateMs = rawLateMs >= 60_000 ? rawLateMs : 0;
-  const underTimeMs = timeOut && timeIn && !hasOpenSession && now >= end
+  let lateMs = rawLateMs >= 60_000 ? rawLateMs : 0;
+  let underTimeMs = timeOut && timeIn && !hasOpenSession && now >= end
     ? Math.max(0, end.getTime() - timeOut.at.getTime()) : 0;
   const overtime = timeOut && timeIn && timeOut.at > end && !hasOpenSession
     ? accountTime(events.flatMap((event) => {
@@ -55,8 +56,16 @@ export function calculateHubDay(dayKey: string, sourceEvents: HubEvent[], settin
     startedAt: interval.start.toISOString(), endedAt: interval.open ? null : interval.end.toISOString(),
     durationMs: interval.milliseconds, isOpen: interval.open,
   }));
-  const breakOverMs = excessClickedSessionMilliseconds(clickedRecords, "Break Out", "Break In", breakLimit, asOf);
-  const lunchOverMs = excessClickedSessionMilliseconds(clickedRecords, "Lunch Break Out", "Lunch Break In", lunchLimit, asOf);
+  let breakOverMs = excessClickedSessionMilliseconds(clickedRecords, "Break Out", "Break In", breakLimit, asOf);
+  let lunchOverMs = excessClickedSessionMilliseconds(clickedRecords, "Lunch Break Out", "Lunch Break In", lunchLimit, asOf);
+  if (attendanceDurationModelEnabled()) {
+    const calculated = calculateSlotAttendance(clickedRecords, { breakMinutes: breakLimit / 60_000, lunchMinutes: lunchLimit / 60_000,
+      graceMinutes: settings.lateGraceMinutes, shiftStart: start, shiftEnd: end }, now);
+    lateMs = calculated.lateMinutes * 60_000;
+    underTimeMs = calculated.earlyTimeOutMinutes * 60_000;
+    breakOverMs = calculated.excessBreakMinutes * 60_000;
+    lunchOverMs = calculated.excessLunchMinutes * 60_000;
+  }
   const review: string[] = projection.issues.map((issue) => issue.message);
   const active: { break?: Date; lunch?: Date; offPhone?: Date } = {};
   let lunchAttempts = 0;
@@ -65,7 +74,7 @@ export function calculateHubDay(dayKey: string, sourceEvents: HubEvent[], settin
     if (event.source === "Time In" || event.source === "Login") { lunchAttempts = 0; }
     if (event.source === lastSource) review.push(`Duplicate ${event.source}`);
     lastSource = event.source;
-    if (event.at < start || event.at > end) review.push("Event outside shift");
+    if (event.at < start || (event.at > end && !event.autoTimeOut)) review.push("Event outside shift");
     if (event.source === "Break Out") {
       if (active.break) review.push("Break Out without Break In");
       active.break = event.at;
@@ -105,7 +114,7 @@ export function calculateHubDay(dayKey: string, sourceEvents: HubEvent[], settin
   if (hasOpenSession) issues.push("OPEN SESSION");
   if (excused) issues.push("EXCUSED");
   return {
-    dayKey, shiftStart: start.toISOString(), shiftEnd: end.toISOString(),
+    dayKey, shiftStart: start.toISOString(), shiftEnd: end.toISOString(), autoTimeOut: events.some((event) => event.autoTimeOut),
     breakMinutes: breakLimit / 60_000, lunchMinutes: lunchLimit / 60_000, breakSessions,
     timeline: buckets.intervals.map((interval) => ({ bucket: interval.bucket, start: interval.start.toISOString(), end: interval.end.toISOString() })),
     timeIn: timeIn?.at.toISOString() || null, timeOut: hasOpenSession ? null : timeOut?.at.toISOString() || null,
@@ -114,6 +123,6 @@ export function calculateHubDay(dayKey: string, sourceEvents: HubEvent[], settin
     milliseconds: { ...buckets.milliseconds, late: excused ? 0 : lateMs, underTime: excused ? 0 : underTimeMs,
       overBreak: excused ? 0 : breakOverMs, overLunch: excused ? 0 : lunchOverMs, overtime },
     status: events.length ? (isInProgress ? "In progress" : hasOpenSession || !timeIn ? "Needs review" : "Present") : "No record",
-    events: events.map((event) => ({ id: event.id, source: event.source, at: event.at.toISOString(), eventId: event.eventId || null })),
+    events: events.map((event) => ({ id: event.id, source: event.source, at: event.at.toISOString(), eventId: event.eventId || null, autoTimeOut: event.autoTimeOut || undefined })),
   };
 }

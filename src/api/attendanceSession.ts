@@ -6,9 +6,10 @@ import { attendanceSessionCacheKey, retainAttendanceSnapshot } from "../lib/atte
 
 export const attendanceIntegrityEnabled = import.meta.env.VITE_CRM_ATTENDANCE_INTEGRITY === "true" ||
     (import.meta.env.DEV && import.meta.env.VITE_CRM_ATTENDANCE_INTEGRITY !== "false");
+export const attendanceDurationModelEnabled = import.meta.env.VITE_CRM_ATTENDANCE_DURATION_MODEL === "true";
 export type SessionEvent = { id: string; source: "Login" | "Logout" | "Time In" | "Time Out" | "Break Out" | "Break In" |
     "Lunch Break Out" | "Lunch Break In" | "Off the Phone Out" | "Off the Phone In"; at: string; commandId: string; sequence: number; sessionId?: string;
-    attendanceStatus?: "On time" | "Late" | "Undertime" | "" };
+    attendanceStatus?: "On time" | "Late" | "Undertime" | ""; autoTimeOut?: boolean };
 export type AttendanceSessionSnapshot = {
     dashboardDays?: DashboardAttendanceDay[];
     currentShiftDay?: string;
@@ -17,6 +18,8 @@ export type AttendanceSessionSnapshot = {
     assignedShift: { dayKey: string; start: string; end: string; resetDeadline: string } | null;
     reviewState: string; review: string[]; records: SessionEvent[]; syncPending: boolean;
     historyReviewRequired?: boolean;
+    allowedActions?: SessionEvent["source"][];
+    autoTimeOutEnabled?: boolean;
     sessions: Array<{ id: string; startedAt: string; endedAt: string | null; mode: string; modeSince: string; lifecycle: string;
         events: SessionEvent[]; shift: AttendanceSessionSnapshot["assignedShift"]; time?: { scheduled: { online: number } } }>;
     audit: Array<{ commandId: string; actor: { code: string; role: string }; reason: string; operation: string; at: string; targetIds: string[] }>;
@@ -32,7 +35,8 @@ export type DashboardAttendanceDay = {
         allowedMs: number; overMs: number; isOpen: boolean }>;
 };
 export type AttendancePolicy = { revision: number; graceMinutes: number; breakMinutes: number; lunchMinutes: number;
-    shiftStart: string; shiftEnd: string; recoveryEnabled: boolean; recoveryTime: string };
+    shiftStart: string; shiftEnd: string; recoveryEnabled: boolean; recoveryTime: string; autoTimeOutTime?: string;
+    autoTimeOutEnabled?: boolean };
 export type AttendanceCommand = { commandId: string; expectedRevision: number; fingerprint?: string;
     operation: "action" | "correct" | "undo"; source?: SessionEvent["source"]; reason?: string;
     targetCommandId?: string; changes?: Array<{ targetId?: string; source?: SessionEvent["source"]; at?: string; remove?: boolean }> };

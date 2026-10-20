@@ -1,10 +1,11 @@
 import { accountTime, bucketForAttendanceSource } from "./timeAccounting";
 import type { AttendanceSource } from "../models/Attendance";
+import { attendanceBreakGapEnabled, attendanceDurationModelEnabled } from "../config/rolloutFlags";
 
 export type AttendanceMode = "ONLINE" | "BREAK" | "LUNCH" | "OFF THE PHONE" | "OFFLINE";
 export type AssignedShift = { dayKey: string; start: string; end: string; resetDeadline: string; ambiguous?: boolean };
 export type SessionEvent = { id: string; source: AttendanceSource; at: string; sequence: number; commandId: string;
-  recordedAt: string; sessionId?: string; shift?: AssignedShift; origin?: { businessId: string; recordId: string };
+  recordedAt: string; autoTimeOut?: boolean; sessionId?: string; shift?: AssignedShift; origin?: { businessId: string; recordId: string };
   replicaOrigins?: Array<{ businessId: string; recordId: string }>; legacyReviewed?: boolean; legacyBoundary?: boolean };
 export type SessionCorrection = { commandId: string; targets: string[]; reason: string; actor: string; at: string };
 export type SystemClosure = { id: string; sessionId: string; effectiveAt: string; processedAt: string; commandId: string };
@@ -64,12 +65,14 @@ export function projectAttendance(events: SessionEvent[], corrections: SessionCo
     const returnMode = returns[event.source];
     if (outMode) {
       if (active.mode !== "ONLINE") { issues.push({ eventId: event.id, message: `Cannot start ${outMode} from ${active.mode}.` }); continue; }
-      const previous = active.events.filter((item) => item.source === event.source);
+      const slotSessions = attendanceDurationModelEnabled() && active.shift
+        ? sessions.filter((session) => session.shift?.dayKey === active!.shift!.dayKey) : [active];
+      const previous = slotSessions.flatMap((session) => session.events).filter((item) => item.source === event.source);
       if (outMode === "LUNCH" && previous.length) {
         issues.push({ eventId: event.id, message: "Only one lunch is allowed per session.", historical: event.legacyReviewed });
         if (!event.legacyReviewed) continue;
       }
-      if (outMode === "BREAK" && (previous.length >= 2 || previous.some((item) => Date.parse(event.at) - Date.parse(item.at) < 30 * 60_000))) {
+      if (outMode === "BREAK" && (previous.length >= 2 || (attendanceBreakGapEnabled() && previous.some((item) => Date.parse(event.at) - Date.parse(item.at) < 30 * 60_000)))) {
         issues.push({ eventId: event.id, message: "Only two breaks are allowed, with a 30 minute gap between starts.", historical: event.legacyReviewed });
         if (!event.legacyReviewed) continue;
       }

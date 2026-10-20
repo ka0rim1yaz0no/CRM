@@ -36,6 +36,8 @@ import { DataTablePagination } from "../../../components/admin/DataTable";
 import { setAppTheme } from "../../../lib/appTheme";
 import { emitToast } from "../../../lib/toast";
 import { themeOptions, type ThemeKey } from "../../../lib/themes";
+import { attendanceDurationModelEnabled } from "../../../api/attendanceSession";
+import AttendancePolicyEditor from "../../../components/AttendancePolicyEditor";
 
 type SettingsTab = "Businesses" | "Departments" | "Branches" | "Tools" | "Product Categories" | "Features" | "Themes" | "System";
 
@@ -43,7 +45,7 @@ const emptyRole: RoleInput = { department: "", name: "", branch: "All branches",
 const emptyBranch: BranchInput = { name: "", company: "Assistly", location: "" };
 const emptyTool: ToolInput = { name: "", link: "", branches: [] };
 const emptyProductCategory: ProductCategoryInput = { name: "", description: "" };
-const systemSettingCount = currencyOptions.length + 13;
+const systemSettingCount = currencyOptions.length + 13 - (attendanceDurationModelEnabled ? 2 : 0);
 
 export default function AdminSettings() {
     const queryClient = useQueryClient();
@@ -1119,6 +1121,11 @@ export default function AdminSettings() {
                                                             </select>
                                                         </td>
                                                     </tr>
+                                                    {attendanceDurationModelEnabled && <tr className="text-sm text-white/80">
+                                                        <td className="px-5 py-4 font-semibold text-white">Attendance allowances and cutoff</td>
+                                                        <td colSpan={3} className="px-5 py-4"><AttendancePolicyEditor /></td>
+                                                    </tr>}
+                                                    {!attendanceDurationModelEnabled && <>
                                                     <tr className="bg-white/[0.02] text-sm text-white/80 transition hover:bg-white/[0.035]">
                                                         <td className="px-5 py-4 font-semibold text-white">Official 1st break</td>
                                                         <td className="px-5 py-4 text-white/65">{systemSettings?.officialFirstBreakStartTime || "01:00"} - {systemSettings?.officialFirstBreakEndTime || "01:15"}</td>
@@ -1212,6 +1219,7 @@ export default function AdminSettings() {
                                                             </div>
                                                         </td>
                                                     </tr>
+                                                    </>}
                                                     <tr className="text-sm text-white/80 transition hover:bg-white/[0.035]">
                                                         <td className="px-5 py-4 font-semibold text-white">Late grace minutes</td>
                                                         <td className="px-5 py-4 text-white/65">{systemSettings?.lateGraceMinutes ?? 0} min</td>

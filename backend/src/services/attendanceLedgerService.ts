@@ -5,22 +5,33 @@ import { Employee } from "../models/Employee";
 import { getAttendanceBusinessIdentity } from "../models/BusinessUserAccess";
 import { getBusinessById, getCurrentBusinessId, runWithBusiness } from "../config/tenancy";
 import { SystemSettings } from "../models/SystemSettings";
-import { attendanceRecoveryEnvironmentEnabled } from "../config/rolloutFlags";
+import { attendanceAutoTimeOutEnabled, attendanceDurationModelEnabled, attendanceIntegrityEnabled, attendanceRecoveryEnvironmentEnabled } from "../config/rolloutFlags";
 import { assignAttendanceShift } from "./attendanceShift";
 import { projectAttendance, sessionTime, type SessionEvent } from "./attendanceSessionState";
+import { attendanceAutoTimeOutCutoff } from "./attendanceAutoTimeOut";
+import { attendanceDerivedDaysDueForRefresh, deriveAttendanceDays } from "./attendanceDerived";
+import { attendanceDerivedAuditDelta, replayAttendanceDerived, sameAttendanceDerivedValues, type AttendanceDerivedAuditDelta } from "./attendanceDerivedAudit";
 
 export class AttendanceCommandError extends Error {
   constructor(public status: number, public code: string, message: string, public details?: unknown) { super(message); }
 }
 export type AttendanceIdentity = { key: string; code: string; businessIds: string[]; canonicalBusinessId: string; employeeId: string };
-export type AttendanceCommand = { commandId: string; expectedRevision: number; fingerprint?: string; operation: "action" | "correct" | "undo" | "recover";
+export type AttendanceCommand = { commandId: string; expectedRevision: number; fingerprint?: string; operation: "action" | "correct" | "undo" | "recover" | "auto-time-out" | "recalculate";
   source?: SessionEvent["source"]; changes?: Array<{ targetId?: string; source?: SessionEvent["source"]; at?: string; remove?: boolean }>;
-  sessionId?: string; targetCommandId?: string; reason?: string; previewRevision?: number };
+  sessionId?: string; dayKey?: string; targetCommandId?: string; reason?: string; previewRevision?: number };
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const supportedSources = new Set(["Login", "Logout", "Time In", "Time Out", "Break Out", "Break In", "Lunch Break Out", "Lunch Break In", "Off the Phone Out", "Off the Phone In"]);
 const hash = (value: unknown) => crypto.createHash("sha256").update(JSON.stringify(value)).digest("hex");
 export function recoveryCommandId(sessionId: string) {
   const hex = hash(`attendance-recovery:${sessionId}`);
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+}
+export function autoTimeOutCommandId(sessionId: string) {
+  const hex = hash(`attendance-auto-time-out:${sessionId}`);
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+}
+export function attendanceDerivedRefreshCommandId(dayKey: string, shiftEnd: string) {
+  const hex = hash(`attendance-derived-refresh:${dayKey}:${shiftEnd}`);
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
 }
 
@@ -37,11 +48,11 @@ export async function resolveAttendanceIdentity(employeeId: string, actor: Atten
 }
 export async function attendancePolicy(businessId = getCurrentBusinessId()) {
   const stored = await AttendancePolicy.findById("global-attendance").lean();
-  if (stored) return stored;
+  if (stored) return { ...stored, autoTimeOutTime: stored.autoTimeOutTime ?? "08:05" };
   const settings = await runWithBusiness(businessId, () => SystemSettings.findOne({ key: "system" }).lean());
   return { _id: "global-attendance", revision: 0, graceMinutes: settings?.lateGraceMinutes || 0, breakMinutes: 15, lunchMinutes: 60,
     shiftStart: settings?.officialShiftStartTime || "23:00", shiftEnd: settings?.officialShiftEndTime || "08:00",
-    recoveryEnabled: false, recoveryTime: "22:59", audit: [] };
+    recoveryEnabled: false, recoveryTime: "22:59", autoTimeOutTime: "08:05", audit: [] };
 }
 export async function readAttendanceLedger(identity: AttendanceIdentity) {
   const ledger = await AttendanceLedger.findById(identity.key).lean();
@@ -71,26 +82,37 @@ export function attendanceSnapshot(ledger: AttendanceLedgerDocument, now = new D
   const projection = projectAttendance(ledger.events, ledger.corrections, ledger.closures);
   const session = projection.active;
   const last = projection.sessions.at(-1);
+  const sequence = ledger.events.reduce((max, event) => Math.max(max, event.sequence), -1) + 1;
+  const allowedActions = ledger.migrationRequired || projection.blockingIssues.length ? [] : [...supportedSources].filter((source) => {
+    const additions: SessionEvent[] = [];
+    const append = (candidate: SessionEvent["source"]) => additions.push({ id: `allowed:${sequence + additions.length}:${candidate}`,
+      commandId: "allowed-action-preview", sequence: sequence + additions.length, source: candidate, at: now.toISOString(), recordedAt: now.toISOString() });
+    if (source === "Time Out" && session?.mode === "OFF THE PHONE") append("Off the Phone In");
+    append(source as SessionEvent["source"]);
+    return !projectAttendance([...ledger.events, ...additions], ledger.corrections, ledger.closures).blockingIssues.length;
+  });
   const review = [...projection.issues.map((issue) => issue.message), ...projection.sessions.filter((item) => item.lifecycle === "system-closed").map(() => "Administrative missing-checkout closure requires review.")];
   if (ledger.legacyAdoption?.businessStreamsDiffer) review.push("Historical business copies differed. Their original evidence was backed up and retained during reviewed adoption.");
   if (ledger.migrationRequired) review.push("Legacy history is readable, but adoption requires a reviewed migration and backup. No historical records were changed.");
   if (session?.shift?.ambiguous) review.push("Early clock-in assignment needs review. Automatic recovery is disabled for this ambiguous shift.");
   return { sessionId: session?.id || null, revision: ledger.revision, fingerprint: hash(ledger.events),
     state: session?.mode || "OFFLINE", stateSince: session?.modeSince || last?.modeSince || null,
-    lifecycle: session?.lifecycle || last?.lifecycle || "none", assignedShift: session?.shift || null,
+    lifecycle: session?.lifecycle || last?.lifecycle || "none", assignedShift: session?.shift || null, allowedActions,
     openIntervals: session && session.mode !== "ONLINE" ? [{ mode: session.mode, startedAt: session.modeSince }] : [],
     reviewState: ledger.migrationRequired ? "migration-review" : projection.blockingIssues.length ? "needs-correction" : "verified", review,
     historyReviewRequired: projection.issues.some((issue) => issue.historical) || Boolean(ledger.legacyAdoption?.businessStreamsDiffer), serverTime: now.toISOString(),
     sessions: projection.sessions.map((item) => ({ ...item, time: sessionTime(item, now) })), records: projection.effectiveEvents, audit: ledger.audit,
     time: session ? sessionTime(session, now) : null, syncPending: ledger.jobs.some((job) => !job.done),
-    systemClosure: last?.closure || null };
+    systemClosure: last?.closure || null, ...(attendanceDurationModelEnabled() ? { derived: ledger.derived } : {}) };
 }
 
 function replaySnapshot(ledger: AttendanceLedgerDocument, revision: number, serverTime: string) {
   const all = new Set(ledger.commands.map((command) => command.id));
   const included = new Set(ledger.commands.filter((command) => command.revision <= revision).map((command) => command.id));
   const visible = (commandId: string) => !all.has(commandId) || included.has(commandId);
-  return attendanceSnapshot({ ...ledger, revision, events: ledger.events.filter((event) => visible(event.commandId)),
+  return attendanceSnapshot({ ...ledger, revision,
+    derived: revision === ledger.revision ? ledger.derived : replayAttendanceDerived(ledger, revision),
+    events: ledger.events.filter((event) => visible(event.commandId)),
     corrections: ledger.corrections.filter((correction) => visible(correction.commandId)), closures: ledger.closures.filter((closure) => visible(closure.commandId)),
     audit: ledger.audit.filter((audit) => audit.afterRevision <= revision) }, new Date(serverTime));
 }
@@ -172,8 +194,34 @@ function applyAttendanceCommand(ledger: AttendanceLedgerDocument, input: Attenda
     if (actor.role !== "system") throw new AttendanceCommandError(403, "SYSTEM_ONLY", "Recovery is a system operation.");
     const active = before.active;
     if (!active || active.id !== input.sessionId || !active.shift || active.shift.ambiguous || now < new Date(active.shift.resetDeadline) ||
-      !(policy.recoveryEnabled || attendanceRecoveryEnvironmentEnabled())) throw new AttendanceCommandError(409, "RECOVERY_NOT_DUE", "This session is not eligible for recovery.");
+      attendanceAutoTimeOutEnabled() || !(policy.recoveryEnabled || attendanceRecoveryEnvironmentEnabled())) throw new AttendanceCommandError(409, "RECOVERY_NOT_DUE", "This session is not eligible for recovery.");
     closures.push({ id: crypto.randomUUID(), sessionId: active.id, effectiveAt: active.shift.resetDeadline, processedAt: now.toISOString(), commandId: input.commandId });
+  } else if (input.operation === "auto-time-out") {
+    if (actor.role !== "system") throw new AttendanceCommandError(403, "SYSTEM_ONLY", "Automatic time-out is a system operation.");
+    const active = before.active;
+    const cutoff = attendanceAutoTimeOutCutoff(active, policy.autoTimeOutTime);
+    if (!attendanceIntegrityEnabled() || !attendanceAutoTimeOutEnabled() || before.blockingIssues.length || !active || active.id !== input.sessionId ||
+        !cutoff || now < cutoff || now < new Date(active.shift!.end)) {
+      throw new AttendanceCommandError(409, "AUTO_TIME_OUT_NOT_DUE", "This session is not eligible for automatic time-out.");
+    }
+    if (input.commandId !== autoTimeOutCommandId(active.id)) throw new AttendanceCommandError(422, "INVALID_AUTO_TIME_OUT_ID", "Automatic time-out requires its stable session command ID.");
+    const at = cutoff.toISOString();
+    const returnSource = active.mode === "BREAK" ? "Break In" : active.mode === "LUNCH" ? "Lunch Break In" : active.mode === "OFF THE PHONE" ? "Off the Phone In" : null;
+    if (returnSource) append(returnSource, at).autoTimeOut = true;
+    append("Time Out", at).autoTimeOut = true;
+  } else if (input.operation === "recalculate") {
+    if (actor.role !== "system") throw new AttendanceCommandError(403, "SYSTEM_ONLY", "Derived attendance refresh is a system operation.");
+    const day = attendanceDerivedDaysDueForRefresh(ledger, now).find((item) => item.dayKey === input.dayKey);
+    if (!attendanceIntegrityEnabled() || !attendanceDurationModelEnabled() || !day) {
+      throw new AttendanceCommandError(409, "DERIVED_REFRESH_NOT_DUE", "This closed attendance day is not due for derived refresh.");
+    }
+    if (input.commandId !== attendanceDerivedRefreshCommandId(day.dayKey, day.shiftEnd)) {
+      throw new AttendanceCommandError(422, "INVALID_DERIVED_REFRESH_ID", "Derived refresh requires its stable shift-day command ID.");
+    }
+    if (input.source || input.changes || input.sessionId || input.targetCommandId) {
+      throw new AttendanceCommandError(422, "INVALID_DERIVED_REFRESH", "Derived refresh cannot change attendance events.");
+    }
+    targets.push(...day.eventIds);
   }
   const after = projectAttendance(events, corrections, closures);
   if (after.blockingIssues.length) throw new AttendanceCommandError(422, "INVALID_TIMELINE", "The resulting timeline is invalid. Correct the affected paired or later events together.", after.blockingIssues);
@@ -184,15 +232,20 @@ function applyAttendanceCommand(ledger: AttendanceLedgerDocument, input: Attenda
 export async function previewAttendanceCommand(identity: AttendanceIdentity, input: AttendanceCommand, actor: AttendanceActor, now = new Date()) {
   const ledger = await readAttendanceLedger(identity);
   if (ledger.revision !== input.expectedRevision) throw new AttendanceCommandError(409, "STALE_REVISION", "Attendance changed. Refresh the correction preview.");
-  const plan = applyAttendanceCommand(ledger, input, actor, await attendancePolicy(identity.canonicalBusinessId), now);
+  const policy = await attendancePolicy(identity.canonicalBusinessId);
+  const plan = applyAttendanceCommand(ledger, input, actor, policy, now);
+  const next = { ...ledger, events: plan.events, corrections: plan.corrections, closures: plan.closures };
+  if (attendanceDurationModelEnabled()) next.derived = deriveAttendanceDays(next, policy, now);
   return { revision: ledger.revision, employeeCode: identity.code, businessIds: identity.businessIds, targets: plan.targets,
-    before: attendanceSnapshot(ledger, now), after: attendanceSnapshot({ ...ledger, events: plan.events, corrections: plan.corrections, closures: plan.closures }, now),
+    before: attendanceSnapshot(ledger, now), after: attendanceSnapshot(next, now),
     payrollImpact: "Pending payroll will be recalculated; finalized payroll remains finalized.", allowed: true };
 }
 
 export async function executeAttendanceCommand(identity: AttendanceIdentity, input: AttendanceCommand, actor: AttendanceActor, now = new Date()) {
+  if (["auto-time-out", "recalculate"].includes(input.operation) && actor.role !== "system") throw new AttendanceCommandError(403, "SYSTEM_ONLY", "This attendance operation is system-only.");
   if (!uuid.test(input.commandId) || !Number.isInteger(input.expectedRevision) || input.expectedRevision < 0) throw new AttendanceCommandError(426, "ATTENDANCE_REFRESH_REQUIRED", "Refresh CRM to use the current attendance controls.");
-  const requestHash = hash({ ...input, fingerprint: undefined });
+  const request = { ...input, fingerprint: undefined, ...(["auto-time-out", "recalculate"].includes(input.operation) ? { expectedRevision: undefined } : {}) };
+  const requestHash = hash(input.operation === "recalculate" ? Object.fromEntries(Object.entries(request).sort(([a], [b]) => a.localeCompare(b))) : request);
   let ledger = await readAttendanceLedger(identity);
   if (ledger.migrationRequired) throw new AttendanceCommandError(409, "MIGRATION_REVIEW_REQUIRED", "Legacy attendance needs a reviewed adoption plan and database backup before enabling writes. No attendance was changed.");
   const replay = ledger.commands.find((command) => command.id === input.commandId);
@@ -202,7 +255,7 @@ export async function executeAttendanceCommand(identity: AttendanceIdentity, inp
   }
   const due = projectAttendance(ledger.events, ledger.corrections, ledger.closures).active;
   const currentPolicy = await attendancePolicy(identity.canonicalBusinessId);
-  if (input.operation === "action" && due?.shift && !due.shift.ambiguous && now >= new Date(due.shift.resetDeadline) &&
+  if (!attendanceAutoTimeOutEnabled() && input.operation === "action" && due?.shift && !due.shift.ambiguous && now >= new Date(due.shift.resetDeadline) &&
       (currentPolicy.recoveryEnabled || attendanceRecoveryEnvironmentEnabled())) {
     await executeAttendanceCommand(identity, { commandId: recoveryCommandId(due.id), expectedRevision: ledger.revision,
       operation: "recover", sessionId: due.id, reason: "Configured administrative missing-checkout recovery" }, { role: "system", code: "attendance-recovery" }, now);
@@ -212,7 +265,7 @@ export async function executeAttendanceCommand(identity: AttendanceIdentity, inp
   const seed = { _id: ledger._id, employeeCode: ledger.employeeCode, businessIds: ledger.businessIds,
     canonicalBusinessId: ledger.canonicalBusinessId, revision: ledger.revision, fence: ledger.fence,
     events: ledger.events, corrections: ledger.corrections, closures: ledger.closures, audit: ledger.audit, commands: ledger.commands, jobs: ledger.jobs };
-  try { await AttendanceLedger.updateOne({ _id: identity.key }, { $setOnInsert: seed }, { upsert: true }); }
+  try { if (input.operation !== "recalculate") await AttendanceLedger.updateOne({ _id: identity.key }, { $setOnInsert: seed }, { upsert: true }); }
   catch (error) { if ((error as { code?: number }).code !== 11000) throw error; }
   const token = crypto.randomUUID();
   const locked = await acquireAttendanceLease(identity.key, token, now);
@@ -230,19 +283,40 @@ export async function executeAttendanceCommand(identity: AttendanceIdentity, inp
     if (ledger.revision !== input.expectedRevision) throw new AttendanceCommandError(409, "STALE_REVISION", "Attendance changed. Refresh and review your retained draft.");
     const policy = await attendancePolicy(identity.canonicalBusinessId);
     const active = projectAttendance(ledger.events, ledger.corrections, ledger.closures).active;
-    if (input.operation === "action" && active?.shift && !active.shift.ambiguous && now >= new Date(active.shift.resetDeadline) && (policy.recoveryEnabled || attendanceRecoveryEnvironmentEnabled())) {
+    if (!attendanceAutoTimeOutEnabled() && input.operation === "action" && active?.shift && !active.shift.ambiguous && now >= new Date(active.shift.resetDeadline) && (policy.recoveryEnabled || attendanceRecoveryEnvironmentEnabled())) {
       throw new AttendanceCommandError(409, "RECOVERY_PENDING", "The previous shift is due for administrative recovery. Refresh after recovery completes.");
     }
     const plan = applyAttendanceCommand(ledger, input, actor, policy, now);
     const revision = ledger.revision + 1;
     const next = { ...ledger, events: plan.events, corrections: plan.corrections, closures: plan.closures, revision,
       jobs: [...ledger.jobs, ...identity.businessIds.map((businessId) => ({ businessId, revision, done: false }))] };
+    let derivedDelta: AttendanceDerivedAuditDelta | undefined;
+    if (attendanceDurationModelEnabled()) {
+      const beforeDerived = ledger.derived ?? deriveAttendanceDays(ledger, policy, now);
+      const previous = new Map(beforeDerived.map((day) => [day.dayKey, day]));
+      const calculated = deriveAttendanceDays(next, policy, now);
+      next.derived = input.operation === "recalculate"
+        ? beforeDerived.map((day) => day.dayKey === input.dayKey ? calculated.find((item) => item.dayKey === day.dayKey)! : day)
+        : calculated.map((day) => {
+          const old = previous.get(day.dayKey);
+          return old && sameAttendanceDerivedValues(old, day) ? old : day;
+        });
+      derivedDelta = attendanceDerivedAuditDelta(beforeDerived, next.derived);
+      if (input.operation === "recalculate" && !derivedDelta.afterDerived.some((day) => day.dayKey === input.dayKey)) {
+        const day = next.derived.find((item) => item.dayKey === input.dayKey)!;
+        derivedDelta.derivedMetadata = [{ dayKey: day.dayKey, computedAt: day.computedAt, revision: day.revision, policyRevision: day.policyRevision }];
+      }
+      next.derivedBaseline = ledger.derivedBaseline ?? { revision: ledger.revision, days: beforeDerived };
+    }
     const result = attendanceSnapshot(next, now);
     const audit = { commandId: input.commandId, actor, reason: input.reason || "Manual attendance button", operation: input.operation,
       at: now.toISOString(), beforeRevision: ledger.revision, afterRevision: revision, targetIds: plan.targets,
-      beforeState: plan.before.active?.mode || "OFFLINE", afterState: plan.after.active?.mode || "OFFLINE" };
+      beforeState: plan.before.active?.mode || "OFFLINE", afterState: plan.after.active?.mode || "OFFLINE",
+      ...(derivedDelta || {}) };
     const committed = await commitAttendanceRevision(identity.key, token, ledger.fence, ledger.revision, {
-      $set: { events: plan.events, corrections: plan.corrections, closures: plan.closures, revision, jobs: next.jobs, businessIds: identity.businessIds },
+      $set: { ...(input.operation === "recalculate" ? {} : { events: plan.events, corrections: plan.corrections, closures: plan.closures }),
+        revision, jobs: next.jobs, businessIds: identity.businessIds,
+        ...(derivedDelta ? { derived: next.derived, ...(!ledger.derivedBaseline ? { derivedBaseline: next.derivedBaseline } : {}) } : {}) },
       $push: { audit, commands: { id: input.commandId, actor: `${actor.role}:${actor.code}`, hash: requestHash, revision,
         result: { serverTime: result.serverTime, state: result.state, sessionId: result.sessionId } } },
     }, now);

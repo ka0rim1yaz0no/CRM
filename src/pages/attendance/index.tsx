@@ -475,7 +475,8 @@ import {
 import { buildOffPhoneAttendanceSessions, formatAttendanceDuration } from "../../lib/attendanceRecords";
 import { formatDateInTimeZone, formatTimeInTimeZone } from "../../lib/dateTime";
 import MainLayout from "../layout";
-import { attendanceIntegrityEnabled, getAttendanceSession, sessionEventRecord, type AttendanceSessionSnapshot } from "../../api/attendanceSession";
+import { attendanceDurationModelEnabled, attendanceIntegrityEnabled, getAttendanceSession, sessionEventRecord, type AttendanceSessionSnapshot } from "../../api/attendanceSession";
+import { attendanceBreakControl, attendanceDurationControls } from "../../lib/attendanceDurationUi";
 import { attendanceServerNow } from "../../lib/attendanceHubState";
 import { getActiveBusinessId } from "../../api/businessStorage";
 import "./attendance.css";
@@ -635,6 +636,9 @@ export default function AttendancePage() {
     const actionSlotKey = latestSlotKey && latestSlotHasOpenAttendance ? latestSlotKey : nowSlotKey;
     const displayedServerSession = confirmedSession && displayedAttendanceSession(confirmedSession.sessions, confirmedSession.sessionId);
     const displaySlotKey = displayedServerSession?.shift?.dayKey || confirmedSession?.assignedShift?.dayKey || (latestSlotHasOpenAttendance ? latestSlotKey : nowSlotKey);
+    const displayedShiftDay = confirmedSession?.dashboardDays?.find((day) => day.dayKey === displaySlotKey);
+    const displayedShiftEventIds = new Set(displayedShiftDay?.eventIds || []);
+    const durationSlotRecords = confirmedSession?.records.filter((event) => displayedShiftEventIds.has(event.id)).map((event) => sessionEventRecord(event, employeeId)) || [];
     const activeServerRecords = confirmedSession?.sessions.find((session) => session.id === confirmedSession.sessionId)?.events.map((event) => sessionEventRecord(event, employeeId));
     const displayedServerRecords = displayedServerSession?.events.map((event) => sessionEventRecord(event, employeeId));
     const actionSlotRecords: AttendanceRecord[] = [...(attendanceIntegrityEnabled ? activeServerRecords || [] : recordsBySlot[actionSlotKey] || [])].sort((left, right) => compareAttendanceRecords(right, left));
@@ -715,7 +719,7 @@ export default function AttendancePage() {
     };
     const canTimeIn = !hasOpenAttendanceSlot;
     const canTimeOut = hasOpenAttendanceSlot && currentStatus !== "BREAK" && currentStatus !== "LUNCH";
-    const canBreakOut = hasOpenAttendanceSlot && currentStatus === "ONLINE" && breakOutCount === breakInCount && breakOutCount < 2 && hasBreakGapElapsed;
+    const canBreakOut = hasOpenAttendanceSlot && currentStatus === "ONLINE" && breakOutCount === breakInCount && breakOutCount < 2 && (attendanceDurationModelEnabled || hasBreakGapElapsed);
     const canBreakIn = isOnBreak && breakInCount < breakOutCount;
     const canLunchBreakOut = hasOpenAttendanceSlot && !hasLunchOut && currentStatus === "ONLINE";
     const canLunchBreakIn = isOnLunchBreak && !hasLunchIn;
@@ -834,7 +838,7 @@ export default function AttendancePage() {
                 queryClient.setQueryData<AttendanceRecord[]>(attendanceQueryKey(employeeId), (current = []) => mergeAttendanceHistory(current, result.attendanceRecords!));
             }
             queryClient.invalidateQueries({ queryKey: attendanceQueryKey(employeeId) });
-            setManualOffPhoneStartedAt(status === "OFF THE PHONE" ? Date.now() : null);
+            setManualOffPhoneStartedAt(status === "OFF THE PHONE" ? serverNowMs : null);
             setMessage(result.attendanceRecords?.some((record) => record.syncPending)
                 ? `${statusLabels[availabilityStatus]} saved here. Sync to another business is pending and will retry.`
                 : `Status changed to ${statusLabels[availabilityStatus]}.`);
@@ -856,6 +860,16 @@ export default function AttendancePage() {
     const statusDisabled = (status: EmployeeAvailabilityStatus) => {
         if (attendanceIntegrityEnabled && (!confirmedSession || sessionQuery.isError || confirmedSession.reviewState !== "verified")) return true;
         if (!employeeId || isLoading || isEmployeeLoading || isSaving || status === currentStatus) return true;
+        if (attendanceDurationModelEnabled) {
+            if (!confirmedSession?.allowedActions) return true;
+            if (!displayedShiftDay && (status === "BREAK" || status === "LUNCH" ||
+                (status === "ONLINE" && (currentStatus === "BREAK" || currentStatus === "LUNCH")))) return true;
+            const source = status === "ONLINE" ? currentStatus === "BREAK" ? "Break In" : currentStatus === "LUNCH" ? "Lunch Break In"
+                : currentStatus === "OFF THE PHONE" ? "Off the Phone In" : "Time In"
+                : status === "BREAK" ? "Break Out" : status === "LUNCH" ? "Lunch Break Out"
+                    : status === "OFFLINE" ? "Time Out" : "Off the Phone Out";
+            if (!confirmedSession.allowedActions.includes(source)) return true;
+        }
         if (status === "ONLINE") return !canSetOnline;
         if (status === "OFFLINE") return !canSetOffline;
         if (status === "LUNCH") return !canSetLunch;
@@ -906,11 +920,34 @@ export default function AttendancePage() {
         }
     };
 
-    const actionButtons = statusOrder.map((status) => {
+    const durationControls = attendanceDurationControls(durationSlotRecords, serverNowMs, confirmedSession?.allowances,
+        displayedShiftDay?.overBreakRows, new Set(confirmedSession?.sessions.filter((session) => session.lifecycle !== "open")
+            .flatMap((session) => session.events.map((event) => event.id))));
+    const breakControl = attendanceBreakControl(durationControls);
+    const durationButtons = [breakControl.control, durationControls[2]].map((control, index) => {
+        const status = index === 1 ? "LUNCH" : "BREAK";
+        const active = control.state === "active";
+        const disabled = control.state === "done" || control.state === "review" || (active ? currentStatus !== status || statusDisabled("ONLINE")
+            : statusDisabled(status));
+        const Icon = active ? FiLogIn : FiCoffee;
+        const label = index === 0 ? "Break" : "Lunch";
+        const action = active ? index === 1 ? "End lunch" : `End break ${breakControl.breakNumber}`
+            : control.state === "done" ? "Done" : control.state === "review" ? "Needs review" : index === 0 ? `Start break ${breakControl.breakNumber}` : "Start";
+        return <button key={label} type="button" disabled={disabled}
+            aria-label={`${label}: ${action}`} title={action} aria-pressed={active}
+            onClick={() => handleStatusChange(active ? "ONLINE" : status)}
+            className={["inline-flex h-12 min-w-0 items-center justify-center gap-2 rounded-lg border px-4 text-sm font-semibold shadow-lg transition disabled:cursor-not-allowed disabled:border-slate-300 disabled:bg-slate-200 disabled:text-slate-500 disabled:shadow-none",
+                statusButtonStyles[status],
+                active ? "ring-2 ring-slate-950/20 ring-offset-2" : ""].join(" ")}>
+            <Icon className="shrink-0" aria-hidden="true" /><span>{label}</span>
+        </button>;
+    });
+    const actionButtons = statusOrder.filter((status) => !attendanceDurationModelEnabled || (status !== "BREAK" && status !== "LUNCH")).map((status) => {
         const Icon = statusIcon[status];
         const isActive = status === currentStatus;
-        const disabled = statusDisabled(status);
-        const label = status === "ONLINE" ? attendanceOnlineActionLabel(currentStatus) : statusLabels[status];
+        const cardReturn = attendanceDurationModelEnabled && status === "ONLINE" && (currentStatus === "BREAK" || currentStatus === "LUNCH");
+        const disabled = cardReturn || statusDisabled(status);
+        const label = status === "ONLINE" && !cardReturn ? attendanceOnlineActionLabel(currentStatus) : statusLabels[status];
         return <button key={status} type="button" disabled={disabled} onClick={() => handleStatusChange(status)}
             className={["inline-flex h-12 items-center justify-center gap-2 rounded-lg border px-4 text-sm font-semibold shadow-lg transition disabled:cursor-not-allowed disabled:border-slate-300 disabled:bg-slate-200 disabled:text-slate-500 disabled:shadow-none",
                 isActive ? "ring-2 ring-slate-950/20 ring-offset-2" : "", statusButtonStyles[status]].join(" ")}>
@@ -1017,6 +1054,9 @@ export default function AttendancePage() {
                         <div className="mt-3 grid gap-3 sm:grid-cols-2">
                             {actionButtons}
                         </div>
+                        {attendanceDurationModelEnabled && <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2" aria-label="Break and lunch">
+                            {durationButtons}
+                        </div>}
                     </section>
 
                     <section className="rounded-xl border border-[#8fbfff] bg-[#dce9fb] p-5 shadow-sm">
@@ -1045,7 +1085,13 @@ export default function AttendancePage() {
                                 const breakDurationMs = getBreakDurationMs(record);
                                 const breakLimitMs = getBreakLimitMs(record.source, confirmedSession?.allowances);
                                 const breakRemainingMs = typeof breakDurationMs === "number" ? breakLimitMs - breakDurationMs : 0;
-                                const isBreakOvertime = breakLimitMs > 0 && typeof breakDurationMs === "number" && breakDurationMs > breakLimitMs;
+                                const completedBreak = record.source === "Break In" || record.source === "Lunch Break In";
+                                const serverRows = displayedShiftDay?.overBreakRows;
+                                const completedExcessMs = attendanceDurationModelEnabled && completedBreak && typeof breakDurationMs === "number"
+                                    ? serverRows?.find((row) => row.endedAt === record.timeIn)?.overMs ?? 0
+                                    : 0;
+                                const isBreakOvertime = breakLimitMs > 0 && typeof breakDurationMs === "number"
+                                    && (attendanceDurationModelEnabled && completedBreak ? completedExcessMs > 0 : breakDurationMs > breakLimitMs);
                                 const offPhoneSession = offPhoneSessions.find((session) =>
                                     session.endRecord?._id === record._id || (session.isOpen && session.startRecord._id === record._id)
                                 );

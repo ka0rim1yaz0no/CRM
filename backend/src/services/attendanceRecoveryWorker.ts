@@ -5,9 +5,12 @@ import { projectAttendance } from "./attendanceSessionState";
 import { attendanceRecoveryEnvironmentEnabled } from "../config/rolloutFlags";
 import { deliverAttendanceLedger, retryAttendanceLedgers } from "./attendanceLedgerOutbox";
 import { recoveryCommandId } from "./attendanceLedgerService";
+import { attendanceAutoTimeOutEnabled } from "../config/rolloutFlags";
+import { runAttendanceAutoTimeOut } from "./attendanceAutoTimeOutWorker";
+import { runAttendanceDerivedRefresh } from "./attendanceDerivedRefreshWorker";
 
 export async function runAttendanceRecovery(now = new Date()) {
-  if (!attendanceIntegrityEnabled()) return 0;
+  if (!attendanceIntegrityEnabled() || attendanceAutoTimeOutEnabled()) return 0;
   const ledgers = await AttendanceLedger.find({}).lean();
   let closed = 0;
   for (const ledger of ledgers) {
@@ -26,9 +29,19 @@ export async function runAttendanceRecovery(now = new Date()) {
   return closed;
 }
 let timer: NodeJS.Timeout | null = null;
+let running = false;
 export function startAttendanceIntegrityWorker() {
   if (timer || !attendanceIntegrityEnabled()) return;
-  const cycle = async () => { await runAttendanceRecovery(); await retryAttendanceLedgers(); };
+  const cycle = async () => {
+    if (running) return;
+    running = true;
+    try {
+      for (const run of [runAttendanceAutoTimeOut, runAttendanceRecovery, runAttendanceDerivedRefresh, retryAttendanceLedgers]) {
+        try { await run(); } catch { /* Independent maintenance and pending deliveries must still run. */ }
+      }
+    }
+    finally { running = false; }
+  };
   void cycle().catch(() => undefined);
   timer = setInterval(() => { void cycle().catch(() => undefined); }, 15_000);
   timer.unref();

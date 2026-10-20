@@ -15,6 +15,7 @@ import { getActiveBusinessId } from "../api/businessStorage";
 import { attendanceHubFilters, attendanceHubFilterChange } from "../lib/attendanceHubState";
 import { manilaCalendarDate, type ShiftView } from "../../shared/attendanceView";
 import { attendanceBreakAllowanceLabel, attendanceBreaksPerShift, attendanceIssueLabel } from "../lib/attendanceHubLabels";
+import { hasAutoTimeOut } from "../lib/attendanceDurationUi";
 
 const presets = [
     ["today", "Today"], ["yesterday", "Yesterday"], ["this-week", "This week"], ["last-week", "Last week"],
@@ -38,6 +39,7 @@ const clock = (ms: number) => {
 const localTime = (value: string | null | undefined) => value ? timeFormat.format(new Date(value)) : "--";
 const detailTime = (value: string) => dateTimeFormat.format(new Date(value));
 const labelDay = (key: string) => dateFormat.format(new Date(`${key}T12:00:00+08:00`));
+const autoBadge = <span className="attendance-hub-badge" title="Automatic time-out" aria-label="Automatic time-out">Auto</span>;
 
 function BreakRecord({ entry, label, available = true }: { entry?: HubBreakSession; label: string; available?: boolean }) {
     if (!available) return <span className="attendance-hub-break-record">Detail unavailable</span>;
@@ -109,7 +111,7 @@ function LivePanel({ actions, message }: { actions: ReactNode; message?: string 
             <div className="lunch"><span>Lunch</span><strong>{duration(lunchUsed)} / {data?.thresholds.lunchMinutes || 60}m</strong></div>
         </div>
         {(status === "BREAK" || status === "LUNCH") && data?.since && <p className="attendance-hub-overdue">
-            {elapsed > (status === "BREAK" ? 15 : 60) * 60_000 ? "Over allowance" : "Timer running"} - {clock(elapsed)}
+            {elapsed > (status === "BREAK" ? data.thresholds.breakMinutes : data.thresholds.lunchMinutes) * 60_000 ? "Over allowance" : "Timer running"} - {clock(elapsed)}
         </p>}
         {message && <p className="attendance-hub-message">{message}</p>}
         <div className="attendance-hub-actions">{actions}</div>
@@ -150,7 +152,7 @@ function DayDrawer({ selected, onClose, admin }: { selected: { dayKey: string; e
                 <div className="attendance-hub-drawer-actions">{admin && <button type="button" onClick={() => setEditing(true)}>Edit attendance</button>}
                     <button type="button" onClick={() => window.print()}><FiPrinter /> Print</button></div>
                 <p><strong>{day.businessName}</strong> · {localTime(day.shiftStart)} - {localTime(day.shiftEnd)}</p>
-                <div className="attendance-hub-badges">{day.issues.map((issue) => <span key={issue} className={issueClass(issue)}>{attendanceIssueLabel(issue)}</span>)}
+                <div className="attendance-hub-badges">{hasAutoTimeOut(day) && autoBadge}{day.issues.map((issue) => <span key={issue} className={issueClass(issue)}>{attendanceIssueLabel(issue)}</span>)}
                     {day.mismatch && <span className="attendance-hub-badge warning">CROSS-BUSINESS MISMATCH</span>}</div>
                 <h3>Timeline</h3>
                 <div className="attendance-hub-timeline" aria-label="Time allocation">
@@ -163,7 +165,7 @@ function DayDrawer({ selected, onClose, admin }: { selected: { dayKey: string; e
                     <dt>Break {index + 1} · {day.breakMinutes}m allowance</dt><dd><BreakRecord entry={entry} label={`Break ${index + 1}`} /></dd>
                 </div>)}</dl> : <p>{day.breakSessions ? "No recorded breaks." : "Break detail unavailable."}</p>}
                 <table><thead><tr><th>Event</th><th>PH time</th><th>Source</th></tr></thead><tbody>
-                    {timeline.map((event) => <tr key={event.id}><td>{event.source}</td><td>{detailTime(event.at)}</td><td>Attendance</td></tr>)}
+                    {timeline.map((event) => <tr key={event.id}><td>{event.source} {event.autoTimeOut === true && autoBadge}</td><td>{detailTime(event.at)}</td><td>Attendance</td></tr>)}
                 </tbody></table>
                 <h3>Calculation</h3>
                 <dl className="attendance-hub-breakdown">
@@ -192,7 +194,7 @@ function DayDrawer({ selected, onClose, admin }: { selected: { dayKey: string; e
 
 function DayRow({ day, visible, dense, open }: { day: HubDay; visible: Set<Column>; dense: boolean; open: (day: HubDay) => void }) {
     const value: Record<Column, ReactNode> = {
-        shift: `${localTime(day.shiftStart)} - ${localTime(day.shiftEnd)}`, timeIn: localTime(day.timeIn), timeOut: localTime(day.timeOut),
+        shift: `${localTime(day.shiftStart)} - ${localTime(day.shiftEnd)}`, timeIn: localTime(day.timeIn), timeOut: <>{localTime(day.timeOut)} {hasAutoTimeOut(day) && autoBadge}</>,
         worked: duration(day.milliseconds.online), break: <div><span>{duration(day.milliseconds.break)} used / +{duration(day.milliseconds.overBreak)} over</span><small>{attendanceBreakAllowanceLabel(day.breakMinutes)}</small></div>,
         firstBreak: <BreakRecord entry={day.breakSessions?.[0]} label="1st break" available={Boolean(day.breakSessions)} />,
         secondBreak: <><BreakRecord entry={day.breakSessions?.[1]} label="2nd break" available={Boolean(day.breakSessions)} />
@@ -208,7 +210,7 @@ function DayRow({ day, visible, dense, open }: { day: HubDay; visible: Set<Colum
             {day.note && <small title={day.note}>Note</small>}</th>
         {columns.filter((column) => visible.has(column)).map((column) => <td key={column}>{value[column]}</td>)}
     </tr><tr className="attendance-hub-mobile-row"><td><button type="button" onClick={() => open(day)}><strong>{labelDay(day.dayKey)}</strong>
-        <span>{day.status} · {duration(day.milliseconds.online)} worked</span>
+        <span>{day.status} · {duration(day.milliseconds.online)} worked {hasAutoTimeOut(day) && autoBadge}</span>
         <span>1st Break · {day.breakMinutes}m allowance<BreakRecord entry={day.breakSessions?.[0]} label="1st break" available={Boolean(day.breakSessions)} /></span>
         <span>2nd Break · {day.breakMinutes}m allowance<BreakRecord entry={day.breakSessions?.[1]} label="2nd break" available={Boolean(day.breakSessions)} /></span>
         {day.breakSessions?.length > 2 && <span>{day.breakSessions.length - 2} additional break(s) in shift detail</span>}
@@ -321,7 +323,7 @@ export default function AttendanceHub({ admin = false, actions, message, embedde
             onClick={() => setNavOpen(!navOpen)}><FiMenu /></button><div><p className="attendance-hub-eyebrow">Attendance · Asia/Manila</p>
             <h1>Attendance</h1><p>{admin ? "Employees and shift-day records" : "Your shifts and time records"}</p></div>
             <div className="attendance-hub-header-actions"><details className="attendance-hub-help"><summary title="How this is calculated"><FiHelpCircle /> Calculations</summary>
-                <p>Overnight events belong to the shift start day. Online excludes break, lunch, and off-phone. Late starts after the configured grace period. Break allowance: {attendanceBreakAllowanceLabel(data?.thresholds.breakMinutes ?? 15)}; excess is measured separately for each break. Lunch is {data?.thresholds.lunchMinutes ?? 60} minutes per lunch. Undertime is measured after a completed early Time Out and the scheduled shift end. Open sessions are never closed automatically.</p></details>
+                <p>Overnight events belong to the shift start day. Online excludes break, lunch, and off-phone. Late starts after the configured grace period. Break allowance: {attendanceBreakAllowanceLabel(data?.thresholds.breakMinutes ?? 15)}; excess is measured separately for each break. Lunch is {data?.thresholds.lunchMinutes ?? 60} minutes per lunch. Undertime is measured after a completed early Time Out and the scheduled shift end. {data?.autoTimeOutEnabled === true ? "Automatic time-outs are marked Auto." : data?.autoTimeOutEnabled === false ? "Automatic time-out is disabled." : "Automatic time-outs, when enabled, are marked Auto."}</p></details>
                 <button type="button" title="Refresh" onClick={() => void refetch()}><FiRefreshCw /> Refresh</button>
                 <button type="button" title="Export CSV" disabled={!data || isFetching || Boolean(error) || exporting || debouncedEmployee !== filters.employee}
                     onClick={async () => { setExporting(true); setExportError(""); try { await downloadAttendanceHubCsv(queryFilters); } catch (failure) { setExportError(errorText(failure)); } finally { setExporting(false); } }}><FiDownload /> {exporting ? "Exporting..." : "CSV"}</button></div>

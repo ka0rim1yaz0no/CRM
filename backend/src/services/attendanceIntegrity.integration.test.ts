@@ -58,6 +58,68 @@ async function request(path: string, token: string, method = "GET", body?: unkno
   return fetch(`${base}${path}`, { method, headers: { "Content-Type": "application/json", "X-Business-Id": "test-a", [adminToken ? "X-CRM-Admin-Session" : "X-CRM-Attendance-Session"]: token }, ...(body ? { body: JSON.stringify(body) } : {}) });
 }
 
+test("duration model: actual payroll, hub, employee summary and stored replicas remain equal after an edit and fresh reads", async () => {
+  process.env.CRM_ATTENDANCE_DURATION_MODEL = "true";
+  try {
+    const person = await fixture();
+    const { attendancePayrollDtr } = await import("../controllers/payrollController");
+    const { attendanceDashboardPresentation } = await import("./attendanceDashboardPresentation");
+    const changes = [["Time In", "2026-10-15T15:05:00Z"], ["Break Out", "2026-10-15T16:11:00Z"], ["Break In", "2026-10-15T16:26:01Z"],
+      ["Break Out", "2026-10-15T18:00:00Z"], ["Break In", "2026-10-15T18:17:30Z"],
+      ["Lunch Break Out", "2026-10-15T20:00:00Z"], ["Lunch Break In", "2026-10-15T21:01:00Z"], ["Time Out", "2026-10-15T23:50:00Z"]]
+      .map(([source, at]) => ({ source: source as "Time In", at }));
+    let result = await executeAttendanceCommand(person.identity, { commandId: crypto.randomUUID(), expectedRevision: 0,
+      operation: "correct", reason: "Synthetic parity fixture", changes }, admin);
+    await deliverAttendanceLedger(person.identity.key);
+    const token = createAdminDashboardSession(admin.code)!;
+    const verify = async (expectedBreak: number) => {
+      for (const [index, business] of ["test-a", "test-b"].entries()) {
+        const payroll = await runWithBusiness(business, () => attendancePayrollDtr(person.employees[index]._id, "Oct 6, 2026 - Oct 20, 2026"));
+        const row = payroll.rows.find((day) => day.dateKey === "2026-10-15")!;
+        assert.deepEqual([row.lateMinutes, row.excessBreakMinutes, row.excessLunchMinutes, row.earlyTimeOutMinutes], [5, expectedBreak, 1, 10]);
+        const response = await request(`/attendance-hub/days?shiftView=date&shiftDate=2026-10-15&employee=${person.actor.code}&business=${business}`, token, "GET", undefined, true);
+        assert.equal(response.status, 200);
+        const hub = (await response.json()).rows[0];
+        assert.deepEqual([hub.milliseconds.late, hub.milliseconds.overBreak, hub.milliseconds.overLunch, hub.milliseconds.underTime].map((value: number) => value / 60_000), [5, expectedBreak, 1, 10]);
+        const ledger = await readAttendanceLedger(person.identity);
+        const snapshot = attendanceSnapshot(ledger);
+        const dashboard = attendanceDashboardPresentation(snapshot, { shiftStart: "23:00", shiftEnd: "08:00", graceMinutes: 0, breakMinutes: 15, lunchMinutes: 60 }, new Date()).dashboardDays[0];
+        assert.equal(dashboard.milliseconds.overBreak / 60_000, expectedBreak);
+      }
+    };
+    await verify(3);
+    const target = result.records.find((event) => event.source === "Break In")!;
+    result = await executeAttendanceCommand(person.identity, { commandId: crypto.randomUUID(), expectedRevision: result.revision, operation: "correct",
+      reason: "Extend first synthetic break", changes: [{ targetId: target.id, at: "2026-10-15T16:31:00Z" }] }, admin);
+    await deliverAttendanceLedger(person.identity.key);
+    await verify(8);
+  } finally { delete process.env.CRM_ATTENDANCE_DURATION_MODEL; }
+});
+
+test("duration payroll preserves weekend waivers and never uses a previous checkout for an open second session", async () => {
+  process.env.CRM_ATTENDANCE_DURATION_MODEL = "true";
+  try {
+    const person = await fixture();
+    const changes = [["Time In", "2026-10-15T15:00:00Z"], ["Time Out", "2026-10-15T16:00:00Z"], ["Time In", "2026-10-15T17:00:00Z"],
+      ["Time Out", "2026-10-16T00:00:00Z"], ["Time In", "2026-10-17T15:00:00Z"], ["Break Out", "2026-10-17T16:00:00Z"],
+      ["Break In", "2026-10-17T16:20:00Z"], ["Time Out", "2026-10-18T00:00:00Z"],
+      ["Time In", "2026-10-18T15:00:00Z"], ["Time Out", "2026-10-18T16:00:00Z"], ["Time In", "2026-10-18T17:00:00Z"]]
+      .map(([source, at]) => ({ source: source as "Time In", at }));
+    await executeAttendanceCommand(person.identity, { commandId: crypto.randomUUID(), expectedRevision: 0, operation: "correct", reason: "Synthetic payroll session boundaries", changes }, admin);
+    await deliverAttendanceLedger(person.identity.key);
+    const { attendancePayrollDtr } = await import("../controllers/payrollController");
+    const payroll = await runWithBusiness("test-a", () => attendancePayrollDtr(person.employees[0]._id, "Oct 6, 2026 - Oct 20, 2026"));
+    const weekday = payroll.rows.find((row) => row.dateKey === "2026-10-15")!;
+    assert.equal(weekday.grossHours, 8, "offline gaps are not worked time");
+    const weekend = payroll.rows.find((row) => row.dateKey === "2026-10-17")!;
+    assert.equal(weekend.excessBreakMinutes, 0, "the existing weekend exemption is unchanged");
+    const open = payroll.rows.find((row) => row.dateKey === "2026-10-18")!;
+    assert.equal(open.status, "Needs Review");
+    assert.equal(open.timeOut, "-");
+    assert.equal(open.earlyTimeOutMinutes, 0);
+  } finally { delete process.env.CRM_ATTENDANCE_DURATION_MODEL; }
+});
+
 test("real API: every manual employee attendance action stays consistent across business switches", async () => {
   const person = await fixture();
   const token = createAttendanceHubSession(person.actor.code)!;

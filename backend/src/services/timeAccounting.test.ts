@@ -1,9 +1,19 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { accountTime } from "./timeAccounting";
+import { accountTime, clickedSessionIntervals } from "./timeAccounting";
 
 const minute = 60_000;
 const at = (minutes: number) => new Date(minutes * minute);
+
+test("a missing rest return never pairs with a different session's return", () => {
+  const records = [
+    { source: "Time In", timeIn: at(0) }, { source: "Break Out", timeIn: at(20) },
+    { source: "Time Out", timeIn: at(40) }, { source: "Time In", timeIn: at(60) },
+    { source: "Break Out", timeIn: at(80) }, { source: "Break In", timeIn: at(95) },
+  ];
+  const result = clickedSessionIntervals(records, "Break Out", "Break In", at(120));
+  assert.deepEqual(result.map((interval) => [interval.milliseconds / minute, interval.open]), [[20, true], [15, false]]);
+});
 
 test("golden time buckets keep break and lunch out of online", () => {
   const cases = [
