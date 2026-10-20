@@ -126,6 +126,24 @@ export async function legacyAuthentication(request: Request, response: Response,
   if (/^\/(leads|my-leads|log)(\/|$)/.test(path)) {
     const names = [name, ...(employee!.aliases || [])];
     query(request, { employeeId: ownId, employeeCode: actor.code, employeeName: name, employeeNames: names.join(","), assignedAgent: ownId, assignedAgentName: name, assignedAgentNames: names.join(",") });
+    if (request.method === "GET" && path === "/leads/agent-dashboard") {
+      const send = response.json.bind(response);
+      // Preserve the existing calculation; scope its detailed output to the signed employee.
+      response.json = (body: unknown) => {
+        if (!body || typeof body !== "object" || !("agents" in body)) return send(body);
+        const report = body as Record<string, unknown>;
+        const ownRows = (value: unknown) => Array.isArray(value) ? value.filter(row => row && String(row.employeeId) === ownId) : [];
+        return send({ ...report, agents: ownRows(report.agents), monthlyAgents: ownRows(report.monthlyAgents), recentActivity: ownRows(report.recentActivity) });
+      };
+      return next();
+    }
+    if (request.method === "GET" && path === "/leads/employee-logs") {
+      query(request, { employee: name });
+      const allowedNames = new Set(names.map(value => value.trim().toLowerCase()));
+      const send = response.json.bind(response);
+      response.json = (body: unknown) => send(Array.isArray(body) ? body.filter(row => row && allowedNames.has(String(row.employeeName || "").trim().toLowerCase())) : body);
+      return next();
+    }
     const record = path.match(/^\/(?:leads|log)\/([a-f0-9]{24})(?:\/|$)/);
     if (record) {
       if (request.method === "DELETE" || /\/(assign|auto-assign|permanent)$/.test(path)) return denied(response);

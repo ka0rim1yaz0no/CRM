@@ -7,6 +7,7 @@
 - `backend/src/middleware/legacyAuthentication.ts`: private legacy API families require a signed session; verified server identity replaces client claims. Employee membership and record ownership are enforced before reads/writes. Task/lead identity filters cannot be changed to another employee. Tracker-only sessions cannot use full-admin APIs. Explicit integration/bridge/extension transports retain their own credential checks.
 - `backend/src/socket.ts` and `src/lib/socket.ts`: signed handshake, business membership, per-packet verification, expiry disconnection even for idle sockets, 30-second membership rechecks for idle employees, tracker restrictions, timer cleanup and reconnect with current tokens. A membership read timeout fails closed for the socket; it does not create an attendance event.
 - Auth routes, login token metadata, central API headers, file sessions and task population were updated for those contracts. Package downloads accept verified file GET cookies; cookies never authorize attendance/profile writes. The known development extension fallback key is rejected under the new guard; existing agents need a properly configured extension key or an employee-signed session.
+- Browser regression caught the employee dashboard's reuse of `/leads/agent-dashboard` and `/leads/employee-logs`. Signed employees retain access, with server-enforced own-employee detail rows and exact own-name log scope. Existing dashboard arithmetic and full-admin output are unchanged. Tests compare each employee's resulting row with its unchanged admin-calculated counterpart in both businesses.
 - The employee-only `/attendance-hub/live` guard now permits signed employees while the list, summary, detail, note and policy administration remain admin-only. No attendance arithmetic, manual command, automatic cutoff worker or call-dashboard calculation was changed.
 - New read-only Data Check API/controller/service/math, shared report/export types and admin page. Date/business URL filters, explicit Run, per-section loading, match/mismatch/cannot-verify rows, expandable proof/samples, problems filter, plain-text copy and formula-neutralized mismatch CSV. All-business rows identify their business explicitly.
 
@@ -49,7 +50,7 @@ Commands actually run from the repository root unless noted:
 | `npm run typecheck` (backend) | Passed |
 | `npm run build` | Passed, including frontend typecheck; pre-existing large editor bundle warning remains |
 | `npm run lint` | Passed |
-| `node --import tsx --test --test-reporter=spec "src/**/*.test.ts"` (backend) | 455 tests: 453 passed, 2 optional external-Mongo cases skipped, 0 failed; 52.35 seconds |
+| `node --import tsx --test --test-reporter=spec "src/**/*.test.ts"` (backend) | 456 tests: 454 passed, 2 optional external-Mongo cases skipped, 0 failed; 82.85 seconds |
 | `node --test --test-reporter=spec scripts/*.test.mjs` | 48 passed, 0 failed |
 | `npm run build:production` (backend) | Passed, native Node imports resolved |
 | `npm run test:production` (backend) | Passed: compiled production entry, signed guard ON explicitly, login/profile/attendance/dashboard/Data Check config in two fake businesses |

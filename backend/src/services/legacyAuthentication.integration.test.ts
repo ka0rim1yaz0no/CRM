@@ -22,6 +22,7 @@ const { createSocketServer } = await import("../socket");
 const { runWithBusiness } = await import("../config/tenancy");
 const { Employee } = await import("../models/Employee");
 const { Task } = await import("../models/Task");
+const { Lead } = await import("../models/Lead");
 const { setBusinessAccessForEmployeeCode } = await import("../models/BusinessUserAccess");
 const { createAttendanceHubSession } = await import("../config/attendanceHubSession");
 let mongo: MongoMemoryReplSet;
@@ -39,6 +40,7 @@ before(async () => {
       const person = await Employee.create({ employeeCode: code, name: code, status: "Active", role: "Sales", bankAccountNumber: "synthetic-private-bank", businessAccessIds: ["auth-a", "auth-b"] });
       ids[business].push(String(person._id));
       await Task.create({ title: code, assignedTo: person._id });
+      await Lead.create({ businessName: `Synthetic ${code}`, assignedAgent: person._id, assignedAgentName: code, status: "Qualified", comments: [{ authorName: code, authorType: "employee", body: "Synthetic scoped dashboard activity", createdAt: new Date() }] });
     }
   });
   for (const code of ["synthetic-owner", "synthetic-other"]) await setBusinessAccessForEmployeeCode(code, ["auth-a", "auth-b"]);
@@ -82,6 +84,21 @@ test("owner scope defeats spoofed employee ids, filters and task population neve
     const tasks = await (await request(`/tasks?assignedTo=${other}`, "synthetic-owner", business)).json();
     assert.equal(tasks.length, 1); assert.equal(String(tasks[0].assignedTo._id), own);
     assert.equal(JSON.stringify(tasks).includes("synthetic-private-bank"), false);
+  }
+});
+test("the real employee dashboard lead endpoints work in both businesses and cannot expose another employee's detailed rows", async () => {
+  for (const business of ["auth-a", "auth-b"]) {
+    const [own, other] = ids[business];
+    const response = await request(`/leads/agent-dashboard?employeeId=${other}`, "synthetic-owner", business);
+    assert.equal(response.status, 200); const report = await response.json();
+    assert.ok(report.agents.length > 0); assert.ok(report.agents.every((row: { employeeId: string }) => row.employeeId === own));
+    assert.ok(report.monthlyAgents.every((row: { employeeId: string }) => row.employeeId === own));
+    assert.ok(report.recentActivity.every((row: { employeeId: string }) => row.employeeId === own));
+    const adminReport = await (await request("/leads/agent-dashboard", "synthetic-full", business)).json();
+    assert.deepEqual(report.agents[0], adminReport.agents.find((row: { employeeId: string }) => row.employeeId === own), "Own calculation stays identical to the unchanged admin calculation");
+    const logsResponse = await request("/leads/employee-logs?employee=synthetic-other", "synthetic-owner", business);
+    assert.equal(logsResponse.status, 200); const logs = await logsResponse.json();
+    assert.ok(logs.length > 0); assert.ok(logs.every((row: { employeeName: string }) => row.employeeName === "synthetic-owner"));
   }
 });
 test("independent transports fail closed without their actual credentials, and the known development extension key is rejected", async () => {
