@@ -18,6 +18,7 @@ import { AttendanceCommandError, attendancePolicy } from "../services/attendance
 import { attendanceNoteRevision, confirmAttendanceNote } from "../services/attendanceNoteCommand";
 import { projectAttendance } from "../services/attendanceSessionState";
 import { attendanceViewRange, manilaCalendarDate, type ShiftView } from "../../../shared/attendanceView";
+import { serverReadTime } from "../services/readSnapshot";
 
 type Actor = { role: "admin" | "employee"; code: string };
 type HubDay = ReturnType<typeof calculateHubDay> & {
@@ -300,7 +301,7 @@ async function handleHubRead(request: Request, response: Response, mode: "days" 
   const actor = denyIfDisabled(request, response);
   if (!actor) return;
   try {
-    const now = new Date();
+    const now = serverReadTime();
     const filters = assertQuery(request.query, now);
     const loaded = await loadHub(actor, mode === "day" || filters.shiftView ? { ...filters, business: "" } : filters, now, filters.business);
     if (filters.shiftView && filters.business) {

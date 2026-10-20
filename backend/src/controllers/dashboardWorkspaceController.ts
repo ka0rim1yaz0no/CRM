@@ -16,6 +16,7 @@ import { attendanceSlotKey, zonedParts } from "../services/attendanceShift";
 import { withDashboardReadWindow } from "../services/dashboardReadWindow";
 import { readAgentLeadDashboard } from "./leadController";
 import { readDashboardAttendanceSummary } from "./attendanceHubController";
+import { serverReadTime } from "../services/readSnapshot";
 
 function authorize(req: Request, res: Response) {
   if (!dashboardWorkspaceEnabled()) { res.status(404).json({ message: "Dashboard upgrade is disabled." }); return null; }
@@ -40,7 +41,7 @@ const defaults = { revision: 0, targets: [], newLeadHours: 24, followUpHours: 0 
 export async function dashboardWorkspaceSummary(req: Request, res: Response) {
   const actor = authorize(req, res); if (!actor) return;
   try {
-    const now = new Date();
+    const now = serverReadTime();
     const range = dashboardRange(req.query, now);
     const business = String(req.business?.id || "");
     const shiftSettings = { officialShiftStartTime: "23:00", officialShiftEndTime: "08:00", lateGraceMinutes: 0, attendanceTimeZone: "Asia/Manila" };

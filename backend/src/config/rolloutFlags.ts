@@ -28,3 +28,4 @@ export const securityUploadsEnabled = () => enabled("CRM_SECURITY_UPLOAD_AUTH");
 export const securityEnvironmentCodesEnabled = () => enabled("CRM_SECURITY_ENV_CODES");
 export const securityLegacyAuthEnabled = () => enabled("CRM_SECURITY_LEGACY_AUTH");
 export const dataCheckEnabled = () => enabled("CRM_DATA_CHECK");
+export const dataCheckNavigationEnabled = () => ["true", "1"].includes(String(process.env.CRM_DATA_CHECK_NAV || "").trim().toLowerCase());

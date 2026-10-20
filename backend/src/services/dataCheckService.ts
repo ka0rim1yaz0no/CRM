@@ -15,8 +15,10 @@ import { getHubSummary, listHubDays } from "../controllers/attendanceHubControll
 import { attendancePayrollDtr } from "../controllers/payrollController";
 import { getLeadCallSummary } from "../controllers/leadCallStatController";
 import { getCallDashboard } from "../controllers/callDashboardController";
+import { countAdminLeads } from "../controllers/leadController";
 import { calculateSlotAttendance } from "./timeAccounting";
-import { auditAttendance, badCallTimes, checkBounds, compareCheck, punchDays, type AuditPunch, type CheckPolicy } from "./dataCheckMath";
+import { auditAttendance, badCallTimes, checkBounds, compareCheck, percentChangeCheck, punchDays, type AuditPunch, type CheckPolicy } from "./dataCheckMath";
+import { withReadSnapshot } from "./readSnapshot";
 import { dataCheckVerdict, type DataCheckReport, type DataCheckRow, type DataCheckSample, type DataCheckSection } from "../../../shared/dataCheck";
 
 type WorkspaceView = { dashboard: { summary: Record<string, number> }; attendance: Record<string, number>; calls: Array<{ count: number; seconds: number }>; overdueTotal: number; previous: Record<string, number>; deltas: Record<string, number | null> };
@@ -152,8 +154,7 @@ async function inspectAttendance(request: Request, business: BusinessConfig, dat
     key === "deductible" ? summary ? (summary.late + summary.overBreak + summary.overLunch + summary.underTime) / 60_000 : null : summary?.[key], actual,
     "Attendance hub range totals versus independently counted raw punches. Present requires a Time In inside [shift start, shift end). Cross-business conflicts and excuses may intentionally suppress hub totals.", raw.events.filter(event => ["Time In", "Login"].includes(event.source)).map(sample)));
   checks.push(compareCheck("stale-rows", "Attendance", business.id, "Stored attendance rows with stale or missing minutes", 0, stale, "Each effective replica's saved derived late/break/lunch fields is checked against a fresh independent recomputation. Missing legacy derivatives count as stale, not a repair instruction.", staleSamples, false, true));
-  const hasOpen = [...raw.selected.values()].some(events => auditAttendance(events, date, policy, now).open);
-  if (summary && workspace) for (const key of ["employeesPresent", "lateCount", "late", "overBreak", "overLunch", "underTime", "online"]) checks.push(compareCheck(`workspace-hub-${key}`, "Consistency", business.id, `Dashboard vs attendance hub: ${key}`, key === "online" && hasOpen && now < end ? null : workspace.attendance?.[key], summary[key], "Both screen paths currently reuse the attendance hub. Same-code, weaker proof: parity cannot independently validate the shared calculation. Exact running milliseconds cannot be verified across separate live read timestamps.", [], true));
+  if (summary && workspace) for (const key of ["employeesPresent", "lateCount", "late", "overBreak", "overLunch", "underTime", "online"]) checks.push(compareCheck(`workspace-hub-${key}`, "Consistency", business.id, `Dashboard vs attendance hub: ${key}`, workspace.attendance?.[key], summary[key], "Both screen paths reuse the attendance hub and one internal server-time snapshot, including open sessions. Same-code, weaker proof: parity cannot independently validate the shared calculation. Concurrent attendance edits may still require a rerun.", [], true));
   return { business: business.id, policy, rows: raw.selected, codes: raw.people.map(person => person.employeeCode), people: raw.people, raw };
 }
 
@@ -218,7 +219,7 @@ async function inspectCalls(request: Request, business: BusinessConfig, date: st
   } else checks.push(compareCheck("call-attendance", "Calls", business.id, "Calls vs attendance", null, null, "Attendance evidence is unavailable for this comparison."));
 }
 
-async function inspectLeads(business: BusinessConfig, date: string, policy: CheckPolicy, now: Date, workspace: WorkspaceView | null, checks: DataCheckRow[]) {
+async function inspectLeads(request: Request, business: BusinessConfig, date: string, policy: CheckPolicy, now: Date, workspace: WorkspaceView | null, checks: DataCheckRow[]) {
   const { start, end } = checkBounds(date, policy);
   const dayBefore = new Date(+start - 86_400_000);
   const previousEnd = new Date(+end - 86_400_000);
@@ -238,8 +239,10 @@ async function inspectLeads(business: BusinessConfig, date: string, policy: Chec
   const counts = new Map(result.statuses.map(row => [row._id, row.count]));
   const active = result.statuses.filter(row => !["Dead", "Archived"].includes(row._id)).reduce((n, row) => n + row.count, 0);
   for (const [id, key, raw, label] of [["open", "totalOpenLeads", active, "Open leads"], ["qualified", "qualifiedLeads", counts.get("Qualified") || 0, "Qualified leads"], ["negotiation", "negotiationLeads", counts.get("Ongoing Negotiation") || 0, "Negotiation leads"]] as const) checks.push(compareCheck(`leads-${id}`, "Leads", business.id, label, workspace?.dashboard.summary[key], raw, "Current raw Lead status count versus the dashboard card. Dashboard deduplication may intentionally hide duplicate source rows; this check does not deduplicate them or claim a historical status snapshot."));
-  for (const status of ["NEW", "Follow up", "Ongoing comms", "Qualified", "Ongoing Negotiation", "Completed", "Dead", "Archived"]) checks.push(compareCheck(`status-${status}`, "Leads", business.id, `Raw status: ${status}`, ["Qualified", "Ongoing Negotiation"].includes(status) ? workspace?.dashboard.summary[status === "Qualified" ? "qualifiedLeads" : "negotiationLeads"] : null,
-    counts.get(status) || 0, ["Qualified", "Ongoing Negotiation"].includes(status) ? "Compared with the matching card." : "No exact all-record status card exists for this status on the current dashboard. Raw count is shown, but it is not a verified dashboard comparison."));
+  let tabCounts: Record<string, number> | null = null;
+  try { tabCounts = await screen(countAdminLeads, request, business, {}); } catch { /* An unavailable screen is not a zero count. */ }
+  for (const status of ["NEW", "Follow up", "Ongoing comms", "Qualified", "Ongoing Negotiation", "Completed", "Dead", "Archived"]) checks.push(compareCheck(`status-${status}`, "Leads", business.id, `Lead tab status: ${status}`, tabCounts?.[status],
+    counts.get(status) || 0, "Existing admin Leads status-tab count versus independent raw Lead aggregation. These are current status snapshots, not historical cards. Intentional UI deduplication can differ from raw rows; differences stay visible and no records are changed."));
   const defects = result.defects[0] as unknown as Record<string, number> | undefined;
   for (const [key, label] of [["missingAgent", "Leads missing assignedAgent"], ["missingStatus", "Leads missing status"], ["future", "Leads with a future createdAt"]] as const) {
     const records = result[key];
@@ -253,13 +256,13 @@ async function inspectLeads(business: BusinessConfig, date: string, policy: Chec
   ] }).maxTimeMS(queryMs);
   checks.push(compareCheck("lead-overdue", "Leads", business.id, "SLA overdue total", workspace?.overdueTotal, overdue, "Independent Mongo count at the server snapshot using the saved new-lead/follow-up SLA thresholds; compared with overdueTotal, not just the visible top ten."));
   const activity = result.activity[0] || { current: 0, previous: 0 };
-  const exact = activity.previous ? (activity.current - activity.previous) / Math.abs(activity.previous) * 100 : null;
-  const rounded = exact === null ? null : Math.round(exact);
-  checks.push(compareCheck("percent-change", "Consistency", business.id, "Activity percent change", workspace?.deltas.activityToday, rounded,
-    exact === null ? "Previous raw activity is zero; percent change is undefined, not a zero-percent match." : `Independent raw activity ${activity.previous} -> ${activity.current}; unrounded change ${exact.toFixed(6)}%; rounded display ${rounded}%. ${rounded === 0 && exact !== 0 ? "Rounding hides a nonzero change." : "Rounding does not hide the direction."}`));
+  checks.push(percentChangeCheck(business.id, workspace?.deltas.activityToday, activity.current, activity.previous));
 }
 
 export async function runDataCheck(request: Request, date: string, businessId: string, now = new Date()): Promise<DataCheckReport> {
+  return withReadSnapshot(now, () => inspectDataCheck(request, date, businessId, now));
+}
+async function inspectDataCheck(request: Request, date: string, businessId: string, now: Date): Promise<DataCheckReport> {
   const checks: DataCheckRow[] = [];
   const snapshots: ScopeSnapshot[] = [];
   const unavailable = new Set<string>();
@@ -281,7 +284,7 @@ export async function runDataCheck(request: Request, date: string, businessId: s
       } catch { checks.push(missing(business.id, "Attendance", "Attendance could not be completely checked within the read/query safety limits.")); }
       try { ensureBudget(deadline); const rows: DataCheckRow[] = []; await bounded(inspectCalls(request, business, date, policy, now, workspace, raw, rows), Math.max(1000, deadline - Date.now())); checks.push(...rows); }
       catch { checks.push(missing(business.id, "Calls", "Call evidence failed, exceeded the safety limit, or timed out.")); }
-      try { ensureBudget(deadline); const rows: DataCheckRow[] = []; await bounded(inspectLeads(business, date, policy, now, workspace, rows), Math.max(1000, deadline - Date.now())); checks.push(...rows); }
+      try { ensureBudget(deadline); const rows: DataCheckRow[] = []; await bounded(inspectLeads(request, business, date, policy, now, workspace, rows), Math.max(1000, deadline - Date.now())); checks.push(...rows); }
       catch { checks.push(missing(business.id, "Leads", "Lead counts could not be completely checked within the read budget.")); }
     }).catch(() => { unavailable.add(business.id); for (const section of sections) checks.push(missing(business.id, section, "This business is unavailable. Other business results are retained.")); });
   }

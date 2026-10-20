@@ -53,6 +53,7 @@ test("request uses shared signed API with abort signal and a bounded deadline", 
     assert.match(api, /signal/); assert.match(api, /timeout: 35_000/);
     const nav = readFileSync(new URL("../src/pages/admin/adminLayout/index.tsx", import.meta.url), "utf8");
     assert.match(nav, /dataCheckConfig\?\.enabled/);
+    assert.match(nav, /dataCheckConfig\.navigationVisible/);
 });
 test("socket reconnect refreshes signed tokens as well as business identity", () => {
     const exports = {}; let actor = { userType: "employee", attendanceHubSession: "synthetic-one", user: { employeeCode: "fake-owner" } }; let business = "fake-a"; let disconnects = 0;

@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { auditAttendance, badCallTimes, checkBounds, compareCheck, lastCompletedShift, punchDays, validCheckDate, type AuditPunch } from "./dataCheckMath";
+import { auditAttendance, badCallTimes, checkBounds, compareCheck, lastCompletedShift, percentChangeCheck, punchDays, validCheckDate, type AuditPunch } from "./dataCheckMath";
 import { dataCheckCsv, dataCheckText, dataCheckVerdict, type DataCheckReport } from "../../../shared/dataCheck";
-import { dataCheckEnabled, securityLegacyAuthEnabled } from "../config/rolloutFlags";
+import { dataCheckEnabled, dataCheckNavigationEnabled, securityLegacyAuthEnabled } from "../config/rolloutFlags";
 
 const policy = { shiftStart: "23:00", shiftEnd: "08:00", graceMinutes: 0, breakMinutes: 15, lunchMinutes: 60 };
 const date = "2026-10-19";
@@ -85,5 +85,26 @@ test("Data Check and signed legacy authentication default off in production and 
     for (const [key, value] of [["NODE_ENV", before.node], ["CRM_DATA_CHECK", before.check], ["CRM_SECURITY_LEGACY_AUTH", before.legacy]]) {
       if (value === undefined) delete process.env[key!]; else process.env[key!] = value;
     }
+  }
+});
+test("undefined percentage is verified only with explicit dashboard evidence, not confused with unavailable data", () => {
+  assert.equal(percentChangeCheck("fake", null, 0, 0).status, "match");
+  assert.equal(percentChangeCheck("fake", null, 5, 0).status, "match");
+  assert.equal(percentChangeCheck("fake", undefined, 0, 0).status, "cannot-verify");
+  assert.equal(percentChangeCheck("fake", 0, 5, 0).status, "mismatch");
+  assert.equal(percentChangeCheck("fake", 20, 12, 10).status, "match");
+  assert.equal(percentChangeCheck("fake", null, 12, 10).status, "mismatch");
+  assert.match(percentChangeCheck("fake", 0, 1001, 1000).explanation, /Rounding hides a nonzero change/);
+});
+test("Data Check navigation is hidden by default in every environment and can be restored explicitly", () => {
+  const environment = process.env.NODE_ENV, flag = process.env.CRM_DATA_CHECK_NAV;
+  try {
+    delete process.env.CRM_DATA_CHECK_NAV;
+    for (const value of ["development", "test", "production"]) { process.env.NODE_ENV = value; assert.equal(dataCheckNavigationEnabled(), false); }
+    process.env.CRM_DATA_CHECK_NAV = "true"; assert.equal(dataCheckNavigationEnabled(), true);
+    process.env.CRM_DATA_CHECK_NAV = "false"; assert.equal(dataCheckNavigationEnabled(), false);
+  } finally {
+    if (environment === undefined) delete process.env.NODE_ENV; else process.env.NODE_ENV = environment;
+    if (flag === undefined) delete process.env.CRM_DATA_CHECK_NAV; else process.env.CRM_DATA_CHECK_NAV = flag;
   }
 });

@@ -1,5 +1,5 @@
 import type { Request, Response } from "express";
-import { dataCheckEnabled } from "../config/rolloutFlags";
+import { dataCheckEnabled, dataCheckNavigationEnabled } from "../config/rolloutFlags";
 import { verifyAdminDashboardSession } from "../config/adminDashboardSession";
 import { getConfiguredBusinesses } from "../config/tenancy";
 import { attendancePolicy } from "../services/attendanceLedgerService";
@@ -15,10 +15,10 @@ async function readPolicy(business?: string) {
   finally { clearTimeout(timer); }
 }
 export async function dataCheckConfig(_request: Request, response: Response) {
-  if (!dataCheckEnabled()) { response.json({ enabled: false, businesses: [] }); return; }
+  if (!dataCheckEnabled()) { response.set("Cache-Control", "no-store").json({ enabled: false, navigationVisible: false, businesses: [] }); return; }
   let policy;
   try { policy = await readPolicy(); } catch { response.status(503).json({ message: "Attendance policy is unavailable. No records were changed." }); return; }
-  response.set("Cache-Control", "no-store").json({ enabled: true, defaultDate: lastCompletedShift(policy), serverTime: new Date().toISOString(), businesses: getConfiguredBusinesses().map(({ id, name }) => ({ id, name })) });
+  response.set("Cache-Control", "no-store").json({ enabled: true, navigationVisible: dataCheckNavigationEnabled(), defaultDate: lastCompletedShift(policy), serverTime: new Date().toISOString(), businesses: getConfiguredBusinesses().map(({ id, name }) => ({ id, name })) });
 }
 export async function getDataCheck(request: Request, response: Response) {
   if (!dataCheckEnabled()) { response.status(404).json({ message: "Data Check is disabled." }); return; }

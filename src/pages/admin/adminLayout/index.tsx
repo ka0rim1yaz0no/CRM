@@ -253,7 +253,7 @@ export default function AdminLayout({ children }: Props) {
         .map((section) => ({
             ...section,
             items: section.items.map((item) => ({ ...item, path: roleWorkspacePath(item.path, authUser) })).filter((item) =>
-                isEnabled(item.feature, "admin") && (!isPocOperations || isPocOperationsPath(item.path)) && (item.path !== "/admin/data-check" || dataCheckConfig?.enabled)
+                isEnabled(item.feature, "admin") && (!isPocOperations || isPocOperationsPath(item.path)) && (item.path !== "/admin/data-check" || (dataCheckConfig?.enabled && dataCheckConfig.navigationVisible))
             ),
         }))
         .map((section) => isTrackerOnlyAdmin

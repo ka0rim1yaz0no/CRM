@@ -22,6 +22,15 @@ export function compareCheck(id: string, section: DataCheckSection, business: st
   return { id: `${business}:${id}`, section, business, label, dashboardValue, recomputedValue: calculated, difference, status, explanation,
     proof: weaker ? "same-code, weaker proof" : "independent", samples: status === "mismatch" ? samples.slice(0, 10) : [], ...(warningOnly ? { warningOnly: true } : {}) };
 }
+export function percentChangeCheck(business: string, shown: number | null | undefined, current: number, previous: number) {
+  const exact = previous ? (current - previous) / Math.abs(previous) * 100 : null;
+  const rounded = exact === null ? null : Math.round(exact);
+  const row = compareCheck("percent-change", "Consistency", business, "Activity percent change", shown, rounded,
+    exact === null ? "Previous raw activity is zero: the expected percentage is explicitly undefined (null), never 0%. An available dashboard returning null agrees with that result." :
+      `Independent raw activity ${previous} -> ${current}; unrounded change ${exact.toFixed(6)}%; rounded display ${rounded}%. ${rounded === 0 && exact !== 0 ? "Rounding hides a nonzero change." : "Rounding does not hide the direction."}`);
+  if (shown !== undefined) row.status = shown === rounded ? "match" : "mismatch";
+  return row;
+}
 export function punchDays(events: AuditPunch[], policy: CheckPolicy) {
   const result = new Map<string, AuditPunch[]>();
   const active = new Map<string, string>();

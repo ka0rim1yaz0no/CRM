@@ -5,6 +5,7 @@ import http from "node:http";
 import mongoose from "mongoose";
 import { MongoMemoryReplSet } from "mongodb-memory-server";
 import type { DataCheckReport } from "../../../shared/dataCheck";
+import type { Request } from "express";
 
 const prefix = `data_check_${crypto.randomUUID().replaceAll("-", "").slice(0, 16)}`;
 process.env.NODE_ENV = "test";
@@ -38,6 +39,8 @@ const { executeAttendanceCommand, resolveAttendanceIdentity } = await import("./
 const { deliverAttendanceLedger } = await import("./attendanceLedgerOutbox");
 const { clearDataCheckCache } = await import("../controllers/dataCheckController");
 const { dataCheckRateLimit } = await import("../routes/dataCheckRoutes");
+const { runDataCheck } = await import("./dataCheckService");
+const { getBusinessById } = await import("../config/tenancy");
 let mongo: MongoMemoryReplSet; let server: http.Server; let base = "";
 const ids: Record<string, mongoose.Types.ObjectId> = {};
 const date = "2026-10-15";
@@ -60,9 +63,10 @@ async function fingerprint() {
   const output: unknown[] = [];
   for (const name of [`${prefix}_a`, `${prefix}_b`, `${prefix}_control`, prefix]) {
     const db = mongoose.connection.getClient().db(name);
-    for (const { name: collection } of await db.listCollections().toArray()) {
+    for (const { name: collection } of (await db.listCollections().toArray()).sort((a, b) => a.name.localeCompare(b.name))) {
       const records = await db.collection(collection).find({}).sort({ _id: 1 }).toArray();
-      output.push([name, collection, records]);
+      // Lazy model initialization may create an empty indexed collection, not application records.
+      if (records.length) output.push([name, collection, records]);
     }
   }
   return crypto.createHash("sha256").update(JSON.stringify(output)).digest("hex");
@@ -106,6 +110,16 @@ test("Data Check validates dates/businesses and can be disabled without altering
     assert.equal((await request("/dashboard-workspace/summary?preset=today")).status, 200);
   } finally { process.env.CRM_DATA_CHECK = "true"; }
 });
+test("navigation is hidden independently of signed diagnostics, and restoring it does not change dashboard access", async () => {
+  delete process.env.CRM_DATA_CHECK_NAV;
+  const config = await (await request("/admin/data-check/config")).json();
+  assert.equal(config.enabled, true); assert.equal(config.navigationVisible, false);
+  process.env.CRM_DATA_CHECK_NAV = "true";
+  try {
+    assert.equal((await (await request("/admin/data-check/config")).json()).navigationVisible, true);
+    assert.equal((await request("/dashboard-workspace/summary?preset=today")).status, 200);
+  } finally { delete process.env.CRM_DATA_CHECK_NAV; }
+});
 test("normal hand-calculated fixtures compare screen totals, two breaks, lunch, deductions, calls and status cards in both businesses", async () => {
   for (const business of ["check-a", "check-b"]) {
     clearDataCheckCache(); const value = await report(business);
@@ -117,7 +131,8 @@ test("normal hand-calculated fixtures compare screen totals, two breaks, lunch, 
     assert.equal(row(value, `${business}:cross-business-fake-agent`).status, "match");
     assert.equal(row(value, `${business}:bridge-disconnect-gaps`).status, "cannot-verify");
     assert.equal(row(value, `${business}:bridge-freshness`).status, "cannot-verify");
-    assert.equal(row(value, `${business}:percent-change`).status, "cannot-verify");
+    assert.equal(row(value, `${business}:percent-change`).status, "match");
+    for (const status of ["NEW", "Follow up", "Ongoing comms", "Qualified", "Ongoing Negotiation", "Completed", "Dead", "Archived"]) assert.equal(row(value, `${business}:status-${status}`).status, "match");
     assert.equal(row(value, `${business}:fake-agent-dtr`).proof, "same-code, weaker proof");
     assert.ok(value.checks.every(item => item.samples.length <= 10));
     assert.doesNotMatch(JSON.stringify(value), /synthetic-private-(bank|phone|email)|bankAccount|password|credential/i);
@@ -132,6 +147,24 @@ test("cached all-business report is read-only down to the stored document hashes
   assert.equal(first.generatedAt, second.generatedAt);
   assert.equal(Date.parse(first.expiresAt) - Date.parse(first.generatedAt), 60_000);
   assert.equal(await fingerprint(), before, "GET must not write attendance, caches, repairs or audit documents");
+});
+test("running dashboard and hub totals compare at one exact server instant, without changing open attendance", async () => {
+  for (const business of ["check-a", "check-b"]) await runWithBusiness(business, () => Employee.create({ employeeCode: "fake-open", name: "Synthetic Open", role: "Sales", team: "Sales Outreach", dateHired: "2026-10-01", businessAccessIds: ["check-a", "check-b"] }));
+  await setBusinessAccessForEmployeeCode("fake-open", ["check-a", "check-b"]);
+  const person = await runWithBusiness("check-a", () => Employee.findOne({ employeeCode: "fake-open" }).select("_id").lean()); assert.ok(person);
+  const identity = await runWithBusiness("check-a", () => resolveAttendanceIdentity(String(person._id), admin));
+  const at = new Date("2026-10-16T16:00:00Z");
+  await executeAttendanceCommand(identity, { commandId: crypto.randomUUID(), expectedRevision: 0, operation: "correct", reason: "Synthetic open comparison", changes: [{ source: "Time In", at: "2026-10-16T15:00:00Z" }] }, admin, at);
+  await deliverAttendanceLedger(identity.key);
+  const token = createAdminDashboardSession(admin.code)!;
+  const req = { business: getBusinessById("check-a"), header: (name: string) => name.toLowerCase() === "x-crm-admin-session" ? token : undefined } as unknown as Request;
+  const before = await fingerprint();
+  const value = await runWithBusiness("check-a", () => runDataCheck(req, "2026-10-16", "all", at));
+  for (const business of ["check-a", "check-b"]) {
+    const online = row(value, `${business}:workspace-hub-online`);
+    assert.equal(online.status, "match"); assert.equal(online.dashboardValue, 3600_000); assert.equal(online.recomputedValue, 3600_000);
+  }
+  assert.equal(await fingerprint(), before, "Reading a fixed instant never closes or rewrites attendance");
 });
 test("stored stale derivatives warn without silently repairing them", async () => {
   await runWithBusiness("check-a", () => Attendance.updateMany({ employee: ids["check-a"] }, { $set: { "derived.excessBreakMinutes": 99 } }));
