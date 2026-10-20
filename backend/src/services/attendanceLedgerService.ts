@@ -150,7 +150,9 @@ export async function commitAttendanceRevision(id: string, token: string, fence:
   return attendancePayrollTransaction(async activeSession => {
     const ledger = await AttendanceLedger.findById(id, null, { session: activeSession }).select("employeeCode businessIds").lean();
     if (!ledger) return null;
-    await lockPayrollAttendance(ledger.businessIds.map(businessId => ({ businessId, employeeCode: ledger.employeeCode })), activeSession);
+    const assigned = (update.$set as { businessIds?: string[] } | undefined)?.businessIds || [];
+    const businessIds = [...new Set([...ledger.businessIds, ...assigned])];
+    await lockPayrollAttendance(businessIds.map(businessId => ({ businessId, employeeCode: ledger.employeeCode })), activeSession);
     return commit(activeSession);
   }, session);
 }

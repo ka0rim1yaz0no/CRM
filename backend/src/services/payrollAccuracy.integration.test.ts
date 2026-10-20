@@ -33,7 +33,7 @@ const { runWithBusiness, getBusinessConnection } = await import("../config/tenan
 const { setBusinessAccessForEmployeeCode } = await import("../models/BusinessUserAccess");
 const { createAdminDashboardSession } = await import("../config/adminDashboardSession");
 const { assignAttendanceShift } = await import("./attendanceShift");
-const { executeAttendanceCommand, autoTimeOutCommandId } = await import("./attendanceLedgerService");
+const { executeAttendanceCommand, autoTimeOutCommandId, resolveAttendanceIdentity } = await import("./attendanceLedgerService");
 const { deliverAttendanceLedger } = await import("./attendanceLedgerOutbox");
 const { syncEmployeePayrollRecords } = await import("../controllers/payrollController");
 const period = "Oct 15, 2026 - Oct 15, 2026";
@@ -110,6 +110,51 @@ function gate() {
   const promise = new Promise<void>(done => { resolve = done; });
   return { promise, resolve };
 }
+
+test("attendance membership expansion fences both the stored and newly assigned business", async () => {
+  await AttendanceLedger.updateOne({ _id: "synthetic-payroll" }, { businessIds: ["pay-a"] });
+  await correctSyntheticBreak("pay-b");
+  const fences = await PayrollAttendanceFence.find().sort({ _id: 1 }).lean();
+  assert.deepEqual(fences.map(item => JSON.parse(String(item._id))), [["pay-a", "90000003"], ["pay-b", "90000003"]]);
+  assert.deepEqual((await AttendanceLedger.findById("synthetic-payroll").lean())?.businessIds, ["pay-a", "pay-b"]);
+});
+
+test("HTTP edit, fresh reads, explicit recompute approval and payment stay consistent across business refreshes", async () => {
+  const identity = await runWithBusiness("pay-a", () => resolveAttendanceIdentity(String(ids[0]), { role: "admin", code: "90000001" }));
+  const seed = await AttendanceLedger.findById("synthetic-payroll").lean(); assert.ok(seed);
+  await AttendanceLedger.deleteOne({ _id: seed._id });
+  await AttendanceLedger.create({ ...seed, _id: identity.key });
+  for (const business of ["pay-a", "pay-b"]) await runWithBusiness(business, () => Attendance.updateMany({}, { ledgerIdentity: identity.key }));
+  const first = await preview(); assert.equal((await confirm(first.data)).status, 200);
+  const edited = await request(`/employees/${ids[1]}/attendance/commands`, { operation: "correct", commandId: crypto.randomUUID(), expectedRevision: 1,
+    reason: "Synthetic refreshed cross-business edit", changes: [{ targetId: "e2", at: new Date(start + 77 * 60_000).toISOString() }] }, "pay-b");
+  assert.equal(edited.status, 200, JSON.stringify(edited.data)); assert.equal(edited.data.revision, 2);
+  for (const business of ["pay-a", "pay-b"]) {
+    const employee = await request("/auth/login", { employeeCode: "90000003" }, business); assert.equal(employee.status, 200);
+    const response = await fetch(`${base}/employees/${business === "pay-a" ? ids[0] : ids[1]}/attendance/session`, { headers: { "X-Business-Id": business, "X-CRM-Attendance-Session": employee.data.attendanceHubSession } });
+    assert.equal(response.status, 200); const session = await response.json(); assert.equal(session.revision, 2);
+    const dtr = await request(`/payroll/dtr/90000003?payPeriod=${encodeURIComponent(period)}`, undefined, business);
+    assert.equal(dtr.status, 200); assert.equal(dtr.data.rows[0].deductibleMinutes, 18); assert.equal(dtr.data.rows[0].excessBreakMinutes, 2);
+    assert.equal(dtr.data.summary.deductions, 46.20, "reading changed attendance must not silently rewrite the saved cutoff");
+    assert.equal((await request("/dashboard-workspace/summary?preset=today", undefined, business)).status, 200);
+    assert.equal((await request("/call-dashboard", undefined, business)).status, 200);
+  }
+  const fresh = await preview(); assert.equal(fresh.status, 200); assert.equal(fresh.data.rows[0].after.deductions, 48.91);
+  assert.equal((await confirm(fresh.data)).status, 200);
+  for (const business of ["pay-a", "pay-b"]) {
+    const records = await request(`/payroll/records?payPeriod=${encodeURIComponent(period)}`, undefined, business);
+    assert.equal(records.status, 200); assert.equal(records.data.length, 1); assert.equal(records.data[0].deductions, 48.91); assert.equal(records.data[0].netPay, 14951.09);
+    assert.equal(records.data[0].calculationAudit.length, 2);
+    const dtr = await request(`/payroll/dtr/90000003?payPeriod=${encodeURIComponent(period)}`, undefined, business);
+    assert.equal(dtr.status, 200); assert.equal(dtr.data.summary.deductibleMinutes, 18); assert.equal(dtr.data.summary.deductions, 48.91);
+  }
+  const record = await runWithBusiness("pay-a", () => PayrollRecord.findOne().lean());
+  assert.equal((await request(`/payroll/records/${record!._id}/paid`, {}, "pay-a", token, "PATCH")).status, 200);
+  for (const business of ["pay-a", "pay-b"]) {
+    const records = await request(`/payroll/records?payPeriod=${encodeURIComponent(period)}`, undefined, business);
+    assert.equal(records.data.length, 1); assert.equal(records.data[0].status, "Paid"); assert.equal(records.data[0].deductions, 48.91);
+  }
+});
 
 test("approval holds every business attendance fence until its complete payroll transaction commits", { timeout: 25000 }, async () => {
   const first = await preview();
