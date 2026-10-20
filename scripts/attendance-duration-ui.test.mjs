@@ -133,3 +133,11 @@ test("Break and Lunch match the other button heights and show only their names",
     assert.doesNotMatch(buttons, /h-32|"Available"|of 2 used|Over by|Excess pending refresh/);
     assert.match(buttons, /aria-pressed=\{active\}/);
 });
+
+test("duration layout puts Off the Phone on its own row below Break and Lunch without changing legacy controls", () => {
+    const page = readFileSync(new URL("../src/pages/attendance/index.tsx", import.meta.url), "utf8");
+    const layout = page.slice(page.indexOf("const displayedMessage ="));
+    assert.match(layout, /attendanceDurationModelEnabled \? actionButtons\.filter\(\(button\) => button\.key !== "OFF THE PHONE"\) : actionButtons/);
+    assert.ok(layout.indexOf('aria-label="Break and lunch"') < layout.indexOf('aria-label="Off the Phone"'));
+    assert.match(layout, /aria-label="Off the Phone">\s*\{actionButtons\.filter\(\(button\) => button\.key === "OFF THE PHONE"\)\}/);
+});

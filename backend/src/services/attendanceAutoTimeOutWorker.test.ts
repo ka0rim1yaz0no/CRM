@@ -9,7 +9,7 @@ import { projectAttendance, type SessionEvent } from "./attendanceSessionState";
 import { attendancePolicy, attendanceSnapshot, autoTimeOutCommandId, executeAttendanceCommand, type AttendanceCommand } from "./attendanceLedgerService";
 import { runAttendanceAutoTimeOut, runAttendanceAutoTimeOutCycle } from "./attendanceAutoTimeOutWorker";
 import { runAttendanceRecovery } from "./attendanceRecoveryWorker";
-import { validateAttendanceAutoTimeOutTime } from "../controllers/attendanceSessionController";
+import { attendanceError, validateAttendanceAutoTimeOutTime } from "../controllers/attendanceSessionController";
 
 const flagNames = ["CRM_ATTENDANCE_INTEGRITY", "CRM_ATTENDANCE_AUTO_TIMEOUT", "CRM_ATTENDANCE_DURATION_MODEL", "CRM_ATTENDANCE_RECOVERY_CUTOFF", "CRM_ATTENDANCE_BREAK_GAP"] as const;
 let savedFlags: Array<string | undefined>;
@@ -307,6 +307,19 @@ test("cutoff calculation does not use slot rollover and handles month/year bound
   }
 });
 
+test("weekend overnight sessions close once at their own 08:05 cutoff", async () => {
+  for (const day of ["2026-10-17", "2026-10-18"]) {
+    fixture([event("Time In", `${day}T15:00:00Z`, 0)]);
+    const cutoff = attendanceAutoTimeOutCutoff(projectAttendance(store.events).active)!;
+    assert.equal(await runAttendanceAutoTimeOut(new Date(cutoff.getTime() - 1), noDelivery), 0);
+    assert.equal(await runAttendanceAutoTimeOut(cutoff, noDelivery), 1);
+    assert.equal(store.events.at(-1)?.at, cutoff.toISOString());
+    assert.equal(store.events.at(-1)?.autoTimeOut, true);
+    assert.equal(await runAttendanceAutoTimeOut(new Date(cutoff.getTime() + 3_600_000), noDelivery), 0);
+    assert.equal(store.events.filter((item) => item.source === "Time Out").length, 1);
+  }
+});
+
 test("policy rejects cutoffs before 08:00 and malformed HH:MM, accepting the exact end and later times", () => {
   for (const value of ["00:00", "07:00", "07:59"]) {
     assert.throws(() => validateAttendanceAutoTimeOutTime(value), { status: 422, code: "AUTO_TIME_OUT_BEFORE_SHIFT_END" });
@@ -376,4 +389,92 @@ test("disabled cycles report zero counts without scanning ledgers", async () => 
   assert.deepEqual(await runAttendanceAutoTimeOutCycle(now("00:05:00"), noDelivery),
     { scanned: 0, closed: 0, skipped: 0, failed: 0, deliveryPending: 0 });
   assert.equal(scan.mock.callCount(), 0);
+});
+
+test("08:05 and later Break Out is a 409 pending response with no request-side writes; worker still closes exactly at cutoff", async () => {
+  const before = copy(store);
+  for (const clock of ["00:05:00", "00:05:01"]) {
+    let status = 0; let body: { code?: string } = {};
+    const response = { status(value: number) { status = value; return this; }, json(value: { code?: string }) { body = value; return this; } };
+    try {
+      await executeAttendanceCommand(identity, { commandId: crypto.randomUUID(), expectedRevision: store.revision, operation: "action", source: "Break Out" },
+        { role: "employee", code: identity.code }, now(clock));
+      assert.fail("Post-cutoff action must be rejected");
+    } catch (error) { attendanceError(response as never, error); }
+    assert.equal(status, 409);
+    assert.equal(body.code, "AUTO_TIME_OUT_PENDING");
+    assert.deepEqual(store, before);
+  }
+  assert.equal(await runAttendanceAutoTimeOut(now("00:05:15"), noDelivery), 1);
+  assert.equal(store.events.at(-1)?.at, cutoff);
+  assert.equal(store.events.at(-1)?.autoTimeOut, true);
+});
+
+test("08:04:59 Break Out succeeds and worker closes the open break at 08:05", async () => {
+  await executeAttendanceCommand(identity, { commandId: crypto.randomUUID(), expectedRevision: store.revision, operation: "action", source: "Break Out" },
+    { role: "employee", code: identity.code }, now("00:04:59"));
+  assert.equal(store.events.at(-1)?.source, "Break Out");
+  assert.equal(await runAttendanceAutoTimeOut(now("00:05:15"), noDelivery), 1);
+  assert.deepEqual(store.events.slice(-2).map((item) => [item.source, item.at]), [["Break In", cutoff], ["Time Out", cutoff]]);
+});
+
+test("all non-checkout actions, including returns, wait for the worker once cutoff is due", async () => {
+  const employee = { role: "employee" as const, code: identity.code };
+  for (const source of ["Time In", "Login", "Break Out", "Lunch Break Out", "Off the Phone Out"] as const) {
+    await assert.rejects(executeAttendanceCommand(identity, { commandId: crypto.randomUUID(), expectedRevision: store.revision, operation: "action", source },
+      employee, now("00:05:01")), { status: 409, code: "AUTO_TIME_OUT_PENDING" });
+  }
+  for (const [out, source] of [["Break Out", "Break In"], ["Lunch Break Out", "Lunch Break In"], ["Off the Phone Out", "Off the Phone In"]] as const) {
+    fixture(); store.events.push(event(out, "2026-10-15T23:50:00Z", 1));
+    await assert.rejects(executeAttendanceCommand(identity, { commandId: crypto.randomUUID(), expectedRevision: store.revision, operation: "action", source },
+      employee, now("00:05:01")), { status: 409, code: "AUTO_TIME_OUT_PENDING" });
+    assert.equal(store.events.length, 2);
+  }
+  assert.equal(commitCalls, 0);
+});
+
+test("manual Time Out and legacy Logout keep precedence after cutoff without automatic writes", async () => {
+  for (const source of ["Time Out", "Logout"] as const) {
+    fixture();
+    await executeAttendanceCommand(identity, { commandId: crypto.randomUUID(), expectedRevision: store.revision, operation: "action", source },
+      { role: "employee", code: identity.code }, now("00:05:01"));
+    assert.equal(store.events.at(-1)?.source, source);
+    assert.equal(store.events.at(-1)?.at, "2026-10-16T00:05:01.000Z");
+    assert.equal(store.events.at(-1)?.autoTimeOut, undefined);
+    assert.equal(await runAttendanceAutoTimeOut(now("00:05:15"), noDelivery), 0);
+  }
+});
+
+test("snapshot uses the configured cutoff, hides actions only when due, and never writes", () => {
+  const before = copy(store);
+  assert.ok(attendanceSnapshot(store, now("00:04:59"), policy).allowedActions.includes("Break Out"));
+  assert.deepEqual(attendanceSnapshot(store, now("00:05:00"), policy).allowedActions, []);
+  assert.ok(attendanceSnapshot(store, now("00:05:00"), { autoTimeOutTime: "08:10" }).allowedActions.includes("Break Out"));
+  assert.deepEqual(attendanceSnapshot(store, now("00:10:00"), { autoTimeOutTime: "08:10" }).allowedActions, []);
+  assert.deepEqual(store, before);
+  process.env.CRM_ATTENDANCE_AUTO_TIMEOUT = "false";
+  assert.ok(attendanceSnapshot(store, now("00:05:00"), policy).allowedActions.includes("Break Out"));
+});
+
+test("custom cutoff and disabled flag preserve pre-cutoff manual actions", async () => {
+  policy.autoTimeOutTime = "08:10";
+  await executeAttendanceCommand(identity, { commandId: crypto.randomUUID(), expectedRevision: store.revision, operation: "action", source: "Break Out" },
+    { role: "employee", code: identity.code }, now("00:05:01"));
+  assert.equal(store.events.at(-1)?.source, "Break Out");
+  assert.equal(await runAttendanceAutoTimeOut(now("00:10:00"), noDelivery), 1);
+  assert.equal(store.events.at(-1)?.at, "2026-10-16T00:10:00.000Z");
+  fixture(); policy.autoTimeOutTime = "08:05"; process.env.CRM_ATTENDANCE_AUTO_TIMEOUT = "false";
+  await executeAttendanceCommand(identity, { commandId: crypto.randomUUID(), expectedRevision: store.revision, operation: "action", source: "Break Out" },
+    { role: "employee", code: identity.code }, now("00:05:01"));
+  assert.equal(store.events.at(-1)?.source, "Break Out");
+});
+
+test("cutoff policy is rechecked under the lease before committing a manual action", async () => {
+  let reads = 0;
+  mock.method(AttendancePolicy, "findById", () => ({ lean: async () => ({ ...policy, autoTimeOutTime: ++reads === 1 ? "08:10" : "08:05" }) }) as never);
+  await assert.rejects(executeAttendanceCommand(identity, { commandId: crypto.randomUUID(), expectedRevision: store.revision, operation: "action", source: "Break Out" },
+    { role: "employee", code: identity.code }, now("00:05:01")), { status: 409, code: "AUTO_TIME_OUT_PENDING" });
+  assert.equal(store.events.length, 1);
+  assert.equal(store.commands.length, 0);
+  assert.equal(commitCalls, 0);
 });

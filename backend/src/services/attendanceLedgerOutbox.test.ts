@@ -60,6 +60,8 @@ test("every pending ordinary action copies canonical day derivation and auto mar
     assert.equal(operations.length, 4);
     for (const operation of operations) assert.deepEqual(operation.updateOne.update.$set.derived, ledger.derived![0]);
     assert.equal(operations[3].updateOne.update.$set.autoTimeOut, true);
+    assert.equal(operations[2].updateOne.update.$set.sequence, 2);
+    assert.equal(operations[3].updateOne.update.$set.sequence, 3);
   }
   assert.ok(ledger.jobs.every((job) => job.done));
 });
@@ -125,7 +127,17 @@ test("derived-only refresh delivers stored deductions, emits updates and recalcu
       actions.push(`payroll:${scope!.businessIds![0]}`);
       assert.ok(scope!.attendanceDates!.some((date) => date.toISOString() === "2026-10-15T15:00:00.000Z"));
     } });
-  assert.deepEqual(actions, ["emit:employee-fake-a", "payroll:fake-a", "emit:employee-fake-b", "payroll:fake-b"]);
+  assert.deepEqual(actions, ["payroll:fake-a", "emit:employee-fake-a", "payroll:fake-b", "emit:employee-fake-b"]);
   for (const operations of writes.values()) assert.equal((operations[0].updateOne.update.$set.derived as { earlyTimeOutMinutes: number }).earlyTimeOutMinutes, 60);
   assert.ok(ledger.jobs.every((job) => job.done));
+});
+
+test("payroll failure still publishes the confirmed attendance state while leaving the business pending", async () => {
+  const { ledger } = fixture();
+  const emitted: string[] = [];
+  const result = await deliverAttendanceLedger(ledger._id, { now,
+    emitAvailability: (payload) => { emitted.push(payload.employeeId); },
+    recalculatePayroll: async (_id, _from, _to, scope) => { if (scope!.businessIds![0] === "fake-b") throw new Error("Synthetic failure"); } });
+  assert.deepEqual(emitted, ["employee-fake-a", "employee-fake-b"]);
+  assert.deepEqual(result?.pendingBusinessIds, ["fake-b"]);
 });

@@ -21,6 +21,7 @@ import { buildOffPhoneAttendanceSessions } from "../../../lib/attendanceRecords"
 import { formatTimeInTimeZone } from "../../../lib/dateTime";
 import { attendanceInputValue, buildAttendanceDraftChanges, type DraftField } from "../../../lib/attendanceCommandDraft";
 import { attendanceIntegrityEnabled, getAttendanceSession, previewAttendanceCommand, submitAttendanceCommand, sessionEventRecord, type AttendanceCommand } from "../../../api/attendanceSession";
+import { refreshAttendanceWorkspace } from "../../../lib/employeeWorkspaceCache";
 import { getActiveBusinessId } from "../../../api/businessStorage";
 import { getAuthUser } from "../../../api/authStorage";
 
@@ -217,9 +218,7 @@ function AttendanceForm() {
                 setSavedNotice(result?.syncPending ? "Saved. Business synchronization is pending and will retry automatically." : "Attendance saved and synchronized.");
                 setConfirmation(null); dirty.current = false; setIsDirty(false); hydrated.current = "";
             }
-            await queryClient.invalidateQueries({ queryKey: ["employee-attendance"] });
-            await queryClient.invalidateQueries({ queryKey: ["attendance-session"] });
-            await queryClient.invalidateQueries({ queryKey: ["attendance-hub"] });
+            await refreshAttendanceWorkspace(queryClient);
             if (!attendanceIntegrityEnabled) navigate("/admin/hr?tab=attendance");
         },
         onError: (error) => {

@@ -15,6 +15,9 @@ export const attendanceIntegrityEnabled = () => enabled("CRM_ATTENDANCE_INTEGRIT
 export const attendanceActiveSessionEnabled = () => attendanceIntegrityEnabled() || enabled("CRM_ATTENDANCE_ACTIVE_SESSION");
 export const attendanceRecoveryEnvironmentEnabled = () => String(process.env.CRM_ATTENDANCE_RECOVERY_CUTOFF || "").toLowerCase() === "true";
 export const attendanceDurationModelEnabled = () => ["true", "1"].includes(String(process.env.CRM_ATTENDANCE_DURATION_MODEL || "").toLowerCase());
-// Retain the existing restriction until the business explicitly changes it.
-export const attendanceBreakGapEnabled = () => !["false", "0"].includes(String(process.env.CRM_ATTENDANCE_BREAK_GAP ?? "true").toLowerCase());
+// Duration-mode policy permits the second break immediately; legacy mode retains its original default.
+export const attendanceBreakGapEnabled = () => {
+  const value = process.env.CRM_ATTENDANCE_BREAK_GAP;
+  return value === undefined ? !attendanceDurationModelEnabled() : !["false", "0"].includes(value.toLowerCase());
+};
 export const attendanceAutoTimeOutEnabled = () => String(process.env.CRM_ATTENDANCE_AUTO_TIMEOUT || "").trim().toLowerCase() === "true";

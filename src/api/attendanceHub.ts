@@ -10,6 +10,7 @@ export type HubDay = {
     employeeCode: string; employeeId: string; employeeName: string; role: string; team: string; scopeKey: string;
     businessId: string; businessName: string; status: string; inProgress: boolean; excused: boolean; absent: boolean;
     mismatch: boolean; issues: string[]; review: string[]; note: string; leave: string | null;
+    noteRevision?: number; noteExcused?: boolean; attendanceRevision?: number; syncPending?: boolean;
     graceMinutes: number; breakMinutes: number; lunchMinutes: number;
     breakSessions: HubBreakSession[];
     noteRevisions: Array<{ reason: string; excused: boolean; by: string; at: string }>;
@@ -60,9 +61,16 @@ export async function getAttendanceHubDay(dayKey: string, employeeCode: string, 
         { params: { preset: "custom", from: dayKey, to: dayKey, employeeCode, business }, headers: sessionHeaders() });
     return response.data.day;
 }
-export async function saveAttendanceHubNote(day: HubDay, reason: string, excused: boolean) {
-    const response = await api.post(`/attendance-hub/day/${encodeURIComponent(day.dayKey)}/note`,
-        { employeeCode: day.employeeCode, businessId: day.businessId, reason, excused }, { headers: sessionHeaders() });
+export type AttendanceHubNoteRequest = { commandId: string; expectedRevision?: number; expectedNoteRevision?: number };
+export type AttendanceHubNoteResponse = { employeeCode: string; dayKey: string; businessId?: string; reason: string; excused: boolean;
+    noteRevision?: number; attendanceRevision?: number; policyRevision?: number; syncPending?: boolean; replayed?: boolean;
+    derived?: { dayKey: string; lateMinutes: number; excessBreakMinutes: number; excessLunchMinutes: number; earlyTimeOutMinutes: number;
+        deductibleMinutes: number; status: string; computedAt: string; policyRevision?: number } | null };
+export async function saveAttendanceHubNote(day: HubDay, reason: string, excused: boolean, command: AttendanceHubNoteRequest = {
+    commandId: crypto.randomUUID(), expectedRevision: day.attendanceRevision, expectedNoteRevision: day.noteRevision,
+}) {
+    const response = await api.post<AttendanceHubNoteResponse>(`/attendance-hub/day/${encodeURIComponent(day.dayKey)}/note`,
+        { employeeCode: day.employeeCode, businessId: day.businessId, reason, excused, ...command }, { headers: sessionHeaders() });
     return response.data;
 }
 export async function downloadAttendanceHubCsv(filters: HubFilters) {

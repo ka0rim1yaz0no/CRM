@@ -27,6 +27,7 @@ export type AttendanceDocument = {
   isEffective?: boolean;
   ledgerIdentity?: string;
   ledgerRevision?: number;
+  sequence?: number;
   autoTimeOut?: boolean;
   derived?: AttendanceDerivedDay;
 };
@@ -58,6 +59,7 @@ const attendanceSchema = new Schema<AttendanceDocument>(
     isEffective: { type: Boolean, default: undefined },
     ledgerIdentity: String,
     ledgerRevision: Number,
+    sequence: Number,
     autoTimeOut: { type: Boolean, default: undefined },
     derived: { type: Schema.Types.Mixed, default: undefined },
   },

@@ -462,7 +462,7 @@ function isAttendanceTimeInSource(source?: string) {
   return source === "Login" || source === "Time In";
 }
 
-function groupPayrollAttendanceBySlot<TRecord extends { source: string; timeIn: Date }>(
+function groupPayrollAttendanceBySlot<TRecord extends { source: string; timeIn: Date; sequence?: number }>(
   records: TRecord[],
   settings?: PayrollCutoffSettings & {
     attendanceTimeZone?: string | null;
@@ -474,7 +474,7 @@ function groupPayrollAttendanceBySlot<TRecord extends { source: string; timeIn: 
   let activeSlotKey = "";
 
   [...records]
-    .sort((left, right) => left.timeIn.getTime() - right.timeIn.getTime())
+    .sort((left, right) => left.timeIn.getTime() - right.timeIn.getTime() || (left.sequence ?? 0) - (right.sequence ?? 0))
     .forEach((record) => {
       const recordSlotKey = attendanceSlotKey(record.timeIn, settings);
       const slotKey = isAttendanceTimeInSource(record.source) || !activeSlotKey ? recordSlotKey : activeSlotKey;
@@ -612,11 +612,11 @@ export async function attendancePayrollDtr(employeeId: Types.ObjectId, payPeriod
     employee: employeeId,
     isArchived: false,
     timeIn: { $gte: start, $lt: queryEnd },
-  }).sort({ timeIn: 1 }).lean();
+  }).sort({ timeIn: 1, sequence: 1, _id: 1 }).lean();
   const grouped = groupPayrollAttendanceBySlot(records, settings);
 
   const rows = periodDateKeys(start, end).map<PayrollDtrRow>((slotKey) => {
-    const dayRecords = [...(grouped[slotKey] || [])].sort((left, right) => left.timeIn.getTime() - right.timeIn.getTime());
+    const dayRecords = [...(grouped[slotKey] || [])].sort((left, right) => left.timeIn.getTime() - right.timeIn.getTime() || (left.sequence ?? 0) - (right.sequence ?? 0));
     const bounds = hubShiftBounds(slotKey, settings);
     const calculated = policy ? calculateSlotAttendance(dayRecords, { ...policy, shiftStart: bounds.start, shiftEnd: bounds.end }, new Date()) : null;
     const isWeekendSlot = isWeekendDateKey(slotKey);

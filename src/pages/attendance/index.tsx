@@ -949,6 +949,7 @@ export default function AttendancePage() {
         const disabled = cardReturn || statusDisabled(status);
         const label = status === "ONLINE" && !cardReturn ? attendanceOnlineActionLabel(currentStatus) : statusLabels[status];
         return <button key={status} type="button" disabled={disabled} onClick={() => handleStatusChange(status)}
+            data-attendance-action={status}
             className={["inline-flex h-12 items-center justify-center gap-2 rounded-lg border px-4 text-sm font-semibold shadow-lg transition disabled:cursor-not-allowed disabled:border-slate-300 disabled:bg-slate-200 disabled:text-slate-500 disabled:shadow-none",
                 isActive ? "ring-2 ring-slate-950/20 ring-offset-2" : "", statusButtonStyles[status]].join(" ")}>
             <Icon className="shrink-0" aria-hidden="true" /><span>{isSaving && !disabled ? "Saving..." : label}</span>
@@ -996,6 +997,7 @@ export default function AttendancePage() {
                                 {confirmedSession?.review.length ? <p className="text-sm text-amber-700">{confirmedSession.historyReviewRequired && confirmedSession.reviewState === "verified"
                                     ? "Historical attendance needs administrator review. Your current manual attendance controls remain available."
                                     : `Attendance needs review: ${confirmedSession.review[0]}`}</p> : null}
+                                {confirmedSession?.policySyncPending && <p role="status" className="text-sm text-amber-700">Attendance policy update is synchronizing across businesses.</p>}
                                 {confirmedSession?.recoveryEnabled && confirmedSession.systemClosure && <p className="text-sm text-amber-700">Previous shift closed automatically because time-out was missing. Please request an attendance correction.</p>}
                             </div>
                         </div>
@@ -1052,10 +1054,13 @@ export default function AttendancePage() {
                         </dl>
 
                         <div className="mt-3 grid gap-3 sm:grid-cols-2">
-                            {actionButtons}
+                            {attendanceDurationModelEnabled ? actionButtons.filter((button) => button.key !== "OFF THE PHONE") : actionButtons}
                         </div>
                         {attendanceDurationModelEnabled && <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2" aria-label="Break and lunch">
                             {durationButtons}
+                        </div>}
+                        {attendanceDurationModelEnabled && <div className="mt-3 grid gap-3" aria-label="Off the Phone">
+                            {actionButtons.filter((button) => button.key === "OFF THE PHONE")}
                         </div>}
                     </section>
 

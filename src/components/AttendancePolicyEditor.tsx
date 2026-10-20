@@ -46,6 +46,6 @@ export default function AttendancePolicyEditor() {
             <button type="submit" disabled={!draft || save.isPending || (attendanceDurationModelEnabled && !validAttendanceCutoff(cutoff))}><FiSave aria-hidden="true" />{save.isPending ? "Saving..." : "Save configuration"}</button>
         </form>}
         {(save.isError || query.isError) && <p role="alert">{(save.error || query.error) instanceof Error ? (save.error || query.error)?.message : "Unable to save configuration. Refresh and review your draft."}</p>}
-        {save.isSuccess && <p role="status">Configuration saved.</p>}
+        {save.isSuccess && <p role="status">{query.data?.policySyncPending ? "Configuration saved. Attendance and payroll synchronization is pending and will retry." : "Configuration saved."}</p>}
     </details>;
 }

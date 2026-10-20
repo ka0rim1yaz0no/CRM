@@ -25,7 +25,6 @@ export default function AttendanceCorrections({ employeeId, businessId = getActi
     const save = useMutation({ mutationFn: () => submitAttendanceCommand(employeeId, preview!.command, businessId), onSuccess: (snapshot) => {
         setMode(null); setPreview(null); setReason(""); setError(snapshot.syncPending ? "Saved. Business synchronization is pending and will retry automatically." : "Saved and synchronized.");
         void refreshAttendanceWorkspace(client);
-        void client.invalidateQueries({ queryKey: ["payroll"] });
     }, onError: (failure) => { setError(errorText(failure)); void query.refetch(); } });
     if (!enabled) return null;
     const events = dayKey ? query.data?.sessions.filter((session) => session.shift?.dayKey === dayKey).flatMap((session) => session.events) || [] : query.data?.records || [];

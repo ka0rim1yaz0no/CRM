@@ -3,7 +3,8 @@ import type { QueryClient } from "@tanstack/react-query";
 export function refreshAttendanceWorkspace(client: QueryClient) {
     // Tenant copies have different employee IDs. Invalidate views, never copy one tenant's payload into another.
     return Promise.all(["attendance-session", "employee-attendance", "employee-dashboard-attendance",
-        "attendance-hub", "attendance-hub-day", "attendance-hub-live", "employees-attendance"].map((key) =>
+        "attendance-hub", "attendance-hub-day", "attendance-hub-live", "employees-attendance",
+        "payroll", "payroll-records", "payroll-stats", "payroll-dtr", "payroll-payslip-dtr"].map((key) =>
         client.invalidateQueries({ queryKey: [key] })));
 }
 

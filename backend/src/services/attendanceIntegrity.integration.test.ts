@@ -58,6 +58,31 @@ async function request(path: string, token: string, method = "GET", body?: unkno
   return fetch(`${base}${path}`, { method, headers: { "Content-Type": "application/json", "X-Business-Id": "test-a", [adminToken ? "X-CRM-Admin-Session" : "X-CRM-Attendance-Session"]: token }, ...(body ? { body: JSON.stringify(body) } : {}) });
 }
 
+test("automatic break return and checkout keep canonical sequence and accurate payroll in every business", async () => {
+  process.env.CRM_ATTENDANCE_DURATION_MODEL = "true";
+  process.env.CRM_ATTENDANCE_AUTO_TIMEOUT = "true";
+  try {
+    const person = await fixture();
+    await executeAttendanceCommand(person.identity, { commandId: crypto.randomUUID(), expectedRevision: 0, operation: "correct", reason: "Synthetic open break cutoff",
+      changes: [{ source: "Time In", at: "2026-10-15T15:00:00Z" }, { source: "Break Out", at: "2026-10-15T23:45:00Z" }] }, admin, new Date("2026-10-16T00:04:00Z"));
+    const { runAttendanceAutoTimeOut } = await import("./attendanceAutoTimeOutWorker");
+    const { attendancePayrollDtr } = await import("../controllers/payrollController");
+    assert.equal(await runAttendanceAutoTimeOut(new Date("2026-10-16T00:05:00Z")), 1);
+    for (const [index, business] of ["test-a", "test-b"].entries()) await runWithBusiness(business, async () => {
+      const records = await Attendance.find({ employee: person.employees[index]._id }).sort({ timeIn: 1, sequence: 1, _id: 1 }).lean();
+      assert.deepEqual(records.map((record) => record.source), ["Time In", "Break Out", "Break In", "Time Out"]);
+      assert.ok(records[2].sequence! < records[3].sequence!);
+      assert.equal(records[2].timeIn.toISOString(), "2026-10-16T00:05:00.000Z");
+      assert.equal(records[3].autoTimeOut, true);
+      const payroll = await attendancePayrollDtr(person.employees[index]._id, "Oct 6, 2026 - Oct 20, 2026");
+      const row = payroll.rows.find((day) => day.dateKey === "2026-10-15")!;
+      assert.equal(row.excessBreakMinutes, 5);
+      assert.equal(row.earlyTimeOutMinutes, 0);
+      assert.equal(row.status, "Present");
+    });
+  } finally { delete process.env.CRM_ATTENDANCE_DURATION_MODEL; process.env.CRM_ATTENDANCE_AUTO_TIMEOUT = "false"; }
+});
+
 test("duration model: actual payroll, hub, employee summary and stored replicas remain equal after an edit and fresh reads", async () => {
   process.env.CRM_ATTENDANCE_DURATION_MODEL = "true";
   try {

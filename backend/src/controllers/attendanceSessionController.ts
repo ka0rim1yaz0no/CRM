@@ -2,7 +2,7 @@ import type { Request, Response } from "express";
 import { Types } from "mongoose";
 import { verifyAdminDashboardSession } from "../config/adminDashboardSession";
 import { verifyAttendanceHubSession } from "../config/attendanceHubSession";
-import { attendanceActiveSessionEnabled, attendanceAutoTimeOutEnabled, attendanceIntegrityEnabled, attendanceRecoveryEnvironmentEnabled } from "../config/rolloutFlags";
+import { attendanceActiveSessionEnabled, attendanceAutoTimeOutEnabled, attendanceDurationModelEnabled, attendanceIntegrityEnabled, attendanceRecoveryEnvironmentEnabled } from "../config/rolloutFlags";
 import { AttendanceLedger, AttendancePolicy, type AttendanceActor } from "../models/AttendanceLedger";
 import { Attendance } from "../models/Attendance";
 import { Employee } from "../models/Employee";
@@ -16,6 +16,8 @@ import { listEmployeeAttendance, listEmployeesAttendance } from "./attendanceCon
 import { previewLegacyAttendanceMigration } from "../services/attendanceMigrationPreview";
 import { withAttendanceStatuses } from "../services/attendanceSnapshotPresentation";
 import { attendanceDashboardPresentation } from "../services/attendanceDashboardPresentation";
+import { attendancePolicySyncPending, hasAttendancePolicyRefreshPending, runAttendancePolicyRefresh } from "../services/attendancePolicyRefreshWorker";
+import { deriveAttendanceDays } from "../services/attendanceDerived";
 
 export function verifiedAttendanceActor(request: Request): AttendanceActor {
   const admin = verifyAdminDashboardSession(request.header("x-crm-admin-session"));
@@ -36,10 +38,12 @@ export async function getActiveAttendanceSession(request: Request, response: Res
     const identity = await resolveAttendanceIdentity(String(request.params.employeeId), actor);
     const ledger = await readAttendanceLedger(identity);
     const policy = await attendancePolicy(identity.canonicalBusinessId);
-    const snapshot = withAttendanceStatuses(attendanceSnapshot(ledger), policy.graceMinutes);
+    const policySyncPending = attendanceDurationModelEnabled() && attendancePolicySyncPending(ledger, policy.revision);
+    const stored = attendanceSnapshot(ledger, new Date(), policy);
+    const snapshot = withAttendanceStatuses({ ...stored, ...(policySyncPending ? { derived: deriveAttendanceDays(ledger, policy, new Date(stored.serverTime)), syncPending: true } : {}) }, policy.graceMinutes);
     response.set("Cache-Control", "no-store").json({ ...snapshot, ...attendanceDashboardPresentation(snapshot, policy, new Date(snapshot.serverTime)), ...(actor.role === "admin" ? { policy } : {}),
       allowances: { breakMinutes: policy.breakMinutes, lunchMinutes: policy.lunchMinutes },
-      autoTimeOutEnabled: attendanceIntegrityEnabled() && attendanceAutoTimeOutEnabled(),
+      autoTimeOutEnabled: attendanceIntegrityEnabled() && attendanceAutoTimeOutEnabled(), policySyncPending,
       recoveryEnabled: policy.recoveryEnabled || attendanceRecoveryEnvironmentEnabled(),
       resetDeadline: policy.recoveryEnabled || attendanceRecoveryEnvironmentEnabled() ? snapshot.assignedShift?.resetDeadline || null : null });
   } catch (error) { attendanceError(response, error); }
@@ -88,7 +92,8 @@ export async function getAttendancePolicy(request: Request, response: Response) 
   if (!attendanceIntegrityEnabled()) { response.status(404).json({ message: "Attendance configuration is disabled." }); return; }
   try {
     if (verifiedAttendanceActor(request).role !== "admin") throw new AttendanceCommandError(403, "ADMIN_ONLY", "Attendance configuration is restricted to administrators.");
-    response.set("Cache-Control", "no-store").json({ ...await attendancePolicy(), autoTimeOutEnabled: attendanceAutoTimeOutEnabled() });
+    const policy = await attendancePolicy();
+    response.set("Cache-Control", "no-store").json({ ...policy, autoTimeOutEnabled: attendanceAutoTimeOutEnabled(), policySyncPending: await hasAttendancePolicyRefreshPending(policy.revision) });
   } catch (error) { attendanceError(response, error); }
 }
 export function validateAttendanceAutoTimeOutTime(value: unknown, shiftEnd = "08:00") {
@@ -123,7 +128,12 @@ export async function saveAttendancePolicy(request: Request, response: Response)
           autoTimeOutTime: before.autoTimeOutTime }, after } } }, { upsert: before.revision === 0 });
       if (!saved.modifiedCount && !saved.upsertedCount) throw new AttendanceCommandError(409, "STALE_REVISION", "Configuration changed.");
     } catch (error) { if ((error as { code?: number }).code === 11000) throw new AttendanceCommandError(409, "STALE_REVISION", "Configuration changed."); throw error; }
-    response.json({ _id: "global-attendance", ...after, revision: before.revision + 1, autoTimeOutEnabled: attendanceAutoTimeOutEnabled() });
+    let policySyncPending = false;
+    if (attendanceDurationModelEnabled()) {
+      try { const result = await runAttendancePolicyRefresh(); policySyncPending = Boolean(result.failed || result.deliveryPending); }
+      catch { policySyncPending = true; /* The durable policy revision is retried by the worker. */ }
+    }
+    response.json({ _id: "global-attendance", ...after, revision: before.revision + 1, autoTimeOutEnabled: attendanceAutoTimeOutEnabled(), policySyncPending });
   } catch (error) { attendanceError(response, error); }
 }
 

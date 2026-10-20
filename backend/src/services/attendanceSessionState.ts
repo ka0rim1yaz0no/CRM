@@ -69,11 +69,13 @@ export function projectAttendance(events: SessionEvent[], corrections: SessionCo
         ? sessions.filter((session) => session.shift?.dayKey === active!.shift!.dayKey) : [active];
       const previous = slotSessions.flatMap((session) => session.events).filter((item) => item.source === event.source);
       if (outMode === "LUNCH" && previous.length) {
-        issues.push({ eventId: event.id, message: "Only one lunch is allowed per session.", historical: event.legacyReviewed });
+        issues.push({ eventId: event.id, message: attendanceDurationModelEnabled() ? "Lunch was already started for this attendance slot." : "Only one lunch is allowed per session.", historical: event.legacyReviewed });
         if (!event.legacyReviewed) continue;
       }
       if (outMode === "BREAK" && (previous.length >= 2 || (attendanceBreakGapEnabled() && previous.some((item) => Date.parse(event.at) - Date.parse(item.at) < 30 * 60_000)))) {
-        issues.push({ eventId: event.id, message: "Only two breaks are allowed, with a 30 minute gap between starts.", historical: event.legacyReviewed });
+        const message = attendanceDurationModelEnabled() ? previous.length >= 2 ? "Only two breaks are allowed per attendance slot."
+          : "Please wait at least 30 minutes before starting another break." : "Only two breaks are allowed, with a 30 minute gap between starts.";
+        issues.push({ eventId: event.id, message, historical: event.legacyReviewed });
         if (!event.legacyReviewed) continue;
       }
       active.mode = outMode;

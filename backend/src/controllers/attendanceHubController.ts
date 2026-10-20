@@ -1,7 +1,7 @@
 import type { Request, Response } from "express";
 import { verifyAdminDashboardSession } from "../config/adminDashboardSession";
 import { verifyAttendanceHubSession } from "../config/attendanceHubSession";
-import { attendanceHubEnabled } from "../config/rolloutFlags";
+import { attendanceDurationModelEnabled, attendanceHubEnabled } from "../config/rolloutFlags";
 import { getAttendanceBusinessIdentities, getBusinessAccessForEmployeeCode } from "../models/BusinessUserAccess";
 import { getBusinessById, runForEachBusiness, runWithBusiness, type BusinessConfig } from "../config/tenancy";
 import { defaultSystemSettings } from "./systemSettingsController";
@@ -14,14 +14,15 @@ import { SystemSettings } from "../models/SystemSettings";
 import { calculateHubDay, hubDayKey, hubShiftBounds, hubTimeZone, type HubEvent, type HubSettings } from "../services/attendanceHubMath";
 import { bucketForAttendanceSource } from "../services/timeAccounting";
 import { AttendanceLedger } from "../models/AttendanceLedger";
-import { attendancePolicy } from "../services/attendanceLedgerService";
+import { AttendanceCommandError, attendancePolicy } from "../services/attendanceLedgerService";
+import { attendanceNoteRevision, confirmAttendanceNote } from "../services/attendanceNoteCommand";
 import { projectAttendance } from "../services/attendanceSessionState";
 import { attendanceViewRange, manilaCalendarDate, type ShiftView } from "../../../shared/attendanceView";
 
 type Actor = { role: "admin" | "employee"; code: string };
 type HubDay = ReturnType<typeof calculateHubDay> & {
   employeeCode: string; employeeId: string; employeeName: string; role: string; team: string; scopeKey: string;
-  businessId: string; businessName: string; note: string; noteRevisions: unknown[];
+  businessId: string; businessName: string; note: string; noteRevisions: unknown[]; noteRevision: number; noteExcused: boolean; attendanceRevision: number;
   audit: unknown[]; leave: string | null; absent: boolean; mismatch: boolean; graceMinutes: number;
 };
 const dayPattern = /^\d{4}-\d{2}-\d{2}$/;
@@ -133,7 +134,7 @@ async function loadHub(actor: Actor, filters: ReturnType<typeof assertQuery>, no
       (!filters.team || employee.team === filters.team) && (!filters.role || employee.role === filters.role));
     if (!visible.length) return;
     const ledgers = await AttendanceLedger.find({ employeeCode: { $in: visible.map((employee) => employee.employeeCode) }, businessIds: business.id })
-      .select("employeeCode businessIds events corrections closures jobs").lean();
+      .select("employeeCode businessIds events corrections closures jobs derived revision").lean();
     const identities = await getAttendanceBusinessIdentities(visible.map((employee) => employee.employeeCode));
     businesses.push(business);
     const settingsRecord = await SystemSettings.findOne({ key: "system" }).lean();
@@ -209,6 +210,7 @@ async function loadHub(actor: Actor, filters: ReturnType<typeof assertQuery>, no
           day.review.push("Administrative missing-checkout closure; no Time Out recorded.");
         }
         if (ledger?.jobs.some((job) => !job.done)) day.review.push("Business synchronization pending");
+        if (ledger?.derived?.some((entry) => entry.policyRevision !== policy.revision)) day.review.push("Attendance policy recalculation pending");
         const hired = employee.dateHired && dayDate(employee.dateHired.slice(0, 10)) ? employee.dateHired.slice(0, 10) : null;
         const absent = !eventsForDay.length && !excused && isWorkday(key) && (!hired || key >= hired) && now >= new Date(day.shiftEnd);
         if (absent) { day.status = "Absent"; day.issues.push("ABSENT"); }
@@ -220,7 +222,8 @@ async function loadHub(actor: Actor, filters: ReturnType<typeof assertQuery>, no
         });
         rows.push({ ...day, scopeKey, employeeCode: employee.employeeCode, employeeId: String(employee._id), employeeName: employee.name,
           role: employee.role, team: employee.team, businessId: business.id, businessName: business.name,
-          note: note?.reason || "", noteRevisions: note?.revisions || [], audit, leave: leave?.leaveType || null, absent,
+          note: note?.reason || "", noteRevisions: note?.revisions || [], noteRevision: attendanceNoteRevision(note), noteExcused: note?.excused || false,
+          attendanceRevision: ledger?.revision || 0, audit, leave: leave?.leaveType || null, absent,
           mismatch: false, graceMinutes: settings.lateGraceMinutes });
       }
     }
@@ -430,6 +433,11 @@ export async function saveHubDayNote(request: Request, response: Response) {
     response.status(400).json({ message: "Valid employee, shift day, business, and reason are required." }); return;
   }
   try {
+    if (attendanceDurationModelEnabled()) {
+      response.json(await confirmAttendanceNote({ employeeCode: code, businessId, dayKey, reason, excused,
+        commandId: request.body?.commandId, expectedRevision: request.body?.expectedRevision, expectedNoteRevision: request.body?.expectedNoteRevision }, actor));
+      return;
+    }
     const note = await runWithBusiness(businessId, async () => {
       const employee = await Employee.findOne({ employeeCode: code, status: { $ne: "Archived" } }).select("_id").lean();
       if (!employee) return null;
@@ -439,5 +447,8 @@ export async function saveHubDayNote(request: Request, response: Response) {
     });
     if (!note) { response.status(404).json({ message: "Employee not found in this business." }); return; }
     response.json(note);
-  } catch { response.status(503).json({ message: "Could not save the attendance note." }); }
+  } catch (error) {
+    if (error instanceof AttendanceCommandError) response.status(error.status).json({ code: error.code, message: error.message });
+    else response.status(503).json({ message: "Could not save the attendance note. Your draft is retained." });
+  }
 }

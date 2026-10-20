@@ -8,6 +8,7 @@ import { recoveryCommandId } from "./attendanceLedgerService";
 import { attendanceAutoTimeOutEnabled } from "../config/rolloutFlags";
 import { runAttendanceAutoTimeOut } from "./attendanceAutoTimeOutWorker";
 import { runAttendanceDerivedRefresh } from "./attendanceDerivedRefreshWorker";
+import { runAttendancePolicyRefresh } from "./attendancePolicyRefreshWorker";
 
 export async function runAttendanceRecovery(now = new Date()) {
   if (!attendanceIntegrityEnabled() || attendanceAutoTimeOutEnabled()) return 0;
@@ -36,7 +37,7 @@ export function startAttendanceIntegrityWorker() {
     if (running) return;
     running = true;
     try {
-      for (const run of [runAttendanceAutoTimeOut, runAttendanceRecovery, runAttendanceDerivedRefresh, retryAttendanceLedgers]) {
+      for (const run of [runAttendanceAutoTimeOut, runAttendanceRecovery, runAttendancePolicyRefresh, runAttendanceDerivedRefresh, retryAttendanceLedgers]) {
         try { await run(); } catch { /* Independent maintenance and pending deliveries must still run. */ }
       }
     }

@@ -20,6 +20,7 @@ export type AttendanceSessionSnapshot = {
     historyReviewRequired?: boolean;
     allowedActions?: SessionEvent["source"][];
     autoTimeOutEnabled?: boolean;
+    policySyncPending?: boolean;
     sessions: Array<{ id: string; startedAt: string; endedAt: string | null; mode: string; modeSince: string; lifecycle: string;
         events: SessionEvent[]; shift: AttendanceSessionSnapshot["assignedShift"]; time?: { scheduled: { online: number } } }>;
     audit: Array<{ commandId: string; actor: { code: string; role: string }; reason: string; operation: string; at: string; targetIds: string[] }>;
@@ -36,7 +37,7 @@ export type DashboardAttendanceDay = {
 };
 export type AttendancePolicy = { revision: number; graceMinutes: number; breakMinutes: number; lunchMinutes: number;
     shiftStart: string; shiftEnd: string; recoveryEnabled: boolean; recoveryTime: string; autoTimeOutTime?: string;
-    autoTimeOutEnabled?: boolean };
+    autoTimeOutEnabled?: boolean; policySyncPending?: boolean };
 export type AttendanceCommand = { commandId: string; expectedRevision: number; fingerprint?: string;
     operation: "action" | "correct" | "undo"; source?: SessionEvent["source"]; reason?: string;
     targetCommandId?: string; changes?: Array<{ targetId?: string; source?: SessionEvent["source"]; at?: string; remove?: boolean }> };

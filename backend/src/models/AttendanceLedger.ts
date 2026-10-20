@@ -7,6 +7,7 @@ export type AttendanceActor = { code: string; role: "admin" | "employee" | "syst
 export type AttendanceAudit = { commandId: string; actor: AttendanceActor; reason: string; operation: string; at: string;
   beforeRevision: number; afterRevision: number; targetIds: string[]; beforeState: string; afterState: string;
   beforeDerived?: AttendanceDerivedDay[]; afterDerived?: AttendanceDerivedDay[];
+  noteReference?: { businessId: string; dayKey: string; noteRevision: number; contentHash: string };
   derivedAuditVersion?: 1; removedDerivedDays?: string[]; derivedMetadata?: AttendanceDerivedMetadata[] };
 export type AttendanceLedgerDocument = {
   _id: string; employeeCode: string; businessIds: string[]; canonicalBusinessId: string; revision: number; fence: number;

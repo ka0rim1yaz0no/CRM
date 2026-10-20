@@ -42,6 +42,7 @@ export async function deliverAttendanceLedger(identityKey: string, options: {
   const emitAvailability = options.emitAvailability || emitEmployeeAvailabilityUpdated;
   const deliveredBusinessIds: string[] = [];
   for (const businessId of pending) {
+    let notification: Parameters<typeof emitAvailability>[0] | undefined;
     try {
       await runWithBusiness(businessId, async () => {
         const employee = await Employee.findOne({ employeeCode: ledger.employeeCode, status: { $ne: "Archived" } }).select("_id").lean();
@@ -55,7 +56,7 @@ export async function deliverAttendanceLedger(identityKey: string, options: {
               ? { _id: origin.recordId, $or: [{ ledgerRevision: { $lte: ledger.revision } }, { ledgerRevision: { $exists: false } }] }
               : { employee: employee._id, eventId: event.id, $or: [{ ledgerRevision: { $lte: ledger.revision } }, { ledgerRevision: { $exists: false } }] },
             update: { $set: { employee: employee._id, eventId: event.id, source: event.source, timeIn: new Date(event.at),
-              isEffective: true, ledgerIdentity: ledger._id, ledgerRevision: ledger.revision,
+              isEffective: true, ledgerIdentity: ledger._id, ledgerRevision: ledger.revision, sequence: event.sequence,
               ...(event.autoTimeOut === undefined ? {} : { autoTimeOut: event.autoTimeOut }),
               ...(durationModel && derivedByEvent.has(event.id) ? { derived: derivedByEvent.get(event.id) } : {}),
               attendanceStatus: attendanceEventStatus(event.source, new Date(event.at), shifts.get(event.id) || null, policy.graceMinutes) },
@@ -77,7 +78,7 @@ export async function deliverAttendanceLedger(identityKey: string, options: {
         const firstPendingRevision = Math.min(...ledger.jobs.filter((job) => !job.done && job.businessId === businessId).map((job) => job.revision));
         const affected = ledger.audit.filter((audit) => audit.afterRevision >= firstPendingRevision && audit.afterRevision <= ledger.revision &&
           (durationModel || ["correct", "undo", "recover", "auto-time-out"].includes(audit.operation)));
-        emitAvailability({ employeeId: String(employee._id), availabilityStatus: state });
+        notification = { employeeId: String(employee._id), availabilityStatus: state };
         if (affected.length || durationModel) {
           const targets = new Set(affected.flatMap((audit) => audit.targetIds));
           const commands = new Set(affected.map((audit) => audit.commandId));
@@ -96,6 +97,11 @@ export async function deliverAttendanceLedger(identityKey: string, options: {
       if (completion.matchedCount) deliveredBusinessIds.push(businessId);
     } catch {
       // The command is already durable. The pending job remains retryable.
+    } finally {
+      // Publish after payroll and the completion marker so a refreshing tab cannot race the saved totals.
+      if (notification) {
+        try { await runWithBusiness(businessId, () => emitAvailability(notification!)); } catch { /* Reads and durable retries remain available. */ }
+      }
     }
   }
   return { revision: ledger.revision, deliveredBusinessIds, pendingBusinessIds: pending.filter((id) => !deliveredBusinessIds.includes(id)) };

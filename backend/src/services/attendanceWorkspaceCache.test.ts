@@ -14,6 +14,10 @@ test("manual attendance refresh invalidates shift lists, details and all assigne
     ["attendance-hub", "fake-admin", "synthetic-b", { shiftView: "today" }],
     ["attendance-hub-day", "synthetic-b", "2026-10-19", "99009991"],
     ["attendance-hub-live", "synthetic-b"],
+    ["payroll-records", { businessId: "synthetic-a" }],
+    ["payroll-stats"],
+    ["payroll-dtr", "employee-b", "synthetic-period"],
+    ["payroll-payslip-dtr", "employee-a", "synthetic-period"],
   ];
   try {
     for (const key of keys) client.setQueryData(key, { synthetic: true });
