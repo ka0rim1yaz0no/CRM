@@ -52,6 +52,12 @@ export function validAttendanceCutoff(value: string) {
     return /^([01]\d|2[0-3]):[0-5]\d$/.test(value);
 }
 
+export function attendanceRestActionLabel(control: Pick<AttendanceDurationControl, "label" | "state">) {
+    const name = control.label === "Lunch" ? "Lunch" : "Break";
+    // Display wording does not rename the stored attendance event sources.
+    return `${name} ${control.state === "active" ? "Out" : "In"}`;
+}
+
 export function attendanceBreakControl(controls: AttendanceDurationControl[]) {
     const breaks = controls.filter((control) => control.label !== "Lunch");
     const control = breaks.find((item) => item.state === "active") || breaks.find((item) => item.state === "available")

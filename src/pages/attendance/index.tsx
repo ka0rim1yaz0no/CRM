@@ -476,7 +476,7 @@ import { buildOffPhoneAttendanceSessions, formatAttendanceDuration } from "../..
 import { formatDateInTimeZone, formatTimeInTimeZone } from "../../lib/dateTime";
 import MainLayout from "../layout";
 import { attendanceDurationModelEnabled, attendanceIntegrityEnabled, getAttendanceSession, sessionEventRecord, type AttendanceSessionSnapshot } from "../../api/attendanceSession";
-import { attendanceBreakControl, attendanceDurationControls } from "../../lib/attendanceDurationUi";
+import { attendanceBreakControl, attendanceDurationControls, attendanceRestActionLabel } from "../../lib/attendanceDurationUi";
 import { attendanceServerNow } from "../../lib/attendanceHubState";
 import { getActiveBusinessId } from "../../api/businessStorage";
 import "./attendance.css";
@@ -931,15 +931,16 @@ export default function AttendancePage() {
             : statusDisabled(status));
         const Icon = active ? FiLogIn : FiCoffee;
         const label = index === 0 ? "Break" : "Lunch";
+        const actionLabel = attendanceRestActionLabel(control);
         const action = active ? index === 1 ? "End lunch" : `End break ${breakControl.breakNumber}`
             : control.state === "done" ? "Done" : control.state === "review" ? "Needs review" : index === 0 ? `Start break ${breakControl.breakNumber}` : "Start";
         return <button key={label} type="button" disabled={disabled}
-            aria-label={`${label}: ${action}`} title={action} aria-pressed={active}
+            aria-label={`${actionLabel}: ${action}`} title={`${actionLabel}: ${action}`} aria-pressed={active}
             onClick={() => handleStatusChange(active ? "ONLINE" : status)}
             className={["inline-flex h-12 min-w-0 items-center justify-center gap-2 rounded-lg border px-4 text-sm font-semibold shadow-lg transition disabled:cursor-not-allowed disabled:border-slate-300 disabled:bg-slate-200 disabled:text-slate-500 disabled:shadow-none",
                 statusButtonStyles[status],
                 active ? "ring-2 ring-slate-950/20 ring-offset-2" : ""].join(" ")}>
-            <Icon className="shrink-0" aria-hidden="true" /><span>{label}</span>
+            <Icon className="shrink-0" aria-hidden="true" /><span>{actionLabel}</span>
         </button>;
     });
     const actionButtons = statusOrder.filter((status) => !attendanceDurationModelEnabled || (status !== "BREAK" && status !== "LUNCH")).map((status) => {

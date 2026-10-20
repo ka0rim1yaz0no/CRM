@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
-import { attendanceBreakControl, attendanceDurationControls, hasAutoTimeOut, validAttendanceCutoff } from "../src/lib/attendanceDurationUi.ts";
+import { attendanceBreakControl, attendanceDurationControls, attendanceRestActionLabel, hasAutoTimeOut, validAttendanceCutoff } from "../src/lib/attendanceDurationUi.ts";
 
 const start = Date.parse("2026-10-20T17:00:00Z");
 const event = (source, seconds, sequence = 0) => ({ source, timeIn: new Date(start + seconds * 1000).toISOString(), sequence });
@@ -38,6 +38,17 @@ test("an administratively closed missing return stops timing and consumes a brea
     assert.equal(selected.control.label, "Break 2");
     assert.equal(selected.used, 1);
     assert.equal(selected.exhausted, false);
+});
+
+test("visible In starts a rest and Out ends it for both break cycles and lunch after reload", () => {
+    const states = [[], [event("Break Out", 0)], pair(900), [...pair(900), event("Break Out", 2000)],
+        [...pair(900), event("Break Out", 2000), event("Break In", 2900)]];
+    assert.deepEqual(states.map((records) => attendanceRestActionLabel(attendanceBreakControl(
+        attendanceDurationControls(JSON.parse(JSON.stringify(records)), start + 3_000_000)).control)),
+    ["Break In", "Break Out", "Break In", "Break Out", "Break In"]);
+    assert.deepEqual([[], [event("Lunch Break Out", 0)], pair(3600, "Lunch Break Out", "Lunch Break In")]
+        .map((records) => attendanceRestActionLabel(attendanceDurationControls(records, start + 4_000_000)[2])),
+    ["Lunch In", "Lunch Out", "Lunch In"]);
 });
 
 test("completed break excess displays server nearest-minute values without recomputing", () => {
@@ -125,11 +136,13 @@ test("frontend rollout is explicit true only and retains the legacy controls", (
     assert.match(settings, /!attendanceDurationModelEnabled && <>/);
 });
 
-test("Break and Lunch match the other button heights and show only their names", () => {
+test("Break and Lunch keep matching button heights and display their next action", () => {
     const page = readFileSync(new URL("../src/pages/attendance/index.tsx", import.meta.url), "utf8");
     const buttons = page.slice(page.indexOf("const durationButtons ="), page.indexOf("const actionButtons ="));
     assert.match(buttons, /inline-flex h-12 min-w-0 items-center/);
-    assert.match(buttons, /<span>\{label\}<\/span>/);
+    assert.match(buttons, /const actionLabel = attendanceRestActionLabel\(control\)/);
+    assert.match(buttons, /<span>\{actionLabel\}<\/span>/);
+    assert.match(buttons, /aria-label=\{`\$\{actionLabel\}: \$\{action\}`\}/);
     assert.doesNotMatch(buttons, /h-32|"Available"|of 2 used|Over by|Excess pending refresh/);
     assert.match(buttons, /aria-pressed=\{active\}/);
 });
