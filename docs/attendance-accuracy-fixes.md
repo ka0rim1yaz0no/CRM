@@ -1,5 +1,15 @@
 # Local Attendance Accuracy Review
 
+## October 21 Follow-Up: Immediate Early Checkout
+
+The user subsequently changed the early-departure presentation rule: with `CRM_ATTENDANCE_ACCURACY_FIXES` enabled, a recorded Offline/Time Out (or Logout) before the scheduled shift end now shows undertime immediately. The shared `calculateSlotAttendance` remains the only calculation, reused by canonical derived days, the admin hub, employee dashboard presentation, and payroll calculation detail. Open sessions, including break/lunch/off-phone and a reopened session, have no undertime. Closing again uses only the latest departure, with the existing upward minute rounding and shift-window clipping. Future-dated checkout does not trigger this early calculation. Flag-off behavior still waits for shift end.
+
+Example: an 08:00 scheduled end and 06:35:11 checkout produce 85 minutes of undertime immediately. No new attendance events or automatic checkout rules are added. Payroll remains provisional/review-blocked until scheduled shift end; a visible undertime badge is not permission to finalize payroll early. Existing saved historical snapshots and approved cutoffs are not rewritten by this change.
+
+Regression tests first reproduced three failures (expected 85/60 minutes, received zero). Added HTTP coverage verifies closed/reopened sessions, active online/break/lunch/off-phone modes, stored replicas, dashboard numbers, hub badges and summary totals in three synthetic businesses, including repeated read-only refreshes.
+
+Follow-up verification: backend typecheck and root lint/build passed; all 531 backend tests completed (529 passed, two optional external-Mongo skips), and all 64 frontend regression tests passed. After backing up the four isolated local databases, localhost:5173 was restarted with this source; normal admin login, business switching, and refresh showed Alex's same 06:35 checkout as 85m with the UNDERTIME badge in Sample Studio and Sample Operations. Existing attendance evidence/derived snapshots and saved payroll fingerprints were unchanged through restart and read-only previews. Initial startup requests hit the API throttle; after its existing window cleared, a normal reload/login worked without altering security limits. New behavior is a live read calculation for the existing example, not an automatic historical snapshot rewrite. Local backup: `outputs/security-phase1-fixture-1792536422556`; screenshot: `outputs/immediate-undertime-local.png`. The user authorized publishing this follow-up to GitHub, but not online deployment.
+
 Scope: local source only. No deployment, GitHub push, historical rewrite, or production flag change is authorized by this task. Employee attendance markup/styles, CallDashboardPanel.tsx, api/callDashboard.ts, and authentication/security rules are excluded.
 
 ## Phase 0: Reproduction

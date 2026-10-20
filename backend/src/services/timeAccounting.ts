@@ -49,7 +49,8 @@ export function calculateSlotAttendance(records: Array<{ source: string; timeIn:
   const accurate = payrollAccuracyEnabled() || attendanceAccuracyFixesEnabled();
   const lateEnd = accurate && first ? Math.min(first.timeIn.getTime(), policy.shiftEnd.getTime()) : first?.timeIn.getTime();
   const lateMinutes = first ? Math.max(0, Math.floor((lateEnd! - policy.shiftStart.getTime()) / 60_000) - policy.graceMinutes) : 0;
-  const earlyTimeOutMinutes = first && timeOut && now >= policy.shiftEnd
+  // A recorded checkout establishes early departure; an open/reopened session never does.
+  const earlyTimeOutMinutes = first && timeOut && (now >= policy.shiftEnd || (attendanceAccuracyFixesEnabled() && timeOut.timeIn <= now))
     ? Math.max(0, Math.ceil((policy.shiftEnd.getTime() - (accurate ? Math.max(timeOut.timeIn.getTime(), first.timeIn.getTime(), policy.shiftStart.getTime()) : timeOut.timeIn.getTime())) / 60_000)) : 0;
   const excessBreakMinutes = breakSessions.reduce((total, interval) => total + interval.excessMinutes, 0);
   const excessLunchMinutes = lunchSessions.reduce((total, interval) => total + interval.excessMinutes, 0);

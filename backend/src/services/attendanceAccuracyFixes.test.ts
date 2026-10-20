@@ -17,6 +17,63 @@ afterEach(() => { for (const key of ["CRM_ATTENDANCE_ACCURACY_FIXES", "CRM_PAYRO
 } });
 const enable = () => { process.env.CRM_ATTENDANCE_ACCURACY_FIXES = "true"; process.env.CRM_PAYROLL_ACCURACY = "true"; };
 
+test("accuracy: a completed early checkout shows undertime immediately in every attendance consumer", () => {
+  enable();
+  const records = [punch("Time In", 454, 57), punch("Time Out", 455, 11)];
+  const now = records[1].timeIn;
+  const before = structuredClone(records);
+  const expected = calculateSlotAttendance(records, policy, now);
+  assert.equal(expected.earlyTimeOutMinutes, 85);
+  assert.ok(expected.issues.includes("UNDER TIME"));
+  const settings = { officialShiftStartTime: "23:00", officialShiftEndTime: "08:00", lateGraceMinutes: 0, attendanceTimeZone: "Asia/Manila" };
+  const events: SessionEvent[] = records.map((record, sequence) => ({ id: `early-${sequence}`, source: record.source as SessionEvent["source"],
+    at: record.timeIn.toISOString(), recordedAt: record.timeIn.toISOString(), sequence, commandId: `early-cmd-${sequence}`,
+    ...(sequence === 0 ? { shift: assignAttendanceShift(record.timeIn) } : {}) }));
+  const hub = calculateHubDay("2026-10-15", events.map(event => ({ ...event, at: new Date(event.at) })), settings, now);
+  const derived = deriveAttendanceDays({ events }, { ...policy, shiftStart: "23:00", shiftEnd: "08:00" }, now)[0];
+  const dashboard = attendanceDashboardPresentation({ records: events, sessions: [{ shift: events[0].shift!, events }] },
+    { ...policy, shiftStart: "23:00", shiftEnd: "08:00" }, now).dashboardDays[0];
+  for (const day of [hub, dashboard]) assert.equal(day.milliseconds.underTime, 85 * 60_000);
+  assert.ok(hub.issues.includes("UNDER TIME"));
+  assert.equal(derived.earlyTimeOutMinutes, 85); assert.ok(derived.issues.includes("UNDER TIME"));
+  const payroll = accuratePayrollDay(records, policy, now, 8, false);
+  assert.equal(payroll.calculated.earlyTimeOutMinutes, 85);
+  assert.equal(payroll.review, true, "the shift is still provisional for payroll until its scheduled end");
+  assert.equal(payroll.components.deductibleMinutes, 0, "showing undertime must not bypass payroll review");
+  assert.deepEqual(records, before, "read calculations must not change evidence");
+});
+
+test("accuracy: online, break, lunch, off-phone and reopened sessions never show undertime", () => {
+  enable();
+  for (const source of ["Time In", "Break Out", "Lunch Break Out", "Off the Phone Out"]) {
+    const records = [punch("Time In", 0), punch("Time Out", 450), punch("Time In", 455),
+      ...(source === "Time In" ? [] : [punch(source, 456)])];
+    for (const asOf of [punch("", 457).timeIn, end]) {
+      const day = calculateSlotAttendance(records, policy, asOf);
+      assert.equal(day.hasOpenSession, true); assert.equal(day.earlyTimeOutMinutes, 0);
+      assert.ok(!day.issues.includes("UNDER TIME"));
+    }
+  }
+  const closedAgain = calculateSlotAttendance([punch("Time In", 0), punch("Time Out", 450), punch("Time In", 455), punch("Time Out", 480)], policy, punch("", 480).timeIn);
+  assert.equal(closedAgain.earlyTimeOutMinutes, 60, "use only the latest checkout, not the earlier gap");
+});
+
+test("accuracy: early checkout respects custom shift end, ceil rounding, and flag rollback", () => {
+  enable();
+  for (const [minute, second, expected] of [[455, 0, 85], [455, 1, 85], [454, 59, 86], [540, 0, 0], [545, 0, 0]]) {
+    const records = [punch("Time In", 0), punch("Time Out", minute, second)];
+    assert.equal(calculateSlotAttendance(records, policy, records[1].timeIn).earlyTimeOutMinutes, expected);
+  }
+  const custom = { ...policy, shiftStart: new Date("2026-10-31T14:00:00Z"), shiftEnd: new Date("2026-10-31T23:00:00Z") };
+  const records = [{ source: "Time In", timeIn: custom.shiftStart }, { source: "Time Out", timeIn: new Date("2026-10-31T21:35:00Z") }];
+  assert.equal(calculateSlotAttendance(records, custom, records[1].timeIn).earlyTimeOutMinutes, 85);
+  assert.equal(calculateSlotAttendance(records, custom, new Date(+records[1].timeIn - 1)).earlyTimeOutMinutes, 0, "future-dated checkout cannot trigger early departure yet");
+  assert.equal(calculateSlotAttendance([records[0], { ...records[1], source: "Logout" }], custom, records[1].timeIn).earlyTimeOutMinutes, 85);
+  process.env.CRM_ATTENDANCE_ACCURACY_FIXES = "false";
+  assert.equal(calculateSlotAttendance(records, custom, records[1].timeIn).earlyTimeOutMinutes, 0);
+  assert.equal(calculateSlotAttendance(records, custom, custom.shiftEnd).earlyTimeOutMinutes, 85);
+});
+
 for (const [name, source, duration, expected] of [
   ["manual timeout break", "Break Out", 100, 25], ["08:05 automatic timeout break", "Break Out", 545, 470],
   ["manual timeout lunch", "Lunch Break Out", 140, 20],

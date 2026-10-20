@@ -212,6 +212,50 @@ test("HTTP: two back-to-back 15-minute breaks, one 60-minute lunch, and atomic r
   }
 });
 
+test("HTTP: early Offline shows undertime immediately in every business; active and reopened modes clear it", async () => {
+  const person = await fixture();
+  const verify = async (expected: number, mode: string) => {
+    const before = await core(person);
+    for (const [index, business] of businesses.entries()) {
+      const current = await session(person, index);
+      assert.equal(current.state, mode); assert.equal(current.syncPending, false);
+      assert.equal(current.derived[0].earlyTimeOutMinutes, expected);
+      assert.equal(current.dashboardDays[0].milliseconds.underTime, expected * 60_000);
+      const hub = await request<{ rows: Array<{ mismatch: boolean; timeOut: string | null; issues: string[];
+        milliseconds: { underTime: number } }>; summary: { underTimeCount: number; underTime: number } }>(person, index,
+        `/attendance-hub/days?business=${business}&employee=${person.code}&shiftView=date&shiftDate=${shiftDay}`, { admin: true });
+      assert.equal(hub.rows.length, 1); assert.equal(hub.rows[0].mismatch, false);
+      assert.equal(hub.rows[0].milliseconds.underTime, expected * 60_000);
+      assert.equal(hub.rows[0].issues.includes("UNDER TIME"), expected > 0);
+      assert.equal(Boolean(hub.rows[0].timeOut), mode === "OFFLINE");
+      assert.equal(hub.summary.underTimeCount, expected > 0 ? 1 : 0);
+      assert.equal(hub.summary.underTime, expected * 60_000);
+      await runWithBusiness(business, async () => {
+        const copies = await Attendance.find({ employee: person.ids[index], isEffective: { $ne: false } }).lean();
+        assert.ok(copies.length);
+        for (const copy of copies) assert.equal(copy.derived!.earlyTimeOutMinutes, expected);
+      });
+    }
+    assert.equal(await core(person), before, "refreshing cannot write attendance or payroll");
+  };
+  await action(person, "Time In", 454 * 60);
+  await verify(0, "ONLINE");
+  await action(person, "Time Out", 455 * 60 + 11);
+  await verify(85, "OFFLINE");
+  await action(person, "Time In", 456 * 60, 200, 1);
+  await verify(0, "ONLINE");
+  await action(person, "Break Out", 456 * 60 + 1);
+  await verify(0, "BREAK");
+  await action(person, "Break In", 456 * 60 + 2);
+  await action(person, "Lunch Break Out", 456 * 60 + 3);
+  await verify(0, "LUNCH");
+  await action(person, "Lunch Break In", 456 * 60 + 4);
+  await action(person, "Off the Phone Out", 456 * 60 + 5);
+  await verify(0, "OFF THE PHONE");
+  await action(person, "Time Out", 480 * 60, 200, 2);
+  await verify(60, "OFFLINE");
+});
+
 test("HTTP: accuracy rounding is 15:00 = 0, 15:01 = 1, and 15:30 = 1 minute after refresh", async () => {
   for (const [duration, expected] of [[900, 0], [901, 1], [930, 1]]) {
     mock.timers.setTime(start);
