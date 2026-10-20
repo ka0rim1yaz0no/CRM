@@ -60,7 +60,7 @@ jobs:
         run: npx tsx --test $(find src -type f -name '*.test.ts' -print)
 
       - name: Run frontend attendance, security and payroll regressions
-        run: node --test scripts/attendance-duration-ui.test.mjs scripts/credential-vault-ui.test.mjs scripts/security-auth-ui.test.mjs scripts/data-check-ui.test.mjs scripts/payroll-accuracy-ui.test.mjs scripts/payroll-payslip-ui.test.mjs scripts/payslip-pdf.test.mjs
+        run: node --test scripts/attendance-duration-ui.test.mjs scripts/credential-vault-ui.test.mjs scripts/security-auth-ui.test.mjs scripts/session-authorization-ui.test.mjs scripts/data-check-ui.test.mjs scripts/payroll-accuracy-ui.test.mjs scripts/payroll-payslip-ui.test.mjs scripts/payslip-pdf.test.mjs
 
       - name: Run blocking lint
         run: npm run lint

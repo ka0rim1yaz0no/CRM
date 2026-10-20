@@ -2,7 +2,8 @@ import axios from "axios";
 import { backendOrigin } from "./backendUrl";
 import { emitToast } from "./toast";
 import { getActiveBusinessId } from "../api/businessStorage";
-import { getAuthUser } from "../api/authStorage";
+import { getAuthUser, clearAuthUser } from "../api/authStorage";
+import { shouldExpireCrmSession } from "./sessionAuthorization";
 
 export const api = axios.create({
     baseURL: import.meta.env.VITE_API_URL || `${backendOrigin}/api`,
@@ -41,6 +42,11 @@ api.interceptors.response.use(
         return response;
     },
     (error) => {
+        if (shouldExpireCrmSession(error, getAuthUser())) {
+            clearAuthUser();
+            emitToast({ tone: "error", message: "Your session has expired. Sign in again to continue." });
+            return Promise.reject(error);
+        }
         const method = error?.config?.method;
         const url = error?.config?.url || "";
 

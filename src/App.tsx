@@ -1,11 +1,12 @@
 
 import { BrowserRouter, Navigate, Route, Routes, useLocation } from 'react-router'
-import { lazy, Suspense } from 'react'
+import { lazy, Suspense, useSyncExternalStore } from 'react'
 import type { ReactNode } from 'react'
 import { getAuthUser } from './api/authStorage'
 import { isPocOperationsUser } from './lib/roleAccess'
 import { EmployeeLiveShareProvider } from './components/EmployeeLiveShare'
 import EmployeeVoiceCall from './components/EmployeeVoiceCall'
+import { subscribeCredentialContext, getCredentialContextRevision } from './lib/credentialContext'
 
 const FeatureRoute = lazy(() => import('./components/FeatureRoute'))
 const Login = lazy(() => import('./pages/Login'))
@@ -162,6 +163,7 @@ function RoutedApp() {
 }
 
 function App() {
+  useSyncExternalStore(subscribeCredentialContext, getCredentialContextRevision)
   return (
     <BrowserRouter>
       <EmployeeLiveShareProvider>

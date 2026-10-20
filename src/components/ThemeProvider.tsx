@@ -11,12 +11,13 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
         const refresh = () => {
             const request = ++generation;
             setAppTheme(getStoredThemeKey());
-            if (getAuthUser()?.userType === "admin") return;
+            const auth = getAuthUser();
+            if (!auth || auth.userType === "admin") return;
             const business = getActiveBusinessId();
             void import("../api/systemSettings")
-                .then(({ getSystemSettings }) => getSystemSettings())
+                .then(({ getSystemSettings }) => request === generation && getAuthUser()?.attendanceHubSession === auth.attendanceHubSession ? getSystemSettings() : null)
                 .then((settings) => {
-                    if (request === generation && business === getActiveBusinessId() && !hasAppThemeOverride()) {
+                    if (settings && request === generation && business === getActiveBusinessId() && !hasAppThemeOverride()) {
                         setAppTheme(settings.themeKey, { userOverride: false });
                     }
                 })

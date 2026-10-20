@@ -73,6 +73,26 @@ test("full admin remains allowed and employee/tracker cannot elevate, including 
   }
   assert.equal((await request("/employees", "synthetic-owner", "auth-c")).status, 403);
 });
+
+test("system settings retain signed access across businesses and classify expiry without changing attendance", async () => {
+  const { AttendanceLedger } = await import("../models/AttendanceLedger");
+  const { Attendance } = await import("../models/Attendance");
+  const fingerprint = async () => JSON.stringify({ ledgers: await AttendanceLedger.find({}).sort({ _id: 1 }).lean(),
+    copies: await Promise.all(["auth-a", "auth-b", "auth-c"].map(business => runWithBusiness(business, () => Attendance.find({}).sort({ _id: 1 }).lean()))) });
+  const before = await fingerprint();
+  for (const business of ["auth-a", "auth-b"]) {
+    for (const actor of ["synthetic-full", "synthetic-tracker", "synthetic-owner"]) {
+      for (let refresh = 0; refresh < 2; refresh++) assert.equal((await request("/system-settings", actor, business)).status, 200);
+    }
+    const invalid = await request("/system-settings", "", business, undefined, { "X-CRM-Admin-Session": "expired-synthetic-token" });
+    assert.equal(invalid.status, 401); assert.equal((await invalid.json()).code, "CRM_SESSION_REQUIRED");
+    const denied = await fetch(base + "/api/system-settings", { method: "PUT", headers: { "Content-Type": "application/json", "X-Business-Id": business,
+      "X-CRM-Attendance-Session": tokens["synthetic-owner"].attendanceHubSession! }, body: JSON.stringify({ lateGraceMinutes: 99 }) });
+    assert.equal(denied.status, 403, "reading settings never grants employees configuration-write access");
+  }
+  assert.equal((await request("/system-settings", "synthetic-owner", "auth-c")).status, 403);
+  assert.equal(await fingerprint(), before, "settings reads and authentication failures cannot write attendance");
+});
 test("owner scope defeats spoofed employee ids, filters and task population never exposes bank fields", async () => {
   for (const business of ["auth-a", "auth-b"]) {
     const [own, other] = ids[business];

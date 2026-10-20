@@ -37,7 +37,7 @@ function denied(response: Response) { response.status(403).json({ message: "This
 export async function authenticateLegacyAuthRoute(request: Request, response: Response, next: NextFunction) {
   if (!securityLegacyAuthEnabled()) return next();
   const actor = signedCrmIdentity(request.header("x-crm-admin-session"), request.header("x-crm-attendance-session"));
-  if (!actor) { response.status(401).json({ message: "A signed CRM session is required." }); return; }
+  if (!actor) { response.status(401).json({ code: "CRM_SESSION_REQUIRED", message: "A signed CRM session is required." }); return; }
   if (actor.access === "tracker") return denied(response);
   if (actor.type === "employee") {
     const employee = await signedEmployeeInBusiness(actor.code, request.business?.id || "");
@@ -61,7 +61,7 @@ export async function legacyAuthentication(request: Request, response: Response,
   catch { response.status(400).json({ message: "Invalid request path." }); return; }
   if (usesIndependentCredential(path, request.method) || response.locals.crmVerifiedFileSession) return next();
   const actor = signedCrmIdentity(request.header("x-crm-admin-session"), request.header("x-crm-attendance-session"));
-  if (!actor) { response.status(401).json({ message: "Sign in again. A signed CRM session is required." }); return; }
+  if (!actor) { response.status(401).json({ code: "CRM_SESSION_REQUIRED", message: "Sign in again. A signed CRM session is required." }); return; }
   const employee = actor.type === "employee" ? await signedEmployeeInBusiness(actor.code, request.business?.id || "") : null;
   if (actor.type === "employee" && !employee) return denied(response);
   const name = employee?.name || actor.name;
