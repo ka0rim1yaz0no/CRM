@@ -1,0 +1,82 @@
+/* Keep the print document outside modal scrolling and independent of screen width. */
+.payroll-print-root {
+  position: absolute;
+  top: 0;
+  left: -10000px;
+  width: 190mm;
+  visibility: hidden;
+  pointer-events: none;
+  background: #ffffff;
+  color: #0f172a;
+  font-family: Arial, sans-serif;
+}
+
+.payroll-print-root .payslip-print {
+  position: static !important;
+  inset: auto !important;
+  width: 100% !important;
+  height: auto !important;
+  min-height: 0 !important;
+  max-height: none !important;
+  padding: 0 !important;
+  overflow: visible !important;
+  box-shadow: none !important;
+  line-height: 1.25;
+}
+
+.payroll-print-root .payslip-print > div {
+  overflow: visible;
+}
+
+.payroll-print-root :is(p, td, th) {
+  overflow-wrap: anywhere;
+}
+
+.payroll-print-root .grid > div {
+  min-width: 0;
+}
+
+@page payroll-payslip {
+  size: A4 portrait;
+  margin: 10mm;
+}
+
+@media print {
+  html:has(body > .payroll-print-root),
+  body:has(> .payroll-print-root) {
+    width: auto !important;
+    min-width: 0 !important;
+    height: auto !important;
+    min-height: 0 !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    overflow: visible !important;
+    background: #ffffff !important;
+  }
+
+  body:has(> .payroll-print-root) > :not(.payroll-print-root) {
+    display: none !important;
+  }
+
+  .payroll-print-root {
+    position: static !important;
+    inset: auto !important;
+    width: 100% !important;
+    max-width: 190mm;
+    height: auto !important;
+    visibility: visible !important;
+    page: payroll-payslip;
+  }
+
+  .payroll-print-root,
+  .payroll-print-root * {
+    visibility: visible !important;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  .payroll-print-root :is(.payslip-print, table, tr) {
+    break-inside: avoid-page;
+    page-break-inside: avoid;
+  }
+}

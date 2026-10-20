@@ -1,5 +1,7 @@
 import type { FormEvent } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+import "./payslip-print.css";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toPng } from "html-to-image";
 import {
@@ -1645,6 +1647,11 @@ export default function PayrollPage() {
                     </div>
                 )}
 
+                {payslipRecord && payslipPreviewRecord && createPortal(
+                    <div className="payroll-print-root" aria-hidden="true" data-payroll-print-sheet>
+                        <PayslipDocument record={payslipPreviewRecord} money={money} payrollRunDay={systemSettings?.payrollRunDay} />
+                    </div>, document.body
+                )}
                 {payslipRecord && payslipPreviewRecord && (
                     <div
                         className="modal-backdrop-enter fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4 py-6 backdrop-blur-sm"

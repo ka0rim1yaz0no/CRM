@@ -101,3 +101,11 @@ test("print action invokes printing only for a verified loaded payslip", () => {
         assert.equal(printed, Number(ready));
     }
 });
+test("print sheet reuses the payslip document outside the clipping modal with bounded paper layout", () => {
+    const css = readFileSync(new URL("../src/pages/admin/payroll/payslip-print.css", import.meta.url), "utf8");
+    assert.match(source, /createPortal\([\s\S]*?className="payroll-print-root"[\s\S]*?<PayslipDocument record=\{payslipPreviewRecord\}[\s\S]*?document\.body/);
+    for (const rule of ["width: 190mm", "size: A4 portrait", "margin: 10mm", "min-height: 0 !important", "overflow: visible !important", "position: static !important", "break-inside: avoid-page", "print-color-adjust: exact"])
+        assert.ok(css.includes(rule), rule);
+    assert.match(css, /body:has\(> \.payroll-print-root\) > :not\(\.payroll-print-root\)\s*\{\s*display: none !important/);
+    assert.doesNotMatch(css, /position: fixed|max-height:\s*\d|overflow:\s*hidden/);
+});
