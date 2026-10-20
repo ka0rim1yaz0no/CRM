@@ -1,6 +1,9 @@
 import { useEffect, useRef } from "react";
-import { useNavigate } from "react-router";
+import { useLocation, useNavigate } from "react-router";
+import { useQueryClient } from "@tanstack/react-query";
 import { getAuthUser } from "../api/authStorage";
+import { getActiveBusinessId } from "../api/businessStorage";
+import { displayedQueueChanged, firstDisplayedAutoCallLead, isAutoCallLeadAssigned } from "../lib/displayedAutoCallQueue";
 import {
     activateCallBridgeForEmployee,
     callTimingV2Enabled,
@@ -75,22 +78,12 @@ function getTerminalLeadReservationErrorCode(error: unknown) {
     return code === "LEAD_ALREADY_COMMENTED" || code === "LEAD_NOT_ASSIGNED" || code === "LEAD_NOT_FOUND" || code === "LEAD_NOT_CALLABLE" ? code : null;
 }
 
-function isLeadAssignedToEmployee(
-    lead: Awaited<ReturnType<typeof getLead>>,
-    employeeId: string,
-    employeeNames: string[]
-) {
-    const assignedAgentId = typeof lead.assignedAgent === "object" && lead.assignedAgent
-        ? String(lead.assignedAgent._id || "")
-        : String(lead.assignedAgent || "");
-    const normalizedEmployeeNames = new Set(employeeNames.map((value) => value.trim().toLowerCase()).filter(Boolean));
-
-    return assignedAgentId === employeeId || normalizedEmployeeNames.has(String(lead.assignedAgentName || "").trim().toLowerCase());
-}
-
 export default function EmployeeAutoCaller() {
     const isChecking = useRef(false);
     const navigate = useNavigate();
+    const queryClient = useQueryClient();
+    const isLeadsPage = useLocation().pathname === "/leads";
+    const activeBusinessId = getActiveBusinessId();
 
     useEffect(() => {
         const initialAuthUser = getAuthUser();
@@ -151,6 +144,8 @@ export default function EmployeeAutoCaller() {
 
         const employeeId = initialAuthUser.user._id;
         const employeeCode = String(initialAuthUser.user.employeeCode || employeeId).trim();
+        const businessId = activeBusinessId;
+        const scope = { employeeId, businessId };
         const lastCallStorageKey = `${AUTO_CALL_STORAGE_PREFIX}:${employeeCode}`;
         let isDisposed = false;
         let intervalId: number | undefined;
@@ -166,7 +161,7 @@ export default function EmployeeAutoCaller() {
 
             const authUser = getAuthUser();
 
-            if (authUser?.userType !== "employee" || authUser.user._id !== employeeId) {
+            if (authUser?.userType !== "employee" || authUser.user._id !== employeeId || getActiveBusinessId() !== businessId) {
                 return;
             }
 
@@ -224,50 +219,17 @@ export default function EmployeeAutoCaller() {
                 const employeeNames = Array.from(
                     new Set([employee.name, employee.employeeCode, ...(employee.aliases || [])].filter(Boolean))
                 );
-                let pendingComment = getAutoCallPendingComment(employee.employeeCode);
-
-                let queueAutoCallLead: Awaited<ReturnType<typeof getNextAutoCallLead>> = null;
-
-                if (pendingComment) {
-                    const pendingLeadId = pendingComment.leadId;
-                    const baselineCommentMarker = pendingComment.baselineCommentMarker;
-
-                    try {
-                        const pendingLead = await getLead(pendingLeadId, { timeoutMs: AUTO_CALL_API_TIMEOUT_MS });
-                        const pendingPhone = normalizePhoneForCall(pendingLead.phone);
-                        const commentUnchanged = getEmployeeCommentMarker(pendingLead.comments) === baselineCommentMarker;
-                        const stillAssigned = isLeadAssignedToEmployee(pendingLead, employeeId, employeeNames);
-
-                        if (
-                            !blockedLeadIds.has(pendingLeadId) &&
-                            commentUnchanged &&
-                            stillAssigned &&
-                            pendingPhone &&
-                            isLeadEligibleForAutoCall(pendingLead, new Date(), employeeNames)
-                        ) {
-                            queueAutoCallLead = {
-                                lead: pendingLead,
-                                normalizedPhone: pendingPhone,
-                                queue: pendingLead.status === "Follow up" ? "Follow up" : "NEW",
-                            };
-                        } else {
-                            clearAutoCallPendingComment(employee.employeeCode, pendingLeadId);
-                            pendingComment = null;
-                        }
-                    } catch {
-                        clearAutoCallPendingComment(employee.employeeCode, pendingLeadId);
-                        pendingComment = null;
-                    }
-                }
-
-                if (!queueAutoCallLead) {
-                    queueAutoCallLead = await getNextAutoCallLead({
+                if (!isLeadsPage) {
+                    // Open the actual work list before selecting; never dial from an invisible queue.
+                    const available = await getNextAutoCallLead({
                         employeeId,
                         employeeNames,
                         excludedLeadIds: Array.from(blockedLeadIds),
                     }, { timeoutMs: AUTO_CALL_API_TIMEOUT_MS });
+                    if (available && !isDisposed && getActiveBusinessId() === businessId) navigate("/leads");
+                    return;
                 }
-
+                const queueAutoCallLead = firstDisplayedAutoCallLead(scope, employeeNames, blockedLeadIds);
                 const firstCallableLead = queueAutoCallLead?.lead;
                 const normalizedPhone = queueAutoCallLead?.normalizedPhone;
 
@@ -275,15 +237,36 @@ export default function EmployeeAutoCaller() {
                     return;
                 }
 
+                const selectionStillCurrent = () => {
+                    const auth = getAuthUser();
+                    const head = firstDisplayedAutoCallLead(scope, employeeNames, blockedLeadIds);
+                    return !isDisposed && auth?.userType === "employee" && auth.user._id === employeeId &&
+                        getActiveBusinessId() === businessId && isWithinAutoCallWindow() &&
+                        head?.lead._id === firstCallableLead._id && head.normalizedPhone === normalizedPhone;
+                };
+                const fresh = await getLead(firstCallableLead._id, { timeoutMs: AUTO_CALL_API_TIMEOUT_MS });
+                if (!isAutoCallLeadAssigned(fresh, employeeId, employeeNames) || !isLeadEligibleForAutoCall(fresh, new Date(), employeeNames)) {
+                    blockedLeadIds.add(firstCallableLead._id);
+                    void queryClient.invalidateQueries({ queryKey: ["leads"] });
+                    return;
+                }
+                if (normalizePhoneForCall(fresh.phone) !== normalizedPhone) {
+                    void queryClient.invalidateQueries({ queryKey: ["leads"] });
+                    return;
+                }
+                const pendingComment = getAutoCallPendingComment(employee.employeeCode);
+
                 let reservation: Awaited<ReturnType<typeof reserveCallBridgeCall>>;
 
                 try {
                     if (reservationNotBefore > Date.now()) {
                         await wait(reservationNotBefore - Date.now() + (callTimingV2Enabled ? 0 : 25));
                     }
+                    if (!selectionStillCurrent()) return;
                     reservation = await reserveCallBridgeCall(employee.employeeCode, {
                         timeoutMs: AUTO_CALL_API_TIMEOUT_MS,
                         leadId: firstCallableLead._id,
+                        businessId,
                         ...(callTimingV2Enabled ? { attemptId: crypto.randomUUID() } : {}),
                     });
                 } catch (error) {
@@ -306,7 +289,7 @@ export default function EmployeeAutoCaller() {
                 reservedEmployeeCode = employee.employeeCode;
                 reservedLeadId = firstCallableLead._id;
                 reservationToken = reservation.reservationToken;
-                if (isDisposed) return;
+                if (!selectionStillCurrent()) return;
 
                 const currentPendingComment = getAutoCallPendingComment(employee.employeeCode);
                 const selectedPendingLeadId = pendingComment?.leadId || "";
@@ -329,15 +312,17 @@ export default function EmployeeAutoCaller() {
                     const launchedAt = Date.now();
                     if (!callTimingV2Enabled) window.localStorage.setItem(lastCallStorageKey, String(launchedAt));
                     navigate(`/leads?lead=${encodeURIComponent(firstCallableLead._id)}`, {
-                        state: { autoCallLead: firstCallableLead },
+                        state: { autoCallLead: firstCallableLead, autoCallPreserveFilters: true },
                     });
                     await wait(150);
 
                     try {
+                        if (!selectionStillCurrent()) return;
                         const dialStart = await markCallBridgeDialStarted(employee.employeeCode, {
                             timeoutMs: AUTO_CALL_API_TIMEOUT_MS,
                             leadId: firstCallableLead._id,
                             reservationToken,
+                            businessId,
                         });
                         if (callTimingV2Enabled && dialStart.alreadyStarted) {
                             reservedEmployeeCode = "";
@@ -348,6 +333,7 @@ export default function EmployeeAutoCaller() {
                         return;
                     }
 
+                    if (!selectionStillCurrent()) return;
                     launchPhoneCall(normalizedPhone);
                     callWasLaunched = true;
 
@@ -386,12 +372,13 @@ export default function EmployeeAutoCaller() {
                             timeoutMs: AUTO_CALL_API_TIMEOUT_MS,
                             leadId: reservedLeadId,
                             reservationToken,
+                            businessId,
                         });
                     } catch {
                         // The lease still expires if the cleanup request cannot reach the server.
                     }
                 }
-                isChecking.current = false;
+                if (!isDisposed) isChecking.current = false;
             }
         };
 
@@ -407,6 +394,8 @@ export default function EmployeeAutoCaller() {
         };
 
         const startDelay = millisecondsUntilAutoCallWindowStart();
+        const displayedQueueUpdated = () => { void triggerAutoCall(); };
+        window.addEventListener(displayedQueueChanged, displayedQueueUpdated);
 
         if (startDelay === 0) {
             startAutoCallCycle();
@@ -419,9 +408,10 @@ export default function EmployeeAutoCaller() {
             window.clearTimeout(startTimeoutId);
             window.clearTimeout(redialTimeoutId);
             window.clearInterval(intervalId);
+            window.removeEventListener(displayedQueueChanged, displayedQueueUpdated);
             isChecking.current = false;
         };
-    }, [navigate]);
+    }, [navigate, isLeadsPage, queryClient, activeBusinessId]);
 
     return null;
 }

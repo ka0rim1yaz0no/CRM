@@ -1,5 +1,5 @@
 import type { FormEvent, UIEvent } from "react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FiArchive, FiCalendar, FiCheckCircle, FiClock, FiEdit2, FiMail, FiMessageCircle, FiPhone, FiPlus, FiSave, FiSearch, FiStar, FiUserPlus, FiVoicemail, FiX } from "react-icons/fi";
 import { FaWhatsapp } from "react-icons/fa";
@@ -16,6 +16,8 @@ import { formatCstDate, formatLeadScheduleDate, formatLeadScheduleDateTime, form
 import { clearAutoCallPendingComment, getAutoCallPendingComment, getEmployeeCommentMarker, startAutoCallPendingComment } from "../../lib/employeeAutoCall";
 import { getPhoneCallUrl } from "../../lib/phoneNumber";
 import { socket } from "../../lib/socket";
+import { getActiveBusinessId } from "../../api/businessStorage";
+import { publishDisplayedAutoCallQueue, clearDisplayedAutoCallQueue } from "../../lib/displayedAutoCallQueue";
 
 const tabs: Array<LeadStatus | "ALL"> = [
     "NEW",
@@ -453,6 +455,8 @@ export default function Leads() {
     const employeeCode = authUser?.userType === "employee"
         ? String(authUser.user.employeeCode || authUser.user._id).trim()
         : "";
+    const displayedQueueOwner = useRef(Symbol("employee-displayed-leads"));
+    const displayedBusinessId = getActiveBusinessId();
     const requestedLeadId = searchParams.get("lead") || "";
     const routedAutoCallLead = (location.state as { autoCallLead?: Lead } | null)?.autoCallLead;
     const employeeName = authUser?.userType === "employee" ? authUser.user.name : "Employee";
@@ -516,10 +520,10 @@ export default function Leads() {
     const employeeLeadTab = getEmployeeLeadTab(activeTab);
     const requestedEmployeeLeadTab = isGlobalLeadSearchActive ? "all" : employeeLeadTab;
     const leadQueryKey = useMemo(
-        () => ["leads", employeeId, employeeLeadNames.join("|"), requestedEmployeeLeadTab, activeTab, effectiveLeadSearch, isGlobalLeadSearchActive, leadStateFilter] as const,
-        [activeTab, effectiveLeadSearch, employeeId, employeeLeadNames, isGlobalLeadSearchActive, leadStateFilter, requestedEmployeeLeadTab]
+        () => ["leads", employeeId, employeeLeadNames.join("|"), requestedEmployeeLeadTab, activeTab, effectiveLeadSearch, isGlobalLeadSearchActive, leadStateFilter, displayedBusinessId] as const,
+        [activeTab, effectiveLeadSearch, employeeId, employeeLeadNames, isGlobalLeadSearchActive, leadStateFilter, requestedEmployeeLeadTab, displayedBusinessId]
     );
-    const { data: leadPageData, isLoading, isError } = useQuery({
+    const { data: leadPageData, isLoading, isError, isFetching: isLeadListFetching } = useQuery({
         queryKey: leadQueryKey,
         queryFn: () =>
             getMyLeads({
@@ -615,6 +619,14 @@ export default function Leads() {
                 );
         return isGlobalLeadSearchActive ? searchFilteredLeads : sortEmployeeLeadsForWorkQueue(searchFilteredLeads, queueClock);
     }, [activeCategoryTab, activeTab, canUseLeadCategories, effectiveLeadSearch, employeeId, isGlobalLeadSearchActive, leads, queueClock, showFavoritesOnly]);
+    useLayoutEffect(() => {
+        publishDisplayedAutoCallQueue(displayedQueueOwner.current, { employeeId, businessId: displayedBusinessId }, filteredLeads,
+            Boolean(employeeId && !isLoading && !isError && !isLeadListFetching && !isFetchingMoreLeads && leadSearch.trim() === debouncedLeadSearch));
+    }, [employeeId, displayedBusinessId, filteredLeads, isLoading, isError, isLeadListFetching, isFetchingMoreLeads, leadSearch, debouncedLeadSearch]);
+    useLayoutEffect(() => {
+        const owner = displayedQueueOwner.current;
+        return () => clearDisplayedAutoCallQueue(owner);
+    }, []);
     const contactedTodayCount = leadCounts.ContactedToday ?? leads.filter((lead) => isNewWorkQueueLead(lead) && isHiddenFromEmployeeQueueToday(lead)).length;
 
     const routeSelectedLead = requestedLeadId
@@ -1228,7 +1240,7 @@ export default function Leads() {
             }
 
             if (routeLeadId) {
-                if (!shouldSearchAll && !canViewAllLeads) {
+                if (!shouldSearchAll && !canViewAllLeads && !(location.state as { autoCallPreserveFilters?: boolean } | null)?.autoCallPreserveFilters) {
                     setLeadSearch("");
                     setDebouncedLeadSearch("");
                     setIsGlobalLeadSearch(false);

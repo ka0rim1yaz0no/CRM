@@ -237,32 +237,32 @@ export async function getLatestCallBridgeAttempt(employeeCode: string, leadId: s
     return response.data;
 }
 
-export async function reserveCallBridgeCall(employeeCode: string, options: { timeoutMs?: number; leadId?: string; attemptId?: string } = {}) {
+export async function reserveCallBridgeCall(employeeCode: string, options: { timeoutMs?: number; leadId?: string; attemptId?: string; businessId?: string } = {}) {
     const response = await api.post<CallBridgeReservation>(
         "/call-bridge/reserve",
         { employeeCode, leadId: options.leadId, ...(callTimingV2Enabled ? { attemptId: options.attemptId } : {}) },
-        { timeout: options.timeoutMs, headers: autoCallClientHeaders }
+        { timeout: options.timeoutMs, headers: { ...autoCallClientHeaders, ...(options.businessId ? { "X-Business-Id": options.businessId } : {}) } }
     );
     return response.data;
 }
 
-export async function markCallBridgeDialStarted(employeeCode: string, options: { timeoutMs?: number; leadId: string; reservationToken: string }) {
+export async function markCallBridgeDialStarted(employeeCode: string, options: { timeoutMs?: number; leadId: string; reservationToken: string; businessId?: string }) {
     const response = await api.post<{ startedAt: string; dialIntentUntil: string; alreadyStarted?: boolean }>(
         "/call-bridge/dial-start",
         { employeeCode, leadId: options.leadId, reservationToken: options.reservationToken },
-        { timeout: options.timeoutMs, headers: autoCallClientHeaders }
+        { timeout: options.timeoutMs, headers: { ...autoCallClientHeaders, ...(options.businessId ? { "X-Business-Id": options.businessId } : {}) } }
     );
     return response.data;
 }
 
 export async function releaseCallBridgeCall(
     employeeCode: string,
-    options: { timeoutMs?: number; leadId: string; reservationToken: string }
+    options: { timeoutMs?: number; leadId: string; reservationToken: string; businessId?: string }
 ) {
     const response = await api.post<CallBridgeStatus>(
         "/call-bridge/release",
         { employeeCode, leadId: options.leadId, reservationToken: options.reservationToken },
-        { timeout: options.timeoutMs, headers: autoCallClientHeaders }
+        { timeout: options.timeoutMs, headers: { ...autoCallClientHeaders, ...(options.businessId ? { "X-Business-Id": options.businessId } : {}) } }
     );
     return response.data;
 }
