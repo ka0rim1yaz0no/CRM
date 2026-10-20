@@ -7,6 +7,7 @@ import { setAuthUser } from "../api/authStorage";
 import { getActiveBusinessId, setActiveBusinessId, type BusinessOption } from "../api/businessStorage";
 import { activateCallBridgeForEmployee, beginCallBridgeBrowserSession } from "../api/callBridge";
 import { refreshSocketBusinessContext } from "../lib/socket";
+import AssistlyCinematicIntro from "../components/login/AssistlyCinematicIntro";
 
 const BadgeIcon = () => (
   <svg
@@ -99,28 +100,7 @@ function Login() {
   };
 
   return (
-    <main className="login-screen min-h-screen overflow-hidden bg-[#050408] text-white">
-      <section
-        className="relative flex min-h-screen items-center justify-center bg-cover bg-center px-5 py-10 sm:px-8 lg:px-14"
-        style={{ backgroundImage: "url('/images/background.png')" }}
-      >
-        <div className="absolute inset-0 bg-[radial-gradient(circle_at_20%_50%,rgba(111,24,255,0.16),transparent_30%),linear-gradient(90deg,rgba(0,0,0,0.08),rgba(0,0,0,0.28))]" />
-
-        <div className="relative grid w-full max-w-[57.5rem] items-center gap-8 lg:grid-cols-[1fr_26.25rem]">
-          <aside className="flex justify-center lg:justify-start relative left-[-6.5rem]">
-            <div className="flex w-full max-w-[38rem] items-center justify-center lg:justify-start">
-              <div
-                className="login-wordmark w-full max-w-[28rem] drop-shadow-[0_0_1.5rem_rgba(126,47,255,0.22)] sm:max-w-[30rem]"
-                role="img"
-                aria-label="Assistly"
-              >
-                <img className="login-wordmark-layer login-wordmark-symbol" src="/images/logo2.png" alt="" aria-hidden="true" />
-                <img className="login-wordmark-layer login-wordmark-name" src="/images/logo2.png" alt="" aria-hidden="true" />
-                <img className="login-wordmark-layer login-wordmark-tagline" src="/images/logo2.png" alt="" aria-hidden="true" />
-              </div>
-            </div>
-          </aside>
-
+    <AssistlyCinematicIntro>
           <form className="mx-auto w-full max-w-[26.25rem] rounded-2xl border border-[#6423c7] bg-black/55 px-5 py-7 shadow-[0_0_2.125rem_rgba(98,35,199,0.3)] backdrop-blur-md sm:px-8" onSubmit={handleSubmit}>
             <div className="text-center">
               <h1 className="text-xl font-bold sm:text-2xl">Employee Login</h1>
@@ -164,7 +144,7 @@ function Login() {
                 </span>
               </label>
 
-              {error && <p className="text-sm font-semibold text-red-200">{error}</p>}
+              {error && <p role="alert" className="text-sm font-semibold text-red-200">{error}</p>}
 
               <button
                 className="h-12 w-full rounded-lg bg-[linear-gradient(135deg,#7228ff,#4a0ebd)] text-sm font-semibold text-white shadow-[0_0.625rem_1.875rem_rgba(92,32,214,0.28)] transition hover:brightness-110 focus:outline-none focus:ring-2 focus:ring-[#8c35ff] focus:ring-offset-2 focus:ring-offset-black"
@@ -174,9 +154,7 @@ function Login() {
               </button>
             </div>
           </form>
-        </div>
-      </section>
-    </main>
+    </AssistlyCinematicIntro>
   )
 }
 
