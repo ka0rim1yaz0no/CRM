@@ -13,7 +13,7 @@ import { getLatestCallBridgeAttempt } from "../../api/callBridge";
 import { useToast } from "../../lib/toast";
 import { useFeatureFlags } from "../../hooks/useFeatureFlags";
 import { formatCstDate, formatLeadScheduleDate, formatLeadScheduleDateTime, formatLeadScheduleDateTimeInput, getCurrentLeadScheduleDateTimeInput, parseLeadScheduleDateTimeInput, formatPhDateTime } from "../../lib/dateTime";
-import { clearAutoCallPendingComment, getAutoCallPendingComment, getEmployeeCommentMarker, startAutoCallPendingComment } from "../../lib/employeeAutoCall";
+import { AUTO_CALL_API_TIMEOUT_MS, clearAutoCallPendingComment, getAutoCallPendingComment, getEmployeeCommentMarker, isLeadEligibleForAutoCall, startAutoCallPendingComment } from "../../lib/employeeAutoCall";
 import { getPhoneCallUrl } from "../../lib/phoneNumber";
 import { socket } from "../../lib/socket";
 import { getActiveBusinessId } from "../../api/businessStorage";
@@ -355,14 +355,13 @@ function isCallPriorityLead(lead: Lead) {
 }
 
 function getLeadQueueRank(lead: Lead, now = Date.now()) {
-    const hasCommentToday = hasManualCommentToday(lead);
     const scheduledDueNow = isScheduledDueNow(lead, now);
 
-    if (scheduledDueNow && !isHiddenFromEmployeeQueueToday(lead)) return 0;
+    if (lead.status === "NEW" && isLeadEligibleForAutoCall(lead, new Date(now))) return 0;
     const scheduledToday = isScheduledForToday(lead);
-    if (lead.status === "NEW" && !hasCommentToday && !scheduledToday) return 1;
-    if (lead.status === "NEW" && !scheduledToday) return 2;
-    if (lead.status === "Follow up" && !scheduledToday) return 3;
+    if (lead.status === "NEW" && !scheduledToday) return 1;
+    if (lead.status === "Follow up" && !scheduledToday && !scheduledDueNow) return 2;
+    if (scheduledDueNow && !isHiddenFromEmployeeQueueToday(lead)) return 3;
     if (scheduledToday) return 5;
     return 4;
 }
@@ -376,7 +375,7 @@ function sortEmployeeLeadsForWorkQueue(leads: Lead[], now = Date.now()) {
             return firstRank - secondRank;
         }
 
-        if (firstRank === 0 || firstRank === 5) {
+        if (firstRank === 3 || firstRank === 5) {
             return (parseLeadTime(first.followUpAt) || 0) - (parseLeadTime(second.followUpAt) || 0);
         }
 
@@ -489,6 +488,7 @@ export default function Leads() {
     const leadListRef = useRef<HTMLDivElement>(null);
     const leadPageRef = useRef(1);
     const leadFetchInFlightRef = useRef(false);
+    const leadFetchRetryAtRef = useRef(0);
     const [activeLeadAction, setActiveLeadAction] = useState<LeadActionName | null>(null);
     const [passAgentId, setPassAgentId] = useState("");
     const [passConfirm, setPassConfirm] = useState<{ lead: Lead; agent: Employee } | null>(null);
@@ -523,6 +523,12 @@ export default function Leads() {
         () => ["leads", employeeId, employeeLeadNames.join("|"), requestedEmployeeLeadTab, activeTab, effectiveLeadSearch, isGlobalLeadSearchActive, leadStateFilter, displayedBusinessId] as const,
         [activeTab, effectiveLeadSearch, employeeId, employeeLeadNames, isGlobalLeadSearchActive, leadStateFilter, requestedEmployeeLeadTab, displayedBusinessId]
     );
+    const leadPagingScope = JSON.stringify(leadQueryKey);
+    const leadPagingScopeRef = useRef<string | null>(leadPagingScope);
+    useLayoutEffect(() => {
+        leadPagingScopeRef.current = leadPagingScope;
+        return () => { if (leadPagingScopeRef.current === leadPagingScope) leadPagingScopeRef.current = null; };
+    }, [leadPagingScope]);
     const { data: leadPageData, isLoading, isError, isFetching: isLeadListFetching } = useQuery({
         queryKey: leadQueryKey,
         queryFn: () =>
@@ -617,12 +623,8 @@ export default function Leads() {
                         .toLowerCase()
                         .includes(searchText)
                 );
-        return isGlobalLeadSearchActive ? searchFilteredLeads : sortEmployeeLeadsForWorkQueue(searchFilteredLeads, queueClock);
+        return sortEmployeeLeadsForWorkQueue(searchFilteredLeads, queueClock);
     }, [activeCategoryTab, activeTab, canUseLeadCategories, effectiveLeadSearch, employeeId, isGlobalLeadSearchActive, leads, queueClock, showFavoritesOnly]);
-    useLayoutEffect(() => {
-        publishDisplayedAutoCallQueue(displayedQueueOwner.current, { employeeId, businessId: displayedBusinessId }, filteredLeads,
-            Boolean(employeeId && !isLoading && !isError && !isLeadListFetching && !isFetchingMoreLeads && leadSearch.trim() === debouncedLeadSearch));
-    }, [employeeId, displayedBusinessId, filteredLeads, isLoading, isError, isLeadListFetching, isFetchingMoreLeads, leadSearch, debouncedLeadSearch]);
     useLayoutEffect(() => {
         const owner = displayedQueueOwner.current;
         return () => clearDisplayedAutoCallQueue(owner);
@@ -671,11 +673,14 @@ export default function Leads() {
 
     const employeeLeadNameKey = employeeLeadNames.join("|");
     const fetchMoreLeads = useCallback(async () => {
-        if (!employeeId || leadFetchInFlightRef.current || !hasMoreLeads) {
-            return;
+        const currentPage = queryClient.getQueryData<MyLeadsPage>(leadQueryKey);
+        const scopeIsCurrent = () => leadPagingScopeRef.current === leadPagingScope && getActiveBusinessId() === displayedBusinessId;
+        if (!employeeId || !scopeIsCurrent() || leadFetchInFlightRef.current || !hasMoreLeads ||
+            !currentPage?.hasMore || leadFetchRetryAtRef.current > Date.now()) {
+            return false;
         }
 
-        const nextPage = leadPageRef.current + 1;
+        const nextPage = currentPage.nextPage ?? currentPage.page + 1;
         leadFetchInFlightRef.current = true;
         setIsFetchingMoreLeads(true);
 
@@ -690,7 +695,9 @@ export default function Leads() {
                 searchAll: isGlobalLeadSearchActive || undefined,
                 includeArchived: isGlobalLeadSearchActive || undefined,
                 state: leadStateFilter !== "ALL" ? leadStateFilter : undefined,
-            });
+            }, { timeoutMs: AUTO_CALL_API_TIMEOUT_MS });
+            // A refetch can replace an appended page while this request is pending.
+            if (!scopeIsCurrent() || queryClient.getQueryData<MyLeadsPage>(leadQueryKey)?.page !== currentPage.page) return false;
             queryClient.setQueryData<typeof leadPageData>(leadQueryKey, (current) => ({
                 ...(current || nextLeadPage),
                 ...nextLeadPage,
@@ -699,13 +706,27 @@ export default function Leads() {
             leadPageRef.current = nextPage;
             setLeadPage(nextPage);
             setHasMoreLeads(nextLeadPage.hasMore);
+            leadFetchRetryAtRef.current = 0;
+            return true;
         } catch {
-            showToast({ tone: "error", message: "Could not load more leads. Please try again." });
+            if (scopeIsCurrent()) {
+                leadFetchRetryAtRef.current = Date.now() + 5_000;
+                showToast({ tone: "error", message: "Could not load more leads. Please try again." });
+            }
+            return false;
         } finally {
-            leadFetchInFlightRef.current = false;
-            setIsFetchingMoreLeads(false);
+            if (scopeIsCurrent()) {
+                leadFetchInFlightRef.current = false;
+                setIsFetchingMoreLeads(false);
+            }
         }
-    }, [employeeId, hasMoreLeads, employeeLeadNames, requestedEmployeeLeadTab, effectiveLeadSearch, isGlobalLeadSearchActive, leadStateFilter, queryClient, leadQueryKey, showToast]);
+    }, [employeeId, displayedBusinessId, leadPagingScope, hasMoreLeads, employeeLeadNames, requestedEmployeeLeadTab, effectiveLeadSearch, isGlobalLeadSearchActive, leadStateFilter, queryClient, leadQueryKey, showToast]);
+
+    useLayoutEffect(() => {
+        publishDisplayedAutoCallQueue(displayedQueueOwner.current, { employeeId, businessId: displayedBusinessId }, filteredLeads,
+            Boolean(employeeId && !isLoading && !isError && !isLeadListFetching && !isFetchingMoreLeads && leadSearch.trim() === debouncedLeadSearch),
+            hasMoreLeads && (activeTab === "NEW" || activeTab === "Follow up" || activeTab === "ALL") ? fetchMoreLeads : undefined);
+    }, [employeeId, displayedBusinessId, filteredLeads, isLoading, isError, isLeadListFetching, isFetchingMoreLeads, leadSearch, debouncedLeadSearch, hasMoreLeads, activeTab, fetchMoreLeads]);
 
     const [previousLeadPagingScope1, setPreviousLeadPagingScope1] = useState<readonly unknown[] | null>(null);
     const leadPagingScope1Inputs = [employeeId, employeeLeadNameKey, effectiveLeadSearch, isGlobalLeadSearchActive, leadStateFilter, requestedEmployeeLeadTab];
@@ -717,6 +738,7 @@ export default function Leads() {
     useEffect(() => {
         leadPageRef.current = 1;
         leadFetchInFlightRef.current = false;
+        leadFetchRetryAtRef.current = 0;
     }, [employeeId, employeeLeadNameKey, effectiveLeadSearch, isGlobalLeadSearchActive, leadStateFilter, requestedEmployeeLeadTab]);
 
     const [previousLeadStateSelection, setPreviousLeadStateSelection] = useState<readonly unknown[] | null>(null);

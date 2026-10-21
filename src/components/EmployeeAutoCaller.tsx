@@ -3,9 +3,10 @@ import { useLocation, useNavigate } from "react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import { getAuthUser } from "../api/authStorage";
 import { getActiveBusinessId } from "../api/businessStorage";
-import { displayedQueueChanged, firstDisplayedAutoCallLead, isAutoCallLeadAssigned } from "../lib/displayedAutoCallQueue";
+import { displayedQueueChanged, firstDisplayedAutoCallLead, isAutoCallLeadAssigned, requestMoreDisplayedAutoCallLeads } from "../lib/displayedAutoCallQueue";
 import {
     activateCallBridgeForEmployee,
+    canUseCallBridgeBrowserSession,
     callTimingV2Enabled,
     getCallBridgeStatus,
     markCallBridgeDialStarted,
@@ -133,7 +134,7 @@ export default function EmployeeAutoCaller() {
             isDisposed = true;
             window.clearInterval(intervalId);
         };
-    }, []);
+    }, [activeBusinessId]);
 
     useEffect(() => {
         const initialAuthUser = getAuthUser();
@@ -151,11 +152,17 @@ export default function EmployeeAutoCaller() {
         let intervalId: number | undefined;
         let startTimeoutId: number | undefined;
         let redialTimeoutId: number | undefined;
+        let prepareTimeoutId: number | undefined;
         let redialDeadline = 0;
+        let retryRequested = false;
         const blockedLeadIds = new Set<string>();
 
-        const triggerAutoCall = async () => {
-            if (isDisposed || isChecking.current || !isWithinAutoCallWindow()) {
+        const triggerAutoCall = async (retryIfBusy = false) => {
+            if (isDisposed || !isWithinAutoCallWindow()) {
+                return;
+            }
+            if (isChecking.current) {
+                if (retryIfBusy) retryRequested = true;
                 return;
             }
 
@@ -200,21 +207,32 @@ export default function EmployeeAutoCaller() {
                         remainingCooldown > 0 &&
                         remainingCooldown <= 10_000;
 
-                    if (canPrepareDuringCooldown) {
-                        reservationNotBefore = callTimingV2Enabled ? Date.now() + remainingCooldown : deadline;
-                    } else if (remainingCooldown > 0 && deadline !== redialDeadline) {
+                    if (remainingCooldown > 0 && deadline !== redialDeadline) {
                         window.clearTimeout(redialTimeoutId);
+                        window.clearTimeout(prepareTimeoutId);
                         redialDeadline = deadline;
                         redialTimeoutId = window.setTimeout(() => {
                             redialDeadline = 0;
-                            void triggerAutoCall();
+                            void triggerAutoCall(true);
                         }, Math.max(0, remainingCooldown));
+                        if (remainingCooldown > 10_000) {
+                            prepareTimeoutId = window.setTimeout(() => {
+                                void triggerAutoCall(true);
+                            }, remainingCooldown - 10_000);
+                        }
+                    }
+                    if (canPrepareDuringCooldown) {
+                        reservationNotBefore = callTimingV2Enabled ? Date.now() + remainingCooldown : deadline;
                     }
                     if (!canPrepareDuringCooldown) return;
                 }
 
-                window.clearTimeout(redialTimeoutId);
-                redialDeadline = 0;
+                // Keep the deadline wake armed while asynchronous lead preparation is in flight.
+                if (!reservationNotBefore) {
+                    window.clearTimeout(redialTimeoutId);
+                    window.clearTimeout(prepareTimeoutId);
+                    redialDeadline = 0;
+                }
 
                 const employeeNames = Array.from(
                     new Set([employee.name, employee.employeeCode, ...(employee.aliases || [])].filter(Boolean))
@@ -234,19 +252,21 @@ export default function EmployeeAutoCaller() {
                 const normalizedPhone = queueAutoCallLead?.normalizedPhone;
 
                 if (!firstCallableLead || !normalizedPhone || isDisposed) {
+                    if (!isDisposed && await requestMoreDisplayedAutoCallLeads(scope)) retryRequested = true;
                     return;
                 }
 
                 const selectionStillCurrent = () => {
                     const auth = getAuthUser();
                     const head = firstDisplayedAutoCallLead(scope, employeeNames, blockedLeadIds);
-                    return !isDisposed && auth?.userType === "employee" && auth.user._id === employeeId &&
+                    return !isDisposed && canUseCallBridgeBrowserSession(employee.employeeCode) && auth?.userType === "employee" && auth.user._id === employeeId &&
                         getActiveBusinessId() === businessId && isWithinAutoCallWindow() &&
                         head?.lead._id === firstCallableLead._id && head.normalizedPhone === normalizedPhone;
                 };
                 const fresh = await getLead(firstCallableLead._id, { timeoutMs: AUTO_CALL_API_TIMEOUT_MS });
                 if (!isAutoCallLeadAssigned(fresh, employeeId, employeeNames) || !isLeadEligibleForAutoCall(fresh, new Date(), employeeNames)) {
                     blockedLeadIds.add(firstCallableLead._id);
+                    retryRequested = true;
                     void queryClient.invalidateQueries({ queryKey: ["leads"] });
                     return;
                 }
@@ -275,6 +295,7 @@ export default function EmployeeAutoCaller() {
                     if (terminalErrorCode) {
                         blockedLeadIds.add(firstCallableLead._id);
                         clearAutoCallPendingComment(employee.employeeCode, firstCallableLead._id);
+                        retryRequested = true;
                     }
                     return;
                 }
@@ -283,6 +304,7 @@ export default function EmployeeAutoCaller() {
                     if (reservation.code) {
                         blockedLeadIds.add(firstCallableLead._id);
                         clearAutoCallPendingComment(employee.employeeCode, firstCallableLead._id);
+                        retryRequested = true;
                     }
                     return;
                 }
@@ -378,7 +400,13 @@ export default function EmployeeAutoCaller() {
                         // The lease still expires if the cleanup request cannot reach the server.
                     }
                 }
-                if (!isDisposed) isChecking.current = false;
+                if (!isDisposed) {
+                    isChecking.current = false;
+                    if (retryRequested) {
+                        retryRequested = false;
+                        void triggerAutoCall();
+                    }
+                }
             }
         };
 
@@ -407,6 +435,7 @@ export default function EmployeeAutoCaller() {
             isDisposed = true;
             window.clearTimeout(startTimeoutId);
             window.clearTimeout(redialTimeoutId);
+            window.clearTimeout(prepareTimeoutId);
             window.clearInterval(intervalId);
             window.removeEventListener(displayedQueueChanged, displayedQueueUpdated);
             isChecking.current = false;
