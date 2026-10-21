@@ -7,7 +7,7 @@
     "dev:attendance": "node scripts/start-attendance-local.mjs",
     "dev:local-review": "node scripts/start-attendance-local.mjs --local-review --adopt-legacy",
     "preview:local-review": "node scripts/preview-local-review.mjs",
-    "dev": "vite",
+    "dev": "node scripts/start-local-frontend.mjs",
     "dev:backend": "npm run dev --prefix backend",
     "call-bridge:package": "powershell -NoProfile -ExecutionPolicy Bypass -File callbridge/package-call-bridge.ps1",
     "live-view-agent:package": "powershell -NoProfile -ExecutionPolicy Bypass -File liveview-agent/package-live-view-agent.ps1",
