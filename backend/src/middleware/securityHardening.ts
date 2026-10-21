@@ -28,7 +28,7 @@ export function securityMiddleware() {
     apiLimit: guarded(rateLimit({ windowMs: 60_000, limit: numberSetting("CRM_SECURITY_API_MAX", 600, 60_000), keyGenerator: apiKey,
       standardHeaders: "draft-8", legacyHeaders: false, skip: request => request.method === "OPTIONS" || request.path === "/health",
       message: { message: "Too many requests. Please try again shortly." } })),
-    loginIpLimit: guarded(rateLimit({ ...loginOptions, requestPropertyName: "loginIpLimit" })),
+    loginIpLimit: guarded(rateLimit({ ...loginOptions, limit: numberSetting("CRM_SECURITY_LOGIN_IP_MAX", loginOptions.limit, 1_000), requestPropertyName: "loginIpLimit" })),
     loginCodeLimit: guarded(rateLimit({ ...loginOptions, requestPropertyName: "loginCodeLimit", keyGenerator: request => hash(String(request.body?.employeeCode || "").trim().slice(0, 100)) })),
   };
 }

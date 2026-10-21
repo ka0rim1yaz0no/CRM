@@ -24,7 +24,7 @@ const { Employee } = await import("../models/Employee");
 const { Attendance } = await import("../models/Attendance");
 const { AttendanceLedger, AttendancePolicy } = await import("../models/AttendanceLedger");
 const { setBusinessAccessForEmployeeCode } = await import("../models/BusinessUserAccess");
-const { readLocalLegacyAdoptionPlan, adoptLocalLegacyAttendance } = await import("./localLegacyAttendanceAdoption");
+const { readLocalLegacyAdoptionPlan, adoptLocalLegacyAttendance, adoptReviewedLegacyAttendance } = await import("./localLegacyAttendanceAdoption");
 const { resolveAttendanceIdentity, attendanceSnapshot, readAttendanceLedger } = await import("./attendanceLedgerService");
 const { deliverAttendanceLedger } = await import("./attendanceLedgerOutbox");
 const { createAttendanceHubSession } = await import("../config/attendanceHubSession");
@@ -144,4 +144,20 @@ test("concurrent adoption is idempotent and business membership changes abort th
   process.env.NODE_ENV = "production";
   try { await assert.rejects(adoptLocalLegacyAttendance(person.identity, receipt.manifest), /restricted/); }
   finally { process.env.NODE_ENV = environment; }
+});
+
+test("production-reviewed copy adoption shares the same preservation transaction and records its distinct actor", async () => {
+  const person = await fixture(); const receipt = await backup(person.identity);
+  const verified = JSON.parse(await fs.readFile(receipt.manifest, "utf8"));
+  assert.equal((await adoptReviewedLegacyAttendance(person.identity, verified, "production-reviewed-adoption"))?.status, "adopted");
+  const ledger = await readAttendanceLedger(person.identity);
+  assert.equal(ledger.audit[0].actor.code, "production-reviewed-adoption");
+  assert.equal(ledger.legacyAdoption?.fingerprint, receipt.plan.fingerprint);
+  assert.equal(ledger.closures.length, 0);
+  for (const replica of receipt.plan.replicas) await runWithBusiness(replica.businessId, async () => {
+    for (const original of replica.records) {
+      const saved = await Attendance.collection.findOne({ _id: new mongoose.Types.ObjectId(original.id) });
+      assert.equal(saved?.source, original.source); assert.equal(saved?.timeIn.toISOString(), original.at);
+    }
+  });
 });

@@ -57,6 +57,18 @@ async function verifiedBackup(identity: AttendanceIdentity, manifestPath: string
 
 export async function adoptLocalLegacyAttendance(identity: AttendanceIdentity, manifestPath: string) {
   const backup = await verifiedBackup(identity, manifestPath);
+  return adoptReviewedLegacyAttendance(identity, backup, "local-reviewed-adoption");
+}
+
+// Operational callers must verify their own backup and isolated target before invoking this transaction.
+export async function adoptReviewedLegacyAttendance(identity: AttendanceIdentity,
+  backup: Pick<LocalAdoptionBackup, "id" | "createdAt" | "fingerprints">,
+  actor: "local-reviewed-adoption" | "production-reviewed-adoption") {
+  if (!["local-reviewed-adoption", "production-reviewed-adoption"].includes(actor) || !backup.id ||
+      !Number.isFinite(Date.parse(backup.createdAt)) || Date.parse(backup.createdAt) > Date.now() ||
+      Date.now() - Date.parse(backup.createdAt) > 86_400_000 || !/^[a-f0-9]{64}$/.test(backup.fingerprints?.[identity.key] || "")) {
+    throw new Error("A current verified review fingerprint is required.");
+  }
   const session = await mongoose.startSession();
   try {
     return await session.withTransaction(async () => {
@@ -65,6 +77,7 @@ export async function adoptLocalLegacyAttendance(identity: AttendanceIdentity, m
       if (existing) return { status: "already-adopted" as const, historyReviewRequired: Boolean(existing.legacyAdoption?.historicalIssues) };
       const plan = await readLocalLegacyAdoptionPlan(identity, session);
       if (!backup.fingerprints[identity.key] || backup.fingerprints[identity.key] !== plan.fingerprint) throw new Error("Legacy data changed after review/backup. Nothing was adopted.");
+      if (plan.events.length >= 10_000) throw new Error("Legacy history exceeds canonical attendance capacity.");
       if (!plan.ready) return { status: "blocked" as const, historyReviewRequired: true };
       if (identity.key.startsWith("access:")) {
         const access = mongoose.connection.getClient().db(process.env.CONTROL_DATABASE_NAME || "crm_control").collection("businessuseraccesses");
@@ -93,8 +106,8 @@ export async function adoptLocalLegacyAttendance(identity: AttendanceIdentity, m
       const commandId = crypto.randomUUID(); const at = new Date().toISOString();
       await AttendanceLedger.create([{ _id: identity.key, employeeCode: identity.code, businessIds: identity.businessIds,
         canonicalBusinessId: identity.canonicalBusinessId, revision: 1, fence: 0, events: plan.events, corrections: [], closures: [], commands: [],
-        audit: [{ commandId, actor: { role: "admin", code: "local-reviewed-adoption" }, operation: "legacy-adopt",
-          reason: `Reviewed local legacy adoption; backup ${backup.id}. Original punches retained; no inferred checkout.`, at,
+        audit: [{ commandId, actor: { role: "admin", code: actor }, operation: "legacy-adopt",
+          reason: `Reviewed legacy adoption (${actor}); backup ${backup.id}. Original punches retained; no inferred checkout.`, at,
           beforeRevision: 0, afterRevision: 1, targetIds: plan.events.map((event) => event.id), beforeState: "legacy-review", afterState: "adopted" }],
         legacyAdoption: { backupId: backup.id, fingerprint: plan.fingerprint, sourceCount: plan.sourceCount, duplicateCount: plan.duplicates.length,
           businessStreamsDiffer: plan.businessStreamsDiffer, historicalIssues: plan.timelineIssues.length, adoptedAt: at },

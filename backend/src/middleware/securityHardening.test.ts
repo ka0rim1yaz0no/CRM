@@ -62,6 +62,19 @@ test("hardening: per-code limiter works independently of client IP and never exp
     assert.equal((await post(base, "/", { employeeCode: "another-synthetic-code" })).status, 401);
   } finally { await new Promise<void>(resolve => { server.close(() => resolve()); server.closeAllConnections(); }); }
 });
+
+test("hardening: a shared office IP budget does not weaken the per-code failure limit", async () => {
+  process.env.CRM_SECURITY_LOGIN_MAX = "2";
+  process.env.CRM_SECURITY_LOGIN_IP_MAX = "20";
+  try {
+    await fixture(async base => {
+      for (let n = 0; n < 5; n++) assert.equal((await post(base, "/login", { employeeCode: `fake-office-${n}` })).status, 401);
+      for (let n = 0; n < 2; n++) assert.equal((await post(base, "/login", { employeeCode: "fake-repeated" })).status, 401);
+      assert.equal((await post(base, "/login", { employeeCode: "fake-repeated" })).status, 429);
+      assert.equal((await post(base, "/login", { employeeCode: "valid-fake" })).status, 200);
+    });
+  } finally { delete process.env.CRM_SECURITY_LOGIN_MAX; delete process.env.CRM_SECURITY_LOGIN_IP_MAX; }
+});
 test("hardening flags default on only in dev/test, and rollback retains large bodies without Helmet", async () => {
   for (const env of ["production", "test", "development"]) {
     process.env.NODE_ENV = env;
