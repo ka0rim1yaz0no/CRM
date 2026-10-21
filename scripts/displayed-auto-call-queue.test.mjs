@@ -3,7 +3,6 @@ import { readFileSync } from "node:fs";
 import { runInNewContext } from "node:vm";
 import test from "node:test";
 import ts from "typescript";
-import * as eligibility from "../src/lib/employeeAutoCall.ts";
 import { normalizePhoneForCall } from "../src/lib/phoneNumber.ts";
 
 function load(file, sandbox) {
@@ -18,7 +17,7 @@ const scope = { employeeId: "fake-employee", businessId: "fake-a" };
 const lead = (id, extra = {}) => ({ _id: id, status: "NEW", assignedAgent: scope.employeeId, phone: "+12025550101", comments: [], ...extra });
 
 function fixture(options = {}) {
-    let now = Date.parse("2026-10-20T23:00:00Z"), nextTimer = 0, business = scope.businessId;
+    let now = Date.parse(options.at || "2026-10-20T23:00:00Z"), nextTimer = 0, business = scope.businessId;
     let pending = { leadId: "old-pending", baselineCommentMarker: "old" };
     const listeners = new Map(), timers = new Map(), effects = [], cleanups = [];
     const calls = { reserve: [], dialStart: [], dial: [], release: [], navigate: [], invalidated: 0 };
@@ -27,6 +26,7 @@ function fixture(options = {}) {
         setInterval: () => ++nextTimer, setTimeout: (callback, ms) => { const id = ++nextTimer; timers.set(id, { callback, ms }); return id; },
         localStorage: { getItem: () => "0", setItem() {} } };
     class Clock extends Date { constructor(value) { super(value === undefined ? now : value); } static now() { return now; } }
+    const eligibility = load("src/lib/employeeAutoCall.ts", { window, Date: Clock, Intl });
     const queue = load("src/lib/displayedAutoCallQueue.ts", { ...eligibility, normalizePhoneForCall, window, Date: Clock });
     const owner = Symbol("test-view");
     let rows = options.rows || [lead("first"), lead("old-pending")];
@@ -71,6 +71,14 @@ test("first displayed eligible lead wins over an old pending lead", async () => 
     assert.equal(state.calls.reserve[0].leadId, "first"); assert.equal(state.calls.dial.length, 1);
     assert.equal(state.calls.reserve[0].businessId, "fake-a");
     assert.equal(state.calls.navigate[0][1].state.autoCallPreserveFilters, true); state.stop();
+});
+
+test("the queue tests use the same frozen clock for the Philippine call window and caller", async () => {
+    const state = fixture({ at: "2026-10-21T04:00:00Z" });
+    await state.settle(false);
+    assert.equal(state.calls.reserve.length, 0);
+    assert.equal(state.calls.dial.length, 0);
+    state.stop();
 });
 
 test("filtered order is authoritative, including an empty or loading view", async () => {
