@@ -55,7 +55,7 @@ export default function EmployeeAutoCaller() {
         };
         let restoredAttempt = "";
         const progress = (message: string) => { if (current()) setCallingProgress(scope, message); };
-        const invalidate = () => { void queryClient.invalidateQueries({ queryKey: callingQueueKey(scope) }); };
+        const invalidate = () => { void queryClient.invalidateQueries({ queryKey: callingQueueKey(scope) }, { cancelRefetch: false }); };
         const arm = (remaining: number, prepare = true) => {
             window.clearTimeout(timer); window.clearTimeout(prepareTimer);
             const delay = Math.min(2147483647, Math.max(0, remaining));
@@ -188,12 +188,14 @@ export default function EmployeeAutoCaller() {
         const workChanged = () => { if (!callingWorkMessage(scope)) void tick(true); };
         void tick();
         const interval = window.setInterval(() => { void tick(); }, AUTO_CALL_CHECK_INTERVAL_MS);
-        window.addEventListener("focus", refresh); document.addEventListener("visibilitychange", visible);
+        window.addEventListener("focus", refresh); window.addEventListener("online", refresh); window.addEventListener("pageshow", refresh);
+        document.addEventListener("visibilitychange", visible);
         window.addEventListener(callingWorkflowChanged, workChanged);
         socket.on("connect", refresh); socket.on("lead:changed", refresh); socket.on("call-dashboard:updated", refresh);
         return () => {
             disposed = true; window.clearInterval(interval); window.clearTimeout(timer); window.clearTimeout(prepareTimer);
-            window.removeEventListener("focus", refresh); document.removeEventListener("visibilitychange", visible);
+            window.removeEventListener("focus", refresh); window.removeEventListener("online", refresh); window.removeEventListener("pageshow", refresh);
+            document.removeEventListener("visibilitychange", visible);
             window.removeEventListener(callingWorkflowChanged, workChanged); socket.off("connect", refresh); socket.off("lead:changed", refresh); socket.off("call-dashboard:updated", refresh);
             if (pending) void release(pending);
         };

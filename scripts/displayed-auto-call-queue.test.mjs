@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { runInNewContext } from "node:vm";
 import test from "node:test";
 import ts from "typescript";
+import { QueryClient, QueryObserver } from "@tanstack/react-query";
 
 const source = readFileSync(new URL("../src/components/EmployeeAutoCaller.tsx", import.meta.url), "utf8");
 const ast = ts.createSourceFile("caller.tsx", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
@@ -11,7 +12,7 @@ const code = ts.transpileModule(ts.createPrinter().printFile(ts.factory.updateSo
 }).outputText;
 const first = { _id: "server-head", status: "Follow up", phone: "+12025550121", businessName: "Synthetic callback", comments: [] };
 function fixture(options = {}) {
-    let clock = 0, business = "fake-a", nextTimer = 0, nextAttempt = 0, work = "", active = Boolean(options.busy), dispatchStartedAt = 0, dialPendingUntil = 0;
+    let clock = 0, business = options.business || "fake-a", nextTimer = 0, nextAttempt = 0, work = "", active = Boolean(options.busy), dispatchStartedAt = 0, dialPendingUntil = 0;
     const effects = [], cleanups = [], refs = [], timers = new Map(), intervals = new Map(), listeners = new Map();
     let refIndex = 0;
     const calls = { reserve: [], dispatch: [], launch: [], launchAt: [], release: [], record: [], queue: 0, queueAt: [], progress: [], navigation: [] };
@@ -31,6 +32,10 @@ function fixture(options = {}) {
         setTimeout: (callback, delay) => { const id = ++nextTimer; timers.set(id, { callback, at: clock + delay }); return id; }, clearTimeout: id => timers.delete(id),
         setInterval: callback => { const id = ++nextTimer; intervals.set(id, callback); return id; }, clearInterval: id => intervals.delete(id) };
     const latency = () => options.apiLatency ? new Promise(resolve => window.setTimeout(resolve, options.apiLatency)) : Promise.resolve();
+    const fetchQueue = async () => { calls.queue++; calls.queueAt.push(clock); await latency(); if (options.queueFailure) throw new Error("Synthetic queue failure"); return page(); };
+    const client = options.realQueryClient ? new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: Infinity } } }) : null;
+    const observer = client && new QueryObserver(client, { queryKey: ["calling-queue", business, employee._id], queryFn: fetchQueue, initialData: page(), staleTime: Infinity });
+    const unsubscribe = observer?.subscribe(() => {});
     const exports = {};
     class BrowserDate extends Date { static now() { return super.now() + (options.wrongClock ? 86400000000 : 0); } }
     runInNewContext(code, { exports, JSON, Date: BrowserDate, Symbol, performance: { now: () => clock }, window,
@@ -40,10 +45,11 @@ function fixture(options = {}) {
         useEffect: callback => effects.push(callback), useLayoutEffect: callback => effects.push(callback),
         useNavigate: () => (...args) => calls.navigation.push(args), useLocation: () => ({ pathname: "/dashboard", search: "" }), URLSearchParams,
         useMemo: make => make(), useRef: value => refs[refIndex++] ||= { current: value }, useSyncExternalStore: (_subscribe, get) => get(), useCallingQueue() {},
-        useQueryClient: () => ({ setQueryData() {}, fetchQuery: async () => { calls.queue++; calls.queueAt.push(clock); await latency(); if (options.queueFailure) throw new Error("Synthetic queue failure"); return page(); }, invalidateQueries: async () => {} }),
+        useQueryClient: () => ({ setQueryData() {}, fetchQuery: input => client ? client.fetchQuery({ ...input, queryFn: fetchQueue }) : fetchQueue(),
+            invalidateQueries: (...args) => client ? client.invalidateQueries(...args) : Promise.resolve() }),
         getAuthUser: () => auth, getActiveBusinessId: () => business, callingQueueKey: scope => ["calling-queue", scope.businessId, scope.employeeId],
         callingWorkMessage: () => work, callingWorkflowChanged: "work-changed", setCallingProgress: (_scope, value) => calls.progress.push(value),
-        fetchCallingQueue() {}, socket: { on() {}, off() {} },
+        fetchCallingQueue() {}, socket: { on: (name, listener) => listeners.set(`socket:${name}`, listener), off: name => listeners.delete(`socket:${name}`) },
         getEmployeeSummary: async () => { await latency(); await options.onSummary?.(); return employee; }, isSalesRole: role => role === "Sales", normalizeEmployeeAvailabilityStatus: value => value,
         activateCallBridgeForEmployee: async () => { await latency(); return {}; }, canUseCallBridgeBrowserSession: () => options.activationBlocked !== true,
         getCallBridgeStatus: async () => { await latency(); return status(); },
@@ -79,8 +85,72 @@ function fixture(options = {}) {
         event: async name => { listeners.get(name)?.(); await settle(); },
         refresh: () => { for (const cleanup of cleanups.splice(0)) cleanup(); refs.length = 0; mount(); },
         endCall: () => { active = false; dialPendingUntil = 0; options.cooldown = clock + 30000; },
-        work: value => { work = value; }, stop: () => { for (const cleanup of cleanups.splice(0)) cleanup(); }, switchBusiness: () => { business = "fake-b"; } };
+        cancelQueue: () => client?.cancelQueries({ queryKey: ["calling-queue", business, employee._id] }),
+        work: value => { work = value; }, stop: () => { for (const cleanup of cleanups.splice(0)) cleanup(); unsubscribe?.(); client?.clear(); }, switchBusiness: () => { business = "fake-b"; } };
 }
+
+test("an intentional cancellation after a saved lead update refreshes immediately without network backoff", async () => {
+    const state = fixture({ realQueryClient: true, apiLatency: 100 });
+    try {
+        await state.settle(); await state.advance(150);
+        await state.cancelQueue(); await state.settle();
+        await state.advance(1000);
+        assert.equal(state.calls.launch.length, 1, "a confirmed cache update is not a service outage");
+        assert.equal(state.calls.reserve.length, 1);
+        assert.ok(!state.calls.progress.some(message => message.includes("service unavailable")));
+    } finally { state.stop(); }
+});
+
+test("live dashboard updates cannot cancel a slow authoritative queue read and strand the caller in backoff", async () => {
+    for (let index = 0; index < 6; index++) {
+        const business = `synthetic-${index}`, state = fixture({ realQueryClient: true, apiLatency: 200, business });
+        try {
+            await state.settle(); await state.advance(200);
+            for (let event = 0; event < 4; event++) {
+                await state.advance(40); await state.event("socket:call-dashboard:updated");
+            }
+            await state.advance(2000);
+            assert.equal(state.calls.launch.length, 1, "socket traffic must not require a browser refresh to complete the first call");
+            assert.equal(state.calls.reserve.length, 1);
+            assert.equal(state.calls.reserve[0].businessId, business);
+            assert.ok(!state.calls.progress.some(message => message.includes("service unavailable")), "query cancellation must not masquerade as a provider failure");
+        } finally { state.stop(); }
+    }
+});
+
+test("reconnect and restored-page events resume an eligible caller without refreshing or double dialing", async () => {
+    for (const name of ["online", "pageshow", "socket:connect"]) {
+        const options = { bridgeUnavailable: true }, state = fixture(options);
+        try {
+            await state.settle(); assert.equal(state.calls.launch.length, 0);
+            options.bridgeUnavailable = false;
+            await state.event(name);
+            assert.equal(state.calls.launch.length, 1, `${name} must resume normal readiness checks`);
+            await state.event(name); await state.event(name);
+            await state.advance(2000); await state.tick();
+            assert.equal(state.calls.launch.length, 1, "repeated recovery notifications cannot duplicate an active call");
+        } finally { state.stop(); }
+    }
+});
+
+test("live updates during a slow read preserve active calls and the original post-call deadline", async () => {
+    const state = fixture({ realQueryClient: true, busy: true, apiLatency: 100 });
+    try {
+        await state.settle(); await state.advance(100);
+        for (let event = 0; event < 4; event++) {
+            await state.advance(20); await state.event("socket:call-dashboard:updated");
+        }
+        await state.advance(2000);
+        assert.equal(state.calls.reserve.length, 0);
+        assert.equal(state.calls.release.length, 0, "refresh recovery must not release an observed active call");
+        state.endCall(); await state.event("socket:call-dashboard:updated");
+        await state.advance(29999);
+        assert.equal(state.calls.launch.length, 0, "no recovery event can shorten the server cooldown");
+        await state.advance(1001);
+        assert.equal(state.calls.launch.length, 1);
+        assert.ok(state.calls.launchAt[0] >= 32180 && state.calls.launchAt[0] <= 33180);
+    } finally { state.stop(); }
+});
 
 test("the actual coordinator reserves and launches only the authoritative target, independently of browsing or pending notes", async () => {
     const state = fixture();

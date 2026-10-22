@@ -32,7 +32,7 @@ export function useCallingQueue(input: CallingScope, enabled = true) {
     useEffect(() => {
         if (!nextAt || !serverTime || receivedAt === undefined) return;
         const remaining = +new Date(nextAt) - +new Date(serverTime) - Math.max(0, performance.now() - receivedAt);
-        const timer = window.setTimeout(() => { void client.invalidateQueries({ queryKey: callingQueueKey(scope) }); }, Math.min(2147483647, Math.max(0, remaining)));
+        const timer = window.setTimeout(() => { void client.invalidateQueries({ queryKey: callingQueueKey(scope) }, { cancelRefetch: false }); }, Math.min(2147483647, Math.max(0, remaining)));
         return () => window.clearTimeout(timer);
     }, [client, nextAt, serverTime, receivedAt, scope]);
     return query;
