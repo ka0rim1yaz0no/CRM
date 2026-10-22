@@ -48,6 +48,7 @@ import {
     groupAttendanceRecordsBySlot,
     isWeekendAttendanceSlotKey,
     isAttendanceTimeOutUndertime,
+    attendanceRecordStatus,
     isAttendanceTimeInLate,
 } from "../../../lib/attendanceSlots";
 import { buildOffPhoneAttendanceSessions, formatAttendanceDuration } from "../../../lib/attendanceRecords";
@@ -3015,8 +3016,7 @@ export default function AdminEmployees() {
                                                         session.endRecord?._id === attendance._id ||
                                                         (session.isOpen && session.startRecord._id === attendance._id)
                                                     );
-                                                    const isUnderTime = isAttendanceTimeOutUndertime(attendance, employeeAttendanceSettings);
-                                                    const displayedAttendanceStatus = attendance.attendanceStatus || (isUnderTime ? "Undertime" : "");
+                                                    const displayedAttendanceStatus = attendanceRecordStatus(attendance, employeeAttendanceSettings);
 
                                                     return (
                                                         <article key={attendance._id} className="flex items-start gap-3 rounded-lg border border-slate-300 bg-white p-3">

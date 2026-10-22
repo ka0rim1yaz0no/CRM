@@ -1,6 +1,5 @@
 import { api } from "../lib/api";
-import { isLeadEligibleForAutoCall } from "../lib/employeeAutoCall";
-import { normalizePhoneForCall } from "../lib/phoneNumber";
+import type { CallingDecision } from "../../shared/leadCallingPolicy";
 import type { Employee } from "./employees";
 import type { Team } from "./teams";
 
@@ -30,6 +29,7 @@ export type Lead = {
     createdByType: "admin" | "employee" | "system";
     assignedAgent: Employee | null;
     assignedAgentName: string;
+    assignmentRevision?: number;
     autoAssignedAt: string | null;
     assignedTeam: Team | null;
     favoriteByEmployees?: string[];
@@ -236,6 +236,7 @@ export type LeadImportResult = {
 };
 
 export type MyLeadsPage = {
+    receivedAt?: number;
     leads: Lead[];
     tab: EmployeeLeadTab;
     page: number;
@@ -244,6 +245,22 @@ export type MyLeadsPage = {
     stateOptions: LeadStateOption[];
     hasMore: boolean;
     nextPage: number | null;
+    callingQueue?: CallingQueueSnapshot;
+};
+
+export type CallingQueueSnapshot = {
+    policyVersion: string;
+    scope: { employeeId: string; employeeCode: string; businessId: string };
+    version: string;
+    serverTime: string;
+    nextEligibilityChangeAt: string | null;
+    nextLeadId: string | null;
+    nextLead: Lead | null;
+    nextReason: CallingDecision["reason"] | null;
+    nextDecision: (CallingDecision & { leadId: string; normalizedPhone: string | null }) | null;
+    entries: Array<CallingDecision & { leadId: string; normalizedPhone: string | null }>;
+    callingWindow: { permitted: boolean; nextStartAt: string | null };
+    waitReason: string | null;
 };
 
 export type EmployeeLeadTab = "my" | "qualified" | "negotiation" | "completed" | "dead" | "archived" | "all";
@@ -429,9 +446,10 @@ export async function getAdminLeads(params: {
     state?: string;
     unassigned?: boolean;
     exportFile?: boolean;
-}) {
+}, context: LeadAssignmentContext = {}) {
     const endpoint = params.tab && params.tab !== "leads" ? `/admin-leads/${params.tab}` : "/admin-leads";
     const response = await api.get<AdminLeadsPage>(endpoint, {
+        headers: assignmentHeaders(context),
         params: {
             ...params,
             tab: undefined,
@@ -459,8 +477,9 @@ export async function getAdminLeadCounts(params: {
     search?: string;
     state?: string;
     unassigned?: boolean;
-} = {}) {
+} = {}, context: LeadAssignmentContext = {}) {
     const response = await api.get<LeadCountResult>("/admin-leads/counts", {
+        headers: assignmentHeaders(context),
         params: {
             ...params,
             assignedAgentNames: params.assignedAgentNames?.join(","),
@@ -475,8 +494,8 @@ export async function getAgentLeadDashboard(params: { month?: string; dateFrom?:
     return response.data;
 }
 
-export async function getLead(id: string, options: { timeoutMs?: number } = {}) {
-    const response = await api.get<Lead>(`/leads/${id}`, { timeout: options.timeoutMs });
+export async function getLead(id: string, options: LeadAssignmentContext & { timeoutMs?: number } = {}) {
+    const response = await api.get<Lead>(`/leads/${id}`, { timeout: options.timeoutMs, headers: assignmentHeaders(options) });
     return response.data;
 }
 
@@ -492,7 +511,8 @@ export async function getMyLeads(params: {
     includeArchived?: boolean;
     state?: string;
     autoCallEligible?: boolean;
-}, options: { timeoutMs?: number } = {}) {
+    callingQueue?: boolean;
+}, options: { timeoutMs?: number; businessId?: string; employeeSession?: string } = {}) {
     const endpoint = params.tab && params.tab !== "my" ? `/my-leads/${params.tab}` : "/my-leads";
     const response = await api.get<MyLeadsPage>(endpoint, {
         params: {
@@ -501,6 +521,8 @@ export async function getMyLeads(params: {
             employeeNames: params.employeeNames?.join(","),
         },
         timeout: options.timeoutMs,
+        headers: { ...(options.businessId ? { "X-Business-Id": options.businessId } : {}),
+            ...(options.employeeSession ? { "X-CRM-Attendance-Session": options.employeeSession } : {}) },
     });
     return response.data;
 }
@@ -509,39 +531,12 @@ export async function getNextAutoCallLead(params: {
     employeeId: string;
     employeeNames: string[];
     excludedLeadIds?: string[];
-}, options: { timeoutMs?: number } = {}) {
-    const excludedLeadIds = new Set(params.excludedLeadIds || []);
-    let page = 1;
-
-    while (true) {
-        const leadPage = await getMyLeads({
-            employeeId: params.employeeId,
-            employeeNames: params.employeeNames,
-            tab: "my",
-            queue: "ALL",
-            page,
-            limit: 50,
-            autoCallEligible: true,
-        }, options);
-        const callableLead = leadPage.leads
-            .filter((item) => !excludedLeadIds.has(item._id))
-            .filter((item) => isLeadEligibleForAutoCall(item, new Date(), params.employeeNames))
-            .map((lead) => ({ lead, normalizedPhone: normalizePhoneForCall(lead.phone) }))
-            .find((item) => Boolean(item.normalizedPhone));
-
-        if (callableLead?.normalizedPhone) {
-            return {
-                ...callableLead,
-                queue: callableLead.lead.status === "Follow up" ? "Follow up" as const : "NEW" as const,
-            };
-        }
-
-        if (!leadPage.hasMore || leadPage.nextPage === null) {
-            return null;
-        }
-
-        page = leadPage.nextPage;
-    }
+}, options: { timeoutMs?: number; businessId?: string; employeeSession?: string } = {}) {
+    const page = await getMyLeads({ employeeId: params.employeeId, callingQueue: true, limit: 1 }, options);
+    const queue = page.callingQueue;
+    return queue?.nextLead && queue.nextDecision?.normalizedPhone
+        ? { lead: queue.nextLead, reason: queue.nextReason, normalizedPhone: queue.nextDecision.normalizedPhone, queue: queue.nextLead.status === "Follow up" ? "Follow up" as const : "NEW" as const }
+        : null;
 }
 
 export async function getMyLeadCounts(params: { employeeId?: string; employeeNames?: string[]; state?: string } = {}) {
@@ -569,21 +564,22 @@ export async function importLeads(leads: LeadImportInput[]) {
     return response.data;
 }
 
-export async function updateLead(id: string, lead: LeadInput) {
-    const response = await api.put<Lead>(`/leads/${id}`, lead);
+export async function updateLead(id: string, lead: LeadInput, context: LeadAssignmentContext = {}) {
+    const response = await api.put<Lead>(`/leads/${id}`, lead, { headers: assignmentHeaders(context) });
     return response.data;
 }
 
 export async function assignLead(
     id: string,
-    assignment: { assignedAgent: string; assignedAgentName?: string } & LeadActivityActorInput
+    assignment: { assignedAgent: string; assignedAgentName?: string; expectedAssignmentRevision?: number } & LeadActivityActorInput,
+    context: LeadAssignmentContext = {}
 ) {
-    const response = await api.patch<Lead>(`/leads/${id}/assign`, assignment);
+    const response = await api.patch<Lead>(`/leads/${id}/assign`, assignment, { headers: assignmentHeaders(context) });
     return response.data;
 }
 
-export async function archiveLead(id: string, actor: LeadActivityActorInput = {}) {
-    const response = await api.patch<Lead>(`/leads/${id}/archive`, actor);
+export async function archiveLead(id: string, actor: LeadActivityActorInput = {}, context: LeadAssignmentContext = {}) {
+    const response = await api.patch<Lead>(`/leads/${id}/archive`, actor, { headers: assignmentHeaders(context) });
     return response.data;
 }
 
@@ -606,6 +602,21 @@ export async function bulkArchiveLeads(leadIds: string[]) {
     return response.data;
 }
 
+export type EmployeeBulkArchiveResult = { archivedCount: number; archivedIds: string[]; conflictIds: string[];
+    busyIds: string[]; alreadyArchivedCount: number; selectedCount: number; preservedOtherOwnerCount: number };
+
+export async function getLeadWorkspaceCapabilities(context: LeadAssignmentContext) {
+    const response = await api.get<{ phoneDeduplication: boolean; employeeBulkArchive: boolean }>("/leads/workspace-capabilities", { headers: assignmentHeaders(context) });
+    return response.data;
+}
+
+export async function archiveEmployeeLeads(leads: Array<{ _id: string; assignmentRevision?: number }>, context: LeadAssignmentContext) {
+    const response = await api.patch<EmployeeBulkArchiveResult>("/leads/employee/bulk/archive", {
+        leadIds: leads.map(lead => lead._id), expectedAssignmentRevisions: Object.fromEntries(leads.map(lead => [lead._id, lead.assignmentRevision || 0])),
+    }, { headers: assignmentHeaders(context) });
+    return response.data;
+}
+
 export async function archiveAllActiveLeads() {
     const response = await api.patch<LeadBulkArchiveResult>("/leads/bulk/archive-all", {
         confirmation: "ARCHIVE_ALL_ACTIVE_LEADS",
@@ -624,12 +635,24 @@ export async function bulkRestoreLeads(leadIds: string[]) {
     return response.data;
 }
 
-export async function bulkAssignLeads(input: { leadIds: string[]; assignedAgent: string; assignedAgentName: string }) {
+export type LeadAssignmentContext = { businessId?: string; employeeSession?: string; adminSession?: string };
+
+function assignmentHeaders(context: LeadAssignmentContext) {
+    if (context.employeeSession !== undefined || context.adminSession !== undefined) return {
+        ...(context.businessId ? { "X-Business-Id": context.businessId } : {}),
+        "X-CRM-Attendance-Session": context.employeeSession || "", "X-CRM-Admin-Session": context.adminSession || "",
+    };
+    return { ...(context.businessId ? { "X-Business-Id": context.businessId } : {}),
+        ...(context.employeeSession ? { "X-CRM-Attendance-Session": context.employeeSession } : {}),
+        ...(context.adminSession ? { "X-CRM-Admin-Session": context.adminSession } : {}) };
+}
+
+export async function bulkAssignLeads(input: { leadIds: string[]; assignedAgent: string; assignedAgentName: string; expectedAssignmentRevisions?: Record<string, number> }, context: LeadAssignmentContext = {}) {
     const response = await api.patch<LeadBulkAssignResult>("/leads/bulk/assign", {
         ...input,
         activityActorName: "Admin",
         activityActorType: "admin",
-    });
+    }, { headers: assignmentHeaders(context) });
     return response.data;
 }
 
@@ -659,29 +682,31 @@ export async function permanentlyDeleteAllArchivedLeads() {
     return response.data;
 }
 
-export async function autoAssignLead(id: string) {
-    const response = await api.patch<Lead>(`/leads/${id}/auto-assign`);
+export async function autoAssignLead(id: string, context: LeadAssignmentContext = {}) {
+    const response = await api.patch<Lead>(`/leads/${id}/auto-assign`, {}, { headers: assignmentHeaders(context) });
     return response.data;
 }
 
-export async function reassignNewLeads() {
-    const response = await api.patch<LeadReassignmentResult>("/leads/reassign-new");
+export async function reassignNewLeads(context: LeadAssignmentContext = {}) {
+    const response = await api.patch<LeadReassignmentResult>("/leads/reassign-new", {}, { headers: assignmentHeaders(context) });
     return response.data;
 }
 
 export async function scheduleLeadFollowUp(
     id: string,
-    followUp: { followUpAt: string; followUpNote?: string; followUpPriority?: number } & LeadActivityActorInput
+    followUp: { followUpAt: string; followUpNote?: string; followUpPriority?: number } & LeadActivityActorInput,
+    options: { businessId?: string; employeeSession?: string } = {}
 ) {
-    const response = await api.patch<Lead>(`/leads/${id}/follow-up`, followUp);
+    const response = await api.patch<Lead>(`/leads/${id}/follow-up`, followUp, { headers: { ...(options.businessId ? { "X-Business-Id": options.businessId } : {}), ...(options.employeeSession ? { "X-CRM-Attendance-Session": options.employeeSession } : {}) } });
     return response.data;
 }
 
 export async function addLeadComment(
     id: string,
-    comment: { body: string; authorName?: string; authorType?: "admin" | "employee" }
+    comment: { body: string; authorName?: string; authorType?: "admin" | "employee" },
+    options: LeadAssignmentContext = {}
 ) {
-    const response = await api.post<Lead>(`/leads/${id}/comments`, comment);
+    const response = await api.post<Lead>(`/leads/${id}/comments`, comment, { headers: assignmentHeaders(options) });
     return response.data;
 }
 
@@ -694,9 +719,10 @@ type LeadActivityActorInput = {
 export async function recordLeadCall(
     id: string,
     actor: LeadActivityActorInput & { callOutcome?: "confirmed" | "failed" } = {},
-    options: { timeoutMs?: number } = {}
+    options: { timeoutMs?: number; businessId?: string; employeeSession?: string } = {}
 ) {
-    const response = await api.post<Lead>(`/leads/${id}/calls`, actor, { timeout: options.timeoutMs });
+    const response = await api.post<Lead>(`/leads/${id}/calls`, actor, { timeout: options.timeoutMs,
+        headers: { ...(options.businessId ? { "X-Business-Id": options.businessId } : {}), ...(options.employeeSession ? { "X-CRM-Attendance-Session": options.employeeSession } : {}) } });
     return response.data;
 }
 
@@ -705,13 +731,13 @@ export async function updateLeadComment(id: string, commentId: string, comment: 
     return response.data;
 }
 
-export async function updateLeadStatus(id: string, status: LeadStatus, actor: LeadActivityActorInput = {}) {
-    const response = await api.patch<Lead>(`/leads/${id}/status`, { status, ...actor });
+export async function updateLeadStatus(id: string, status: LeadStatus, actor: LeadActivityActorInput = {}, options: { businessId?: string; employeeSession?: string } = {}) {
+    const response = await api.patch<Lead>(`/leads/${id}/status`, { status, ...actor }, { headers: { ...(options.businessId ? { "X-Business-Id": options.businessId } : {}), ...(options.employeeSession ? { "X-CRM-Attendance-Session": options.employeeSession } : {}) } });
     return response.data;
 }
 
-export async function toggleLeadFavorite(id: string, input: { employeeId: string; favorite: boolean }) {
-    const response = await api.patch<Lead>(`/leads/${id}/favorite`, input);
+export async function toggleLeadFavorite(id: string, input: { employeeId: string; favorite: boolean }, context: LeadAssignmentContext = {}) {
+    const response = await api.patch<Lead>(`/leads/${id}/favorite`, input, { headers: assignmentHeaders(context) });
     return response.data;
 }
 

@@ -2,7 +2,7 @@ import { normalizeEmployeeAvailabilityStatus, type Employee } from "../../../api
 import { type AttendanceRecord } from "../../../api/attendance";
 import { type AgentLeadActivity, type AgentLeadMonthlyRow, type AgentLeadProgress, type Lead, type LeadCallStat } from "../../../api/leads";
 import { buildOffPhoneAttendanceSessions, type OffPhoneAttendanceSession } from "../../../lib/attendanceRecords";
-import { isAttendanceTimeOutUndertime } from "../../../lib/attendanceSlots";
+import { attendanceRecordStatus } from "../../../lib/attendanceSlots";
 import { formatPhDate, formatPhDateTime } from "../../../lib/dateTime";
 
 const numberFormatter = new Intl.NumberFormat("en-US");
@@ -458,11 +458,11 @@ export function formatAttendanceDuration(milliseconds: number) {
 }
 
 export function getAttendanceStatusText(record: AttendanceRecord) {
-    return String(record.attendanceStatus || (isAttendanceTimeOutUndertime(record) ? "Undertime" : "")).trim().toLowerCase();
+    return attendanceRecordStatus(record).toLowerCase();
 }
 
 export function getAttendanceStatusLabel(record: AttendanceRecord) {
-    return record.attendanceStatus || (isAttendanceTimeOutUndertime(record) ? "Undertime" : "No status");
+    return attendanceRecordStatus(record) || "No status";
 }
 
 function getBreakReturnSource(source?: AttendanceRecord["source"]) {

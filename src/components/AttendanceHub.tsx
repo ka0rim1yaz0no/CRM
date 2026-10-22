@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSearchParams } from "react-router";
-import { FiAlertCircle, FiChevronDown, FiDownload, FiFilter, FiHelpCircle, FiMenu, FiPrinter, FiRefreshCw, FiX } from "react-icons/fi";
+import { FiAlertCircle, FiDownload, FiFilter, FiHelpCircle, FiMenu, FiPrinter, FiRefreshCw, FiX } from "react-icons/fi";
 import { getAuthUser } from "../api/authStorage";
 import { downloadAttendanceHubCsv, getAttendanceHubDay, getAttendanceHubDays, getAttendanceHubLive,
     type HubDay, type HubBreakSession, type HubFilters, type HubResponse } from "../api/attendanceHub";
@@ -189,7 +189,13 @@ function DayDrawer({ selected, onClose, admin }: { selected: { dayKey: string; e
     </div>;
 }
 
-function DayRow({ day, visible, dense, open }: { day: HubDay; visible: Set<Column>; dense: boolean; open: (day: HubDay) => void }) {
+type RowEmployee = Pick<HubDay, "employeeName" | "employeeCode" | "team">;
+
+function EmployeeIdentity({ employee }: { employee: RowEmployee }) {
+    return <><strong>{employee.employeeName}</strong><small>{employee.employeeCode} · {employee.team || "--"}</small></>;
+}
+
+function DayRow({ day, visible, dense, open, employee }: { day: HubDay; visible: Set<Column>; dense: boolean; open: (day: HubDay) => void; employee?: RowEmployee }) {
     const value: Record<Column, ReactNode> = {
         shift: `${localTime(day.shiftStart)} - ${localTime(day.shiftEnd)}`, timeIn: localTime(day.timeIn), timeOut: <>{localTime(day.timeOut)} {hasAutoTimeOut(day) && autoBadge}</>,
         worked: duration(day.milliseconds.online), break: <div><span>{duration(day.milliseconds.break)} used / +{duration(day.milliseconds.overBreak)} over</span><small>{attendanceBreakAllowanceLabel(day.breakMinutes)}</small></div>,
@@ -202,16 +208,18 @@ function DayRow({ day, visible, dense, open }: { day: HubDay; visible: Set<Colum
             {day.mismatch && <span className="attendance-hub-badge warning">MISMATCH</span>}</div>,
         notes: <span className="attendance-hub-note-preview" title={day.note}>{day.note || "--"}</span>,
     };
+    const date = <><button type="button" className="attendance-hub-day-link" onClick={() => open(day)}>{labelDay(day.dayKey)}</button>
+        {day.note && <small title={day.note}>Note</small>}</>;
     return <><tr className={dense ? "dense" : ""}>
-        <th scope="row"><button type="button" className="attendance-hub-day-link" onClick={() => open(day)}>{labelDay(day.dayKey)}</button>
-            {day.note && <small title={day.note}>Note</small>}</th>
+        {employee && <th scope="row" className="attendance-hub-employee-cell"><EmployeeIdentity employee={employee} /></th>}
+        {employee ? <td>{date}</td> : <th scope="row">{date}</th>}
         {columns.filter((column) => visible.has(column)).map((column) => <td key={column}>{value[column]}</td>)}
-    </tr><tr className="attendance-hub-mobile-row"><td><button type="button" onClick={() => open(day)}><strong>{labelDay(day.dayKey)}</strong>
+    </tr>{!employee && <tr className="attendance-hub-mobile-row"><td><button type="button" onClick={() => open(day)}><strong>{labelDay(day.dayKey)}</strong>
         <span>{day.status} · {duration(day.milliseconds.online)} worked {hasAutoTimeOut(day) && autoBadge}</span>
         <span>1st Break · {day.breakMinutes}m allowance<BreakRecord entry={day.breakSessions?.[0]} label="1st break" available={Boolean(day.breakSessions)} /></span>
         <span>2nd Break · {day.breakMinutes}m allowance<BreakRecord entry={day.breakSessions?.[1]} label="2nd break" available={Boolean(day.breakSessions)} /></span>
         {day.breakSessions?.length > 2 && <span>{day.breakSessions.length - 2} additional break(s) in shift detail</span>}
-        <span>{day.issues.map(attendanceIssueLabel).join(" · ") || "No issues"}</span>{day.note && <span>{day.note}</span>}</button></td></tr></>;
+        <span>{day.issues.map(attendanceIssueLabel).join(" · ") || "No issues"}</span>{day.note && <span>{day.note}</span>}</button></td></tr>}</>;
 }
 
 export default function AttendanceHub({ admin = false, actions, message, embedded = false }: { admin?: boolean; actions?: ReactNode; message?: string; embedded?: boolean }) {
@@ -227,7 +235,6 @@ export default function AttendanceHub({ admin = false, actions, message, embedde
     });
     const [selected, setSelected] = useState<{ dayKey: string; employeeCode: string; businessId?: string } | null>(null);
     const closeDay = useCallback(() => setSelected(null), []);
-    const [expanded, setExpanded] = useState<Set<string>>(new Set());
     const [navOpen, setNavOpen] = useState(false);
     const [dense, setDense] = useState(false);
     const [visible, setVisible] = useState<Set<Column>>(() => new Set(columns.filter((column) => column !== "break")));
@@ -361,11 +368,6 @@ export default function AttendanceHub({ admin = false, actions, message, embedde
                         <option value="today">Today</option><option value="date">Specific Date</option><option value="all">All Shifts</option></select></label>
                         {filters.shiftView === "date" && <input aria-label="Specific shift date" type="date" max={data.history?.today || manilaCalendarDate(new Date())} value={filters.shiftDate || ""} onChange={(event) => setShiftView("date", event.target.value)} />}
                         <button type="button" onClick={() => setShiftView("today")} disabled={filters.shiftView === "today"}>Reset to Today</button></>}
-                    {admin && <button type="button" disabled={!groups.length || isPlaceholderData} aria-expanded={groups.length > 0 && groups.every(({ employee }) => expanded.has(employee.scopeKey))}
-                        aria-controls={groups.map(({ employee }) => `attendance-days-${encodeURIComponent(employee.scopeKey)}`).join(" ")}
-                        aria-label={groups.length > 0 && groups.every(({ employee }) => expanded.has(employee.scopeKey)) ? "Collapse all employees on this page" : "Expand all employees on this page"}
-                        onClick={() => setExpanded((current) => groups.every(({ employee }) => current.has(employee.scopeKey)) ? new Set() : new Set(groups.map(({ employee }) => employee.scopeKey)))}>
-                        {groups.length > 0 && groups.every(({ employee }) => expanded.has(employee.scopeKey)) ? "Collapse all" : groups.some(({ employee }) => expanded.has(employee.scopeKey)) ? "Expand all (mixed)" : "Expand all"}</button>}
                     <button type="button" onClick={() => setDense(!dense)}>{dense ? "Comfortable" : "Compact"}</button>
                     <details><summary><FiFilter /> Columns</summary><div>{columns.map((column) => <label key={column}>
                         <input type="checkbox" checked={visible.has(column)} onChange={() => setVisible((current) => {
@@ -373,17 +375,32 @@ export default function AttendanceHub({ admin = false, actions, message, embedde
                         })} /> {columnLabels[column]}</label>)}</div></details></div></div>
                 {admin && <p className="attendance-hub-record-range">{filters.shiftView === "today" ? "Current shift" : filters.shiftView === "date" ? "Shift date" : filters.shiftView === "all" ? "All Shifts · historical window" : "Linked date range"}: {data.range.from}{data.range.to !== data.range.from ? ` to ${data.range.to}` : ""} · Asia/Manila{filters.shiftView === "today" && data.history?.today && data.history.today !== data.range.from ? ` · Calendar date: ${data.history.today}` : ""}{isPlaceholderData ? " · Updating..." : ""}</p>}
                 {!groups.length && <p className="attendance-hub-empty">No shift records match these filters.</p>}
-                {groups.map(({ employee, days }) => <div key={employee.scopeKey} className="attendance-hub-employee-group">
-                    {admin && <button type="button" className="attendance-hub-group-toggle" aria-expanded={expanded.has(employee.scopeKey)} aria-controls={`attendance-days-${encodeURIComponent(employee.scopeKey)}`}
-                        onClick={() => setExpanded((current) => { const next = new Set(current); if (next.has(employee.scopeKey)) next.delete(employee.scopeKey); else next.add(employee.scopeKey); return next; })}>
-                        <strong>{employee.employeeName}</strong><span>{employee.employeeCode} · {employee.team} · {days.length} days · {duration(days.reduce((sum, day) => sum + day.milliseconds.online, 0))} worked · {days.reduce((sum, day) => sum + day.issues.length, 0)} issues</span><FiChevronDown /></button>}
-                    <div id={`attendance-days-${encodeURIComponent(employee.scopeKey)}`} hidden={admin && !expanded.has(employee.scopeKey)}>{(!admin || expanded.has(employee.scopeKey)) && <div className="attendance-hub-table-scroll">
-                        {isPlaceholderData ? <p className="attendance-hub-empty" role="status">Loading selected shifts...</p> : (!days.length || (filters.shiftView !== "all" && days.every((day) => !day.events.length))) ? <p className="attendance-hub-empty">No shift record for this date {days.flatMap((day) => day.issues).map((issue) => <span className={issueClass(issue)} key={issue}>{attendanceIssueLabel(issue)}</span>)}</p> : <table><thead><tr><th scope="col">
-                        <button type="button" onClick={() => setSort("date")}>Date</button></th>
-                        {columns.filter((column) => visible.has(column)).map((column) => <th scope="col" key={column} aria-sort={filters.sort === column ? filters.direction === "asc" ? "ascending" : "descending" : "none"}>
-                            {column === "notes" ? columnLabels[column] : <button type="button" onClick={() => setSort(column)}>{columnLabels[column]}{(column === "firstBreak" || column === "secondBreak") && ` (${data.thresholds.breakMinutes}m)`}</button>}</th>)}</tr></thead><tbody>
-                        {days.map((day) => <DayRow key={`${day.employeeCode}:${day.dayKey}`} day={day} visible={visible} dense={dense} open={showDay} />)}
-                    </tbody></table>}</div>}</div></div>)}
+                {groups.length > 0 && <div className={`attendance-hub-table-scroll${admin ? " attendance-hub-inline-table" : ""}`}>
+                    <table aria-label="Employee shift records"><thead><tr>
+                        {admin && <th scope="col">Employee</th>}
+                        <th scope="col"><button type="button" onClick={() => setSort("date")}>Date</button></th>
+                        {columns.filter(column => visible.has(column)).map(column => <th scope="col" key={column}
+                            aria-sort={filters.sort === column ? filters.direction === "asc" ? "ascending" : "descending" : "none"}>
+                            {column === "notes" ? columnLabels[column] : <button type="button" onClick={() => setSort(column)}>{columnLabels[column]}{(column === "firstBreak" || column === "secondBreak") && ` (${data.thresholds.breakMinutes}m)`}</button>}
+                        </th>)}
+                    </tr></thead><tbody>
+                        {groups.map(({ employee, days }) => {
+                            const records = admin && filters.shiftView !== "all" ? days.filter(day => day.events.length > 0) : days;
+                            return records.length ? records.map(day => <DayRow key={`${employee.scopeKey}:${day.dayKey}`}
+                                day={day} employee={admin ? employee : undefined} visible={visible} dense={dense} open={showDay} />)
+                                : <tr key={employee.scopeKey} className={dense ? "dense" : ""}>
+                                    {admin && <th scope="row" className="attendance-hub-employee-cell"><EmployeeIdentity employee={employee} /></th>}
+                                    <td>{filters.shiftView === "all" ? "--" : labelDay(filters.shiftDate || data.range.from)}</td>
+                                    <td colSpan={Math.max(1, visible.size)} className="attendance-hub-empty-shift">
+                                        {isPlaceholderData ? <span role="status">Loading selected shifts...</span> : <>No shift record for this date{" "}
+                                            {[...new Set(days.flatMap(day => day.issues))].map(issue => <span className={issueClass(issue)} key={issue}>{attendanceIssueLabel(issue)}</span>)}
+                                            {days.filter(day => day.note).map(day => <small key={day.dayKey}>{day.note}</small>)}</>}
+                                        {days.filter(day => day.leave).map(day => <small key={`leave-${day.dayKey}`}>Approved leave: {day.leave}</small>)}
+                                    </td>
+                                </tr>;
+                        })}
+                    </tbody></table>
+                </div>}
                 {filters.shiftView === "all" && data.history && <nav className="attendance-hub-pagination" aria-label="Shift history windows">
                     <button type="button" disabled={!data.history.hasNewer || isFetching} onClick={() => setFilter("historyPage", String(data.history!.page - 1))}>Newer shifts</button>
                     <span>{data.range.from} to {data.range.to}</span>

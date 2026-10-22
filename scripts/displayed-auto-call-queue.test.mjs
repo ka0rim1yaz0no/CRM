@@ -3,292 +3,286 @@ import { readFileSync } from "node:fs";
 import { runInNewContext } from "node:vm";
 import test from "node:test";
 import ts from "typescript";
-import { normalizePhoneForCall } from "../src/lib/phoneNumber.ts";
 
-function load(file, sandbox) {
-    const text = readFileSync(new URL(`../${file}`, import.meta.url), "utf8");
-    const ast = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
-    const source = ts.createPrinter().printFile(ts.factory.updateSourceFile(ast, ast.statements.filter(node => !ts.isImportDeclaration(node))));
-    const exports = {};
-    runInNewContext(ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText, { exports, Event, ...sandbox });
-    return exports;
-}
-const scope = { employeeId: "fake-employee", businessId: "fake-a" };
-const lead = (id, extra = {}) => ({ _id: id, status: "NEW", assignedAgent: scope.employeeId, phone: "+12025550101", comments: [], ...extra });
-
+const source = readFileSync(new URL("../src/components/EmployeeAutoCaller.tsx", import.meta.url), "utf8");
+const ast = ts.createSourceFile("caller.tsx", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+const code = ts.transpileModule(ts.createPrinter().printFile(ts.factory.updateSourceFile(ast, ast.statements.filter(node => !ts.isImportDeclaration(node)))), {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
+}).outputText;
+const first = { _id: "server-head", status: "Follow up", phone: "+12025550121", businessName: "Synthetic callback", comments: [] };
 function fixture(options = {}) {
-    let now = Date.parse(options.at || "2026-10-20T23:00:00Z"), nextTimer = 0, business = scope.businessId;
-    let pending = { leadId: "old-pending", baselineCommentMarker: "old" }, activationBlocked = false;
-    const listeners = new Map(), timers = new Map(), effects = [], cleanups = [], references = [];
-    let referenceIndex = 0;
-    const calls = { reserve: [], dialStart: [], dial: [], release: [], navigate: [], invalidated: 0, summaries: 0, loadMore: 0 };
-    const window = { dispatchEvent: event => listeners.get(event.type)?.(), addEventListener: (name, callback) => listeners.set(name, callback),
-        removeEventListener: name => listeners.delete(name), clearTimeout: id => timers.delete(id), clearInterval() {},
-        setInterval: () => ++nextTimer, setTimeout: (callback, ms) => { const id = ++nextTimer; timers.set(id, { callback, ms }); return id; },
-        localStorage: { getItem: () => "0", setItem() {} } };
-    class Clock extends Date { constructor(value) { super(value === undefined ? now : value); } static now() { return now; } }
-    const eligibility = load("src/lib/employeeAutoCall.ts", { window, Date: Clock, Intl });
-    const queue = load("src/lib/displayedAutoCallQueue.ts", { ...eligibility, normalizePhoneForCall, window, Date: Clock });
-    const owner = Symbol("test-view");
-    let rows = options.rows || [lead("first"), lead("old-pending")];
-    const publish = (leads, ready = true, more = Boolean(options.onLoadMore)) => {
-        rows = leads;
-        queue.publishDisplayedAutoCallQueue(owner, scope, rows, ready, more ? async () => {
-            calls.loadMore++;
-            return options.onLoadMore({ publish });
-        } : undefined);
-    };
-    publish(rows, options.ready !== false);
-    const employee = { _id: scope.employeeId, employeeCode: "fake-code", role: "Sales", availabilityStatus: "ONLINE", name: "Synthetic" };
-    const auth = { userType: "employee", user: employee };
-    const caller = load("src/components/EmployeeAutoCaller.tsx", { ...eligibility, ...queue, window, Date: Clock,
-        normalizePhoneForCall, crypto: { randomUUID: () => `attempt-${++nextTimer}` },
-        useRef: current => references[referenceIndex++] ||= { current }, useEffect: callback => effects.push(callback), useNavigate: () => (...args) => calls.navigate.push(args),
-        useLocation: () => ({ pathname: options.path || "/leads" }),
-        useQueryClient: () => ({ invalidateQueries: async () => { calls.invalidated++; } }),
-        getAuthUser: () => auth, getActiveBusinessId: () => business,
-        activateCallBridgeForEmployee: async () => ({}), canUseCallBridgeBrowserSession: () => !activationBlocked,
-        getEmployeeSummary: async () => { calls.summaries++; await options.onSummary?.(calls.summaries); return employee; }, normalizeEmployeeAvailabilityStatus: value => value,
-        getCallBridgeStatus: async () => ({ ready: now >= (options.cooldown || 0), connected: true, nextivaProcessDetected: true,
-            state: calls.dial.length ? "active" : "idle", nextCallAllowedAt: options.cooldown ? new Date(options.cooldown).toISOString() : null,
-            serverTime: new Date(now).toISOString(), clientReceivedAt: now, lastCallEndedAt: null }),
-        getNextAutoCallLead: async () => ({ lead: lead("background"), normalizedPhone: "+12025550101" }),
-        getLead: async id => { if (options.blockActivationAt === 'onRead') activationBlocked = true; await options.onRead?.({ id, publish, switchBusiness: () => { business = "fake-b"; } }); return (typeof options.fresh === "function" ? options.fresh(id) : options.fresh) || rows.find(row => row._id === id) || lead(id); },
-        getAutoCallPendingComment: () => pending, clearAutoCallPendingComment: () => { pending = null; },
-        startAutoCallPendingComment: (_code, id) => { pending = { leadId: id }; },
-        reserveCallBridgeCall: async (_code, input) => { calls.reserve.push({ ...input, at: now }); if (options.blockActivationAt === 'onReserve') activationBlocked = true; options.onReserve?.({ publish }); return options.reservationResult?.(input) || { allowed: true, reservationToken: "fake-token" }; },
-        markCallBridgeDialStarted: async (_code, input) => { calls.dialStart.push(input); if (options.blockActivationAt === 'onDialStart') activationBlocked = true; options.onDialStart?.({ publish }); return { alreadyStarted: options.alreadyStarted || false }; },
-        releaseCallBridgeCall: async (_code, input) => { calls.release.push(input); }, recordLeadCall: async () => ({}), callTimingV2Enabled: true,
-        document: { body: { appendChild() {} }, createElement: () => ({ setAttribute() {}, remove() {}, click() { calls.dial.push(now); } }) } });
-    const mount = () => {
-        referenceIndex = 0; effects.length = 0;
-        caller.default();
-        for (const callback of effects) { const cleanup = callback(); if (cleanup) cleanups.push(cleanup); }
-    };
-    const stop = () => { for (const cleanup of cleanups.splice(0)) cleanup(); };
-    mount();
-    const settle = async (runTimers = true) => {
-        for (let step = 0; step < 15; step++) {
-            await new Promise(resolve => setImmediate(resolve));
-            if (runTimers && timers.size) {
-                const [id, timer] = timers.entries().next().value;
-                timers.delete(id); now += timer.ms; timer.callback();
-            }
+    let clock = 0, business = "fake-a", nextTimer = 0, nextAttempt = 0, work = "", active = Boolean(options.busy), dispatchStartedAt = 0, dialPendingUntil = 0;
+    const effects = [], cleanups = [], refs = [], timers = new Map(), intervals = new Map(), listeners = new Map();
+    let refIndex = 0;
+    const calls = { reserve: [], dispatch: [], launch: [], launchAt: [], release: [], record: [], queue: 0, queueAt: [], progress: [], navigation: [] };
+    const employee = { _id: "fake-person", employeeCode: "fake-code", role: "Sales", availabilityStatus: options.availability || "ONLINE" };
+    const auth = { userType: "employee", user: employee, attendanceHubSession: "fake-signed-session" };
+    const serverTime = () => new Date(Date.parse("2026-10-22T17:00:00Z") + clock).toISOString();
+    const page = () => { const head = options.headAt?.(clock) || first; return { leads: [head], callingQueue: { scope: { employeeId: employee._id, businessId: business }, version: "server-version",
+        serverTime: serverTime(), nextLead: options.empty ? null : head, nextLeadId: options.empty ? null : head._id,
+        nextDecision: { normalizedPhone: head.phone }, callingWindow: { permitted: options.outside !== true }, nextEligibilityChangeAt: options.nextAt || null } }; };
+    const status = () => ({ ready: !options.bridgeUnavailable && !active && clock >= (options.cooldown || 0) && clock >= dialPendingUntil,
+        state: options.bridgeUnavailable ? "unknown" : active ? "active" : clock < dialPendingUntil ? "calling" : "idle", reason: options.bridgeUnavailable ? "Call Bridge cannot confirm provider state" : undefined,
+        serverTime: new Date(Date.parse("2026-10-22T17:00:00Z") + clock).toISOString(),
+        nextCallAllowedAt: options.cooldown ? new Date(Date.parse("2026-10-22T17:00:00Z") + options.cooldown).toISOString() : null,
+        observedAttemptId: active ? options.unrelated ? "other-attempt" : calls.reserve.at(-1)?.attemptId : null,
+        observedLeadId: active ? options.unrelated ? "other-lead" : calls.reserve.at(-1)?.leadId : null });
+    const window = { addEventListener: (name, listener) => listeners.set(name, listener), removeEventListener: name => listeners.delete(name),
+        setTimeout: (callback, delay) => { const id = ++nextTimer; timers.set(id, { callback, at: clock + delay }); return id; }, clearTimeout: id => timers.delete(id),
+        setInterval: callback => { const id = ++nextTimer; intervals.set(id, callback); return id; }, clearInterval: id => intervals.delete(id) };
+    const latency = () => options.apiLatency ? new Promise(resolve => window.setTimeout(resolve, options.apiLatency)) : Promise.resolve();
+    const exports = {};
+    class BrowserDate extends Date { static now() { return super.now() + (options.wrongClock ? 86400000000 : 0); } }
+    runInNewContext(code, { exports, JSON, Date: BrowserDate, Symbol, performance: { now: () => clock }, window,
+        document: { visibilityState: "visible", addEventListener() {}, removeEventListener() {}, body: { appendChild() {} },
+            createElement: () => ({ href: "", setAttribute() {}, remove() {}, click() { calls.launch.push(this.href); calls.launchAt.push(clock); active = !options.launchUnconfirmed; } }) },
+        crypto: { randomUUID: () => `attempt-${++nextAttempt}` },
+        useEffect: callback => effects.push(callback), useLayoutEffect: callback => effects.push(callback),
+        useNavigate: () => (...args) => calls.navigation.push(args), useLocation: () => ({ pathname: "/dashboard", search: "" }), URLSearchParams,
+        useMemo: make => make(), useRef: value => refs[refIndex++] ||= { current: value }, useSyncExternalStore: (_subscribe, get) => get(), useCallingQueue() {},
+        useQueryClient: () => ({ setQueryData() {}, fetchQuery: async () => { calls.queue++; calls.queueAt.push(clock); await latency(); if (options.queueFailure) throw new Error("Synthetic queue failure"); return page(); }, invalidateQueries: async () => {} }),
+        getAuthUser: () => auth, getActiveBusinessId: () => business, callingQueueKey: scope => ["calling-queue", scope.businessId, scope.employeeId],
+        callingWorkMessage: () => work, callingWorkflowChanged: "work-changed", setCallingProgress: (_scope, value) => calls.progress.push(value),
+        fetchCallingQueue() {}, socket: { on() {}, off() {} },
+        getEmployeeSummary: async () => { await latency(); await options.onSummary?.(); return employee; }, isSalesRole: role => role === "Sales", normalizeEmployeeAvailabilityStatus: value => value,
+        activateCallBridgeForEmployee: async () => { await latency(); return {}; }, canUseCallBridgeBrowserSession: () => options.activationBlocked !== true,
+        getCallBridgeStatus: async () => { await latency(); return status(); },
+        reserveCallBridgeCall: async (_code, input) => { calls.reserve.push({ ...input, at: clock }); await latency(); await options.onReserve?.({ switchBusiness: () => { business = "fake-b"; } });
+            if (options.lostReserve && calls.reserve.length === 1) throw new Error("Synthetic lost reserve response");
+            if (options.queueChanged && calls.reserve.length === 1) throw { response: { status: 409, data: { code: "CALL_QUEUE_CHANGED", message: "Queue changed" } } };
+            return { allowed: true, reservationToken: input.attemptId, leadId: input.leadId, normalizedPhone: input.normalizedPhone }; },
+        markCallBridgeDialStarted: async (_code, input) => { calls.dispatch.push({ ...input, at: clock });
+            if (!options.lostDispatch || calls.dispatch.length === 1) dispatchStartedAt = clock;
+            options.cooldown = dispatchStartedAt + 30000;
+            dialPendingUntil = dispatchStartedAt + 30000;
+            await latency();
+            if (options.lostDispatch && calls.dispatch.length === 1) throw new Error("Synthetic lost dispatch response");
+            return { leadId: input.leadId, normalizedPhone: calls.reserve.at(-1)?.normalizedPhone, alreadyStarted: Boolean(options.lostDispatch && calls.dispatch.length > 1),
+                serverTime: serverTime(), dialIntentUntil: new Date(Date.parse("2026-10-22T17:00:00Z") + dispatchStartedAt + 30000).toISOString() }; },
+        releaseCallBridgeCall: async (_code, input) => { calls.release.push({ ...input, at: clock }); dialPendingUntil = 0; },
+        startAutoCallPendingComment() {}, getEmployeeCommentMarker: () => "", recordLeadCall: async (_id, input, request) => calls.record.push({ input, request }),
+        AUTO_CALL_API_TIMEOUT_MS: 10000, AUTO_CALL_CHECK_INTERVAL_MS: 5000, callTimingV2Enabled: options.timing !== false,
+    });
+    const mount = () => { refIndex = 0; effects.length = 0; exports.default(); for (const effect of effects) { const cleanup = effect(); if (cleanup) cleanups.push(cleanup); } };
+    const settle = async () => { for (let i = 0; i < 25; i++) await new Promise(resolve => setImmediate(resolve)); };
+    const advance = async milliseconds => {
+        const until = clock + milliseconds;
+        while (true) {
+            const next = [...timers.entries()].filter(([, value]) => value.at <= until).sort((a, b) => a[1].at - b[1].at)[0];
+            if (!next) break;
+            clock = next[1].at; timers.delete(next[0]); next[1].callback(); await settle();
         }
+        clock = until;
     };
-    const runTimer = milliseconds => {
-        const entry = [...timers.entries()].find(([, timer]) => timer.ms === milliseconds);
-        assert.ok(entry, `expected a ${milliseconds} ms timer`);
-        const [id, timer] = entry;
-        timers.delete(id); now += timer.ms; timer.callback();
-    };
-    return { queue, publish, calls, settle, timers, runTimer, stop, remount: () => { stop(); mount(); } };
+    mount();
+    return { calls, settle, advance, tick: async () => { for (const callback of intervals.values()) callback(); await settle(); },
+        event: async name => { listeners.get(name)?.(); await settle(); },
+        refresh: () => { for (const cleanup of cleanups.splice(0)) cleanup(); refs.length = 0; mount(); },
+        endCall: () => { active = false; dialPendingUntil = 0; options.cooldown = clock + 30000; },
+        work: value => { work = value; }, stop: () => { for (const cleanup of cleanups.splice(0)) cleanup(); }, switchBusiness: () => { business = "fake-b"; } };
 }
 
-test("the exact deadline wake survives an occupied preflight without waiting for another five-second poll", async () => {
-    const deadline = Date.parse("2026-10-20T23:00:09Z");
-    let releaseRead, reads = 0;
-    const gate = new Promise(resolve => { releaseRead = resolve; });
-    const state = fixture({ cooldown: deadline, onRead: async () => {
-        if (++reads === 1) { await gate; throw new Error("synthetic temporary preflight failure"); }
-    } });
+test("the actual coordinator reserves and launches only the authoritative target, independently of browsing or pending notes", async () => {
+    const state = fixture();
     try {
-        await state.settle(false);
-        assert.equal(state.calls.reserve.length, 0);
-        state.runTimer(9_000);
-        releaseRead();
-        await state.settle(false);
-        assert.equal(state.calls.reserve.length, 1, "a busy deadline must enqueue one immediate recheck");
-        assert.equal(state.calls.reserve[0].at, deadline, "the recheck cannot add a five-second interval");
-        state.runTimer(150);
-        await state.settle(false);
-        assert.equal(state.calls.dial.length, 1);
-        assert.equal(state.calls.dialStart.length, 1);
-    } finally { releaseRead(); state.stop(); }
+        await state.settle();
+        assert.deepEqual(state.calls.reserve.map(input => input.leadId), [first._id]);
+        assert.equal(state.calls.reserve[0].queueVersion, "server-version");
+        assert.deepEqual(state.calls.launch, [`tel:${first.phone}`]);
+        await state.advance(2000);
+        assert.equal(state.calls.record[0].input.callOutcome, "confirmed");
+        assert.equal(state.calls.record[0].request.businessId, "fake-a");
+    } finally { state.stop(); }
 });
 
-test("cooldown preparation starts at ten seconds remaining and never reserves before the server deadline", async () => {
-    const deadline = Date.parse("2026-10-20T23:00:30Z");
-    const state = fixture({ cooldown: deadline });
+test("30-second server cooldown survives preparation; no browser wall clock grants permission early", async () => {
+    const state = fixture({ cooldown: 30000, wrongClock: true });
     try {
-        await state.settle(false);
+        await state.settle(); await state.advance(29999);
         assert.equal(state.calls.reserve.length, 0);
-        state.runTimer(20_000);
-        await state.settle(false);
-        assert.equal(state.calls.reserve.length, 0);
-        state.runTimer(10_000);
-        await state.settle(false);
+        await state.advance(1);
         assert.equal(state.calls.reserve.length, 1);
-        assert.equal(state.calls.reserve[0].at, deadline);
+        assert.equal(state.calls.reserve[0].at, 30000);
     } finally { state.stop(); }
 });
 
-test("server-rejected displayed rows advance immediately to the first eligible row without interval penalties", async () => {
-    const rows = [...Array.from({ length: 47 }, (_, index) => lead(`blocked-${index}`)), lead("eligible")];
-    const state = fixture({ rows, reservationResult: input => input.leadId.startsWith("blocked")
-        ? { allowed: false, code: "LEAD_ALREADY_COMMENTED" } : undefined });
-    try {
-        await state.settle(false);
-        assert.deepEqual(state.calls.reserve.map(row => row.leadId), rows.map(row => row._id));
-        assert.equal(new Set(state.calls.reserve.map(row => row.at)).size, 1, "rejected rows must not each add five seconds");
-        state.runTimer(150);
-        await state.settle(false);
-        assert.equal(state.calls.dial.length, 1);
-        assert.equal(state.calls.dialStart.length, 1);
-    } finally { state.stop(); }
-});
-
-test("exhausting rejected rows or a non-terminal reservation refusal never creates a retry loop", async () => {
-    for (const code of ["LEAD_ALREADY_COMMENTED", undefined]) {
-        const state = fixture({ rows: [lead("only")], reservationResult: () => ({ allowed: false, code }) });
+test("a lost reserve response reuses its attempt ID and a lost dispatch response never launches twice", async () => {
+    for (const fault of ["lostReserve", "lostDispatch"]) {
+        const state = fixture({ [fault]: true });
         try {
-            await state.settle(false);
-            assert.equal(state.calls.reserve.length, 1);
-            assert.equal(state.calls.dial.length, 0);
+            await state.settle(); await state.advance(5000); await state.tick();
+            assert.ok(state.calls.reserve.length >= 1);
+            assert.equal(new Set(state.calls.reserve.map(input => input.attemptId)).size, 1);
+            assert.equal(state.calls.launch.length, fault === "lostReserve" ? 1 : 0);
+            assert.ok(state.calls.progress.some(message => /unavailable|confirmed/.test(message)));
         } finally { state.stop(); }
     }
 });
 
-test("an exhausted displayed page loads the next filtered page before choosing its eligible lead", async () => {
-    const state = fixture({ rows: [lead("blocked")],
-        reservationResult: input => input.leadId === "blocked" ? { allowed: false, code: "LEAD_ALREADY_COMMENTED" } : undefined,
-        onLoadMore: async ({ publish }) => { publish([lead("blocked"), lead("next-page")], true, false); return true; },
-    });
+test("stale queue rejection is retried without permanently excluding the lead", async () => {
+    const state = fixture({ queueChanged: true });
     try {
-        await state.settle(false);
-        assert.equal(state.calls.loadMore, 1);
-        assert.deepEqual(state.calls.reserve.map(row => row.leadId), ["blocked", "next-page"]);
-        state.runTimer(150);
-        await state.settle(false);
-        assert.equal(state.calls.dial.length, 1);
-        assert.equal(state.calls.dialStart.length, 1);
+        await state.settle(); assert.equal(state.calls.launch.length, 0);
+        await state.advance(5000); await state.tick();
+        assert.equal(state.calls.reserve.length, 2); assert.equal(state.calls.launch.length, 1);
     } finally { state.stop(); }
 });
 
-test("load-more requests are scoped, coalesced and backed off after a failed read", async () => {
-    const state = fixture({ ready: false });
+test("a failed queue read recovers without excluding any lead", async () => {
+    const options = { queueFailure: true }, state = fixture(options);
+    try {
+        await state.settle(); assert.equal(state.calls.launch.length, 0);
+        options.queueFailure = false;
+        await state.advance(5000); await state.tick();
+        assert.equal(state.calls.reserve[0].leadId, first._id);
+        assert.equal(state.calls.launch.length, 1);
+    } finally { state.stop(); }
+});
+
+test("business changes after reservation release only the captured scope and never launch the old target", async () => {
+    const state = fixture({ onReserve: ({ switchBusiness }) => switchBusiness() });
+    try {
+        await state.settle();
+        assert.equal(state.calls.launch.length, 0);
+        assert.equal(state.calls.release.length, 1);
+        assert.equal(state.calls.release[0].businessId, "fake-a");
+    } finally { state.stop(); }
+});
+
+test("unsaved or saving work waits without discarding drafts, then resumes the next eligible lead", async () => {
     let release;
     const gate = new Promise(resolve => { release = resolve; });
-    const owner = Symbol("paging-owner");
-    let loads = 0;
-    const load = async () => { loads++; await gate; return false; };
+    const state = fixture({ onSummary: () => gate });
     try {
-        state.queue.publishDisplayedAutoCallQueue(owner, scope, [], false, load);
-        assert.equal(await state.queue.requestMoreDisplayedAutoCallLeads(scope), false);
-        state.queue.publishDisplayedAutoCallQueue(owner, scope, [], true, load);
-        assert.equal(await state.queue.requestMoreDisplayedAutoCallLeads({ ...scope, businessId: "foreign" }), false);
-        const first = state.queue.requestMoreDisplayedAutoCallLeads(scope);
-        assert.equal(await state.queue.requestMoreDisplayedAutoCallLeads(scope), false);
-        assert.equal(loads, 1);
-        release();
-        assert.equal(await first, false);
-        assert.equal(await state.queue.requestMoreDisplayedAutoCallLeads(scope), false);
-        assert.equal(loads, 1, "an immediate post-error render cannot create a request loop");
-    } finally { release(); state.queue.clearDisplayedAutoCallQueue(owner); state.stop(); }
+        state.work("Saving lead changes"); release(); await state.settle();
+        assert.equal(state.calls.launch.length, 0);
+        state.work(""); await state.tick();
+        assert.equal(state.calls.launch.length, 1);
+    } finally { release(); state.stop(); }
 });
 
-test("disposing an in-flight caller cannot leave its replacement permanently busy", async () => {
-    let releaseOld;
-    const oldRequest = new Promise(resolve => { releaseOld = resolve; });
-    const state = fixture({ onSummary: ordinal => ordinal === 1 ? oldRequest : undefined });
-    try {
-        await state.settle(false);
-        assert.equal(state.calls.summaries, 1);
-        state.remount();
-        await state.settle(false);
-        assert.equal(state.calls.reserve.length, 1, "the replacement caller must not inherit a disposed request's busy flag");
-        state.runTimer(150);
-        await state.settle(false);
-        assert.equal(state.calls.dial.length, 1);
-        releaseOld();
-        await state.settle(false);
-        const before = state.calls.summaries;
-        state.publish([lead("first"), lead("old-pending")]);
-        await state.settle(false);
-        assert.equal(state.calls.summaries, before, "the old request cannot clear the replacement caller's in-flight guard");
-        assert.equal(state.calls.dial.length, 1);
-    } finally { releaseOld(); state.stop(); }
-});
-
-test("first displayed eligible lead wins over an old pending lead", async () => {
-    const state = fixture(); await state.settle();
-    assert.equal(state.calls.reserve[0].leadId, "first"); assert.equal(state.calls.dial.length, 1);
-    assert.equal(state.calls.reserve[0].businessId, "fake-a");
-    assert.equal(state.calls.navigate[0][1].state.autoCallPreserveFilters, true); state.stop();
-});
-
-test("the queue tests use the same frozen clock for the Philippine call window and caller", async () => {
-    const state = fixture({ at: "2026-10-21T04:00:00Z" });
-    await state.settle(false);
-    assert.equal(state.calls.reserve.length, 0);
-    assert.equal(state.calls.dial.length, 0);
-    state.stop();
-});
-
-test("filtered order is authoritative, including an empty or loading view", async () => {
-    for (const options of [{ rows: [lead("filtered-first"), lead("first")] }, { rows: [] }, { ready: false }]) {
-        const state = fixture(options); await state.settle();
-        assert.equal(state.calls.reserve[0]?.leadId, options.rows?.[0]?._id);
-        assert.equal(state.calls.dial.length, options.rows?.length ? 1 : 0); state.stop();
+test("employee availability, hours, bridge refusal, empty queue and failed reads have distinct waiting reasons", async () => {
+    for (const [options, reason] of [[{ availability: "BREAK" }, "Employee not ONLINE"], [{ outside: true }, "Outside calling hours"],
+        [{ activationBlocked: true }, "Call Bridge is waiting"], [{ busy: true }, "Waiting for current call to end"], [{ empty: true }, "No eligible assigned leads"], [{ queueFailure: true }, "unavailable"]]) {
+        const state = fixture(options);
+        try { await state.settle(); assert.equal(state.calls.launch.length, 0); assert.ok(state.calls.progress.some(message => message.includes(reason))); }
+        finally { state.stop(); }
     }
 });
 
-test("invalid phone, recently commented, future follow-up and unassigned rows are skipped", async () => {
-    const rows = [lead("invalid", { phone: "invalid" }), lead("commented", { comments: [{ authorType: "employee", createdAt: "2026-10-20T22:59:00Z" }] }),
-        lead("future", { followUpAt: "2026-10-22T00:00:00Z" }), lead("other", { assignedAgent: "other-employee" }), lead("eligible")];
-    const state = fixture({ rows }); await state.settle(); assert.equal(state.calls.reserve[0].leadId, "eligible"); state.stop();
+test("an unrelated observed call cannot confirm this reserved lead", async () => {
+    const state = fixture({ unrelated: true });
+    try {
+        await state.settle(); await state.advance(30000);
+        assert.equal(state.calls.record[0].input.callOutcome, "failed");
+        assert.equal(state.calls.progress.at(-1), "Dial launch not confirmed");
+    } finally { state.stop(); }
 });
 
-for (const phase of ["onRead", "onReserve", "onDialStart"]) test(`filter changes during ${phase} cancel the stale candidate`, async () => {
-    const state = fixture({ [phase]: ({ publish }) => publish([lead("new-first")]) }); await state.settle();
-    assert.equal(state.calls.dial.length, 0);
-    if (phase !== "onRead") { assert.equal(state.calls.release.length, 1); assert.equal(state.calls.release[0].businessId, "fake-a"); }
-    state.stop();
+test("an active call takes precedence over an old cooldown deadline", async () => {
+    const state = fixture({ busy: true, cooldown: 30000 });
+    try {
+        await state.settle();
+        assert.equal(state.calls.progress.at(-1), "Waiting for current call to end");
+        await state.advance(30000); await state.tick();
+        assert.equal(state.calls.reserve.length, 0);
+    } finally { state.stop(); }
 });
 
-for (const phase of ['onRead', 'onReserve', 'onDialStart']) test(`activation rejection during ${phase} cancels the physical dial without clearing another caller's claim`, async () => {
-    const state = fixture({ blockActivationAt: phase }); await state.settle();
-    assert.equal(state.calls.dial.length, 0);
-    if (phase !== 'onRead') { assert.equal(state.calls.release.length, 1); assert.equal(state.calls.release[0].reservationToken, 'fake-token'); }
-    state.stop();
+test("persistent network failures back off instead of retrying indefinitely every five seconds", async () => {
+    const state = fixture({ queueFailure: true });
+    try {
+        await state.settle(); await state.advance(5000); await state.tick();
+        assert.deepEqual(state.calls.queueAt, [0, 5000]);
+        await state.advance(5000); await state.tick();
+        assert.deepEqual(state.calls.queueAt, [0, 5000]);
+        await state.advance(5000); await state.tick();
+        assert.deepEqual(state.calls.queueAt, [0, 5000, 15000]);
+    } finally { state.stop(); }
 });
 
-test("business switch, changed phone and an already-consumed dial claim never launch a call", async () => {
-    for (const options of [{ onRead: ({ switchBusiness }) => switchBusiness() }, { fresh: lead("first", { phone: "+12025550102" }) }, { alreadyStarted: true }]) {
-        const state = fixture(options); await state.settle(); assert.equal(state.calls.dial.length, 0); state.stop();
+test("an unapproved frontend timing configuration cannot initiate automatic calls", async () => {
+    const state = fixture({ timing: false });
+    try { await state.settle(); assert.equal(state.calls.reserve.length, 0); assert.match(state.calls.progress.at(-1), /timing.*configuration/i); }
+    finally { state.stop(); }
+});
+
+test("measured deadline wake selects a newly due callback without a full extra poll", async context => {
+    const callback = { ...first, _id: "newly-due-callback", phone: "+12025550123" };
+    const fresh = { ...first, _id: "eligible-new", status: "NEW" };
+    for (const apiLatency of [0, 40]) {
+        const state = fixture({ cooldown: 30000, apiLatency, wrongClock: true, headAt: clock => clock >= 25000 ? callback : fresh });
+        try {
+            await state.settle(); await state.advance(29999);
+            assert.equal(state.calls.reserve.length, 0);
+            await state.advance(501);
+            assert.equal(state.calls.reserve.length, 1);
+            assert.equal(state.calls.reserve[0].leadId, callback._id);
+            assert.equal(state.calls.reserve[0].at, 30000 + 4 * apiLatency);
+            assert.equal(state.calls.dispatch[0].at, 30000 + 5 * apiLatency);
+            assert.equal(state.calls.launchAt[0], 30000 + 6 * apiLatency);
+            const at = offset => new Date(Date.parse("2026-10-22T17:00:00Z") + offset).toISOString();
+            context.diagnostic(JSON.stringify({ layer: "actual-coordinator/fake-clock/mocked-API", apiLatencyMs: apiLatency, endedAt: at(0),
+                nextCallAllowedAt: at(30000), reserveAttemptAt: at(state.calls.reserve[0].at), dialAttemptAt: at(state.calls.dispatch[0].at),
+                mockedLaunchAt: at(state.calls.launchAt[0]), schedulingJitterMs: state.calls.launchAt[0] - 30000, realCalls: 0 }));
+        } finally { state.stop(); }
     }
 });
 
-test("the 30-second server deadline remains required before reservation", async () => {
-    const deadline = Date.parse("2026-10-20T23:00:30Z");
-    const state = fixture({ cooldown: deadline }); await state.settle(false);
-    assert.equal(state.calls.reserve.length, 0);
-    await state.settle(); assert.equal(state.calls.reserve.length, 1); assert.ok(state.calls.reserve[0].at >= deadline);
-    assert.equal(state.calls.dial.length, 1); state.stop();
+test("polling, a browser refresh and temporary note/status saves do not reset the server deadline", async () => {
+    const state = fixture({ cooldown: 30000 });
+    try {
+        await state.settle(); await state.advance(7000); await state.tick();
+        state.work("Saving lead changes"); await state.advance(7000); state.refresh(); await state.settle();
+        await state.advance(6000); state.work(""); await state.event("work-changed");
+        await state.advance(9999); assert.equal(state.calls.reserve.length, 0);
+        await state.advance(1); assert.equal(state.calls.reserve[0].at, 30000);
+    } finally { state.stop(); }
 });
 
-test("background selection opens Leads first and does not dial an invisible queue", async () => {
-    const state = fixture({ path: "/dashboard" }); await state.settle();
-    assert.equal(state.calls.navigate[0][0], "/leads"); assert.equal(state.calls.reserve.length, 0); assert.equal(state.calls.dial.length, 0); state.stop();
+test("a three-minute active call is never interrupted and waits thirty seconds after its actual end", async () => {
+    const state = fixture({ busy: true });
+    try {
+        await state.settle();
+        for (let count = 0; count < 6; count++) { await state.advance(30000); await state.tick(); assert.equal(state.calls.reserve.length, 0); }
+        state.endCall(); await state.event("focus");
+        await state.advance(29999); assert.equal(state.calls.reserve.length, 0);
+        await state.advance(1); assert.equal(state.calls.reserve[0].at, 210000);
+    } finally { state.stop(); }
 });
 
-test("views are employee/business scoped and an old unmount cannot clear a newer view", () => {
-    const state = fixture({ ready: false }); const owner = Symbol(), newer = Symbol();
-    state.queue.publishDisplayedAutoCallQueue(owner, scope, [lead("first")], true);
-    assert.equal(state.queue.firstDisplayedAutoCallLead({ ...scope, businessId: "other" }, [], new Set()), null);
-    assert.equal(state.queue.firstDisplayedAutoCallLead({ ...scope, employeeId: "other" }, [], new Set()), null);
-    state.queue.publishDisplayedAutoCallQueue(newer, scope, [lead("newer")], true);
-    state.queue.clearDisplayedAutoCallQueue(owner);
-    assert.equal(state.queue.firstDisplayedAutoCallLead(scope, [], new Set()).lead._id, "newer");
-    state.queue.clearDisplayedAutoCallQueue(newer); assert.equal(state.queue.firstDisplayedAutoCallLead(scope, [], new Set()), null); state.stop();
+test("missing provider confirmation cannot retry through an unknown bridge", async () => {
+    const options = { launchUnconfirmed: true }, state = fixture(options);
+    try {
+        await state.settle(); options.bridgeUnavailable = true;
+        await state.advance(30000); await state.tick();
+        assert.equal(state.calls.record[0].input.callOutcome, "failed");
+        assert.equal(state.calls.release[0].at, 30000);
+        await state.advance(30000); await state.tick();
+        assert.equal(state.calls.reserve.length, 1);
+        options.bridgeUnavailable = false; await state.tick();
+        assert.equal(state.calls.reserve.length, 2, "once a fresh idle provider is available, the original retry deadline has already passed");
+    } finally { state.stop(); }
 });
 
-test("UI publishes exactly its rendered filtered rows and auto navigation preserves filters", () => {
-    const page = readFileSync(new URL("../src/pages/leads/index.tsx", import.meta.url), "utf8");
-    const caller = readFileSync(new URL("../src/components/EmployeeAutoCaller.tsx", import.meta.url), "utf8");
-    assert.match(page, /publishDisplayedAutoCallQueue[\s\S]*?filteredLeads/);
-    assert.match(page, /filteredLeads\.map\(\(lead\)/);
-    assert.match(page, /leadSearch\.trim\(\) === debouncedLeadSearch/);
-    assert.match(page, /autoCallPreserveFilters/); assert.match(caller, /autoCallPreserveFilters: true/);
-    assert.ok(!caller.includes("queueAutoCallLead = {"), "pending leads must not bypass the displayed queue");
+test("lost dispatch replay uses the original server confirmation deadline instead of adding thirty more seconds", async () => {
+    const state = fixture({ lostDispatch: true });
+    try {
+        await state.settle(); await state.advance(30000);
+        assert.equal(state.calls.dispatch.length, 2);
+        assert.equal(state.calls.launch.length, 0);
+        assert.equal(state.calls.release[0].at, 30000);
+    } finally { state.stop(); }
+});
+
+test("an in-flight readiness check at the deadline proceeds when it completes instead of waiting another interval", async context => {
+    let checks = 0, release;
+    const gate = new Promise(resolve => { release = resolve; });
+    const state = fixture({ cooldown: 30000, onSummary: () => ++checks === 2 ? gate : undefined });
+    try {
+        await state.settle(); await state.advance(29000); await state.tick();
+        await state.advance(1125); release(); await state.settle();
+        assert.equal(state.calls.reserve[0].at, 30125);
+        context.diagnostic(JSON.stringify({ layer: "actual-coordinator/fake-clock/busy-preflight", cooldownDeadlineMs: 30000, readinessCompletedMs: 30125, attemptedDialMs: state.calls.dispatch[0].at, schedulingJitterMs: 125, realCalls: 0 }));
+    } finally { release(); state.stop(); }
 });

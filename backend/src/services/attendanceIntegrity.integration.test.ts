@@ -672,6 +672,46 @@ test("real Mongo: matching codes without explicit control membership are not mer
     assert.equal(new Set(result.employees.map((employee: { scopeKey: string }) => employee.scopeKey)).size, 2);
     assert.ok(result.rows.every((row: { mismatch: boolean }) => !row.mismatch));
 });
+test("real Mongo: filling a historical missing checkout preserves the current shift in every business", async () => {
+  const { identity, employees } = await fixture();
+  const { assignAttendanceShift } = await import("./attendanceShift");
+  const times = ["2026-10-20T15:00:00.000Z", "2026-10-21T15:00:00.000Z", "2026-10-21T17:00:00.000Z"];
+  const events = times.map((at, index) => ({ id: crypto.randomUUID(), commandId: "synthetic-legacy-history", at,
+    source: index === 2 ? "Break Out" as const : "Time In" as const, sequence: index, recordedAt: at,
+    ...(index < 2 ? { shift: assignAttendanceShift(new Date(at), "23:00", "08:00", "22:59"), legacyReviewed: true, legacyBoundary: true } : {}) }));
+  await AttendanceLedger.create({ _id: identity.key, employeeCode: identity.code, businessIds: identity.businessIds,
+    canonicalBusinessId: identity.canonicalBusinessId, revision: 1, events });
+  const now = new Date("2026-10-21T18:00:00.000Z");
+  const before = attendanceSnapshot(await readAttendanceLedger(identity), now);
+  const correction = { commandId: crypto.randomUUID(), expectedRevision: before.revision, fingerprint: before.fingerprint,
+    operation: "correct" as const, reason: "system error", changes: [{ source: "Time Out" as const, at: "2026-10-21T00:00:00.000Z" }] };
+  const preview = await previewAttendanceCommand(identity, correction, admin, now);
+  assert.equal(preview.after.state, "BREAK");
+  assert.equal(preview.after.sessionId, before.sessionId);
+  assert.equal((await readAttendanceLedger(identity)).revision, before.revision);
+  const saved = await executeAttendanceCommand(identity, correction, admin, now);
+  assert.equal(saved.state, before.state);
+  assert.equal(saved.stateSince, before.stateSince);
+  assert.equal(saved.sessionId, before.sessionId);
+  assert.deepEqual(saved.sessions.find(item => item.id === before.sessionId), before.sessions.find(item => item.id === before.sessionId));
+  assert.equal(saved.sessions[0].endedAt, correction.changes[0].at);
+  assert.equal(saved.sessions[0].lifecycle, "manually-closed");
+  assert.equal(saved.audit.at(-1)?.reason, "system error");
+  assert.equal((await executeAttendanceCommand(identity, correction, admin, now)).revision, saved.revision);
+  await deliverAttendanceLedger(identity.key);
+  const ledger = await readAttendanceLedger(identity);
+  assert.deepEqual(ledger.events.slice(0, events.length), events);
+  for (const [index, business] of ["test-a", "test-b"].entries()) await runWithBusiness(business, async () => {
+    const employee = await Employee.findById(employees[index]._id).select("availabilityStatus activeAttendanceSessionId").lean();
+    assert.equal(employee?.availabilityStatus, "BREAK");
+    assert.equal(employee?.activeAttendanceSessionId, before.sessionId);
+    const records = await Attendance.find({ employee: employees[index]._id, source: "Time Out", isEffective: true }).lean();
+    assert.equal(records.length, 1);
+    assert.equal(records[0].timeIn.toISOString(), correction.changes[0].at);
+    assert.notEqual(records[0].attendanceStatus, "Undertime");
+  });
+});
+
 test("real Mongo: correcting a system-closed clock-in preserves session identity and never reopens it", async () => {
   const { identity, actor } = await fixture();
   const opened = await executeAttendanceCommand(identity, command(0, "Time In"), actor, new Date("2026-10-15T14:45:00Z"));

@@ -1,6 +1,5 @@
 import type { ReactNode } from "react";
 import { useEffect, useRef, useState } from "react";
-import EmployeeAutoCaller from "../../components/EmployeeAutoCaller";
 import EmployeeLiveShare from "../../components/EmployeeLiveShare";
 import Navbar from "./navbar";
 import SideBar from "./sidebar";
@@ -58,7 +57,6 @@ export default function MainLayout({ children }: Props) {
             <div className="pointer-events-none fixed inset-0 bg-[radial-gradient(circle_at_0%_20%,color-mix(in_srgb,var(--primary)_18%,transparent),transparent_28%),radial-gradient(circle_at_95%_0%,color-mix(in_srgb,var(--secondary)_14%,transparent),transparent_24%),linear-gradient(135deg,rgba(255,255,255,0.035),transparent_26%)]" />
             <div className="pointer-events-none fixed inset-0 bg-[linear-gradient(90deg,rgba(255,255,255,0.025)_1px,transparent_1px),linear-gradient(180deg,rgba(255,255,255,0.018)_1px,transparent_1px)] bg-[size:4rem_4rem] opacity-20" />
             <SideBar />
-            <EmployeeAutoCaller />
             <main className={["relative flex h-screen flex-col transition-[padding] duration-200", isSidebarCollapsed ? "pl-[5rem]" : "pl-[16rem]"].join(" ")}>
                 <Navbar />
                 <div

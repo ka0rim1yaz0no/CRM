@@ -6,6 +6,7 @@ import { getAuthUser } from './api/authStorage'
 import { isPocOperationsUser } from './lib/roleAccess'
 import { EmployeeLiveShareProvider } from './components/EmployeeLiveShare'
 import EmployeeVoiceCall from './components/EmployeeVoiceCall'
+import EmployeeAutoCaller from './components/EmployeeAutoCaller'
 import { subscribeCredentialContext, getCredentialContextRevision } from './lib/credentialContext'
 
 const FeatureRoute = lazy(() => import('./components/FeatureRoute'))
@@ -168,6 +169,7 @@ function App() {
     <BrowserRouter>
       <EmployeeLiveShareProvider>
         <EmployeeVoiceCall />
+        <EmployeeAutoCaller />
         <RoutedApp />
       </EmployeeLiveShareProvider>
     </BrowserRouter>

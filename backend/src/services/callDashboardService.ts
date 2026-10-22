@@ -142,7 +142,13 @@ export function callDashboardStatus(input: {
   shift: { start: Date; end: Date };
   provider?: "nextiva" | "ringcentral";
 }) {
-  const { availabilityStatus, devices, schedule, attendance, offPhoneStartedAt, now, shift } = input;
+  const { devices, schedule, attendance, offPhoneStartedAt, now, shift } = input;
+  const sortedEvents = [...attendance].filter(event => event.timeIn <= now).sort((a, b) => a.timeIn.getTime() - b.timeIn.getTime());
+  // Duration totals stop at the shift boundary. A later recorded checkout still
+  // determines current presence and must not inherit the old online bucket.
+  const latestTransition = [...sortedEvents].reverse().find(event => event.timeIn >= shift.start &&
+    ["Time In", "Login", "Break In", "Lunch Break In", "Off the Phone In", "Time Out", "Logout", "Break Out", "Lunch Break Out", "Off the Phone Out"].includes(event.source));
+  const availabilityStatus = latestTransition && ["Time Out", "Logout"].includes(latestTransition.source) ? "OFFLINE" : input.availabilityStatus;
   const providerName = input.provider === "ringcentral" ? "RingCentral" : "Nextiva";
   const inShift = now >= shift.start && now < shift.end;
   const withinShift = (date: Date | null | undefined) => date && inShift
@@ -155,7 +161,6 @@ export function callDashboardStatus(input: {
     return { status: presenceStatus as "ONLINE" | "BREAK" | "LUNCH" | "OFF THE PHONE" | "OFFLINE", statusStartedAt: null, transitionUntil: null, detail: "Outside call shift" };
   }
 
-  const sortedEvents = [...attendance].sort((a, b) => a.timeIn.getTime() - b.timeIn.getTime());
   const fresh = devices
     .filter((device) => device.lastSeenAt.getTime() >= now.getTime() - heartbeatFreshnessMs)
     .sort((a, b) => b.lastSeenAt.getTime() - a.lastSeenAt.getTime());
@@ -218,6 +223,10 @@ export function callDashboardStatus(input: {
       transitionUntil: null,
       detail: availabilityStatus === "BREAK" ? "On break" : "At lunch",
     };
+  }
+
+  if (availabilityStatus === "OFFLINE") {
+    return { status: "OFFLINE" as const, statusStartedAt: withinShift(offlineAt), transitionUntil: null, detail: "Not timed in" };
   }
 
   if (active) {

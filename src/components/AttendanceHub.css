@@ -95,12 +95,9 @@
 .attendance-hub-list-tools details > div { position: absolute; z-index: 10; right: 0; top: 100%; display: grid; gap: 7px; width: 160px; padding: 10px;
   background: var(--hub-bg); border: 1px solid var(--hub-border); box-shadow: 0 10px 25px #0002; }
 .attendance-hub-list-tools label { display: flex; gap: 6px; align-items: center; font-size: 12px; }
-.attendance-hub-employee-group { border-top: 1px solid var(--hub-border); }
-.attendance-hub-group-toggle { display: flex; align-items: center; gap: 10px; width: 100%; padding: 12px 24px; color: var(--hub-text); text-align: left; }
-.attendance-hub-group-toggle:hover { background: var(--hub-soft); }
-.attendance-hub-group-toggle span { color: var(--hub-muted); font-size: 12px; }
-.attendance-hub-group-toggle svg { margin-left: auto; transition: transform .2s; }
-.attendance-hub-group-toggle[aria-expanded="true"] svg { transform: rotate(180deg); }
+.attendance-hub-inline-table .attendance-hub-employee-cell { width: 200px; min-width: 180px; max-width: 240px; position: sticky; left: 0; z-index: 1; background: var(--hub-bg, #fff); white-space: normal; overflow-wrap: anywhere; }
+.attendance-hub-inline-table th:first-child { min-width: 180px; }
+.attendance-hub-empty-shift { color: var(--hub-muted); }
 .attendance-hub-table-scroll { overflow-x: auto; }
 .attendance-hub-table-scroll table { width: 100%; border-collapse: collapse; font-size: 11px; white-space: nowrap; }
 .attendance-hub-table-scroll thead { position: sticky; top: 0; z-index: 2; background: var(--hub-soft); }
@@ -225,6 +222,13 @@
 .attendance-hub-kpis { background: var(--hub-bg); grid-template-columns: repeat(7,minmax(0,1fr)); }
 .attendance-hub-kpis button { min-width: 0; border-right: 1px solid var(--hub-border); border-bottom: 1px solid var(--hub-border); }
 .attendance-hub-kpis span { overflow-wrap: anywhere; }
-.attendance-hub-group-toggle { min-width: 0; }
 @media (min-width:761px) and (max-width:1200px) { .attendance-hub-kpis { grid-template-columns: repeat(4,minmax(0,1fr)); } }
 @media (max-width:760px) { .attendance-hub-kpis { grid-template-columns: repeat(2,minmax(0,1fr)); } }
+.attendance-hub-inline-table thead th:first-child { position: sticky; left: 0; z-index: 3; background: var(--hub-soft); }
+@media (max-width:760px) {
+  .attendance-hub-inline-table table { display: table; width: max-content; min-width: 100%; }
+  .attendance-hub-inline-table thead { display: table-header-group; }
+  .attendance-hub-inline-table tbody { display: table-row-group; }
+  .attendance-hub-inline-table tbody > tr:not(.attendance-hub-mobile-row) { display: table-row; }
+  .attendance-hub-inline-table .attendance-hub-mobile-row { display: none; }
+}

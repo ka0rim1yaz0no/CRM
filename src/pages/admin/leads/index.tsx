@@ -1,5 +1,12 @@
 import type { FormEvent, UIEvent } from "react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { getActiveBusinessId } from "../../../api/businessStorage";
+import { getAuthUser } from "../../../api/authStorage";
+import { subscribeCredentialContext } from "../../../lib/credentialContext";
+import { reportRequestError } from "../../../lib/requestErrorToast";
+import { synchronizeLeadWorkspace, type LeadWorkspaceChange } from "../../../lib/leadWorkspaceCache";
+import { connectAuthenticatedSocket, socket } from "../../../lib/socket";
+import { isEligibleLeadRecipient } from "../../../../shared/leadAssignmentPolicy";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
     FiAlertTriangle,
@@ -30,25 +37,24 @@ import {
     FiX,
     FiZap,
 } from "react-icons/fi";
-import { FaWhatsapp } from "react-icons/fa";
 import { useSearchParams } from "react-router";
 import { getRouteLeadTab } from "../../../../shared/leadRoutes";
 import AdminLayout from "../adminLayout";
-import { getEmployees, type Employee } from "../../../api/employees";
+import { getEmployees } from "../../../api/employees";
 import {
     archiveLead,
     addLeadComment,
     assignLead,
     autoSearchTomTomPlacesLeads,
-    autoAssignLead,
+    autoAssignLead as autoAssignLeadInBusiness,
     bulkAssignLeads,
     bulkArchiveLeads,
     bulkPermanentlyDeleteArchivedLeads,
     bulkPermanentlyDeleteActiveLeads,
     bulkRestoreLeads,
     createLead,
-    getAdminLeadCounts,
-    getAdminLeads,
+    getAdminLeadCounts as getAdminLeadCountsInBusiness,
+    getAdminLeads as getAdminLeadsInBusiness,
     getLead,
     getTomTomUsage,
     importLeads,
@@ -388,12 +394,6 @@ function getEditableLeadStatusLabel(status: LeadStatus) {
     if (status === "Follow up") return "FOLLOW UP";
     if (status === "Dead" || status === "Archived") return "ARCHIVE/DEAD";
     return status.toUpperCase();
-}
-
-function isSalesAssignableEmployee(employee: Pick<Employee, "role" | "team">) {
-    return [employee.role, employee.team].some((value) =>
-        String(value || "").trim().toLowerCase().includes("sales")
-    );
 }
 
 function normalizeImportedStatus(value: string): LeadStatus {
@@ -931,6 +931,20 @@ function downloadLeadExcelFile(filename: string, sheetName: string, leads: Lead[
 }
 
 export default function AdminLeads() {
+    const businessId = useSyncExternalStore(subscribeCredentialContext, getActiveBusinessId);
+    return <AdminLeadsWorkspace key={businessId} businessId={businessId} />;
+}
+
+function AdminLeadsWorkspace({ businessId }: { businessId: string }) {
+    const currentAuth = getAuthUser();
+    const assignmentContext = { businessId, adminSession: currentAuth?.userType === "admin" ? currentAuth.sessionToken || undefined : undefined };
+    const assignmentScopeIsCurrent = () => {
+        const auth = getAuthUser();
+        return getActiveBusinessId() === businessId && auth?.userType === "admin" && auth.sessionToken === assignmentContext.adminSession;
+    };
+    const getAdminLeads = (params: Parameters<typeof getAdminLeadsInBusiness>[0]) => getAdminLeadsInBusiness(params, assignmentContext);
+    const getAdminLeadCounts = (params: Parameters<typeof getAdminLeadCountsInBusiness>[0] = {}) => getAdminLeadCountsInBusiness(params, assignmentContext);
+    const autoAssignLead = (id: string) => autoAssignLeadInBusiness(id, assignmentContext);
     const queryClient = useQueryClient();
     const { showToast } = useToast();
     const importInputRef = useRef<HTMLInputElement>(null);
@@ -962,8 +976,12 @@ export default function AdminLeads() {
         data: employees = EMPTY_QUERY_ROWS,
         isLoading: isEmployeesLoading,
     } = useQuery({
-        queryKey: ["employees"],
-        queryFn: getEmployees,
+        queryKey: ["employees", businessId],
+        queryFn: () => getEmployees(undefined, { businessId }),
+    });
+    const { data: recipients = EMPTY_QUERY_ROWS } = useQuery({
+        queryKey: ["lead-recipients", businessId],
+        queryFn: () => getEmployees({ leadRecipients: true }, { businessId }),
     });
 
     const activeEmployees = useMemo(
@@ -1027,6 +1045,7 @@ export default function AdminLeads() {
         () =>
             [
                 "admin-leads",
+                businessId,
                 activeTab,
                 leadQueueFilter,
                 allStatusFilter,
@@ -1038,6 +1057,7 @@ export default function AdminLeads() {
                 selectedAgentName,
             ] as const,
         [
+            businessId,
             activeTab,
             leadQueueFilter,
             allStatusFilter,
@@ -1054,7 +1074,26 @@ export default function AdminLeads() {
     const { data: leadPageData, isLoading, isError } = useQuery({
         queryKey: leadQueryKey,
         queryFn: () => getAdminLeads(leadQueryParams),
+        refetchInterval: 30000,
+        refetchOnReconnect: "always",
     });
+
+    useEffect(() => {
+        connectAuthenticatedSocket();
+        let timer: number | undefined;
+        const refresh = (change: LeadWorkspaceChange = {}) => {
+            if (getActiveBusinessId() !== businessId) return;
+            if (change.lead || change.leadIds?.length) void synchronizeLeadWorkspace(queryClient, businessId, change);
+            window.clearTimeout(timer);
+            timer = window.setTimeout(() => {
+                void queryClient.invalidateQueries({ queryKey: ["admin-leads", businessId] }, { cancelRefetch: false });
+                void queryClient.invalidateQueries({ queryKey: ["admin-route-lead", businessId] }, { cancelRefetch: false });
+                void queryClient.invalidateQueries({ queryKey: ["admin-lead-counts", businessId] }, { cancelRefetch: false });
+            }, 150);
+        };
+        socket.on("lead:changed", refresh); socket.on("connect", refresh);
+        return () => { window.clearTimeout(timer); socket.off("lead:changed", refresh); socket.off("connect", refresh); };
+    }, [businessId, queryClient]);
 
     const leads = leadPageData?.leads || EMPTY_QUERY_ROWS;
     const leadStateOptions = leadPageData?.stateOptions || EMPTY_QUERY_ROWS;
@@ -1096,13 +1135,13 @@ export default function AdminLeads() {
     }, [activeEmployees, leads]);
 
     const salesAssignableEmployees = useMemo(
-        () => activeEmployees.filter(isSalesAssignableEmployee).sort((first, second) => first.name.localeCompare(second.name)),
-        [activeEmployees]
+        () => recipients.filter(isEligibleLeadRecipient).sort((first, second) => first.name.localeCompare(second.name)),
+        [recipients]
     );
 
     const { data: routeLead } = useQuery({
-        queryKey: ["admin-route-lead", routeLeadId],
-        queryFn: () => getLead(routeLeadId),
+        queryKey: ["admin-route-lead", businessId, routeLeadId],
+        queryFn: () => getLead(routeLeadId, assignmentContext),
         enabled: Boolean(routeLeadId && !leads.some((lead) => lead._id === routeLeadId)),
     });
 
@@ -1197,6 +1236,7 @@ export default function AdminLeads() {
         await queryClient.invalidateQueries({ queryKey: ["admin-lead-counts"] });
         await queryClient.invalidateQueries({ queryKey: ["leads"] });
         await queryClient.invalidateQueries({ queryKey: ["lead-counts"] });
+        await queryClient.invalidateQueries({ queryKey: ["calling-queue", businessId] });
         await queryClient.refetchQueries({ queryKey: ["admin-leads"] });
         await queryClient.refetchQueries({ queryKey: ["admin-lead-counts"] });
     };
@@ -1338,8 +1378,9 @@ export default function AdminLeads() {
         },
     });
     const bulkAssignLeadsMutation = useMutation({
-        mutationFn: bulkAssignLeads,
+        mutationFn: (input: Parameters<typeof bulkAssignLeads>[0]) => bulkAssignLeads(input, assignmentContext),
         onSuccess: (result, variables) => {
+            if (!assignmentScopeIsCurrent()) { void invalidateLeads(); return; }
             setSelectedBulkLeadIds([]);
             setIsBulkAssignMenuOpen(false);
             void invalidateLeads();
@@ -1358,7 +1399,8 @@ export default function AdminLeads() {
             });
         },
         onError: (error) => {
-            showToast({ tone: "error", message: getRequestErrorMessage(error, "Could not assign the selected leads.") });
+            reportRequestError(error, "Could not assign the selected leads.");
+            void invalidateLeads();
         },
     });
     const bulkPermanentDeleteMutation = useMutation({
@@ -1411,8 +1453,9 @@ export default function AdminLeads() {
     });
 
     const reassignNewLeadsMutation = useMutation({
-        mutationFn: reassignNewLeads,
+        mutationFn: () => reassignNewLeads(assignmentContext),
         onSuccess: (result) => {
+            if (!assignmentScopeIsCurrent()) { void invalidateLeads(); return; }
             queryClient.setQueryData<AdminLeadsPage>(leadQueryKey, (current) => updateLeadPageData(current, (currentLeads) => {
                 const reassignedLeadsById = new Map(result.leads.map((lead) => [lead._id, lead]));
 
@@ -1426,6 +1469,7 @@ export default function AdminLeads() {
                     : "There were no new leads to reassign.",
             });
         },
+        onError: (error) => { reportRequestError(error, "Could not reassign new leads."); void invalidateLeads(); },
     });
 
     const scheduleFollowUpMutation = useMutation({
@@ -1446,7 +1490,7 @@ export default function AdminLeads() {
 
     const addCommentMutation = useMutation({
         mutationFn: ({ leadId, body }: { leadId: string; body: string }) =>
-            addLeadComment(leadId, { body, authorName: "Admin", authorType: "admin" }),
+            addLeadComment(leadId, { body, authorName: "Admin", authorType: "admin" }, assignmentContext),
         onMutate: (variables) => {
             const previousLeadPage = queryClient.getQueryData<AdminLeadsPage>(leadQueryKey);
             const optimisticComment = {
@@ -1466,27 +1510,27 @@ export default function AdminLeads() {
                     )
                 )
             );
-            setCommentDraft((current) => (current.trim() === variables.body ? "" : current));
-
-            return { previousLeadPage };
+            return { previousLeadPage, businessId, queryKey: leadQueryKey };
         },
-        onSuccess: (lead, variables) => {
-            queryClient.setQueryData<AdminLeadsPage>(leadQueryKey, (current) =>
+        onSuccess: async (lead, variables, context) => {
+            queryClient.setQueryData<AdminLeadsPage>(context.queryKey, (current) =>
                 updateLeadPageData(current, (currentLeads) =>
                     currentLeads.map((currentLead) => (currentLead._id === lead._id ? lead : currentLead))
                 )
             );
-            setCommentDraft((current) => (current.trim() === variables.body ? "" : current));
+            if (getActiveBusinessId() === context.businessId) setCommentDraft((current) => (current.trim() === variables.body ? "" : current));
+            await synchronizeLeadWorkspace(queryClient, context.businessId, { lead });
             void queryClient.invalidateQueries({ queryKey: ["admin-lead-counts"] });
             void queryClient.invalidateQueries({ queryKey: ["lead-counts"] });
             showToast({ tone: "success", message: "Note added to the lead." });
         },
         onError: (error, variables, context) => {
             if (context?.previousLeadPage) {
-                queryClient.setQueryData(leadQueryKey, context.previousLeadPage);
+                queryClient.setQueryData(context.queryKey, context.previousLeadPage);
             }
+            if (context && getActiveBusinessId() !== context.businessId) return;
             setCommentDraft((current) => current || variables.body);
-            showToast({ tone: "error", message: getRequestErrorMessage(error, "Could not add the note. Please try again.") });
+            reportRequestError(error, "Could not add the note. Please try again.");
         },
     });
 
@@ -1503,10 +1547,12 @@ export default function AdminLeads() {
             assignLead(lead._id, {
                 assignedAgent,
                 assignedAgentName,
+                expectedAssignmentRevision: lead.assignmentRevision || 0,
                 activityActorName: "Admin",
                 activityActorType: "admin",
-            }),
+            }, assignmentContext),
         onSuccess: (lead) => {
+            if (!assignmentScopeIsCurrent()) { void invalidateLeads(); return; }
             queryClient.setQueryData<AdminLeadsPage>(leadQueryKey, (current) =>
                 updateLeadPageData(current, (currentLeads) =>
                     currentLeads.map((currentLead) => (currentLead._id === lead._id ? lead : currentLead))
@@ -1517,21 +1563,18 @@ export default function AdminLeads() {
             showToast({ tone: "success", message: `Lead assigned to ${lead.assignedAgent?.name || lead.assignedAgentName}.` });
         },
         onError: (error) => {
-            showToast({ tone: "error", message: getRequestErrorMessage(error, "Could not assign the lead.") });
+            reportRequestError(error, "Could not assign the lead.");
+            void invalidateLeads();
         },
     });
 
     const updateStatusMutation = useMutation({
         mutationFn: ({ id, status }: { id: string; status: LeadStatus }) =>
-            updateLeadStatus(id, status, { activityActorName: "Admin", activityActorType: "admin" }),
-        onSuccess: (lead) => {
-            queryClient.setQueryData<AdminLeadsPage>(leadQueryKey, (current) =>
-                updateLeadPageData(current, (currentLeads) =>
-                    currentLeads.map((currentLead) => (currentLead._id === lead._id ? lead : currentLead))
-                )
-            );
-            setStatusDraft(lead.status);
-            setFollowUpDateTime(formatLeadScheduleDateTimeInput(lead.followUpAt) || getCurrentLeadScheduleDateTimeInput());
+            updateLeadStatus(id, status, { activityActorName: "Admin", activityActorType: "admin" }, assignmentContext),
+        onMutate: () => ({ businessId }),
+        onSuccess: async (lead, _variables, context) => {
+            await synchronizeLeadWorkspace(queryClient, context.businessId, { lead });
+            if (getActiveBusinessId() !== context.businessId) return;
             void invalidateLeads();
         },
         onError: (error) => {
@@ -1541,7 +1584,8 @@ export default function AdminLeads() {
 
     const updateDetailsMutation = useMutation({
         mutationFn: async ({ lead, draft }: { lead: Lead; draft: LeadDetailDraft }) => {
-            const currentLead = await getLead(lead._id);
+            const context = assignmentContext;
+            const currentLead = await getLead(lead._id, context);
             return updateLead(
                 currentLead._id,
                 toLeadInput(
@@ -1553,10 +1597,13 @@ export default function AdminLeads() {
                         activityActorName: "Admin",
                         activityActorType: "admin",
                     }
-                )
+                ), context
             );
         },
-        onSuccess: (lead) => {
+        onMutate: () => ({ businessId }),
+        onSuccess: async (lead, _variables, context) => {
+            await synchronizeLeadWorkspace(queryClient, context.businessId, { lead });
+            if (getActiveBusinessId() !== context.businessId) return;
             queryClient.setQueryData<AdminLeadsPage>(leadQueryKey, (current) =>
                 updateLeadPageData(current, (currentLeads) =>
                     currentLeads.map((currentLead) => (currentLead._id === lead._id ? lead : currentLead))
@@ -1678,12 +1725,12 @@ export default function AdminLeads() {
     }, [assignedAgentFilter, debouncedLeadSearch, leadStateFilter, selectedAgentName]);
 
     const { data: leadCounts = {} } = useQuery({
-        queryKey: ["admin-lead-counts", leadCountParams],
+        queryKey: ["admin-lead-counts", businessId, leadCountParams],
         queryFn: () => getAdminLeadCounts(leadCountParams),
     });
 
     const reassignLeadCountsQuery = useQuery({
-        queryKey: ["admin-lead-counts", "reassign-verification"],
+        queryKey: ["admin-lead-counts", businessId, "reassign-verification"],
         queryFn: () => getAdminLeadCounts(),
         staleTime: 15_000,
     });
@@ -2096,7 +2143,7 @@ export default function AdminLeads() {
 
                 setVerificationAction(null);
                 setIsVerificationAcknowledged(false);
-                reassignNewLeadsMutation.mutate();
+                await runLeadActionAfterComment(selectedLead?._id || "", "assignment", () => reassignNewLeadsMutation.mutateAsync());
                 return;
             }
 
@@ -2204,8 +2251,6 @@ export default function AdminLeads() {
     const placesErrorMessage = (placesMutationError as { response?: { data?: { message?: string } } } | null)?.response?.data?.message;
     const isTomTomUnavailable = isTomTomUsageCheckUnavailable;
 
-    const leadPhone = selectedLead?.phone || "";
-    const whatsappPhone = leadPhone.replace(/\D/g, "");
     const leadActivity = selectedLead ? getLeadActivity(selectedLead) : [];
     const isQualifiedStatusDraft = statusDraft === "Qualified";
     const shouldClearQualifiedFollowUp = Boolean(selectedLead && selectedLead.status === "Qualified" && selectedLead.followUpAt);
@@ -2259,6 +2304,7 @@ export default function AdminLeads() {
                 await startCommentSave(leadId, unsavedComment);
             }
 
+            if (!assignmentScopeIsCurrent()) return;
             await action();
         } catch {
             // Each mutation reports its own error and a failed note prevents the queued action.
@@ -2387,6 +2433,12 @@ export default function AdminLeads() {
         setAssignmentEmployeeId(selectedSalesEmployee?._id || "");
         setIsAssignEditing(false);
     };
+    const handleBulkAssignment = (input: Parameters<typeof bulkAssignLeads>[0]) => {
+        if (bulkAssignLeadsMutation.isPending) return;
+        const assignment = { ...input, leadIds: [...input.leadIds], expectedAssignmentRevisions: Object.fromEntries(
+            leads.filter(lead => input.leadIds.includes(lead._id)).map(lead => [lead._id, lead.assignmentRevision || 0])) };
+        void runLeadActionAfterComment(selectedLead?._id || "", "assignment", () => bulkAssignLeadsMutation.mutateAsync(assignment));
+    };
 
     const handleSaveStatus = () => {
         if (updateStatusMutation.isPending || !selectedLead || !hasStatusUpdate) {
@@ -2461,6 +2513,7 @@ export default function AdminLeads() {
     useQuery({
         queryKey: [
             "admin-lead-queue-counts",
+            businessId,
             activeTab,
             allStatusFilter,
             assignedAgentFilter,
@@ -2685,7 +2738,7 @@ export default function AdminLeads() {
                                                                         type="button"
                                                                         disabled={bulkAssignLeadsMutation.isPending}
                                                                         onClick={() => {
-                                                                            bulkAssignLeadsMutation.mutate({
+                                                                            handleBulkAssignment({
                                                                                 leadIds: selectedBulkLeadIds,
                                                                                 assignedAgent: "UNASSIGNED",
                                                                                 assignedAgentName: "",
@@ -2708,7 +2761,7 @@ export default function AdminLeads() {
                                                                             type="button"
                                                                             disabled={bulkAssignLeadsMutation.isPending}
                                                                             onClick={() => {
-                                                                                bulkAssignLeadsMutation.mutate({
+                                                                                handleBulkAssignment({
                                                                                     leadIds: selectedBulkLeadIds,
                                                                                     assignedAgent: employee._id,
                                                                                     assignedAgentName: employee.name,
@@ -3135,13 +3188,6 @@ export default function AdminLeads() {
                                                 >
                                                     <FiMail className="size-4" aria-hidden="true" />
                                                 </a>
-                                                <a
-                                                    className="flex size-9 items-center justify-center rounded-lg border border-[#1dd1a1] bg-[#1dd1a1] text-white transition hover:border-[#10ac84] hover:bg-[#10ac84]"
-                                                    href={`https://wa.me/${whatsappPhone}`}
-                                                    aria-label="WhatsApp lead"
-                                                >
-                                                    <FaWhatsapp className="size-4" aria-hidden="true" />
-                                                </a>
                                                 <button
                                                     className="flex size-9 items-center justify-center rounded-lg border border-[#5f27cd] bg-[#5f27cd] text-white transition hover:border-[#4f1fb0] hover:bg-[#4f1fb0]"
                                                     type="button"
@@ -3271,6 +3317,7 @@ export default function AdminLeads() {
                                                             className="rounded-md border border-[#2e86de] bg-[#2e86de] px-2 py-1 text-xs font-semibold text-white transition hover:border-[#1f6fbf] hover:bg-[#1f6fbf]"
                                                             type="button"
                                                             onClick={() => setIsAssignEditing(true)}
+                                                            aria-label="Edit lead assignment"
                                                             disabled={Boolean(activeLeadAction)}
                                                         >
                                                             {selectedLead.assignedAgent || selectedLead.assignedAgentName ? "Edit" : "Assign"}
@@ -3317,6 +3364,7 @@ export default function AdminLeads() {
                                                                 className="h-9 rounded-lg border border-[#10ac84] bg-[#10ac84] px-3 text-xs font-semibold text-white transition hover:border-[#0b8f6e] hover:bg-[#0b8f6e] disabled:cursor-not-allowed disabled:opacity-80"
                                                                 type="button"
                                                                 onClick={handleSaveAssignment}
+                                                                aria-label="Save assignment"
                                                                 disabled={saveAssignmentMutation.isPending || Boolean(activeLeadAction) || !assignmentEmployeeId}
                                                             >
                                                                 {activeLeadAction === "assignment" ? "Saving" : "Save"}
@@ -3333,6 +3381,7 @@ export default function AdminLeads() {
                                                     </p>
                                                     <div className="mt-2 grid gap-2 sm:grid-cols-[minmax(0,1fr)_7rem]">
                                                         <select
+                                                            aria-label="Lead status"
                                                             className="h-11 w-full min-w-0 rounded-lg border border-white/10 bg-[#0d1018] px-3 text-sm font-semibold text-white outline-none transition focus:border-[#842cff] focus:ring-2 focus:ring-[#842cff]/20"
                                                             value={statusDraft}
                                                             onChange={(event) => setStatusDraft(event.target.value as LeadStatus)}

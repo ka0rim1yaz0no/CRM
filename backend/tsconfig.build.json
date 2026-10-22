@@ -5,7 +5,8 @@
     "rootDir": "..",
     "outDir": "dist",
     "sourceMap": false,
-    "noEmitOnError": true
+    "noEmitOnError": true,
+    "rewriteRelativeImportExtensions": true
   },
   "include": ["src/**/*.ts"],
   "exclude": ["src/**/*.test.ts", "src/localAttendance.ts", "src/localReview.ts", "src/dev.ts"]

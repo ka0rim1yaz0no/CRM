@@ -1,10 +1,12 @@
+import { evaluateCallingLead } from "../../shared/leadCallingPolicy.ts";
+import { isSalesEmployee } from "../../shared/leadAssignmentPolicy.ts";
 export const AUTO_CALL_MIN_INTERVAL_MS = 30 * 1000;
 export const AUTO_CALL_CHECK_INTERVAL_MS = 5 * 1000;
 export const AUTO_CALL_API_TIMEOUT_MS = 10 * 1000;
 export const AUTO_CALL_CONFIRM_TIMEOUT_MS = 30 * 1000;
 export const AUTO_CALL_CONFIRM_POLL_MS = 2 * 1000;
 export const AUTO_CALL_FAILURE_COOLDOWN_MS = 30 * 60 * 1000;
-export const AUTO_CALL_COMMENT_COOLDOWN_MS = 24 * 60 * 60 * 1000;
+export { AUTO_CALL_COMMENT_COOLDOWN_MS } from "../../shared/leadCallingPolicy.ts";
 export const AUTO_CALL_START_HOUR_PH = 23;
 export const AUTO_CALL_END_HOUR_PH = 8;
 
@@ -88,40 +90,7 @@ export function isLeadEligibleForAutoCall(
     _employeeNames: string[] = []
 ) {
     void _employeeNames;
-    if (lead.status !== "NEW" && lead.status !== "Follow up") {
-        return false;
-    }
-
-    const followUpTime = new Date(lead.followUpAt || "").getTime();
-
-    if (Number.isFinite(followUpTime) && followUpTime > now.getTime()) {
-        return false;
-    }
-
-    const matchingComments = (lead.comments || []).filter((comment) => comment.authorType === "employee");
-    const commentTimes = matchingComments
-        .map((comment) => new Date(comment.createdAt || "").getTime())
-        .filter(Number.isFinite);
-
-    if (commentTimes.length === 0) {
-        return matchingComments.length === 0;
-    }
-
-    if (matchingComments.some((comment) => !Number.isFinite(new Date(comment.createdAt || "").getTime()))) {
-        return false;
-    }
-
-    const latestCommentTime = Math.max(...commentTimes);
-    if (
-        lead.status === "Follow up" &&
-        Number.isFinite(followUpTime) &&
-        followUpTime <= now.getTime() &&
-        latestCommentTime < followUpTime
-    ) {
-        return true;
-    }
-
-    return latestCommentTime <= now.getTime() - AUTO_CALL_COMMENT_COOLDOWN_MS;
+    return evaluateCallingLead(lead, now).callable;
 }
 
 export function startAutoCallPendingComment(employeeCode: string, leadId: string, baselineCommentMarker = "") {
@@ -167,8 +136,8 @@ export function clearAutoCallPendingComment(employeeCode: string, leadId?: strin
     }
 }
 
-export function isSalesRole(role?: string) {
-    return String(role || "").trim().toLowerCase().includes("sales");
+export function isSalesRole(role?: string, team?: string) {
+    return isSalesEmployee({ role, team });
 }
 
 function getPhilippineDateParts(now = new Date()) {

@@ -17,17 +17,18 @@ export const breakAllowanceMs = 15 * 60_000;
 export const lunchAllowanceMs = 60 * 60_000;
 
 export type SlotAttendancePolicy = { breakMinutes: number; lunchMinutes: number; graceMinutes: number; shiftStart: Date; shiftEnd: Date; closingBoundaries?: Date[] };
+type CalculationRecord = { source: string; timeIn: Date; calculationBoundary?: true };
 // Administrative closures are calculation boundaries, never additional stored/clicked attendance events.
-export function recordsWithClosingBoundaries(records: Array<{ source: string; timeIn: Date }>, boundaries: Date[] = []) {
+export function recordsWithClosingBoundaries(records: CalculationRecord[], boundaries: Date[] = []): CalculationRecord[] {
   if (!attendanceAccuracyFixesEnabled() || !boundaries.length) return records;
   return [...records.map((record, index) => ({ ...record, index, boundary: false })),
-    ...boundaries.filter(date => Number.isFinite(+date)).map((timeIn, index) => ({ source: "Time Out", timeIn, index: records.length + index, boundary: true }))]
+    ...boundaries.filter(date => Number.isFinite(+date)).map((timeIn, index) => ({ source: "Time Out", timeIn, index: records.length + index, boundary: true, calculationBoundary: true as const }))]
     .sort((a, b) => +a.timeIn - +b.timeIn ||
       (a.source === "Time In" || a.source === "Login" ? 2 : a.boundary ? 1 : 0) -
       (b.source === "Time In" || b.source === "Login" ? 2 : b.boundary ? 1 : 0) || a.index - b.index)
-    .map(({ source, timeIn }) => ({ source, timeIn }));
+    .map(({ source, timeIn, calculationBoundary }) => ({ source, timeIn, ...(calculationBoundary ? { calculationBoundary } : {}) }));
 }
-export function calculateSlotAttendance(records: Array<{ source: string; timeIn: Date }>, policy: SlotAttendancePolicy, now: Date) {
+export function calculateSlotAttendance(records: CalculationRecord[], policy: SlotAttendancePolicy, now: Date) {
   const ordered = recordsWithClosingBoundaries(records, policy.closingBoundaries).map((record, index) => ({ ...record, index }))
     .filter((record) => Number.isFinite(record.timeIn.getTime()))
     .sort((a, b) => a.timeIn.getTime() - b.timeIn.getTime() || a.index - b.index);
@@ -44,7 +45,9 @@ export function calculateSlotAttendance(records: Array<{ source: string; timeIn:
   const first = ordered.find((record) => record.source === "Time In" || record.source === "Login");
   const final = ordered.at(-1);
   const hasOpenSession = Boolean(first && final && final.source !== "Time Out" && final.source !== "Logout");
-  const timeOut = !hasOpenSession ? [...ordered].reverse().find((record) => record.source === "Time Out" || record.source === "Logout") : undefined;
+  const recordedFinal = [...ordered].reverse().find(record => !record.calculationBoundary);
+  const timeOut = !hasOpenSession && recordedFinal && (recordedFinal.source === "Time Out" || recordedFinal.source === "Logout")
+    ? recordedFinal : undefined;
   // Lateness keeps the existing minute-boundary grace rule; rounding applies to clicked rest durations.
   const accurate = payrollAccuracyEnabled() || attendanceAccuracyFixesEnabled();
   const lateEnd = accurate && first ? Math.min(first.timeIn.getTime(), policy.shiftEnd.getTime()) : first?.timeIn.getTime();

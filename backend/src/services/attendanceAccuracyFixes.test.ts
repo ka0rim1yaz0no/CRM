@@ -74,6 +74,46 @@ test("accuracy: early checkout respects custom shift end, ceil rounding, and fla
   assert.equal(calculateSlotAttendance(records, custom, custom.shiftEnd).earlyTimeOutMinutes, 85);
 });
 
+test("accuracy: undertime requires a real checkout, not an administrative closing boundary", () => {
+  enable();
+  const records = [punch("Time In", 0), punch("Break Out", 470)];
+  const boundary = punch("", 480).timeIn;
+  const before = structuredClone(records);
+  const day = calculateSlotAttendance(records, { ...policy, closingBoundaries: [boundary] }, boundary);
+  assert.equal(day.hasOpenSession, false, "the administrative boundary still closes calculation intervals");
+  assert.equal(day.earlyTimeOutMinutes, 0, "no employee Time Out was recorded");
+  assert.ok(!day.issues.includes("UNDER TIME"));
+  assert.equal(day.breakSessions[0].milliseconds, 10 * 60_000);
+  assert.deepEqual(records, before);
+  const events: SessionEvent[] = records.map((record, sequence) => ({ id: `closure-${sequence}`, source: record.source as SessionEvent["source"],
+    at: record.timeIn.toISOString(), recordedAt: record.timeIn.toISOString(), sequence, commandId: `closure-cmd-${sequence}`,
+    ...(sequence === 0 ? { shift: assignAttendanceShift(record.timeIn) } : {}) }));
+  const settings = { officialShiftStartTime: "23:00", officialShiftEndTime: "08:00", lateGraceMinutes: 0, attendanceTimeZone: "Asia/Manila" };
+  const hub = calculateHubDay("2026-10-15", events.map(event => ({ ...event, at: new Date(event.at) })), settings, boundary, false, [boundary]);
+  const derived = deriveAttendanceDays({ events, closures: [{ id: "synthetic-closure", sessionId: events[0].id,
+    effectiveAt: boundary.toISOString(), processedAt: boundary.toISOString(), commandId: "synthetic-admin-close" }] },
+    { ...policy, shiftStart: "23:00", shiftEnd: "08:00" }, boundary)[0];
+  assert.equal(hub.milliseconds.underTime, 0);
+  assert.ok(!hub.issues.includes("UNDER TIME"));
+  assert.equal(derived.earlyTimeOutMinutes, 0);
+  assert.ok(!derived.issues.includes("UNDER TIME"));
+  const actual = calculateSlotAttendance([punch("Time In", 0), punch("Time Out", 480)],
+    { ...policy, closingBoundaries: [punch("", 490).timeIn] }, punch("", 490).timeIn);
+  assert.equal(actual.earlyTimeOutMinutes, 60, "a calculation boundary cannot hide a real recorded early checkout");
+});
+
+test("accuracy: a late arrival that checks out at 08:00 or later is not undertime", () => {
+  enable();
+  for (const checkout of [540, 545, 600]) {
+    const day = calculateSlotAttendance([punch("Time In", 30), punch("Time Out", checkout)], policy, punch("", checkout).timeIn);
+    assert.equal(day.lateMinutes, 30);
+    assert.equal(day.earlyTimeOutMinutes, 0);
+    assert.ok(!day.issues.includes("UNDER TIME"));
+  }
+  const early = calculateSlotAttendance([punch("Time In", 30), punch("Time Out", 539, 59)], policy, punch("", 539, 59).timeIn);
+  assert.equal(early.earlyTimeOutMinutes, 1);
+});
+
 for (const [name, source, duration, expected] of [
   ["manual timeout break", "Break Out", 100, 25], ["08:05 automatic timeout break", "Break Out", 545, 470],
   ["manual timeout lunch", "Lunch Break Out", 140, 20],

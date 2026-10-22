@@ -470,7 +470,7 @@ import {
     formatAttendanceSlotLabel,
     groupAttendanceRecordsBySlot,
     isAttendanceTimeInSource,
-    isAttendanceTimeOutUndertime,
+    attendanceRecordStatus,
 } from "../../lib/attendanceSlots";
 import { buildOffPhoneAttendanceSessions, formatAttendanceDuration } from "../../lib/attendanceRecords";
 import { formatDateInTimeZone, formatTimeInTimeZone } from "../../lib/dateTime";
@@ -1101,8 +1101,7 @@ export default function AttendancePage() {
                                 const offPhoneSession = offPhoneSessions.find((session) =>
                                     session.endRecord?._id === record._id || (session.isOpen && session.startRecord._id === record._id)
                                 );
-                                const isUnderTime = isAttendanceTimeOutUndertime(record, attendanceSettings);
-                                const displayedAttendanceStatus = record.attendanceStatus || (isUnderTime ? "Undertime" : "");
+                                const displayedAttendanceStatus = attendanceRecordStatus(record, attendanceSettings);
 
                                 return (
                                     <article key={record._id} className="employee-attendance-event flex flex-wrap items-center justify-between gap-3 rounded-lg border border-[#9bbde8] bg-white/75 p-4 shadow-sm">

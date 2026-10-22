@@ -7,15 +7,36 @@ import ts from "typescript";
 const source = readFileSync(new URL("../src/pages/leads/index.tsx", import.meta.url), "utf8");
 const ast = ts.createSourceFile("leads.tsx", source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
 let callback;
+let draftReset;
 function visit(node) {
     if (ts.isVariableDeclaration(node) && node.name.getText(ast) === "fetchMoreLeads") callback = node.initializer.arguments[0];
+    if (ts.isIfStatement(node) && node.expression.getText(ast).startsWith("previousLeadDetailDraft === null")) draftReset = node;
     ts.forEachChild(node, visit);
 }
 visit(ast);
 assert.ok(callback);
+assert.ok(draftReset);
 const compiled = ts.transpileModule(`exports.load = ${ts.createPrinter().printNode(ts.EmitHint.Expression, callback, ast)};`, {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
 }).outputText;
+
+test("initial loading with no selected lead or retained draft does not crash draft restoration", () => {
+    const reset = ts.transpileModule(ts.createPrinter().printNode(ts.EmitHint.Unspecified, draftReset, ast), {
+        compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
+    }).outputText;
+    for (const [selectedLead, retained, expected] of [
+        [undefined, null, ""],
+        [{ _id: "same" }, { lead: { _id: "same" }, body: "retained draft" }, "retained draft"],
+        [{ _id: "other" }, { lead: { _id: "same" }, body: "retained draft" }, ""],
+    ]) {
+        let body;
+        runInNewContext(reset, { previousLeadDetailDraft: null, leadDetailDraftInputs: [selectedLead?._id], selectedLead,
+            setPreviousLeadDetailDraft() {}, setDetailDraft() {}, createLeadDetailDraft: () => ({}), setIsDetailEditing() {},
+            getLeadNoteDraft: () => retained, callingScope: {}, setCommentDraft: value => { body = value; }, setPassAgentId() {}, setPassConfirm() {},
+        });
+        assert.equal(body, expected);
+    }
+});
 
 function fixture(options = {}) {
     const key = ["leads", "fake-person", "fake-names", "my", "NEW", "synthetic search", false, "CA", "fake-a"];
@@ -29,7 +50,7 @@ function fixture(options = {}) {
         leadFetchRetryAtRef: refs.retry, leadPageRef: refs.page, hasMoreLeads: true,
         getActiveBusinessId: () => business, employeeLeadNames: ["fake-name"], requestedEmployeeLeadTab: "my",
         effectiveLeadSearch: "synthetic search", isGlobalLeadSearchActive: false, leadStateFilter: "CA", leadQueryKey: key,
-        LEAD_PAGE_SIZE: 50, AUTO_CALL_API_TIMEOUT_MS: 10000,
+        LEAD_PAGE_SIZE: 50, AUTO_CALL_API_TIMEOUT_MS: 10000, isDefaultCallingView: false, performance: { now: () => now },
         queryClient: { getQueryData: () => cache, setQueryData: (_key, update) => { cache = update(cache); commits.push(cache); } },
         getMyLeads: async (params, requestOptions) => {
             requests.push(JSON.parse(JSON.stringify({ params, requestOptions })));

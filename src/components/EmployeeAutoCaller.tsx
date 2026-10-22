@@ -1,446 +1,202 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useSyncExternalStore } from "react";
 import { useLocation, useNavigate } from "react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import { getAuthUser } from "../api/authStorage";
 import { getActiveBusinessId } from "../api/businessStorage";
-import { displayedQueueChanged, firstDisplayedAutoCallLead, isAutoCallLeadAssigned, requestMoreDisplayedAutoCallLeads } from "../lib/displayedAutoCallQueue";
-import {
-    activateCallBridgeForEmployee,
-    canUseCallBridgeBrowserSession,
-    callTimingV2Enabled,
-    getCallBridgeStatus,
-    markCallBridgeDialStarted,
-    releaseCallBridgeCall,
-    reserveCallBridgeCall,
-} from "../api/callBridge";
+import { activateCallBridgeForEmployee, callTimingV2Enabled, canUseCallBridgeBrowserSession, getCallBridgeStatus, markCallBridgeDialStarted, releaseCallBridgeCall, reserveCallBridgeCall } from "../api/callBridge";
 import { getEmployeeSummary, normalizeEmployeeAvailabilityStatus } from "../api/employees";
-import { getLead, getNextAutoCallLead, recordLeadCall } from "../api/leads";
-import {
-    AUTO_CALL_API_TIMEOUT_MS,
-    AUTO_CALL_CHECK_INTERVAL_MS,
-    AUTO_CALL_CONFIRM_POLL_MS,
-    AUTO_CALL_CONFIRM_TIMEOUT_MS,
-    AUTO_CALL_MIN_INTERVAL_MS,
-    clearAutoCallPendingComment,
-    getAutoCallPendingComment,
-    getEmployeeCommentMarker,
-    isSalesRole,
-    isWithinAutoCallWindow,
-    millisecondsUntilAutoCallWindowStart,
-    startAutoCallPendingComment,
-    isLeadEligibleForAutoCall,
-} from "../lib/employeeAutoCall";
-import { normalizePhoneForCall } from "../lib/phoneNumber";
+import { getLead, recordLeadCall, type Lead } from "../api/leads";
+import { leadBelongsToEmployee } from "../../shared/leadAssignmentPolicy";
+import { AUTO_CALL_API_TIMEOUT_MS, AUTO_CALL_CHECK_INTERVAL_MS, getEmployeeCommentMarker, isSalesRole, startAutoCallPendingComment } from "../lib/employeeAutoCall";
+import { callingQueueKey, callingWorkMessage, callingWorkflowChanged, setCallingProgress } from "../lib/callingWorkflow";
+import { fetchCallingQueue, useCallingQueue } from "../lib/useCallingQueue";
+import { socket } from "../lib/socket";
 
-const AUTO_CALL_STORAGE_PREFIX = "crm:employee-auto-call";
-
-function wait(milliseconds: number) {
-    return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+function currentScope() {
+    const auth = getAuthUser();
+    return auth?.userType === "employee" ? JSON.stringify([auth.user._id, auth.user.employeeCode, getActiveBusinessId(), auth.attendanceHubSession || ""]) : "";
 }
-
-async function waitForConfirmedCall(
-    employeeCode: string,
-    previousCallEndedAt: string | null
-) {
-    const confirmationDeadline = Date.now() + AUTO_CALL_CONFIRM_TIMEOUT_MS;
-    const previousCallEndedTime = previousCallEndedAt ? new Date(previousCallEndedAt).getTime() : 0;
-
-    while (Date.now() < confirmationDeadline) {
-        await wait(AUTO_CALL_CONFIRM_POLL_MS);
-
-        try {
-            const bridgeStatus = await getCallBridgeStatus(employeeCode, { timeoutMs: AUTO_CALL_API_TIMEOUT_MS });
-            const lastCallEndedAt = bridgeStatus.lastCallEndedAt ? new Date(bridgeStatus.lastCallEndedAt).getTime() : 0;
-
-            if (bridgeStatus.state === "active" || lastCallEndedAt > previousCallEndedTime) {
-                return true;
-            }
-        } catch {
-            // Keep watching until the confirmation window closes.
-        }
-    }
-
-    return false;
+function subscribeIdentity(listener: () => void) {
+    for (const name of ["crm:auth-changed", "crm:business-changed", "storage"]) window.addEventListener(name, listener);
+    return () => { for (const name of ["crm:auth-changed", "crm:business-changed", "storage"]) window.removeEventListener(name, listener); };
 }
-
-function launchPhoneCall(phone: string) {
-    const target = phone.trim();
-    const link = document.createElement("a");
-    link.href = `tel:${target}`;
-    link.hidden = true;
-    link.setAttribute("aria-hidden", "true");
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-}
-
-function getTerminalLeadReservationErrorCode(error: unknown) {
-    const code = (error as { response?: { data?: { code?: string } } })?.response?.data?.code;
-    return code === "LEAD_ALREADY_COMMENTED" || code === "LEAD_NOT_ASSIGNED" || code === "LEAD_NOT_FOUND" || code === "LEAD_NOT_CALLABLE" ? code : null;
-}
+type Attempt = { id: string; lead: Lead; phone: string; queueVersion: string; token: string; phase: "reserve" | "dispatch"; expiresAt: number };
 
 export default function EmployeeAutoCaller() {
-    const isChecking = useRef(false);
-    const navigate = useNavigate();
+    const navigate = useNavigate(), location = useLocation();
+    const router = useRef({ navigate, location });
+    useLayoutEffect(() => { router.current = { navigate, location }; }, [navigate, location]);
+    const identity = useSyncExternalStore(subscribeIdentity, currentScope);
+    const [employeeId = "", employeeCode = "", businessId = "", employeeSession = ""]: string[] = identity ? JSON.parse(identity) : [];
+    const scope = useMemo(() => ({ employeeId, businessId }), [employeeId, businessId]);
     const queryClient = useQueryClient();
-    const isLeadsPage = useLocation().pathname === "/leads";
-    const activeBusinessId = getActiveBusinessId();
-
+    const auth = getAuthUser();
+    const salesEmployee = isSalesRole(auth?.user.role, auth?.userType === "employee" ? auth.user.team : undefined);
+    const employeeRoute = location.pathname !== "/login" && !location.pathname.startsWith("/admin/");
+    useCallingQueue(scope, Boolean(identity) && employeeRoute && salesEmployee && callTimingV2Enabled);
+    const operation = useRef<symbol | null>(null);
     useEffect(() => {
-        const initialAuthUser = getAuthUser();
-
-        if (initialAuthUser?.userType !== "employee") {
-            return;
-        }
-
-        const employeeCode = String(initialAuthUser.user.employeeCode || "").trim();
-
-        if (!employeeCode || !isSalesRole(initialAuthUser.user.role)) {
-            return;
-        }
-
-        let isDisposed = false;
-        let activationPending = false;
-
-        const activateComputerForCurrentEmployee = async () => {
-            const authUser = getAuthUser();
-
-            if (
-                isDisposed ||
-                activationPending ||
-                authUser?.userType !== "employee" ||
-                String(authUser.user.employeeCode || "").trim() !== employeeCode
-            ) {
-                return;
-            }
-
-            activationPending = true;
-
-            try {
-                await activateCallBridgeForEmployee(employeeCode, { timeoutMs: AUTO_CALL_API_TIMEOUT_MS });
-            } catch {
-                // Busy and temporary network states are retried without interrupting CRM use.
-            } finally {
-                activationPending = false;
-            }
+        if (!identity || !employeeId || !businessId || !salesEmployee || !employeeRoute) return;
+        if (!callTimingV2Enabled) { setCallingProgress(scope, "Automatic calling requires the approved timing configuration. Refresh or contact an administrator."); return; }
+        let disposed = false, retryRequested = false, timer: number | undefined, prepareTimer: number | undefined;
+        let pending: Attempt | null = null;
+        let retryAfter = 0, consecutiveFailures = 0;
+        const current = () => !disposed && currentScope() === identity;
+        const options = { businessId, employeeSession, timeoutMs: AUTO_CALL_API_TIMEOUT_MS };
+        const showCallLead = (lead: Lead) => {
+            if (!current()) return;
+            queryClient.setQueryData(["lead", businessId, lead._id], lead);
+            const route = router.current;
+            if (route.location.pathname === "/leads" && new URLSearchParams(route.location.search).get("lead") === lead._id) return;
+            const params = new URLSearchParams(route.location.pathname === "/leads" ? route.location.search : "");
+            params.set("lead", lead._id);
+            route.navigate({ pathname: "/leads", search: `?${params}` }, { replace: true,
+                state: { autoCallLead: lead, autoCallPreserveFilters: true, autoCallBusinessId: businessId, autoCallEmployeeId: employeeId } });
         };
-
-        void activateComputerForCurrentEmployee();
-        const intervalId = window.setInterval(() => {
-            void activateComputerForCurrentEmployee();
-        }, AUTO_CALL_CHECK_INTERVAL_MS);
-
-        return () => {
-            isDisposed = true;
-            window.clearInterval(intervalId);
+        let restoredAttempt = "";
+        const progress = (message: string) => { if (current()) setCallingProgress(scope, message); };
+        const invalidate = () => { void queryClient.invalidateQueries({ queryKey: callingQueueKey(scope) }); };
+        const arm = (remaining: number, prepare = true) => {
+            window.clearTimeout(timer); window.clearTimeout(prepareTimer);
+            const delay = Math.min(2147483647, Math.max(0, remaining));
+            timer = window.setTimeout(() => { void tick(true); }, delay);
+            if (prepare && delay > 10000) prepareTimer = window.setTimeout(() => { void queryClient.fetchQuery({ queryKey: callingQueueKey(scope), queryFn: () => fetchCallingQueue(scope, employeeSession) }).catch(() => undefined); }, delay - 10000);
         };
-    }, [activeBusinessId]);
-
-    useEffect(() => {
-        const initialAuthUser = getAuthUser();
-
-        if (initialAuthUser?.userType !== "employee") {
-            return;
-        }
-
-        const employeeId = initialAuthUser.user._id;
-        const employeeCode = String(initialAuthUser.user.employeeCode || employeeId).trim();
-        const businessId = activeBusinessId;
-        const scope = { employeeId, businessId };
-        const lastCallStorageKey = `${AUTO_CALL_STORAGE_PREFIX}:${employeeCode}`;
-        let isDisposed = false;
-        let intervalId: number | undefined;
-        let startTimeoutId: number | undefined;
-        let redialTimeoutId: number | undefined;
-        let prepareTimeoutId: number | undefined;
-        let redialDeadline = 0;
-        let retryRequested = false;
-        const blockedLeadIds = new Set<string>();
-
-        const triggerAutoCall = async (retryIfBusy = false) => {
-            if (isDisposed || !isWithinAutoCallWindow()) {
-                return;
-            }
-            if (isChecking.current) {
-                if (retryIfBusy) retryRequested = true;
-                return;
-            }
-
-            const authUser = getAuthUser();
-
-            if (authUser?.userType !== "employee" || authUser.user._id !== employeeId || getActiveBusinessId() !== businessId) {
-                return;
-            }
-
-            isChecking.current = true;
-            let reservedEmployeeCode = "";
-            let reservedLeadId = "";
-            let reservationToken = "";
-            let callWasLaunched = false;
-            let providerCallConfirmed = false;
-            let reservationNotBefore = 0;
-
+        const release = async (attempt: Attempt) => {
+            try { await releaseCallBridgeCall(employeeCode, { ...options, leadId: attempt.lead._id, reservationToken: attempt.token || attempt.id }); }
+            catch { /* The server lease expires even when cleanup cannot reach it. */ }
+        };
+        const tick = async (retryIfBusy = false) => {
+            if (!current() || performance.now() < retryAfter) return;
+            if (operation.current) { if (retryIfBusy) retryRequested = true; return; }
+            const owner = Symbol("auto-call-operation"); operation.current = owner;
+            let launched = false, consumed = false, failed = false;
             try {
-                const employee = await getEmployeeSummary(employeeId, { timeoutMs: AUTO_CALL_API_TIMEOUT_MS });
-
-                if (!isSalesRole(employee.role) || normalizeEmployeeAvailabilityStatus(employee.availabilityStatus) !== "ONLINE") {
-                    return;
+                const work = callingWorkMessage(scope);
+                if (work) { progress(work); return; }
+                const employee = await getEmployeeSummary(employeeId, options);
+                if (!current()) return;
+                if (!isSalesRole(employee.role, employee.team) || normalizeEmployeeAvailabilityStatus(employee.availabilityStatus) !== "ONLINE") {
+                    progress("Employee not ONLINE"); return;
                 }
-
-                if (!callTimingV2Enabled) {
-                    const now = Date.now();
-                    const lastCallAt = Number(window.localStorage.getItem(lastCallStorageKey) || 0);
-                    if (Number.isFinite(lastCallAt) && now - lastCallAt < AUTO_CALL_MIN_INTERVAL_MS) return;
-                }
-
-                const bridgeStatus = await getCallBridgeStatus(employee.employeeCode, { timeoutMs: AUTO_CALL_API_TIMEOUT_MS });
-
-                if (!bridgeStatus.ready) {
-                    const deadline = bridgeStatus.nextCallAllowedAt ? new Date(bridgeStatus.nextCallAllowedAt).getTime() : 0;
-                    const serverOffsetMs = callTimingV2Enabled && bridgeStatus.serverTime
-                        ? new Date(bridgeStatus.serverTime).getTime() - (bridgeStatus.clientReceivedAt || Date.now()) : 0;
-                    const remainingCooldown = deadline - (Date.now() + serverOffsetMs);
-                    const canPrepareDuringCooldown =
-                        bridgeStatus.connected &&
-                        bridgeStatus.nextivaProcessDetected &&
-                        bridgeStatus.state === "idle" &&
-                        remainingCooldown > 0 &&
-                        remainingCooldown <= 10_000;
-
-                    if (remainingCooldown > 0 && deadline !== redialDeadline) {
-                        window.clearTimeout(redialTimeoutId);
-                        window.clearTimeout(prepareTimeoutId);
-                        redialDeadline = deadline;
-                        redialTimeoutId = window.setTimeout(() => {
-                            redialDeadline = 0;
-                            void triggerAutoCall(true);
-                        }, Math.max(0, remainingCooldown));
-                        if (remainingCooldown > 10_000) {
-                            prepareTimeoutId = window.setTimeout(() => {
-                                void triggerAutoCall(true);
-                            }, remainingCooldown - 10_000);
-                        }
-                    }
-                    if (canPrepareDuringCooldown) {
-                        reservationNotBefore = callTimingV2Enabled ? Date.now() + remainingCooldown : deadline;
-                    }
-                    if (!canPrepareDuringCooldown) return;
-                }
-
-                // Keep the deadline wake armed while asynchronous lead preparation is in flight.
-                if (!reservationNotBefore) {
-                    window.clearTimeout(redialTimeoutId);
-                    window.clearTimeout(prepareTimeoutId);
-                    redialDeadline = 0;
-                }
-
-                const employeeNames = Array.from(
-                    new Set([employee.name, employee.employeeCode, ...(employee.aliases || [])].filter(Boolean))
-                );
-                if (!isLeadsPage) {
-                    // Open the actual work list before selecting; never dial from an invisible queue.
-                    const available = await getNextAutoCallLead({
-                        employeeId,
-                        employeeNames,
-                        excludedLeadIds: Array.from(blockedLeadIds),
-                    }, { timeoutMs: AUTO_CALL_API_TIMEOUT_MS });
-                    if (available && !isDisposed && getActiveBusinessId() === businessId) navigate("/leads");
-                    return;
-                }
-                const queueAutoCallLead = firstDisplayedAutoCallLead(scope, employeeNames, blockedLeadIds);
-                const firstCallableLead = queueAutoCallLead?.lead;
-                const normalizedPhone = queueAutoCallLead?.normalizedPhone;
-
-                if (!firstCallableLead || !normalizedPhone || isDisposed) {
-                    if (!isDisposed && await requestMoreDisplayedAutoCallLeads(scope)) retryRequested = true;
-                    return;
-                }
-
-                const selectionStillCurrent = () => {
-                    const auth = getAuthUser();
-                    const head = firstDisplayedAutoCallLead(scope, employeeNames, blockedLeadIds);
-                    return !isDisposed && canUseCallBridgeBrowserSession(employee.employeeCode) && auth?.userType === "employee" && auth.user._id === employeeId &&
-                        getActiveBusinessId() === businessId && isWithinAutoCallWindow() &&
-                        head?.lead._id === firstCallableLead._id && head.normalizedPhone === normalizedPhone;
-                };
-                const fresh = await getLead(firstCallableLead._id, { timeoutMs: AUTO_CALL_API_TIMEOUT_MS });
-                if (!isAutoCallLeadAssigned(fresh, employeeId, employeeNames) || !isLeadEligibleForAutoCall(fresh, new Date(), employeeNames)) {
-                    blockedLeadIds.add(firstCallableLead._id);
-                    retryRequested = true;
-                    void queryClient.invalidateQueries({ queryKey: ["leads"] });
-                    return;
-                }
-                if (normalizePhoneForCall(fresh.phone) !== normalizedPhone) {
-                    void queryClient.invalidateQueries({ queryKey: ["leads"] });
-                    return;
-                }
-                const pendingComment = getAutoCallPendingComment(employee.employeeCode);
-
-                let reservation: Awaited<ReturnType<typeof reserveCallBridgeCall>>;
-
-                try {
-                    if (reservationNotBefore > Date.now()) {
-                        await wait(reservationNotBefore - Date.now() + (callTimingV2Enabled ? 0 : 25));
-                    }
-                    if (!selectionStillCurrent()) return;
-                    reservation = await reserveCallBridgeCall(employee.employeeCode, {
-                        timeoutMs: AUTO_CALL_API_TIMEOUT_MS,
-                        leadId: firstCallableLead._id,
-                        businessId,
-                        ...(callTimingV2Enabled ? { attemptId: crypto.randomUUID() } : {}),
-                    });
-                } catch (error) {
-                    const terminalErrorCode = getTerminalLeadReservationErrorCode(error);
-
-                    if (terminalErrorCode) {
-                        blockedLeadIds.add(firstCallableLead._id);
-                        clearAutoCallPendingComment(employee.employeeCode, firstCallableLead._id);
-                        retryRequested = true;
-                    }
-                    return;
-                }
-
-                if (!reservation.allowed) {
-                    if (reservation.code) {
-                        blockedLeadIds.add(firstCallableLead._id);
-                        clearAutoCallPendingComment(employee.employeeCode, firstCallableLead._id);
-                        retryRequested = true;
-                    }
-                    return;
-                }
-                reservedEmployeeCode = employee.employeeCode;
-                reservedLeadId = firstCallableLead._id;
-                reservationToken = reservation.reservationToken;
-                if (!selectionStillCurrent()) return;
-
-                const currentPendingComment = getAutoCallPendingComment(employee.employeeCode);
-                const selectedPendingLeadId = pendingComment?.leadId || "";
-
-                if ((currentPendingComment?.leadId || "") !== selectedPendingLeadId) {
-                    return;
-                }
-
-                if (isDisposed || !isWithinAutoCallWindow()) {
-                    return;
-                }
-
-                if (!isDisposed) {
-                    startAutoCallPendingComment(
-                        employee.employeeCode,
-                        firstCallableLead._id,
-                        getEmployeeCommentMarker(firstCallableLead.comments)
-                    );
-
-                    const launchedAt = Date.now();
-                    if (!callTimingV2Enabled) window.localStorage.setItem(lastCallStorageKey, String(launchedAt));
-                    navigate(`/leads?lead=${encodeURIComponent(firstCallableLead._id)}`, {
-                        state: { autoCallLead: firstCallableLead, autoCallPreserveFilters: true },
-                    });
-                    await wait(150);
-
-                    try {
-                        if (!selectionStillCurrent()) return;
-                        const dialStart = await markCallBridgeDialStarted(employee.employeeCode, {
-                            timeoutMs: AUTO_CALL_API_TIMEOUT_MS,
-                            leadId: firstCallableLead._id,
-                            reservationToken,
-                            businessId,
-                        });
-                        if (callTimingV2Enabled && dialStart.alreadyStarted) {
-                            reservedEmployeeCode = "";
-                            return;
-                        }
-                    } catch {
-                        clearAutoCallPendingComment(employee.employeeCode, firstCallableLead._id);
+                if (pending && performance.now() >= pending.expiresAt) { await release(pending); pending = null; }
+                if (!pending) {
+                    progress("Checking calling queue");
+                    const page = await queryClient.fetchQuery({ queryKey: callingQueueKey(scope), queryFn: () => fetchCallingQueue(scope, employeeSession), staleTime: 0 });
+                    if (!current()) return;
+                    const queue = page.callingQueue!;
+                    if (!queue.callingWindow.permitted) {
+                        progress("Outside calling hours");
+                        if (queue.callingWindow.nextStartAt) arm(+new Date(queue.callingWindow.nextStartAt) - +new Date(queue.serverTime));
                         return;
                     }
-
-                    if (!selectionStillCurrent()) return;
-                    launchPhoneCall(normalizedPhone);
-                    callWasLaunched = true;
-
-                    const callConfirmed = await waitForConfirmedCall(
-                        employee.employeeCode,
-                        bridgeStatus.lastCallEndedAt
-                    );
-                    providerCallConfirmed = callConfirmed;
-
-                    if (!callConfirmed) {
-                        // Keep the first lead selected so a missed provider confirmation cannot advance the queue.
+                    await activateCallBridgeForEmployee(employeeCode, options);
+                    if (!current()) return;
+                    if (!canUseCallBridgeBrowserSession(employeeCode)) { progress("Call Bridge is waiting for this browser session"); return; }
+                    const bridge = await getCallBridgeStatus(employeeCode, options);
+                    if (!current()) return;
+                    if (!bridge.ready) {
+                        const snapshotAge = bridge.clientReceivedAtMonotonic === undefined ? 0 : Math.max(0, performance.now() - bridge.clientReceivedAtMonotonic);
+                        const remaining = bridge.nextCallAllowedAt && bridge.serverTime ? +new Date(bridge.nextCallAllowedAt) - +new Date(bridge.serverTime) - snapshotAge : 0;
+                        if (bridge.state === "active") {
+                            progress("Waiting for current call to end");
+                            const observed = `${bridge.observedAttemptId || ""}:${bridge.observedLeadId || ""}`;
+                            if (bridge.observedLeadId && bridge.observedAttemptId && observed !== restoredAttempt) {
+                                try {
+                                    const lead = await getLead(bridge.observedLeadId, options);
+                                    if (current() && leadBelongsToEmployee(lead, employeeId, [employee.name, employee.employeeCode, ...(employee.aliases || [])])) {
+                                        showCallLead(lead); restoredAttempt = observed;
+                                    }
+                                } catch { /* A stale or foreign-business observed lead must not replace this employee's detail. */ }
+                            }
+                        }
+                        else if (bridge.state === "calling") progress("Dial requested; waiting for call confirmation");
+                        else if (bridge.state === "unknown" || bridge.state === "offline") progress(bridge.reason || "Call Bridge unavailable");
+                        else if (remaining > 0) { progress(bridge.waitCode === "DIAL_RETRY_WAIT" ? "Waiting for the unconfirmed dial retry deadline" : "Waiting for call cooldown"); arm(remaining); }
+                        else progress(bridge.reason || "Call Bridge unavailable");
+                        return;
                     }
-
-                    try {
-                        await recordLeadCall(
-                            firstCallableLead._id,
-                            {
-                                activityActorName: employee.name,
-                                activityActorType: "employee",
-                                employeeId: employee._id,
-                                callOutcome: callConfirmed ? "confirmed" : "failed",
-                            },
-                            { timeoutMs: AUTO_CALL_API_TIMEOUT_MS }
-                        );
-                    } catch {
-                        // The next cycle must continue even if activity logging is unavailable.
+                    if (!queue.nextLead || !queue.nextDecision?.normalizedPhone) {
+                        progress(queue.nextEligibilityChangeAt ? "Waiting for the next scheduled lead or comment cooldown" : "No eligible assigned leads"); return;
                     }
-
+                    pending = { id: crypto.randomUUID(), lead: queue.nextLead, phone: queue.nextDecision.normalizedPhone, queueVersion: queue.version,
+                        token: "", phase: "reserve", expiresAt: performance.now() + 45000 };
                 }
-            } catch {
-                // A timed-out or unavailable dependency is retried by the next cycle.
+                const attempt = pending;
+                if (!current() || callingWorkMessage(scope)) return;
+                if (attempt.phase === "reserve") {
+                    const reservation = await reserveCallBridgeCall(employeeCode, { ...options, attemptId: attempt.id, leadId: attempt.lead._id,
+                        queueVersion: attempt.queueVersion, normalizedPhone: attempt.phone });
+                    if (!reservation.allowed) { pending = null; progress(reservation.reason || "Call Bridge unavailable"); invalidate(); return; }
+                    attempt.token = reservation.reservationToken; attempt.phase = "dispatch";
+                    if (reservation.leadId !== attempt.lead._id || reservation.normalizedPhone !== attempt.phone) {
+                        await release(attempt); pending = null; progress("The reserved call target changed. Refreshing queue"); invalidate(); return;
+                    }
+                }
+                if (!current() || callingWorkMessage(scope)) { await release(attempt); pending = null; return; }
+                const dispatch = await markCallBridgeDialStarted(employeeCode, { ...options, leadId: attempt.lead._id, reservationToken: attempt.token });
+                consumed = true; pending = null;
+                if (!current() || callingWorkMessage(scope) || !canUseCallBridgeBrowserSession(employeeCode) || dispatch.leadId !== attempt.lead._id || dispatch.normalizedPhone !== attempt.phone) return;
+                showCallLead(attempt.lead);
+                restoredAttempt = `${attempt.id}:${attempt.lead._id}`;
+                if (dispatch.alreadyStarted) progress("Dial launch already processed; waiting for confirmation");
+                else {
+                    startAutoCallPendingComment(`${businessId}:${employeeCode}`, attempt.lead._id, getEmployeeCommentMarker(attempt.lead.comments));
+                    const link = document.createElement("a"); link.href = `tel:${dispatch.normalizedPhone}`;
+                    link.setAttribute("aria-hidden", "true"); document.body.appendChild(link);
+                    try { link.click(); launched = true; } finally { link.remove(); }
+                    progress("Dial requested; waiting for call confirmation");
+                }
+                const confirmationRemaining = +new Date(dispatch.dialIntentUntil) - +new Date(dispatch.serverTime);
+                if (!Number.isFinite(confirmationRemaining)) throw new Error("Dial confirmation deadline is missing. Waiting for server state.");
+                const confirmationDeadline = performance.now() + Math.max(0, confirmationRemaining);
+                let confirmed = false;
+                while (current() && performance.now() < confirmationDeadline) {
+                    await new Promise(resolve => window.setTimeout(resolve, Math.min(2000, Math.max(0, confirmationDeadline - performance.now()))));
+                    if (!current()) break;
+                    const state = await getCallBridgeStatus(employeeCode, options);
+                    if (!current()) break;
+                    if (state.observedAttemptId === attempt.id && state.observedLeadId === attempt.lead._id) { confirmed = true; break; }
+                }
+                if (current()) {
+                    progress(confirmed ? "Waiting for current call to end" : "Dial launch not confirmed");
+                    await recordLeadCall(attempt.lead._id, { activityActorName: employee.name, activityActorType: "employee", employeeId,
+                        callOutcome: confirmed ? "confirmed" : "failed" }, options).catch(() => undefined);
+                    if (!confirmed) await release(attempt);
+                    invalidate();
+                }
+            } catch (error) {
+                failed = true;
+                const response = (error as { response?: { data?: { code?: string; message?: string }; status?: number } }).response;
+                if (response && (response.status || 0) < 500) {
+                    if (pending) { await release(pending); pending = null; }
+                    progress(response.data?.message || "Calling request failed. Retrying"); invalidate();
+                } else progress(consumed || launched ? "Dial launch not confirmed" : "Queue or call service unavailable. Retrying");
+                // A lost response retains its logical attempt/token for an idempotent retry.
+                const delay = Math.min(30000, AUTO_CALL_CHECK_INTERVAL_MS * 2 ** Math.min(consecutiveFailures++, 3));
+                retryAfter = performance.now() + delay;
+                if (current()) arm(delay, false);
             } finally {
-                if (reservedEmployeeCode && (!callWasLaunched || !providerCallConfirmed)) {
-                    try {
-                        await releaseCallBridgeCall(reservedEmployeeCode, {
-                            timeoutMs: AUTO_CALL_API_TIMEOUT_MS,
-                            leadId: reservedLeadId,
-                            reservationToken,
-                            businessId,
-                        });
-                    } catch {
-                        // The lease still expires if the cleanup request cannot reach the server.
-                    }
-                }
-                if (!isDisposed) {
-                    isChecking.current = false;
-                    if (retryRequested) {
-                        retryRequested = false;
-                        void triggerAutoCall();
-                    }
-                }
+                if (!failed) consecutiveFailures = 0;
+                if (disposed && pending) { await release(pending); pending = null; }
+                if (operation.current === owner) operation.current = null;
+                if (current() && retryRequested) { retryRequested = false; void tick(); }
             }
         };
-
-        const startAutoCallCycle = () => {
-            if (isDisposed) {
-                return;
-            }
-
-            void triggerAutoCall();
-            intervalId = window.setInterval(() => {
-                void triggerAutoCall();
-            }, AUTO_CALL_CHECK_INTERVAL_MS);
-        };
-
-        const startDelay = millisecondsUntilAutoCallWindowStart();
-        const displayedQueueUpdated = () => { void triggerAutoCall(); };
-        window.addEventListener(displayedQueueChanged, displayedQueueUpdated);
-
-        if (startDelay === 0) {
-            startAutoCallCycle();
-        } else {
-            startTimeoutId = window.setTimeout(startAutoCallCycle, startDelay);
-        }
-
+        const refresh = () => { if (current()) { invalidate(); void tick(true); } };
+        const visible = () => { if (document.visibilityState === "visible") refresh(); };
+        const workChanged = () => { if (!callingWorkMessage(scope)) void tick(true); };
+        void tick();
+        const interval = window.setInterval(() => { void tick(); }, AUTO_CALL_CHECK_INTERVAL_MS);
+        window.addEventListener("focus", refresh); document.addEventListener("visibilitychange", visible);
+        window.addEventListener(callingWorkflowChanged, workChanged);
+        socket.on("connect", refresh); socket.on("lead:changed", refresh); socket.on("call-dashboard:updated", refresh);
         return () => {
-            isDisposed = true;
-            window.clearTimeout(startTimeoutId);
-            window.clearTimeout(redialTimeoutId);
-            window.clearTimeout(prepareTimeoutId);
-            window.clearInterval(intervalId);
-            window.removeEventListener(displayedQueueChanged, displayedQueueUpdated);
-            isChecking.current = false;
+            disposed = true; window.clearInterval(interval); window.clearTimeout(timer); window.clearTimeout(prepareTimer);
+            window.removeEventListener("focus", refresh); document.removeEventListener("visibilitychange", visible);
+            window.removeEventListener(callingWorkflowChanged, workChanged); socket.off("connect", refresh); socket.off("lead:changed", refresh); socket.off("call-dashboard:updated", refresh);
+            if (pending) void release(pending);
         };
-    }, [navigate, isLeadsPage, queryClient, activeBusinessId]);
-
+    }, [identity, employeeId, employeeCode, businessId, employeeSession, queryClient, scope, salesEmployee, employeeRoute]);
     return null;
 }

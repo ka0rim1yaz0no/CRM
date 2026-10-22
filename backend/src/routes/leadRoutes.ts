@@ -1,4 +1,6 @@
 import { Router } from "express";
+import { employeeBulkArchive } from "../controllers/employeeLeadArchiveController";
+import { leadPhoneDedupEnabled } from "../config/rolloutFlags";
 import {
   assignLead,
   archiveLead,
@@ -42,6 +44,9 @@ leadRouter.get("/", listLeads);
 leadRouter.get("/call-stats/me", getMyLeadCallStats);
 leadRouter.get("/call-stats", getLeadCallStats);
 leadRouter.get("/counts", countLeads);
+leadRouter.get("/workspace-capabilities", (_request, response) => {
+  response.set("Cache-Control", "no-store").json({ phoneDeduplication: leadPhoneDedupEnabled(), employeeBulkArchive: leadPhoneDedupEnabled() });
+});
 leadRouter.get("/my", listMyLeads);
 leadRouter.get("/agent-dashboard", readAgentLeadDashboard);
 leadRouter.get("/employee-logs", listEmployeeLeadLogs);
@@ -51,6 +56,7 @@ leadRouter.post("/ai-score", scoreLeadsByHighestPotential);
 leadRouter.post("/import", importLeads);
 leadRouter.patch("/reassign-new", reassignNewLeadsBatch);
 leadRouter.patch("/bulk/archive", bulkArchiveLeads);
+leadRouter.patch("/employee/bulk/archive", employeeBulkArchive);
 leadRouter.patch("/bulk/archive-all", archiveAllActiveLeads);
 leadRouter.patch("/bulk/restore", bulkRestoreLeads);
 leadRouter.patch("/bulk/assign", bulkAssignLeads);

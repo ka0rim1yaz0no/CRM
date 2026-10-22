@@ -7,7 +7,9 @@ import { securityLegacyAuthEnabled } from "../config/rolloutFlags";
 import { Employee } from "../models/Employee";
 import { Task } from "../models/Task";
 import { Lead } from "../models/Lead";
-import { getBusinessAccessForEmployeeCode } from "../models/BusinessUserAccess";
+import { getAttendanceBusinessIdentity } from "../models/BusinessUserAccess";
+import { isSalesEmployee } from "../../../shared/leadAssignmentPolicy";
+import { uniquelyOwnedLegacyNames } from "../services/leadAssignment";
 
 export function signedCrmIdentity(adminToken: unknown, employeeToken: unknown) {
   const expiry = (token: unknown): number => JSON.parse(Buffer.from(String(token).split(".")[0], "base64url").toString("utf8")).exp;
@@ -21,8 +23,9 @@ export function signedCrmIdentity(adminToken: unknown, employeeToken: unknown) {
 }
 
 export async function signedEmployeeInBusiness(code: string, businessId: string) {
-  const allowed = await getBusinessAccessForEmployeeCode(code);
-  if (allowed.length && !allowed.includes(businessId)) return null;
+  const identity = await getAttendanceBusinessIdentity(code);
+  const allowed = identity?.businessIds || [];
+  if (identity && !allowed.includes(businessId)) return null;
   const employee = await Employee.findOne({ employeeCode: code, status: { $ne: "Archived" } })
     .select("_id name employeeCode aliases role team businessAccessIds").maxTimeMS(3000).lean();
   if (!employee || (!allowed.length && employee.businessAccessIds?.length && !employee.businessAccessIds.includes(businessId))) return null;
@@ -124,6 +127,7 @@ export async function legacyAuthentication(request: Request, response: Response,
     return denied(response);
   }
   if (/^\/(leads|my-leads|log)(\/|$)/.test(path)) {
+    if (request.method === "PATCH" && path === "/leads/employee/bulk/archive") return next();
     const names = [name, ...(employee!.aliases || [])];
     query(request, { employeeId: ownId, employeeCode: actor.code, employeeName: name, employeeNames: names.join(","), assignedAgent: ownId, assignedAgentName: name, assignedAgentNames: names.join(",") });
     if (request.method === "GET" && path === "/leads/agent-dashboard") {
@@ -146,13 +150,14 @@ export async function legacyAuthentication(request: Request, response: Response,
     }
     const record = path.match(/^\/(?:leads|log)\/([a-f0-9]{24})(?:\/|$)/);
     if (record) {
-      if (request.method === "DELETE" || /\/(assign|auto-assign|permanent)$/.test(path)) return denied(response);
+      if (request.method === "DELETE" || /\/(auto-assign|permanent)$/.test(path)) return denied(response);
+      if (/\/assign$/.test(path) && (request.method !== "PATCH" || !isSalesEmployee(employee!))) return denied(response);
       if (!Types.ObjectId.isValid(record[1])) return denied(response);
       const lead = await Lead.findById(record[1]).select("assignedAgent assignedAgentName status").lean();
-      const owns = lead && (String(lead.assignedAgent) === ownId || (!lead.assignedAgent && names.includes(lead.assignedAgentName)));
+      const owns = lead && (String(lead.assignedAgent) === ownId || (!lead.assignedAgent && (await uniquelyOwnedLegacyNames(ownId, names)).includes(lead.assignedAgentName)));
       const existingReadRole = /outside.*sales|sales.*outside/i.test(`${employee!.role} ${employee!.team}`) || (lead?.status === "Completed" && /inside.*sales|sales.*inside/i.test(`${employee!.role} ${employee!.team}`));
       if (!owns && !(request.method === "GET" && existingReadRole)) return denied(response);
-    } else if (request.method !== "GET" || (!/^\/my-leads(?:\/[^/]+)?$/.test(path) && !["/leads", "/leads/my", "/leads/counts", "/leads/call-stats/me", "/log/call-stats/me", "/log/call-summary/me"].includes(path))) return denied(response);
+    } else if (request.method !== "GET" || (!/^\/my-leads(?:\/[^/]+)?$/.test(path) && !["/leads", "/leads/my", "/leads/counts", "/leads/workspace-capabilities", "/leads/call-stats/me", "/log/call-stats/me", "/log/call-summary/me"].includes(path))) return denied(response);
     if (request.body && typeof request.body === "object") {
       request.body.employeeId = ownId; request.body.employeeCode = actor.code; request.body.employeeName = name;
       if (request.method === "PUT") { request.body.assignedAgent = ownId; request.body.assignedAgentName = name; }

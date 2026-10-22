@@ -15,8 +15,8 @@ test("accepts only the current auto-call browser client", () => {
     assert.equal(isSupportedAutoCallClientVersion(requiredAutoCallClientVersion), true);
     assert.equal(isSupportedAutoCallClientVersion("2026-10-14-comment-lock-v5"), false);
     process.env.CRM_CALL_TIMING_V2 = "false";
-    assert.equal(isSupportedAutoCallClientVersion("2026-10-14-comment-lock-v5"), true);
-    assert.equal(isSupportedAutoCallClientVersion(requiredAutoCallClientVersion), false);
+    assert.equal(isSupportedAutoCallClientVersion("2026-10-14-comment-lock-v5"), false);
+    assert.equal(isSupportedAutoCallClientVersion(requiredAutoCallClientVersion), true);
     assert.equal(isSupportedAutoCallClientVersion(legacyAutoCallClientVersion), false);
     assert.equal(isSupportedAutoCallClientVersion(undefined), false);
   } finally {

@@ -6,7 +6,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 Import-Module Microsoft.PowerShell.Security -ErrorAction Stop
-$BridgeVersion = "0.4.1"
+$BridgeVersion = "0.4.2"
 $InstallDirectory = Join-Path $env:LOCALAPPDATA "Assistly\CallBridge"
 $ConfigPath = Join-Path $InstallDirectory "config.json"
 $LogPath = Join-Path $InstallDirectory "bridge.log"
@@ -291,22 +291,13 @@ try {
     $config = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
     $token = Get-PlainTextToken -EncryptedToken $config.encryptedToken
     $reportedState = "unknown"
-    $inactiveSamples = 0
     $lastHeartbeatAt = [DateTime]::MinValue
 
     do {
         $detection = Get-NextivaDetection
         $nextState = $detection.State
 
-        if ($reportedState -eq "active" -and $nextState -ne "active") {
-            $inactiveSamples += 1
-            if ($inactiveSamples -lt 3) {
-                $nextState = "active"
-            }
-        } else {
-            $inactiveSamples = 0
-        }
-
+        # Send raw transitions promptly; the server owns end confirmation and the 30-second deadline.
         $stateChanged = $nextState -ne $reportedState
         $heartbeatDue = ((Get-Date) - $lastHeartbeatAt).TotalSeconds -ge 5
 
@@ -334,7 +325,7 @@ try {
             break
         }
 
-        Start-Sleep -Seconds 2
+        Start-Sleep -Milliseconds 500
     } while ($true)
 } catch {
     Write-BridgeLog "Bridge stopped: $($_.Exception.Message)"

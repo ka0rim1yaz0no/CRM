@@ -20,13 +20,28 @@ function apiFixture() {
     let auth = admin("fake-old-session");
     let cleared = 0;
     let reject;
+    let applyRequest;
     const notices = [];
     const guards = load("src/lib/sessionAuthorization.ts", {});
-    load("src/lib/api.ts", { axios: { create: () => ({ interceptors: { request: { use() {} }, response: { use(_resolve, fail) { reject = fail; } } } }) },
+    const toastErrors = load("src/lib/requestErrorToast.ts", { emitToast: notice => notices.push(notice) });
+    load("src/lib/api.ts", { axios: { create: () => ({ interceptors: { request: { use(apply) { applyRequest = apply; } }, response: { use(_resolve, fail) { reject = fail; } } } }) },
         backendOrigin: "http://synthetic.invalid", getActiveBusinessId: () => "fake-a", getAuthUser: () => auth,
-        clearAuthUser: () => { cleared++; auth = null; }, emitToast: notice => notices.push(notice), ...guards });
-    return { reject: error => reject(error).catch(value => value), cleared: () => cleared, notices, setAuth: value => { auth = value; } };
+        clearAuthUser: () => { cleared++; auth = null; }, ...toastErrors, ...guards });
+    return { reject: error => reject(error).catch(value => value), applyRequest: config => applyRequest(config), cleared: () => cleared, notices, setAuth: value => { auth = value; } };
 }
+
+test("captured assignment credentials cannot be upgraded to a newer browser account by the interceptor", () => {
+    const state = apiFixture();
+    state.setAuth(admin("fake-new-admin"));
+    const employeeRequest = state.applyRequest({ headers: { "X-Business-Id": "fake-old-business", "X-CRM-Admin-Session": "", "X-CRM-Attendance-Session": "fake-captured-employee" } });
+    assert.equal(employeeRequest.headers["X-CRM-Admin-Session"], "");
+    assert.equal(employeeRequest.headers["X-CRM-Attendance-Session"], "fake-captured-employee");
+    assert.equal(employeeRequest.headers["X-Business-Id"], "fake-old-business");
+    state.setAuth(employee("fake-new-employee"));
+    const adminRequest = state.applyRequest({ headers: { "X-CRM-Admin-Session": "fake-captured-admin", "X-CRM-Attendance-Session": "" } });
+    assert.equal(adminRequest.headers["X-CRM-Admin-Session"], "fake-captured-admin");
+    assert.equal(adminRequest.headers["X-CRM-Attendance-Session"], "");
+});
 
 test("a current signed session failure logs out once, without replaying the failed request", async () => {
     const state = apiFixture();

@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { Request, Response } from "express";
 import { Types } from "mongoose";
 import {
@@ -37,9 +38,15 @@ import { emitCallDashboardUpdated } from "../socket";
 import { resolveCallBridgeBusinessIds, syncCallBridgeBusinessIds } from "../services/callBridgeBusinessService";
 import { callTimingV2Enabled } from "../config/rolloutFlags";
 import { CallBridgeObservation } from "../models/CallBridgeObservation";
-import { canReserveCall, confirmedCallEnd, unconfirmedDialRetryAt } from "../services/callTiming";
-import { acquireCallBridgeLease } from "../services/callBridgeReservation";
+import { canReserveCall, confirmedCallEnd, hasUnconfirmedCall, IDLE_CONFIRMATION_MS, POST_CALL_WAIT_MS, unconfirmedDialRetryAt } from "../services/callTiming";
+import { acquireCallBridgeLease, callTimingWriteConditions } from "../services/callBridgeReservation";
 import { bridgeAvailabilityChangedAt } from "../services/callDashboardService";
+import { employeeCallingQueue, normalizeCallingPhone } from "../services/employeeCallingQueue";
+import { withLeadDispatchOwnership } from "../services/leadAssignment";
+import { isSalesEmployee } from "../../../shared/leadAssignmentPolicy";
+import { callingWindow } from "../../../shared/leadCallingPolicy";
+import { verifyAttendanceHubSession } from "../config/attendanceHubSession";
+import { signedEmployeeInBusiness } from "../middleware/legacyAuthentication";
 import {
   hasReliableTwoWayAudioDetection,
   hasTrackedActiveCall,
@@ -50,9 +57,7 @@ import {
 const pairingLifetimeMs = 10 * 60 * 1000;
 const heartbeatFreshnessMs = 20 * 1000;
 const callLeaseMs = 45 * 1000;
-const postCallDelayMs = 30 * 1000;
 const dialIntentMs = 30 * 1000;
-const activeCallIdleConfirmationMs = 8 * 1000;
 const callBridgePackageFileName = "assistly-call-bridge.zip";
 const ringCentralProviderVersion = "ringcentral-api-v1";
 const validBridgeStates = new Set<CallBridgeState>(["idle", "active", "unknown"]);
@@ -81,6 +86,13 @@ function rejectUnsupportedAutoCallClient(request: Request, response: Response) {
 
 function isLegacyAutoCallClient(request: Request) {
   return cleanString(request.header("x-crm-auto-call-version"), 80) === legacyAutoCallClientVersion;
+}
+
+function rejectUnapprovedCallTiming(response: Response) {
+  if (callTimingV2Enabled()) return false;
+  response.status(409).json({ allowed: false, code: "CALL_TIMING_CONFIGURATION_REQUIRED",
+    message: "Automatic calling requires the approved frontend and backend timing configuration. Contact an administrator." });
+  return true;
 }
 
 function hashSecret(value: string) {
@@ -125,11 +137,12 @@ async function getLeadDialBlock(
 
   if (!lead) return "LEAD_NOT_FOUND";
   const normalizedEmployeeNames = new Set(employeeNames.map((value) => cleanString(value).toLowerCase()).filter(Boolean));
-  const isAssignedToEmployee =
-    String(lead.assignedAgent || "") === employeeId ||
-    normalizedEmployeeNames.has(cleanString(lead.assignedAgentName).toLowerCase());
+  const isAssignedToEmployee = lead.assignedAgent
+    ? String(lead.assignedAgent) === employeeId
+    : normalizedEmployeeNames.has(cleanString(lead.assignedAgentName).toLowerCase());
 
   if (!isAssignedToEmployee) return "LEAD_NOT_ASSIGNED";
+  if (!normalizeCallingPhone(lead.phone)) return "LEAD_NOT_CALLABLE";
   if (!isLeadEligibleForAutoCall(lead, new Date(), employeeNames)) {
     const hasEmployeeComment = hasEmployeeCommentForAutoCall(lead, employeeNames);
     return hasEmployeeComment ? "LEAD_ALREADY_COMMENTED" : "LEAD_NOT_CALLABLE";
@@ -170,6 +183,7 @@ function clearedCallReservationFields() {
     reservedAttemptId: "",
     reservedBusinessId: "",
     reservedLeadId: "",
+    reservedPhone: "",
     reservationTokenHash: "",
     lastDialStartedAt: null,
     dialIntentUntil: null,
@@ -177,7 +191,10 @@ function clearedCallReservationFields() {
 }
 
 function callBridgePackageCandidates() {
+  const moduleDirectory = path.dirname(fileURLToPath(import.meta.url));
   return [
+    path.resolve(moduleDirectory, "../../../../../callbridge/dist", callBridgePackageFileName),
+    path.resolve(moduleDirectory, "../../../callbridge/dist", callBridgePackageFileName),
     path.resolve(process.cwd(), "..", "callbridge", "dist", callBridgePackageFileName),
     path.resolve(process.cwd(), "callbridge", "dist", callBridgePackageFileName),
     path.resolve(process.cwd(), "dist", callBridgePackageFileName),
@@ -199,7 +216,7 @@ async function emitEmployeeCallDashboardUpdated(employeeCode: string, fallbackBu
 
 function aggregateBridgeStatus(
   devices: Array<Pick<CallBridgeDeviceDocument, "state" | "audioSessionActive" | "lastSeenAt" | "lastStateChangedAt" | "lastIdleAt" | "nextivaProcessDetected" | "deviceName" | "bridgeVersion">>,
-  schedule: { callLeaseUntil?: Date | null; nextCallAllowedAt?: Date | null; lastCallEndedAt?: Date | null; lastDialStartedAt?: Date | null } | null,
+  schedule: { callLeaseUntil?: Date | null; nextCallAllowedAt?: Date | null; lastCallEndedAt?: Date | null; lastCallStartedAt?: Date | null; dialIntentUntil?: Date | null; lastDialStartedAt?: Date | null; lastObservedAttemptId?: string; lastObservedLeadId?: string } | null,
   now = new Date()
 ) {
   const provider = getCallProvider();
@@ -215,16 +232,26 @@ function aggregateBridgeStatus(
   const nextCallAllowedAt = schedule?.nextCallAllowedAt ? new Date(schedule.nextCallAllowedAt) : null;
   const leaseActive = Boolean(callLeaseUntil && callLeaseUntil > now);
   const delayActive = Boolean(nextCallAllowedAt && nextCallAllowedAt > now);
+  const unresolvedCall = hasUnconfirmedCall(schedule || {});
+  const dialPending = Boolean(schedule?.dialIntentUntil && schedule.dialIntentUntil > now);
+  const timingApproved = callTimingV2Enabled();
 
   let state: "offline" | "unknown" | "idle" | "calling" | "active" = "offline";
   let reason = provider === "ringcentral" ? "RingCentral API is not connected." : "Call Bridge is offline.";
+  let waitCode = "BRIDGE_UNAVAILABLE";
 
   if (freshDevices.length > 0 && activeDevice) {
     state = "active";
     reason = `A ${providerName} call is active.`;
+    waitCode = "CALL_ACTIVE";
+  } else if (timingApproved && unresolvedCall) {
+    state = "unknown";
+    reason = "Waiting for a reliable confirmation that the previous call ended.";
+    waitCode = "CALL_END_UNCONFIRMED";
   } else if (freshDevices.length > 0 && leaseActive) {
     state = "calling";
     reason = `A ${providerName} call is starting.`;
+    waitCode = "DIAL_UNCONFIRMED";
   } else if (callTimingV2Enabled() && connectedDevice && !hasReliableTwoWayAudioDetection(connectedDevice.bridgeVersion)) {
     state = "unknown";
     reason = "Update Call Bridge to version 0.4.1 or later.";
@@ -234,13 +261,25 @@ function aggregateBridgeStatus(
   } else if (freshDevices.length > 0 && !nextivaProcessDetected) {
     state = "unknown";
     reason = provider === "ringcentral" ? "RingCentral API is unavailable." : "Nextiva is not running.";
+  } else if (timingApproved && dialPending) {
+    state = "calling";
+    reason = "Waiting for confirmation of the previous dial attempt.";
+    waitCode = "DIAL_UNCONFIRMED";
+  } else if (timingApproved && freshDevices.some(device => device.state !== "idle" || !device.nextivaProcessDetected || !hasReliableTwoWayAudioDetection(device.bridgeVersion))) {
+    state = "unknown";
+    reason = "Call Bridge must confirm every connected device is idle.";
   } else if (freshDevices.length > 0 && delayActive) {
     state = "idle";
-    reason = "Waiting 30 seconds after the previous call.";
+    const confirmedWait = schedule?.lastCallEndedAt && nextCallAllowedAt?.getTime() === schedule.lastCallEndedAt.getTime() + POST_CALL_WAIT_MS &&
+      (!schedule.lastDialStartedAt || schedule.lastDialStartedAt <= schedule.lastCallEndedAt);
+    reason = confirmedWait ? "Waiting 30 seconds after the previous call." : "Waiting for the unconfirmed dial retry deadline.";
+    waitCode = confirmedWait ? "POST_CALL_COOLDOWN" : "DIAL_RETRY_WAIT";
   } else if (freshDevices.length > 0) {
     state = "idle";
     reason = provider === "ringcentral" ? "RingCentral is ready." : "Call Bridge is ready.";
+    waitCode = "READY";
   }
+  if (!timingApproved) { reason = "Automatic calling requires the approved timing configuration."; waitCode = "CALL_TIMING_CONFIGURATION_REQUIRED"; }
 
   return {
     provider,
@@ -252,9 +291,13 @@ function aggregateBridgeStatus(
       (!callTimingV2Enabled() || (connectedDevice?.state === "idle" && hasReliableTwoWayAudioDetection(connectedDevice.bridgeVersion))) &&
       !activeDevice &&
       !leaseActive &&
-      !delayActive,
+      !delayActive && timingApproved &&
+      freshDevices.every(device => device.state === "idle" && device.nextivaProcessDetected && hasReliableTwoWayAudioDetection(device.bridgeVersion)) &&
+      canReserveCall(now, schedule || {}),
     state,
     reason,
+    waitCode,
+    postCallWaitMs: POST_CALL_WAIT_MS,
     nextivaProcessDetected,
     deviceName: connectedDevice?.deviceName || "",
     bridgeVersion: connectedDevice?.bridgeVersion || "",
@@ -262,6 +305,8 @@ function aggregateBridgeStatus(
     callLeaseUntil,
     nextCallAllowedAt,
     lastCallEndedAt: schedule?.lastCallEndedAt || null,
+    observedAttemptId: schedule?.lastObservedAttemptId || null,
+    observedLeadId: schedule?.lastObservedLeadId || null,
   };
 }
 
@@ -435,9 +480,9 @@ export async function activateCallBridgeForEmployee(request: Request, response: 
     }
 
     const employee = await Employee.findOne({ employeeCode, status: { $ne: "Archived" } })
-      .select("employeeCode role")
+      .select("employeeCode role team")
       .lean();
-    if (!employee || !cleanString(employee.role).toLowerCase().includes("sales")) {
+    if (!employee || !isSalesEmployee(employee)) {
       response.status(403).json({ message: "Only active sales employees can use RingCentral auto call." });
       return;
     }
@@ -479,10 +524,10 @@ export async function activateCallBridgeForEmployee(request: Request, response: 
   }
 
   const employee = await Employee.findOne({ employeeCode, status: { $ne: "Archived" } })
-    .select("employeeCode name role status")
+    .select("employeeCode name role team status")
     .lean();
 
-  if (!employee || !cleanString(employee.role).toLowerCase().includes("sales")) {
+  if (!employee || !isSalesEmployee(employee)) {
     response.status(403).json({ message: "Only active sales employees can use this Call Bridge computer." });
     return;
   }
@@ -646,9 +691,10 @@ export async function updateCallBridgeHeartbeat(request: Request, response: Resp
   const requestedState = bridgeState(request.body.state);
   const requestedAudioSessionActive = Boolean(request.body.audioSessionActive);
   const hasIdleBaseline = Boolean(device.lastIdleAt);
-  let nextState = requestedState === "active" && !requestedAudioSessionActive
+  const signalState = callTimingV2Enabled() && !request.body.nextivaProcessDetected ? "unknown" : requestedState === "active" && !requestedAudioSessionActive
     ? "idle"
     : requestedState;
+  let nextState = signalState;
 
   // A persistent Windows audio session can look active as soon as the bridge
   // starts. A real manual or automatic call must first have an observed idle
@@ -659,11 +705,11 @@ export async function updateCallBridgeHeartbeat(request: Request, response: Resp
 
   let confirmedCallEndedAt: Date | null = null;
 
-  if (callTimingV2Enabled() && requestedState === "unknown") {
+  if (callTimingV2Enabled() && signalState === "unknown") {
     // A missing/unknown audio signal is not evidence that a call ended.
     device.inactiveSince = null;
     nextState = "unknown";
-  } else if (requestedState === "active") {
+  } else if (signalState === "active") {
     device.inactiveSince = null;
   } else if (previousState === "active" || (callTimingV2Enabled() && Boolean(heartbeatSchedule?.lastCallStartedAt &&
     (!heartbeatSchedule.lastCallEndedAt || heartbeatSchedule.lastCallStartedAt > heartbeatSchedule.lastCallEndedAt)))) {
@@ -672,7 +718,7 @@ export async function updateCallBridgeHeartbeat(request: Request, response: Resp
     if (!inactiveSince) {
       device.inactiveSince = now;
       nextState = "active";
-    } else if (!(callTimingV2Enabled() ? confirmedCallEnd(inactiveSince, now) : now.getTime() - inactiveSince.getTime() >= activeCallIdleConfirmationMs)) {
+    } else if (!(callTimingV2Enabled() ? confirmedCallEnd(inactiveSince, now) : now.getTime() - inactiveSince.getTime() >= IDLE_CONFIRMATION_MS)) {
       nextState = "active";
     } else {
       confirmedCallEndedAt = inactiveSince;
@@ -723,6 +769,12 @@ export async function updateCallBridgeHeartbeat(request: Request, response: Resp
           // Retain the matching dial timestamp until the confirmed end so a
           // legacy bridge cannot end an unrelated or false audio session.
           lastDialStartedAt: heartbeatSchedule?.lastDialStartedAt || null,
+          ...(shouldStartNewObservedCall(previousState, heartbeatSchedule) ? {
+            lastObservedAttemptId: heartbeatSchedule?.lastDialStartedAt && heartbeatSchedule?.dialIntentUntil && heartbeatSchedule.dialIntentUntil >= now
+              ? heartbeatSchedule.reservedAttemptId : "",
+            lastObservedLeadId: heartbeatSchedule?.lastDialStartedAt && heartbeatSchedule?.dialIntentUntil && heartbeatSchedule.dialIntentUntil >= now
+              ? heartbeatSchedule.reservedLeadId : "",
+          } : {}),
           ...((callTimingV2Enabled()
             ? shouldStartNewObservedCall(previousState, heartbeatSchedule)
             : previousState !== "active")
@@ -750,7 +802,7 @@ export async function updateCallBridgeHeartbeat(request: Request, response: Resp
         $set: {
           ...clearedCallReservationFields(),
           lastCallEndedAt: cooldown?.endedAt || callEndedAt,
-          nextCallAllowedAt: cooldown?.nextCallAllowedAt || new Date(callEndedAt.getTime() + postCallDelayMs),
+          nextCallAllowedAt: cooldown?.nextCallAllowedAt || new Date(callEndedAt.getTime() + POST_CALL_WAIT_MS),
           lastCallStartedAt: null,
         },
         $setOnInsert: { employeeCode: device.employeeCode },
@@ -897,6 +949,10 @@ export async function reserveCallBridgeCall(request: Request, response: Response
   const leadId = cleanString(request.body.leadId, 80);
   const attemptId = cleanString(request.body.attemptId, 80);
   const businessId = cleanString(request.business?.id, 80);
+  if (verifyAttendanceHubSession(request.header("x-crm-attendance-session")) !== employeeCode ||
+    !await signedEmployeeInBusiness(employeeCode, businessId)) {
+    response.status(403).json({ message: "A signed employee session in this business is required." }); return;
+  }
 
   if (!employeeCode || cleanString(request.header("x-crm-user-code"), 80) !== employeeCode ||
     cleanString(request.header("x-crm-user-type"), 30).toLowerCase() !== "employee") {
@@ -909,12 +965,13 @@ export async function reserveCallBridgeCall(request: Request, response: Response
     return;
   }
 
-  if (callTimingV2Enabled() && !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(attemptId)) {
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(attemptId)) {
     response.status(400).json({ code: "INVALID_ATTEMPT_ID", message: "A unique dial attempt id is required." });
     return;
   }
 
   if (rejectUnsupportedAutoCallClient(request, response)) return;
+  if (rejectUnapprovedCallTiming(response)) return;
 
 
   if (isAutoCallDisabledForEmployee(employeeCode)) {
@@ -941,7 +998,7 @@ export async function reserveCallBridgeCall(request: Request, response: Response
   const [freshDevices, employee, reservedLead] = await Promise.all([
     Device.find({ employeeCode, lastSeenAt: { $gte: freshAfter }, ...providerFilter }).sort({ lastSeenAt: -1 }).lean(),
     Employee.findOne({ employeeCode, status: { $ne: "Archived" } })
-      .select("name employeeCode aliases role availabilityStatus")
+      .select("name employeeCode aliases role team availabilityStatus")
       .lean(),
     leadId && Types.ObjectId.isValid(leadId)
       ? Lead.findById(leadId).select("phone").lean()
@@ -949,7 +1006,7 @@ export async function reserveCallBridgeCall(request: Request, response: Response
   ]);
 
   const employeeIsOnline = employee && normalizeEmployeeAvailabilityStatus(employee.availabilityStatus) === "ONLINE";
-  const employeeHasSalesRole = employee && cleanString(employee.role).toLowerCase().includes("sales");
+  const employeeHasSalesRole = employee && isSalesEmployee(employee);
 
   if (!employeeIsOnline || !employeeHasSalesRole) {
     const schedule = await getCallBridgeScheduleModel().findOne({ employeeCode }).lean();
@@ -964,6 +1021,28 @@ export async function reserveCallBridgeCall(request: Request, response: Response
           ? "Employee does not have a sales role."
           : "Employee is not online.",
     });
+    return;
+  }
+
+  const queue = await employeeCallingQueue(employee!, businessId, now);
+  const existingReservation = await getCallBridgeScheduleModel().findOne({ employeeCode }).lean();
+  if (existingReservation?.reservedAttemptId === attemptId && existingReservation.reservedLeadId === leadId &&
+    queue.nextLeadId === leadId &&
+    existingReservation.reservedBusinessId === businessId && existingReservation.callLeaseUntil &&
+    existingReservation.callLeaseUntil > now && !existingReservation.lastDialStartedAt) {
+    response.json({ allowed: true, employeeCode, state: "calling", callLeaseUntil: existingReservation.callLeaseUntil,
+      reservationToken: attemptId, attemptId, serverTime: now, leadId, normalizedPhone: existingReservation.reservedPhone });
+    return;
+  }
+  if (!queue.callingWindow.permitted) {
+    response.status(409).json({ allowed: false, code: "OUTSIDE_CALLING_HOURS", message: "Outside calling hours.", nextEligibleAt: queue.callingWindow.nextStartAt, serverTime: now });
+    return;
+  }
+  const head = queue.entries.find(entry => entry.leadId === queue.nextLeadId);
+  if (queue.nextLeadId !== leadId || request.body.queueVersion !== queue.version ||
+    !head?.normalizedPhone || request.body.normalizedPhone !== head.normalizedPhone) {
+    response.status(409).json({ allowed: false, code: "CALL_QUEUE_CHANGED", message: "The calling queue changed. Refreshing the next lead.",
+      nextLeadId: queue.nextLeadId, queueVersion: queue.version, nextEligibilityChangeAt: queue.nextEligibilityChangeAt, serverTime: now });
     return;
   }
 
@@ -990,7 +1069,7 @@ export async function reserveCallBridgeCall(request: Request, response: Response
     currentSchedule.reservedLeadId === leadId && currentSchedule.reservedBusinessId === businessId &&
     currentSchedule.callLeaseUntil && currentSchedule.callLeaseUntil > now && !currentSchedule.lastDialStartedAt) {
     response.json({ allowed: true, employeeCode, state: "calling", callLeaseUntil: currentSchedule.callLeaseUntil,
-      reservationToken: attemptId, attemptId, serverTime: now });
+      reservationToken: attemptId, attemptId, serverTime: now, leadId, normalizedPhone: currentSchedule.reservedPhone });
     return;
   }
 
@@ -1017,10 +1096,10 @@ export async function reserveCallBridgeCall(request: Request, response: Response
   }
 
   const leaseUntil = new Date(now.getTime() + callLeaseMs);
-  const reservationToken = callTimingV2Enabled() ? attemptId : randomToken();
+  const reservationToken = attemptId;
   const schedule = await acquireCallBridgeLease({
     employeeCode, now, leaseUntil, reservationTokenHash: hashSecret(reservationToken),
-    attemptId, businessId, leadId, timingV2: callTimingV2Enabled(),
+    attemptId, businessId, leadId, normalizedPhone: head.normalizedPhone, timingV2: callTimingV2Enabled(),
   });
 
   if (!schedule) {
@@ -1084,7 +1163,7 @@ export async function reserveCallBridgeCall(request: Request, response: Response
     state: "calling",
     callLeaseUntil: leaseUntil,
     reservationToken,
-    ...(callTimingV2Enabled() ? { attemptId, serverTime: now } : {}),
+    attemptId, serverTime: now, leadId, normalizedPhone: head.normalizedPhone,
   });
   await emitEmployeeCallDashboardUpdated(employeeCode, freshDevices.flatMap((device) => device.businessIds));
 }
@@ -1094,6 +1173,10 @@ export async function markCallBridgeDialStarted(request: Request, response: Resp
   let leadId = cleanString(request.body.leadId, 80);
   const reservationToken = cleanString(request.body.reservationToken, 200);
   let businessId = cleanString(request.business?.id, 80);
+  if (verifyAttendanceHubSession(request.header("x-crm-attendance-session")) !== employeeCode ||
+    !await signedEmployeeInBusiness(employeeCode, businessId)) {
+    response.status(403).json({ message: "A signed employee session in this business is required." }); return;
+  }
   const legacyClient = isLegacyAutoCallClient(request);
   if (!employeeCode || cleanString(request.header("x-crm-user-code"), 80) !== employeeCode ||
     cleanString(request.header("x-crm-user-type"), 30).toLowerCase() !== "employee") {
@@ -1103,9 +1186,21 @@ export async function markCallBridgeDialStarted(request: Request, response: Resp
 
 
   if (rejectUnsupportedAutoCallClient(request, response)) return;
+  if (rejectUnapprovedCallTiming(response)) return;
 
   const now = new Date();
   const Schedule = getCallBridgeScheduleModel();
+  const owned = await Schedule.findOne({ employeeCode, reservedBusinessId: businessId, reservedLeadId: leadId,
+    reservationTokenHash: hashSecret(reservationToken), callLeaseUntil: { $gt: now } }).lean();
+  if (owned?.lastDialStartedAt && owned.dialIntentUntil && owned.dialIntentUntil > now) {
+    response.json({ startedAt: owned.lastDialStartedAt, dialIntentUntil: owned.dialIntentUntil, serverTime: now,
+      alreadyStarted: true, leadId, normalizedPhone: owned.reservedPhone });
+    return;
+  }
+  if (!callingWindow(now).permitted) {
+    response.status(409).json({ code: "OUTSIDE_CALLING_HOURS", message: "Outside calling hours.", serverTime: now });
+    return;
+  }
 
   // The v3 browser can lose its active-business header during the route change
   // between reserve and dial-start. Recover only from this employee's live lease.
@@ -1169,11 +1264,18 @@ export async function markCallBridgeDialStarted(request: Request, response: Resp
 
   if (leadId) {
     const employee = await Employee.findOne({ employeeCode, status: { $ne: "Archived" } })
-      .select("name employeeCode aliases")
+      .select("name employeeCode aliases role team availabilityStatus")
       .lean();
     const employeeNames = employee
       ? [employee.name, employee.employeeCode, ...(employee.aliases || [])].filter(Boolean)
       : [employeeCode];
+    const queue = employee ? await employeeCallingQueue(employee, businessId, now) : null;
+    const head = queue?.entries.find(entry => entry.leadId === queue.nextLeadId);
+    if (!employee || normalizeEmployeeAvailabilityStatus(employee.availabilityStatus) !== "ONLINE" || !isSalesEmployee(employee) ||
+      !owned || head?.leadId !== leadId || head.normalizedPhone !== owned.reservedPhone) {
+      response.status(409).json({ code: "CALL_QUEUE_CHANGED", message: "The calling queue or employee availability changed before dialing.", serverTime: now });
+      return;
+    }
     const leadDialBlock = await getLeadDialBlock(leadId, String(employee?._id || ""), employeeNames);
 
     if (leadDialBlock) {
@@ -1194,18 +1296,20 @@ export async function markCallBridgeDialStarted(request: Request, response: Resp
     }
   }
 
-  const schedule = await Schedule.findOneAndUpdate(
+  const dispatchEmployee = await Employee.findOne({ employeeCode, status: { $ne: "Archived" } }).select("_id").lean();
+  const schedule = dispatchEmployee ? await withLeadDispatchOwnership(leadId, String(dispatchEmployee._id), async session => Schedule.findOneAndUpdate(
     {
       employeeCode,
       callLeaseUntil: { $gt: now },
       lastDialStartedAt: null,
       reservedBusinessId: businessId,
       reservedLeadId: leadId,
+      $and: callTimingWriteConditions(now),
       ...(legacyClient || matchedTokenlessReservation ? {} : { reservationTokenHash: hashSecret(reservationToken) }),
     },
-    { $set: { lastDialStartedAt: now, dialIntentUntil: new Date(now.getTime() + dialIntentMs) } },
-    { returnDocument: "after" }
-  );
+    { $set: { lastDialStartedAt: now, dialIntentUntil: new Date(now.getTime() + dialIntentMs), nextCallAllowedAt: unconfirmedDialRetryAt(now) } },
+    { returnDocument: "after", session }
+  ), { employeeCode, attemptId: owned?.reservedAttemptId || reservationToken }) : null;
 
   if (!schedule) {
     if (callTimingV2Enabled() && reservationToken) {
@@ -1214,7 +1318,7 @@ export async function markCallBridgeDialStarted(request: Request, response: Resp
         lastDialStartedAt: { $ne: null }, dialIntentUntil: { $gt: now } }).lean();
       if (existing?.lastDialStartedAt) {
         response.json({ startedAt: existing.lastDialStartedAt, dialIntentUntil: existing.dialIntentUntil,
-          serverTime: now, alreadyStarted: true });
+          serverTime: now, alreadyStarted: true, leadId, normalizedPhone: existing.reservedPhone });
         return;
       }
     }
@@ -1247,7 +1351,7 @@ export async function markCallBridgeDialStarted(request: Request, response: Resp
 
   const devices = await devicesForEmployee(employeeCode);
   response.json({ startedAt: now, dialIntentUntil: schedule.dialIntentUntil,
-    ...(callTimingV2Enabled() ? { serverTime: now, alreadyStarted: false } : {}) });
+    serverTime: now, alreadyStarted: false, leadId, normalizedPhone: schedule.reservedPhone });
   await emitEmployeeCallDashboardUpdated(employeeCode, devices.flatMap((device) => device.businessIds));
 }
 
@@ -1285,7 +1389,7 @@ export async function releaseCallBridgeCall(request: Request, response: Response
     .lean();
   const schedule = await getCallBridgeScheduleModel().findOne({ employeeCode }).lean();
 
-  if (isTrustedBridgeActiveSignal(freshDevices[0], schedule)) {
+  if (freshDevices.some(device => isTrustedBridgeActiveSignal(device, schedule)) || hasUnconfirmedCall(schedule || {})) {
     response.status(409).json({
       employeeCode,
       ...aggregateBridgeStatus(freshDevices, schedule, now),
@@ -1300,6 +1404,7 @@ export async function releaseCallBridgeCall(request: Request, response: Response
     {
       employeeCode,
       reservedBusinessId: businessId,
+      $expr: { $lte: [{ $ifNull: ["$lastCallStartedAt", new Date(0)] }, { $ifNull: ["$lastCallEndedAt", new Date(0)] }] },
       ...(legacyClient ? {} : {
         reservedLeadId: leadId,
         reservationTokenHash: hashSecret(reservationToken),
@@ -1308,8 +1413,8 @@ export async function releaseCallBridgeCall(request: Request, response: Response
     {
       $set: {
         ...clearedCallReservationFields(),
-        ...(retryAt ? { nextCallAllowedAt: retryAt } : {}),
       },
+      ...(retryAt ? { $max: { nextCallAllowedAt: retryAt } } : {}),
     },
     { returnDocument: "after" }
   );

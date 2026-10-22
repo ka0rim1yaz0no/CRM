@@ -66,16 +66,18 @@ export type EmployeeBankInput = Pick<
 >;
 
 type EmployeeListParams = {
+    leadRecipients?: boolean;
     includeArchived?: boolean;
     details?: boolean;
 };
 
 function hasEmployeeListParams(params: unknown): params is EmployeeListParams {
-    return Boolean(params && typeof params === "object" && ("includeArchived" in params || "details" in params));
+    return Boolean(params && typeof params === "object" && ("includeArchived" in params || "details" in params || "leadRecipients" in params));
 }
 
 function employeeListParams(params?: unknown) {
     return {
+        leadRecipients: hasEmployeeListParams(params) && params.leadRecipients ? "true" : undefined,
         includeArchived: hasEmployeeListParams(params) && params.includeArchived ? "true" : undefined,
         summary: hasEmployeeListParams(params) && params.details ? "false" : undefined,
     };
@@ -96,10 +98,11 @@ export async function getEmployee(id: string, options: { timeoutMs?: number } = 
     return response.data;
 }
 
-export async function getEmployeeSummary(id: string, options: { timeoutMs?: number } = {}) {
+export async function getEmployeeSummary(id: string, options: { timeoutMs?: number; businessId?: string; employeeSession?: string } = {}) {
     const response = await api.get<Employee>(`/employees/${id}`, {
         params: { summary: true },
         timeout: options.timeoutMs,
+        headers: { ...(options.businessId ? { "X-Business-Id": options.businessId } : {}), ...(options.employeeSession ? { "X-CRM-Attendance-Session": options.employeeSession } : {}) },
     });
     return response.data;
 }

@@ -15,7 +15,7 @@ function duration(milliseconds: number) {
     return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
 }
 
-function statusClasses(status: CallDashboardRow["status"]) {
+function statusClasses(status: CallDashboardRow["status"] | "UNVERIFIED") {
     if (status === "ON CALL") return "border-emerald-200 bg-emerald-50 text-emerald-800";
     if (status === "ONLINE") return "border-green-200 bg-green-50 text-green-800";
     if (status === "READY") return "border-green-200 bg-green-50 text-green-800";
@@ -26,7 +26,16 @@ function statusClasses(status: CallDashboardRow["status"]) {
     return "border-slate-200 bg-slate-100 text-slate-600";
 }
 
-function visibleStatus(row: CallDashboardRow, now: number, shiftStart: number, shiftEnd: number) {
+function visibleStatus(row: CallDashboardRow, now: number, shiftStart: number, shiftEnd: number, generatedAt = now) {
+    const snapshotAge = Math.max(0, now - generatedAt);
+    if (dashboardV2 && snapshotAge > 45_000) {
+        return { status: "UNVERIFIED" as const, startedAt: 0, detail: "Attendance and call status need a fresh server update. Reconnecting." };
+    }
+    if (dashboardV2 && row.status === "ON CALL" && (snapshotAge > 45_000 ||
+        (row.bridgeHealth && row.bridgeHealth !== "fresh") ||
+        (typeof row.heartbeatAgeMs === "number" && row.heartbeatAgeMs + snapshotAge > 20_000))) {
+        return { status: "UNVERIFIED" as const, startedAt: 0, detail: "Call status needs a fresh bridge confirmation. Refreshing." };
+    }
     if (dashboardV2) return {
         status: row.status,
         startedAt: row.statusStartedAt ? new Date(row.statusStartedAt).getTime() : 0,
@@ -65,7 +74,7 @@ export default function CallDashboardPanel({ businessId, businessName }: { busin
                 ? previous : snapshot;
         },
         enabled: Boolean(businessId),
-        refetchInterval: 15_000,
+        refetchInterval: query => query.state.data?.employees.some(row => row.status === "ON CALL" || row.status === "CALL WAITING") ? 2_000 : 5_000,
         refetchOnWindowFocus: true,
     });
 
@@ -78,9 +87,10 @@ export default function CallDashboardPanel({ businessId, businessName }: { busin
         socket.connect();
         let refreshTimer: number | undefined;
         const update = () => {
-            window.clearTimeout(refreshTimer);
+            if (refreshTimer !== undefined) return;
             refreshTimer = window.setTimeout(() => {
-                void queryClient.invalidateQueries({ queryKey: ["admin-call-dashboard", businessId] });
+                refreshTimer = undefined;
+                void queryClient.invalidateQueries({ queryKey: ["admin-call-dashboard", businessId] }, { cancelRefetch: false });
             }, 250);
         };
         socket.on("call-dashboard:updated", update);
@@ -110,7 +120,7 @@ export default function CallDashboardPanel({ businessId, businessName }: { busin
     const snapshotStale = Boolean(dashboardV2 && data && serverNow - new Date(data.generatedAt).getTime() > 45_000);
     const displayNow = snapshotStale && data
         ? new Date(data.serverTime || data.generatedAt).getTime() + 45_000 : serverNow;
-    const rows = data?.employees.map((row) => ({ row, visible: visibleStatus(row, serverNow, shiftStart, shiftEnd) })) || [];
+    const rows = data?.employees.map((row) => ({ row, visible: visibleStatus(row, serverNow, shiftStart, shiftEnd, new Date(data.generatedAt).getTime()) })) || [];
     const counts = {
         onCall: rows.filter(({ visible }) => visible.status === "ON CALL").length,
         online: rows.filter(({ visible }) => visible.status === "ONLINE").length,
@@ -120,6 +130,7 @@ export default function CallDashboardPanel({ businessId, businessName }: { busin
         break: rows.filter(({ visible }) => visible.status === "BREAK").length,
         lunch: rows.filter(({ visible }) => visible.status === "LUNCH").length,
         offline: rows.filter(({ visible }) => visible.status === "OFFLINE").length,
+        unverified: rows.filter(({ visible }) => visible.status === "UNVERIFIED").length,
     };
     const displayRows = rows.map(({ row, visible }) => {
         const startedAt = visible.startedAt;
@@ -155,6 +166,7 @@ export default function CallDashboardPanel({ businessId, businessName }: { busin
                     {dashboardV2 && <><span><span className="mr-1 inline-block size-2 rounded-full bg-orange-500" />{counts.break} break</span>
                     <span><span className="mr-1 inline-block size-2 rounded-full bg-violet-500" />{counts.lunch} lunch</span></>}
                     <span><span className="mr-1 inline-block size-2 rounded-full bg-slate-400" />{counts.offline} offline</span>
+                    {counts.unverified > 0 && <span>{counts.unverified} unverified</span>}
                 </div>}
             </div>
             {snapshotStale && <p className="border-b border-amber-200 bg-amber-50 px-4 py-2 text-xs text-amber-900" role="status">Call data is stale. Reconnecting to the server.</p>}
@@ -185,7 +197,7 @@ export default function CallDashboardPanel({ businessId, businessName }: { busin
                                     </div>
                                 </td>
                                 <td className="px-4 py-2.5">
-                                    <span className={`inline-flex whitespace-nowrap rounded-md border px-2 py-1 text-xs font-semibold ${statusClasses(visible.status)}`}>{visible.status}</span>
+                                    <span title={visible.detail} className={`inline-flex whitespace-nowrap rounded-md border px-2 py-1 text-xs font-semibold ${statusClasses(visible.status)}`}>{visible.status}</span>
                                 </td>
                                 <td className="px-4 py-2.5 text-right font-mono text-sm tabular-nums" title={statusTimeTitle}>{statusTime}</td>
                                 <td className="px-4 py-2.5 text-right font-mono text-sm tabular-nums">{offPhoneTime}</td>
@@ -210,7 +222,7 @@ export default function CallDashboardPanel({ businessId, businessName }: { busin
                                     <p className="break-words text-xs text-slate-500">{[row.role, row.team, businessName || row.businessName].filter(Boolean).join(" · ")}</p>
                                 </div>
                             </div>
-                            <span className={`inline-flex shrink-0 whitespace-nowrap rounded-md border px-2 py-1 text-xs font-semibold ${statusClasses(visible.status)}`}>
+                            <span title={visible.detail} className={`inline-flex shrink-0 whitespace-nowrap rounded-md border px-2 py-1 text-xs font-semibold ${statusClasses(visible.status)}`}>
                                 {visible.status}
                             </span>
                         </div>

@@ -1,0 +1,32 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { callingWorkMessage, setCallingWork, trackCallingSave, setLeadNoteDraft, getLeadNoteDraft, clearSavedLeadNoteDraft } from "../src/lib/callingWorkflow.ts";
+globalThis.window = new EventTarget();
+const scope = { employeeId: "synthetic-person", businessId: "synthetic-a" };
+const other = { employeeId: "synthetic-person", businessId: "synthetic-b" };
+test("pending saves survive an editor unmount and only their own completion releases the scope", async () => {
+    let resolveFirst, rejectSecond;
+    const first = new Promise(resolve => { resolveFirst = resolve; });
+    const second = new Promise((_resolve, reject) => { rejectSecond = reject; });
+    const owner = Symbol("editor");
+    setCallingWork(scope, owner, "Unsaved lead changes");
+    trackCallingSave(scope, first); trackCallingSave(scope, second);
+    setCallingWork(scope, owner, "");
+    assert.equal(callingWorkMessage(scope), "Saving lead changes");
+    assert.equal(callingWorkMessage(other), "");
+    resolveFirst(); await first; await Promise.resolve();
+    assert.equal(callingWorkMessage(scope), "Saving lead changes");
+    rejectSecond(new Error("Synthetic failure")); await second.catch(() => undefined); await Promise.resolve();
+    assert.equal(callingWorkMessage(scope), "");
+});
+test("failed or late saves cannot erase a different business's note or a newer draft", () => {
+    const lead = { _id: "synthetic-lead" };
+    setLeadNoteDraft(scope, lead, "original"); setLeadNoteDraft(other, lead, "other business");
+    setLeadNoteDraft(scope, lead, "newer draft");
+    clearSavedLeadNoteDraft(scope, lead._id, "original");
+    assert.equal(getLeadNoteDraft(scope).body, "newer draft");
+    assert.equal(getLeadNoteDraft(other).body, "other business");
+    clearSavedLeadNoteDraft(scope, lead._id, "newer draft");
+    assert.equal(getLeadNoteDraft(scope), null);
+    assert.equal(getLeadNoteDraft(other).body, "other business");
+});

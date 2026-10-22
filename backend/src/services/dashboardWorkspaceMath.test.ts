@@ -39,10 +39,10 @@ test("source guard ignores checkout line endings, but still detects code changes
   assert.notEqual(sourceHash("fixture\n"), sourceHash("changed\n"));
 });
 
-test("call dashboard component, API and endpoint source remain unchanged", () => {
+test("reviewed call dashboard freshness component and unchanged API/endpoint contracts stay pinned", () => {
   const root = new URL("../../../", import.meta.url);
   for (const [path, hash] of [
-    ["src/components/CallDashboardPanel.tsx", "D561D37D851A9F885FA5FEFD498404E8D335255F7CCD31C3CBD766482A1568C4"],
+    ["src/components/CallDashboardPanel.tsx", "1E61E63D4F04E1974255C53B294AC10A699E17DA3159878869AE83D687B583A5"],
     ["src/api/callDashboard.ts", "2BD61E9E093FBB952477144CCAFBB43F049FCAB87EE5A6C81282D58BB0C0D923"],
     ["backend/src/controllers/callDashboardController.ts", "8FD7BE4E0DA788F2CA2ED69CA8F05BBC2DBE5C1A2A0B8A003344D2D60E717A5C"],
     ["backend/src/routes/callDashboardRoutes.ts", "18BAE4DB7FE451D0275ABCB3E7BFA53F4DC7C9D1901C39666BFD8B26C3C0BF19"],

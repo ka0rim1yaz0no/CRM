@@ -13,11 +13,19 @@ import { isLeadAutoAssignmentEnabled } from "./systemSettingsController";
 import { formatPhDate } from "../utils/dateTime";
 import { emitLeadChanged } from "../socket";
 import { getCurrentBusinessId, runForEachBusiness } from "../config/tenancy";
-import { AUTO_CALL_COMMENT_COOLDOWN_MS, autoCallPhoneCandidates, isLeadEligibleForAutoCall, shouldBlockCommentedPhone } from "../services/leadAutoCallEligibility";
+import { AUTO_CALL_COMMENT_COOLDOWN_MS, autoCallPhoneCandidates, shouldBlockCommentedPhone } from "../services/leadAutoCallEligibility";
 import { getCallProvider } from "../config/callProvider";
 import { getCallBridgeAttemptModel } from "../models/CallBridge";
 import { getRingCentralMonitorStatus } from "../services/ringCentralCallMonitor";
 import { isRingCentralOutcomeShadowEnabled } from "../services/ringCentralCallClassification";
+import { signedCrmIdentity, signedEmployeeInBusiness } from "../middleware/legacyAuthentication";
+import { employeeCallingQueue, hydrateCallingQueue } from "../services/employeeCallingQueue";
+import { compareCallingLeads, parseCallingSchedule, type CallingPolicyLead } from "../../../shared/leadCallingPolicy";
+import { isSalesEmployee as isSalesAssignableEmployee, isEligibleLeadRecipient } from "../../../shared/leadAssignmentPolicy";
+import { assignmentActor, assignmentSnapshotFilter, invalidateUnstartedLeadReservations, leadRecipients, uniquelyOwnedLegacyNames, writeLeadAssignment } from "../services/leadAssignment";
+import { normalizeLeadPhone, leadPhoneDigitVariants, logicalLeadKey } from "../../../shared/leadPhonePolicy";
+import { leadPhoneDedupEnabled } from "../config/rolloutFlags";
+import { leadPhoneCanonicalSnapshot, restrictToCanonicalPhones } from "../services/leadPhoneCanonical";
 
 const populateLead = [
   { path: "assignedAgent", select: "name employeeCode aliases role team status" },
@@ -31,17 +39,19 @@ const TOMTOM_CALLABLE_LEADS_PER_REQUEST_ESTIMATE = 4;
 const TOMTOM_DUPLICATE_BUFFER_MULTIPLIER = 1.25;
 const PH_TIME_OFFSET_HOURS = 8;
 let leadAutoAssignmentTimer: NodeJS.Timeout | null = null;
+const transientLeadKeys = new WeakMap<object, string>();
+let transientLeadSequence = 0;
 
 type PopulatedLead = Awaited<ReturnType<typeof Lead.find>>[number];
 type AssignmentCandidate = {
   _id: Types.ObjectId;
+  name: string;
   assignedCount: number;
 };
 
 type ImportablePlaceLead = GooglePlaceLead & Partial<Pick<TomTomPlaceLead, "provider" | "providerPlaceId" | "providerCategory">>;
 
 const leadStatuses = ["NEW", "Follow up", "Ongoing comms", "Qualified", "Ongoing Negotiation", "Completed", "Dead", "Archived"] as const;
-const salesAssignmentTextRegex = /sales/i;
 
 type ImportedLead = {
   leadName: string;
@@ -71,10 +81,6 @@ type ImportedLead = {
   createdAt?: Date;
   updatedAt?: Date;
 };
-
-function isSalesAssignableEmployee(employee: { role?: unknown; team?: unknown }) {
-  return salesAssignmentTextRegex.test(String(employee.role || "")) || salesAssignmentTextRegex.test(String(employee.team || ""));
-}
 
 function normalizeLeadValue(value: string) {
   return value.trim().toLowerCase().replace(/\s+/g, " ");
@@ -210,10 +216,13 @@ function wholeTermSearchRegex(value: string) {
 }
 
 function normalizePhoneDigits(value: string) {
+  const canonical = leadPhoneDedupEnabled() ? normalizeLeadPhone(value) : null;
+  if (canonical) return canonical.slice(1);
   return value.replace(/\D/g, "");
 }
 
 function phoneDigitCandidates(value: string) {
+  if (leadPhoneDedupEnabled()) return leadPhoneDigitVariants(value);
   const digits = normalizePhoneDigits(value);
 
   if (digits.length < 7) {
@@ -977,6 +986,14 @@ async function findDuplicateLead(
   },
   excludeId = ""
 ) {
+  if (leadPhoneDedupEnabled()) {
+    const key = logicalLeadKey({ ...lead, _id: "incoming" });
+    if (key === "record:incoming") return null;
+    const snapshot = await leadPhoneCanonicalSnapshot();
+    const duplicate = snapshot.records.filter(record => String(record._id) !== excludeId && logicalLeadKey(record) === key)
+      .sort((a, b) => String(a._id).localeCompare(String(b._id)))[0];
+    return duplicate ? Lead.findById(duplicate._id).populate(populateLead) : null;
+  }
   const filters = getLeadDuplicateFilters(lead);
 
   if (filters.length === 0) {
@@ -1085,6 +1102,8 @@ function getDuplicateLeadMessage(
 
 
 function getLeadDedupKey(lead: {
+  _id?: unknown;
+  status?: string;
   googlePlaceId?: string;
   providerPlaceId?: string;
   placeProvider?: string;
@@ -1094,6 +1113,11 @@ function getLeadDedupKey(lead: {
   phone?: string;
   website?: string;
 }) {
+  if (leadPhoneDedupEnabled()) {
+    if (lead.status === "Archived" && lead._id) return `archived:${String(lead._id)}`;
+    if (!lead._id && !transientLeadKeys.has(lead)) transientLeadKeys.set(lead, `transient-${++transientLeadSequence}`);
+    return logicalLeadKey({ ...lead, _id: lead._id || transientLeadKeys.get(lead) });
+  }
   if (lead.googlePlaceId) {
     return `place:${lead.googlePlaceId}`;
   }
@@ -1819,96 +1843,6 @@ function sortLeadsByFollowUpPriority<T extends { followUpAt?: Date | string | nu
   });
 }
 
-function parseLeadQueueTime(value?: Date | string | null) {
-  if (!value) {
-    return null;
-  }
-
-  const time = new Date(value).getTime();
-  return Number.isNaN(time) ? null : time;
-}
-
-
-
-function isScheduledForToday(lead: { status?: string; followUpAt?: Date | string | null }) {
-  if (lead.status === "Qualified") {
-    return false;
-  }
-
-  return Boolean(lead.followUpAt && formatPhDate(lead.followUpAt) === formatPhDate(new Date()));
-}
-
-function isScheduledDueNow(lead: { status?: string; followUpAt?: Date | string | null }, now = new Date()) {
-  if (lead.status === "Qualified") {
-    return false;
-  }
-
-  const followUpTime = parseLeadQueueTime(lead.followUpAt);
-  return followUpTime !== null && followUpTime <= now.getTime();
-}
-
-function getManualCommentTime(lead: {
-  comments?: { authorName?: string; createdAt?: Date | string | null }[];
-}) {
-  const times = (lead.comments || [])
-    .filter((comment) => comment.authorName !== "CSV Import")
-    .map((comment) => parseLeadQueueTime(comment.createdAt))
-    .filter((time): time is number => time !== null);
-
-  return times.length > 0 ? Math.max(...times) : null;
-}
-
-function getCommentActivityTime(lead: {
-  activity?: { label?: string; createdAt?: Date | string | null }[];
-}) {
-  const times = (lead.activity || [])
-    .filter((item) => String(item.label || "").toLowerCase() === "comment added")
-    .map((item) => parseLeadQueueTime(item.createdAt))
-    .filter((time): time is number => time !== null);
-
-  return times.length > 0 ? Math.max(...times) : null;
-}
-
-function getAssignmentMoveTime(lead: {
-  activity?: { label?: string; detail?: string; createdAt?: Date | string | null }[];
-}) {
-  const times = (lead.activity || [])
-    .filter((item) => {
-      const label = String(item.label || "").toLowerCase();
-      const detail = String(item.detail || "").toLowerCase();
-
-      return label === "assigned" || detail.includes(" passed this lead") || detail.includes(" assigned this lead");
-    })
-    .map((item) => parseLeadQueueTime(item.createdAt))
-    .filter((time): time is number => time !== null);
-
-  return times.length > 0 ? Math.max(...times) : null;
-}
-
-function getUpdateActivityTime(lead: {
-  activity?: { label?: string; createdAt?: Date | string | null }[];
-}) {
-  const times = (lead.activity || [])
-    .filter((item) => {
-      const label = String(item.label || "").toLowerCase();
-      return label === "lead updated" || label === "status updated" || label === "status changed" || label === "follow up scheduled";
-    })
-    .map((item) => parseLeadQueueTime(item.createdAt))
-    .filter((time): time is number => time !== null);
-
-  return times.length > 0 ? Math.max(...times) : null;
-}
-
-function getLeadDeprioritizedTime(lead: {
-  comments?: { authorName?: string; createdAt?: Date | string | null }[];
-  activity?: { label?: string; detail?: string; createdAt?: Date | string | null }[];
-}) {
-  const times = [getManualCommentTime(lead), getCommentActivityTime(lead), getAssignmentMoveTime(lead), getUpdateActivityTime(lead)].filter(
-    (time): time is number => time !== null
-  );
-
-  return times.length > 0 ? Math.max(...times) : null;
-}
 
 function getCurrentPhDayRange() {
   const phOffsetMs = 8 * 60 * 60 * 1000;
@@ -1992,23 +1926,28 @@ async function excludeCommentedPhoneCandidates<T extends { phone?: string; follo
   candidates: T[],
   now = new Date()
 ) {
-  const phoneFilters = candidates
-    .flatMap((lead) => flexiblePhoneRegexes(String(lead.phone || "")))
-    .filter((regex, index, all) => all.findIndex((item) => item.source === regex.source && item.flags === regex.flags) === index)
-    .map((phone) => ({ phone }));
+  const phoneDigits = new Set(candidates.flatMap((lead) => autoCallPhoneCandidates(lead.phone)));
+  if (phoneDigits.size === 0) return candidates;
 
-  if (phoneFilters.length === 0) return candidates;
-
-  const commentedLeads = await Lead.find({
-    $or: phoneFilters,
-    comments: { $elemMatch: { authorType: "employee" } },
-  }).select("phone comments.authorType comments.createdAt").lean();
+  // A candidate-sized regex OR makes Mongo scan each phone thousands of times.
+  // Summarize each commented phone once; retain invalid-date blocking and exact digit matching.
+  const commentedLeads = await Lead.aggregate<{ phone?: string; latestCommentAt: Date | null; hasInvalidComment: boolean }>([
+    { $match: { "comments.authorType": "employee" } },
+    { $project: { _id: 0, phone: 1, commentTimes: { $map: {
+      input: { $filter: { input: { $ifNull: ["$comments", []] }, as: "comment", cond: { $eq: ["$$comment.authorType", "employee"] } } },
+      as: "comment", in: { $convert: { input: "$$comment.createdAt", to: "date", onError: null, onNull: null } },
+    } } } },
+    { $project: { phone: 1, latestCommentAt: { $max: "$commentTimes" }, hasInvalidComment: { $in: [null, "$commentTimes"] } } },
+  ]);
   const commentsByPhone = new Map<string, Array<{ createdAt?: Date | string | null }>>();
 
   for (const commentedLead of commentedLeads) {
-    const employeeComments = (commentedLead.comments || []).filter((comment) => comment.authorType === "employee");
+    if (!phoneDigits.has(normalizePhoneDigits(String(commentedLead.phone || "")))) continue;
+    const employeeComment = { createdAt: commentedLead.hasInvalidComment ? null : commentedLead.latestCommentAt };
     for (const phoneKey of autoCallPhoneCandidates(commentedLead.phone)) {
-      commentsByPhone.set(phoneKey, [...(commentsByPhone.get(phoneKey) || []), ...employeeComments]);
+      const comments = commentsByPhone.get(phoneKey) || [];
+      comments.push(employeeComment);
+      commentsByPhone.set(phoneKey, comments);
     }
   }
 
@@ -2034,69 +1973,14 @@ function createHiddenFromEmployeeQueueTodayFilter() {
   };
 }
 
-function sortLeadsForAgentWorkQueue<
-  T extends {
-    status?: string;
-    followUpAt?: Date | string | null;
-    comments?: { authorName?: string; createdAt?: Date | string | null }[];
-    activity?: { label?: string; detail?: string; createdAt?: Date | string | null }[];
-    createdAt?: Date;
-  }
->(leads: T[], employeeNames: string[] = [], now = new Date()) {
-  return [...leads].sort((first, second) => {
-    const getQueueRank = (lead: T) => {
-      const isAutoCallEligible = isLeadEligibleForAutoCall(lead, now, employeeNames);
-      const hasRecentEmployeeComment = !isAutoCallEligible && lead.status === "NEW";
-      const scheduledDueNow = isScheduledDueNow(lead, now);
-
-      if (scheduledDueNow && isAutoCallEligible) return 0;
-      const scheduledToday = isScheduledForToday(lead);
-      if (lead.status === "NEW" && !hasRecentEmployeeComment && !scheduledToday) return 1;
-      if (lead.status === "NEW" && !scheduledToday) return 2;
-      if (lead.status === "Follow up" && !scheduledToday) return 3;
-      if (scheduledToday) return 5;
-      return 4;
-    };
-    const firstRank = getQueueRank(first);
-    const secondRank = getQueueRank(second);
-
-    if (firstRank !== secondRank) {
-      return firstRank - secondRank;
-    }
-
-    if (firstRank === 0 || firstRank === 5) {
-      return (parseLeadQueueTime(first.followUpAt) || 0) - (parseLeadQueueTime(second.followUpAt) || 0);
-    }
-
-    const firstWorkedAt = getLeadDeprioritizedTime(first);
-    const secondWorkedAt = getLeadDeprioritizedTime(second);
-    if (firstWorkedAt !== null || secondWorkedAt !== null) {
-      if (firstWorkedAt === null) return -1;
-      if (secondWorkedAt === null) return 1;
-      const workedAtDelta = firstWorkedAt - secondWorkedAt;
-
-      if (workedAtDelta !== 0) {
-        return workedAtDelta;
-      }
-    }
-
-    const createdAtDelta = new Date(second.createdAt || 0).getTime() - new Date(first.createdAt || 0).getTime();
-
-    if (createdAtDelta !== 0) {
-      return createdAtDelta;
-    }
-
-    return String((first as { _id?: unknown })._id || "").localeCompare(String((second as { _id?: unknown })._id || ""));
-  });
+function sortLeadsForAgentWorkQueue<T extends CallingPolicyLead>(leads: T[], employeeNames: string[] = [], now = new Date()) {
+  void employeeNames;
+  return [...leads].sort((first, second) => compareCallingLeads(first, second, now));
 }
 
 async function createAssignmentCandidates(excludedAgentIds: string[] = []): Promise<AssignmentCandidate[]> {
   const excludedIds = excludedAgentIds.filter(Boolean);
-  const employees = await Employee.find({
-    status: "Active",
-    $or: [{ role: salesAssignmentTextRegex }, { team: salesAssignmentTextRegex }],
-    ...(excludedIds.length > 0 ? { _id: { $nin: excludedIds } } : {}),
-  }).sort({ createdAt: 1 });
+  const employees = (await leadRecipients()).filter(employee => !excludedIds.includes(String(employee._id)));
 
   if (employees.length === 0) {
     return [];
@@ -2110,6 +1994,7 @@ async function createAssignmentCandidates(excludedAgentIds: string[] = []): Prom
 
   return employees.map((employee) => ({
     _id: employee._id,
+    name: employee.name,
     assignedCount: countsByEmployeeId.get(String(employee._id)) || 0,
   }));
 }
@@ -2149,6 +2034,7 @@ export async function runLeadAutoAssignmentBatch(limit = AUTO_ASSIGNMENT_BATCH_S
   const candidateLeads = await Lead.find({
     status: { $nin: ["Archived", "Dead"] },
     $or: [{ assignedAgent: null }, { assignedAgent: { $exists: false } }],
+    assignedAgentName: { $in: ["", null] },
   })
     .sort({ createdAt: 1 })
     .limit(limit * 5);
@@ -2169,12 +2055,14 @@ export async function runLeadAutoAssignmentBatch(limit = AUTO_ASSIGNMENT_BATCH_S
 
       return {
         updateOne: {
-          filter: { _id: lead._id },
+          filter: assignmentSnapshotFilter(lead),
           update: {
             $set: {
               assignedAgent,
+              assignedAgentName: assignmentCandidates.find(candidate => String(candidate._id) === String(assignedAgent))!.name,
               autoAssignedAt: assignedAt,
             },
+            $inc: { assignmentRevision: 1 },
             $push: activityPush("Assigned", "System auto assigned this lead.", { actorName: "System", actorType: "system" }),
           },
         },
@@ -2222,9 +2110,10 @@ export async function reassignLeadsFromAgent(agentId: string) {
 
   if (!(await isLeadAutoAssignmentEnabled())) {
     const result = await Lead.updateMany(
-      { _id: { $in: leads.map((lead) => lead._id) } },
+      { $or: leads.map(assignmentSnapshotFilter) },
       {
-        $set: { assignedAgent: null, autoAssignedAt: null },
+        $set: { assignedAgent: null, assignedAgentName: "", autoAssignedAt: null },
+        $inc: { assignmentRevision: 1 },
         $push: activityPush("Unassigned", "Lead unassigned because lead auto assignment is turned off.", {
           actorName: "System",
           actorType: "system",
@@ -2232,6 +2121,11 @@ export async function reassignLeadsFromAgent(agentId: string) {
       }
     );
 
+    if (result.modifiedCount) {
+      const ids = leads.map(lead => String(lead._id));
+      await invalidateUnstartedLeadReservations(ids);
+      emitLeadChanged({ action: "unassigned", leadIds: ids });
+    }
     return { reassignedCount: 0, unassignedCount: result.modifiedCount, availableAgents: 0 };
   }
 
@@ -2242,12 +2136,14 @@ export async function reassignLeadsFromAgent(agentId: string) {
 
     return {
       updateOne: {
-        filter: { _id: lead._id },
+        filter: assignmentSnapshotFilter(lead),
         update: {
           $set: {
             assignedAgent,
+            assignedAgentName: assignmentCandidates.find(candidate => String(candidate._id) === String(assignedAgent))?.name || "",
             autoAssignedAt: assignedAgent ? assignedAt : null,
           },
+          $inc: { assignmentRevision: 1 },
           $push: activityPush(
             assignedAgent ? "Reassigned" : "Unassigned",
             assignedAgent ? "Lead reassigned after employee archive/delete." : "Lead unassigned because no active sales agent was available.",
@@ -2260,6 +2156,11 @@ export async function reassignLeadsFromAgent(agentId: string) {
 
   const result = await Lead.bulkWrite(operations, { ordered: false });
 
+  if (result.modifiedCount) {
+    const ids = leads.map(lead => String(lead._id));
+    await invalidateUnstartedLeadReservations(ids);
+    emitLeadChanged({ action: "reassigned", leadIds: ids });
+  }
   return {
     reassignedCount: assignmentCandidates.length > 0 ? result.modifiedCount : 0,
     unassignedCount: assignmentCandidates.length > 0 ? 0 : result.modifiedCount,
@@ -2267,7 +2168,9 @@ export async function reassignLeadsFromAgent(agentId: string) {
   };
 }
 
-export async function reassignNewLeadsBatch(_request: Request, response: Response) {
+export async function reassignNewLeadsBatch(request: Request, response: Response) {
+  const actor = await assignmentActor(request, response, true);
+  if (!actor) return;
   if (!(await isLeadAutoAssignmentEnabled())) {
     response.status(400).json({ message: "Lead auto assignment is turned off in Settings." });
     return;
@@ -2290,26 +2193,35 @@ export async function reassignNewLeadsBatch(_request: Request, response: Respons
   }
 
   const assignedAt = new Date();
-  const operations = sortLeadsByFollowUpPriority(leads).map((lead) => {
+  const operations = sortLeadsByFollowUpPriority(leads).flatMap((lead) => {
     const assignedAgent = pickAssignmentCandidate(assignmentCandidates);
+    const assignedAgentName = assignmentCandidates.find(candidate => String(candidate._id) === String(assignedAgent))!.name;
+    if (String(lead.assignedAgent || "") === String(assignedAgent) && lead.assignedAgentName === assignedAgentName) return [];
 
-    return {
+    return [{
       updateOne: {
-        filter: { _id: lead._id },
+        filter: assignmentSnapshotFilter(lead),
         update: {
           $set: {
             assignedAgent,
+            assignedAgentName,
             autoAssignedAt: assignedAt,
           },
-          $push: activityPush("Reassigned", "Admin reassigned this new lead.", { actorName: "Admin", actorType: "admin" }),
+          $inc: { assignmentRevision: 1 },
+          $push: activityPush("Reassigned", `${actor.name} reassigned this new lead.`, { actorName: actor.name, actorType: "admin" }),
         },
       },
-    };
+    }];
   });
 
-  const result = await Lead.bulkWrite(operations, { ordered: false });
+  const result = operations.length ? await Lead.bulkWrite(operations, { ordered: false }) : { modifiedCount: 0 };
   const updatedLeads = await Lead.find({ _id: { $in: leads.map((lead) => lead._id) } }).populate(populateLead);
 
+  if (result.modifiedCount) {
+    const ids = leads.map(lead => String(lead._id));
+    await invalidateUnstartedLeadReservations(ids);
+    emitLeadChanged({ action: "reassigned-new", leadIds: ids });
+  }
   response.json({
     reassignedCount: result.modifiedCount,
     leads: sortLeadsByFollowUpPriority(updatedLeads),
@@ -2399,6 +2311,7 @@ async function upsertPlacesAsLeads(
                 createdByName: sourceName,
                 createdByType: "system",
                 assignedAgent,
+                assignedAgentName: assignmentCandidates.find(candidate => String(candidate._id) === String(assignedAgent))?.name || "",
                 autoAssignedAt,
                 activity: [leadActivity("Lead created", `${sourceName} lead added${placeCategory ? ` under ${placeCategory}` : ""}${options.actor ? ` by ${options.actor.actorName}` : ""}.`, { actorName: options.actor?.actorName || "System", actorType: options.actor ? "admin" : "system" })],
               },
@@ -2513,6 +2426,7 @@ export async function listLeads(request: Request, response: Response) {
     filter.$and = andFilters;
   }
 
+  await restrictToCanonicalPhones(filter);
   const leadQuery = Lead.find(filter)
     .populate(populateLead)
     .sort({ createdAt: -1 });
@@ -2556,6 +2470,30 @@ export async function readLead(request: Request, response: Response) {
 }
 
 export async function listMyLeads(request: Request, response: Response) {
+  const callingRequested = String(request.query.callingQueue || "").toLowerCase() === "true";
+  const defaultCallingView = !request.query.search && !request.query.state && !request.query.stateFilter &&
+    (!request.params.tab || request.params.tab === "my") && (!request.query.tab || request.query.tab === "my") &&
+    (!request.query.queue || request.query.queue === "ALL");
+  const actor = signedCrmIdentity(request.header("x-crm-admin-session"), request.header("x-crm-attendance-session"));
+  if (callingRequested || (actor?.type === "employee" && defaultCallingView)) {
+    if (actor?.type !== "employee") { response.status(403).json({ message: "A signed employee session is required for the calling queue." }); return; }
+    const businessId = request.business?.id || "";
+    const employee = await signedEmployeeInBusiness(actor.code, businessId);
+    if (!employee) { response.status(403).json({ message: "This employee cannot access this business." }); return; }
+    const page = Math.max(1, Math.floor(Number(request.query.page) || 1));
+    const limit = Math.min(50, Math.max(1, Math.floor(Number(request.query.limit) || 50)));
+    const queue = await employeeCallingQueue(employee, businessId, new Date());
+    if (String(request.query.autoCallEligible || "").toLowerCase() === "true") queue.entries = queue.entries.filter(entry => entry.callable);
+    const hydrated = await hydrateCallingQueue(queue, page, limit);
+    const { leads, entries, ...snapshot } = hydrated;
+    const stateOptions = await getLeadStateOptions({ $or: await createEmployeeLeadAssignmentFilters(String(employee._id), [employee.name, employee.employeeCode, ...(employee.aliases || [])].filter(Boolean)) });
+    response.set("Cache-Control", "no-store");
+    response.json({ leads, tab: "my", page, limit, total: entries.length, stateOptions,
+      hasMore: page * limit < entries.length, nextPage: page * limit < entries.length ? page + 1 : null,
+      callingQueue: { ...snapshot, entries: entries.slice((page - 1) * limit, page * limit),
+        nextDecision: entries.find(entry => entry.leadId === queue.nextLeadId) || null } });
+    return;
+  }
   const employeeId = String(request.query.employeeId || "").trim();
   const employeeNames = parseQueryList(request.query.employeeNames || request.query.employeeName);
   const limit = Math.min(Math.max(Number(request.query.limit || 50) || 50, 1), 50);
@@ -2566,7 +2504,7 @@ export async function listMyLeads(request: Request, response: Response) {
   const searchAll = String(request.query.searchAll || "").toLowerCase() === "true" && Object.keys(searchFilter).length > 0;
   const includeArchived = searchAll || String(request.query.includeArchived || "").toLowerCase() === "true";
   const autoCallEligible = String(request.query.autoCallEligible || "").toLowerCase() === "true";
-  const assignmentFilters = createEmployeeLeadAssignmentFilters(employeeId, employeeNames);
+  const assignmentFilters = await createEmployeeLeadAssignmentFilters(employeeId, employeeNames);
   const canViewAllLeadQueues = await canEmployeeViewAllLeadQueues(employeeId);
   const canViewCompletedQueue = await canEmployeeViewCompletedLeadQueue(employeeId);
   const canBypassAssignmentFilter = canViewAllLeadQueues || (tab === "completed" && canViewCompletedQueue);
@@ -2605,6 +2543,7 @@ export async function listMyLeads(request: Request, response: Response) {
   }
 
   const filter: Record<string, unknown> = { $and: andFilters };
+  await restrictToCanonicalPhones(filter);
   const [total, stateOptions] = await Promise.all([
     Lead.countDocuments(filter),
     getLeadStateOptions(stateOptionFilter),
@@ -2624,6 +2563,7 @@ export async function listMyLeads(request: Request, response: Response) {
     "status",
     "assignedAgent",
     "assignedAgentName",
+    "assignmentRevision",
     "autoAssignedAt",
     "assignedTeam",
     "favoriteByEmployees",
@@ -2657,10 +2597,7 @@ export async function listMyLeads(request: Request, response: Response) {
     const queueCandidates = autoCallEligible
       ? await excludeCommentedPhoneCandidates(candidates, new Date())
       : candidates;
-    const sortedCandidates = sortLeadsForAgentWorkQueue(
-      dedupeLeads(queueCandidates as unknown as PopulatedLead[]),
-      employeeNames,
-    );
+    const sortedCandidates = dedupeLeads(sortLeadsForAgentWorkQueue(queueCandidates, employeeNames) as unknown as PopulatedLead[]);
     const effectiveTotal = sortedCandidates.length;
     const pageCandidates = sortedCandidates.slice((page - 1) * limit, page * limit);
     const pageIds = pageCandidates.map((lead) => lead._id);
@@ -2701,7 +2638,7 @@ export async function listMyLeads(request: Request, response: Response) {
     .limit(limit);
   const pagedLeads = searchAll
     ? dedupeLeads(leads)
-    : sortLeadsForAgentWorkQueue(dedupeLeads(leads), employeeNames);
+    : dedupeLeads(sortLeadsForAgentWorkQueue(leads, employeeNames));
 
   response.json({
     leads: pagedLeads,
@@ -2722,6 +2659,7 @@ export async function listAdminLeads(request: Request, response: Response) {
   const limit = Math.min(Math.max(Number(request.query.limit || defaultLimit) || defaultLimit, 1), maxLimit);
   const page = Math.max(Number(request.query.page || 1) || 1, 1);
   const filter = createAdminLeadTabFilter(request);
+  await restrictToCanonicalPhones(filter);
   const stateOptionFilter = createAdminLeadTabFilter(request, { includeStateFilter: false });
   const [total, stateOptions] = await Promise.all([
     Lead.countDocuments(filter),
@@ -2744,6 +2682,7 @@ export async function listAdminLeads(request: Request, response: Response) {
     "status",
     "assignedAgent",
     "assignedAgentName",
+    "assignmentRevision",
     "autoAssignedAt",
     "assignedTeam",
     "favoriteByEmployees",
@@ -3376,6 +3315,7 @@ export async function readAgentLeadDashboard(request: Request, response: Respons
 
 export async function countAdminLeads(request: Request, response: Response) {
   const baseFilter = createAdminBaseFilter(request);
+  await restrictToCanonicalPhones(baseFilter);
   const leads = await Lead.find(baseFilter)
     .select("status assignedAgent assignedAgentName email phone website businessName businessAddress createdAt")
     .sort({ createdAt: -1, _id: 1 })
@@ -3405,7 +3345,7 @@ export async function countAdminLeads(request: Request, response: Response) {
 export async function countMyLeads(request: Request, response: Response) {
   const employeeId = String(request.query.employeeId || "").trim();
   const employeeNames = parseQueryList(request.query.employeeNames || request.query.employeeName);
-  const assignmentFilters = createEmployeeLeadAssignmentFilters(employeeId, employeeNames);
+  const assignmentFilters = await createEmployeeLeadAssignmentFilters(employeeId, employeeNames);
   const canViewAllLeadQueues = await canEmployeeViewAllLeadQueues(employeeId);
   const canViewCompletedQueue = await canEmployeeViewCompletedLeadQueue(employeeId);
 
@@ -3425,7 +3365,8 @@ export async function countMyLeads(request: Request, response: Response) {
     baseAndFilters.push(stateFilter);
   }
 
-  const baseFilter = baseAndFilters.length > 0 ? { $and: baseAndFilters } : {};
+  const baseFilter: Record<string, unknown> = baseAndFilters.length > 0 ? { $and: baseAndFilters } : {};
+  await restrictToCanonicalPhones(baseFilter);
   const statusCounts = await Lead.aggregate<{ _id: string; count: number }>([
     { $match: baseFilter },
     { $group: { _id: "$status", count: { $sum: 1 } } },
@@ -3437,7 +3378,9 @@ export async function countMyLeads(request: Request, response: Response) {
   });
 
   if (!canViewAllLeadQueues && canViewCompletedQueue) {
-    counts.Completed = await Lead.countDocuments({ status: "Completed" });
+    const completed: Record<string, unknown> = { status: "Completed" };
+    await restrictToCanonicalPhones(completed);
+    counts.Completed = await Lead.countDocuments(completed);
   }
 
   counts.ALL = await Lead.countDocuments({
@@ -3633,15 +3576,15 @@ function getEmployeeLeadTabStatuses(tab: EmployeeLeadTab, queueFilter = "ALL"): 
   return statusesByTab[tab];
 }
 
-function createEmployeeLeadAssignmentFilters(employeeId: string, employeeNames: string[]) {
+async function createEmployeeLeadAssignmentFilters(employeeId: string, employeeNames: string[]) {
   const assignmentFilters: Record<string, unknown>[] = [];
 
   if (employeeId && Types.ObjectId.isValid(employeeId)) {
     assignmentFilters.push({ assignedAgent: new Types.ObjectId(employeeId) });
   }
 
-  employeeNames.forEach((employeeName) => {
-    assignmentFilters.push({ assignedAgentName: flexibleExactRegex(employeeName) });
+  (await uniquelyOwnedLegacyNames(employeeId, employeeNames)).forEach((employeeName) => {
+    assignmentFilters.push({ assignedAgent: null, assignedAgentName: flexibleExactRegex(employeeName) });
   });
 
   return assignmentFilters;
@@ -3712,7 +3655,8 @@ export async function countLeads(request: Request, response: Response) {
     andFilters.push(searchFilter);
   }
 
-  const baseFilter = andFilters.length > 0 ? { $and: andFilters } : {};
+  const baseFilter: Record<string, unknown> = andFilters.length > 0 ? { $and: andFilters } : {};
+  await restrictToCanonicalPhones(baseFilter);
   const statusCounts = await Lead.aggregate<{ _id: string; count: number }>([
     { $match: baseFilter },
     { $group: { _id: "$status", count: { $sum: 1 } } },
@@ -3728,6 +3672,7 @@ export async function countLeads(request: Request, response: Response) {
     ...baseFilter,
     status: { $nin: ["Archived", "Dead"] },
     $and: [
+      ...(Array.isArray(baseFilter.$and) ? baseFilter.$and : []),
       { $or: [{ assignedAgent: null }, { assignedAgent: { $exists: false } }] },
       { $or: [{ assignedAgentName: "" }, { assignedAgentName: { $exists: false } }] },
     ],
@@ -3783,6 +3728,8 @@ export async function createLead(request: Request, response: Response) {
   const autoAssignmentEnabled = await isLeadAutoAssignmentEnabled();
   const assignmentCandidates = autoAssignmentEnabled ? await createAssignmentCandidates() : [];
   const assignedAgent = request.body.assignedAgent || pickAssignmentCandidate(assignmentCandidates);
+  const recipient = assignedAgent ? (await leadRecipients()).find(employee => String(employee._id) === String(assignedAgent)) : null;
+  if (assignedAgent && !recipient) { response.status(400).json({ message: "Select an Active or Training Sales employee with access to this business." }); return; }
   const creator = getActivityActor(request);
   const leadInput = {
     leadName: request.body.leadName || "",
@@ -3798,7 +3745,7 @@ export async function createLead(request: Request, response: Response) {
     createdByType: creator.actorType,
     status: request.body.status || "NEW",
     assignedAgent,
-    assignedAgentName: request.body.assignedAgentName || "",
+    assignedAgentName: recipient?.name || "",
     autoAssignedAt: autoAssignmentEnabled && assignedAgent && !request.body.assignedAgent ? new Date() : null,
     assignedTeam: request.body.assignedTeam || null,
     googlePlaceId: request.body.googlePlaceId || "",
@@ -4038,6 +3985,7 @@ export async function updateLead(request: Request, response: Response) {
     return;
   }
 
+  const assignmentChanged = existingLead && String(existingLead.assignedAgent || "") !== String(leadInput.assignedAgent || "");
   if (leadInput.assignedAgent) {
     if (!Types.ObjectId.isValid(String(leadInput.assignedAgent))) {
       response.status(400).json({ message: "Select a valid Sales employee" });
@@ -4046,21 +3994,29 @@ export async function updateLead(request: Request, response: Response) {
 
     const assignedEmployee = await Employee.findById(leadInput.assignedAgent).select("name status role team");
 
-    if (!assignedEmployee || assignedEmployee.status === "Archived" || !isSalesAssignableEmployee(assignedEmployee)) {
+    if (assignmentChanged && (!assignedEmployee || !isEligibleLeadRecipient(assignedEmployee) || !(await leadRecipients()).some(employee => String(employee._id) === String(assignedEmployee._id)))) {
       response.status(400).json({ message: "Lead can only be assigned to a non-archived employee in Sales" });
       return;
     }
 
-    leadInput.assignedAgentName = assignedEmployee.name;
+    leadInput.assignedAgentName = assignedEmployee?.name || existingLead?.assignedAgentName || "";
   }
 
   const changedFields = existingLead ? summarizeLeadChanges(existingLead.toObject(), leadInput) : [];
-  const assignmentChanged = existingLead && String(existingLead.assignedAgent || "") !== String(leadInput.assignedAgent || "");
-  const actor = getActivityActor(request);
+  let actor = getActivityActor(request);
   const nextAssignedName = leadInput.assignedAgent ? await getEmployeeName(leadInput.assignedAgent) : leadInput.assignedAgentName;
   const updatePayload: Record<string, unknown> = { $set: leadInput };
 
   if (assignmentChanged) {
+    const verified = await assignmentActor(request, response, true);
+    if (!verified) return;
+    actor = { actorName: verified.name, actorType: "admin" };
+    if (request.body.expectedAssignmentRevision !== undefined && request.body.expectedAssignmentRevision !== existingLead.assignmentRevision) {
+      response.status(409).json({ code: "LEAD_ASSIGNMENT_CHANGED", message: "This lead's assignment changed. Refresh before trying again." }); return;
+    }
+    leadInput.assignedAgentName = leadInput.assignedAgent ? nextAssignedName : "";
+    updatePayload.$set = { ...leadInput, autoAssignedAt: null };
+    updatePayload.$inc = { assignmentRevision: 1 };
     updatePayload.$push = activityPush(
       "Assigned",
       actor.actorType === "employee"
@@ -4072,84 +4028,79 @@ export async function updateLead(request: Request, response: Response) {
     updatePayload.$push = activityPush("Lead updated", `${actor.actorName} updated ${changedFields.slice(0, 5).join(", ")}.`, actor);
   }
 
-  const lead = await Lead.findByIdAndUpdate(
-    leadId,
+  const lead = await Lead.findOneAndUpdate(
+    existingLead ? assignmentSnapshotFilter(existingLead) : { _id: leadId },
     updatePayload,
     { returnDocument: "after", runValidators: true }
   ).populate(populateLead);
 
   if (!lead) {
-    response.status(404).json({ message: "Lead not found" });
+    response.status(existingLead ? 409 : 404).json({ code: existingLead ? "LEAD_ASSIGNMENT_CHANGED" : "LEAD_NOT_FOUND", message: existingLead ? "This lead changed while saving. Refresh before trying again." : "Lead not found" });
     return;
   }
 
+  if (assignmentChanged) await invalidateUnstartedLeadReservations([leadId]);
   emitLeadMutation("updated", lead);
   response.json(lead);
 }
 
 export async function assignLead(request: Request, response: Response) {
+  const actor = await assignmentActor(request, response);
+  if (!actor) return;
   const leadId = String(request.params.id);
-  const assignedAgent = String(request.body.assignedAgent || "").trim();
-
-  if (!Types.ObjectId.isValid(leadId)) {
-    response.status(400).json({ message: "Invalid lead id" });
-    return;
+  const recipientId = String(request.body.assignedAgent || "").trim();
+  if (!Types.ObjectId.isValid(leadId) || !Types.ObjectId.isValid(recipientId)) {
+    response.status(400).json({ message: "Select a valid lead and Sales employee." }); return;
   }
-
-  if (!Types.ObjectId.isValid(assignedAgent)) {
-    response.status(400).json({ message: "Select a valid Sales employee" });
-    return;
+  const recipient = (await leadRecipients()).find(employee => String(employee._id) === recipientId);
+  if (!recipient) {
+    response.status(400).json({ code: "LEAD_RECIPIENT_INELIGIBLE", message: "Select an Active or Training Sales employee with access to this business." }); return;
   }
-
-  const employee = await Employee.findById(assignedAgent).select("name status role team");
-
-  if (!employee || employee.status === "Archived" || !isSalesAssignableEmployee(employee)) {
-    response.status(400).json({ message: "Lead can only be assigned to a non-archived employee in Sales" });
-    return;
+  const existing = await Lead.findById(leadId).lean();
+  if (!existing || existing.status === "Archived") {
+    response.status(existing ? 409 : 404).json({ message: existing ? "Archived leads cannot be reassigned." : "Lead not found" }); return;
   }
-
-  const actor = getActivityActor(request);
-  const duplicateGroup = await resolveActiveLeadDuplicateGroups([leadId]);
-
-  if (duplicateGroup.leadIds.length === 0) {
-    const existingLead = await Lead.exists({ _id: leadId });
-    response.status(existingLead ? 409 : 404).json({
-      message: existingLead ? "Archived leads cannot be reassigned." : "Lead not found",
-    });
-    return;
+  if (request.body.expectedAssignmentRevision !== undefined &&
+      (!Number.isSafeInteger(request.body.expectedAssignmentRevision) || request.body.expectedAssignmentRevision < 0)) {
+    response.status(400).json({ message: "Invalid assignment revision." }); return;
   }
-
-  await Lead.updateMany(
-    { _id: { $in: duplicateGroup.leadIds }, status: { $ne: "Archived" } },
-    {
-      $set: {
-        assignedAgent: new Types.ObjectId(assignedAgent),
-        assignedAgentName: employee.name,
-        autoAssignedAt: null,
-      },
-      $push: activityPush(
-        "Assigned",
-        actor.actorType === "employee"
-          ? `${actor.actorName} passed this lead to ${employee.name}.`
-          : `${actor.actorName} assigned this lead to ${employee.name}.`,
-        actor
-      ),
+  if (request.body.expectedAssignmentRevision !== undefined && request.body.expectedAssignmentRevision !== (existing.assignmentRevision || 0)) {
+    response.status(409).json({ code: "LEAD_ASSIGNMENT_CHANGED", message: "This lead's assignment changed. Refresh before trying again." }); return;
+  }
+  if (actor.type === "employee") {
+    const owner = actor.employee!;
+    const names = await uniquelyOwnedLegacyNames(String(owner._id), [owner.name, ...(owner.aliases || [])]);
+    const owns = existing.assignedAgent ? String(existing.assignedAgent) === String(owner._id) : names.includes(existing.assignedAgentName);
+    if (!isSalesAssignableEmployee(owner) || !owns) {
+      response.status(403).json({ message: "You can only pass a lead currently assigned to you." }); return;
     }
-  );
-  const lead = await Lead.findById(leadId).populate(populateLead);
-
-  if (!lead) {
-    response.status(404).json({ message: "Lead not found" });
-    return;
+    if (recipientId === String(owner._id)) {
+      response.status(400).json({ message: "Select another Active or Training Sales employee." }); return;
+    }
   }
-
-  emitLeadMutation("assigned", lead);
+  const activityActor: LeadActivityActor = { actorName: actor.name, actorType: actor.type };
+  const changed = await writeLeadAssignment(existing, recipient, null, activityPush("Assigned",
+    actor.type === "employee" ? `${actor.name} passed this lead to ${recipient.name}.` : `${actor.name} assigned this lead to ${recipient.name}.`, activityActor));
+  const alreadyAssigned = String(existing.assignedAgent || "") === recipientId && existing.assignedAgentName === recipient.name;
+  if (!changed && !alreadyAssigned) {
+    response.status(409).json({ code: "LEAD_ASSIGNMENT_CHANGED", message: "This lead's assignment changed. Refresh before trying again." }); return;
+  }
+  // Admin duplicate handling remains explicit; each copy has its own ownership compare-and-set.
+  if (actor.type === "admin" && changed) {
+    const group = await resolveActiveLeadDuplicateGroups([leadId]);
+    const copies = await Lead.find({ _id: { $in: group.leadIds, $ne: existing._id }, status: { $ne: "Archived" } }).lean();
+    for (const copy of copies) await writeLeadAssignment(copy, recipient, null,
+      activityPush("Assigned", `${actor.name} assigned this lead to ${recipient.name}.`, activityActor));
+    emitLeadChanged({ action: "assigned", leadIds: group.leadIds.map(String), assignedAgentId: recipientId });
+  }
+  const lead = await Lead.findById(leadId).populate(populateLead);
+  if (changed) emitLeadMutation("assigned", lead);
   response.json(lead);
 }
 
 export async function scheduleLeadFollowUp(request: Request, response: Response) {
   const leadId = String(request.params.id);
-  const followUpAt = request.body.followUpAt ? new Date(String(request.body.followUpAt)) : null;
+  const followUpAt = request.body.followUpAt ? new Date(parseCallingSchedule(String(request.body.followUpAt))) : null;
 
   if (!followUpAt || Number.isNaN(followUpAt.getTime())) {
     response.status(400).json({ message: "Valid followUpAt is required" });
@@ -4542,6 +4493,8 @@ export async function toggleLeadFavorite(request: Request, response: Response) {
 }
 
 export async function autoAssignLead(request: Request, response: Response) {
+  const actor = await assignmentActor(request, response, true);
+  if (!actor) return;
   if (!(await isLeadAutoAssignmentEnabled())) {
     response.status(400).json({ message: "Lead auto assignment is turned off in Settings." });
     return;
@@ -4563,13 +4516,9 @@ export async function autoAssignLead(request: Request, response: Response) {
     return;
   }
 
-  await Lead.updateMany(
-    { _id: { $in: duplicateGroup.leadIds }, status: { $ne: "Archived" } },
-    {
-      $set: { assignedAgent, assignedAgentName, autoAssignedAt: new Date() },
-      $push: activityPush("Assigned", `Admin auto assigned this lead${assignedAgentName ? ` to ${assignedAgentName}` : ""}.`, { actorName: "Admin", actorType: "admin" }),
-    }
-  );
+  const snapshots = await Lead.find({ _id: { $in: duplicateGroup.leadIds }, status: { $ne: "Archived" } }).lean();
+  for (const snapshot of snapshots) await writeLeadAssignment(snapshot, { _id: assignedAgent, name: assignedAgentName }, new Date(),
+    activityPush("Assigned", `${actor.name} auto assigned this lead to ${assignedAgentName}.`, { actorName: actor.name, actorType: "admin" }));
   const lead = await Lead.findById(leadId).populate(populateLead);
 
   if (!lead) {
@@ -4640,6 +4589,8 @@ function parseLeadIds(value: unknown) {
 }
 
 export async function bulkArchiveLeads(request: Request, response: Response) {
+  const verified = await assignmentActor(request, response, true);
+  if (!verified) return;
   const leadIds = parseLeadIds(request.body.leadIds);
 
   if (leadIds.length === 0) {
@@ -4647,7 +4598,7 @@ export async function bulkArchiveLeads(request: Request, response: Response) {
     return;
   }
 
-  const actor = getActivityActor(request);
+  const actor = { actorName: verified.name, actorType: "admin" as const };
   const result = await Lead.updateMany(
     { _id: { $in: leadIds }, status: { $ne: "Archived" } },
     {
@@ -4688,6 +4639,10 @@ export async function bulkRestoreLeads(request: Request, response: Response) {
   }
 
   const actor = getActivityActor(request);
+  if (leadPhoneDedupEnabled()) {
+    const result = await restoreProtectedLeads({ _id: { $in: leadIds }, status: "Archived" }, actor);
+    emitLeadChanged({ action: "bulk-restored", leadIds }); response.json(result); return;
+  }
   const result = await Lead.updateMany(
     { _id: { $in: leadIds }, status: "Archived" },
     {
@@ -4700,68 +4655,57 @@ export async function bulkRestoreLeads(request: Request, response: Response) {
   response.json({ restoredCount: result.modifiedCount });
 }
 
+async function restoreProtectedLeads(filter: Record<string, unknown>, actor: ReturnType<typeof getActivityActor>) {
+  const leads = await Lead.find(filter).select("_id").sort({ createdAt: 1, _id: 1 }).lean();
+  let restoredCount = 0, skippedCount = 0;
+  for (const lead of leads) {
+    try {
+      const saved = await Lead.findOneAndUpdate({ _id: lead._id, status: "Archived" }, {
+        $set: { status: "NEW" }, $push: activityPush("Restored", `${actor.actorName} restored this lead.`, actor),
+      }, { returnDocument: "after" });
+      if (saved) restoredCount++; else skippedCount++;
+    } catch (error) {
+      if ((error as { statusCode?: number }).statusCode === 409 || (error as { code?: number }).code === 11000) skippedCount++;
+      else throw error;
+    }
+  }
+  return { restoredCount, skippedCount };
+}
+
 export async function bulkAssignLeads(request: Request, response: Response) {
+  const actor = await assignmentActor(request, response, true);
+  if (!actor) return;
   const leadIds = parseLeadIds(request.body.leadIds);
   const assignedAgent = String(request.body.assignedAgent || "").trim();
-
-  if (leadIds.length === 0) {
-    response.status(400).json({ message: "Select at least one lead" });
-    return;
+  if (!leadIds.length) { response.status(400).json({ message: "Select at least one lead" }); return; }
+  const recipient = assignedAgent === "UNASSIGNED" ? null
+    : (await leadRecipients()).find(employee => String(employee._id) === assignedAgent);
+  if (recipient === undefined) {
+    response.status(400).json({ code: "LEAD_RECIPIENT_INELIGIBLE", message: "Select an Active or Training Sales employee with access to this business." }); return;
   }
-
-  const duplicateGroups = await resolveActiveLeadDuplicateGroups(leadIds);
-
-  if (duplicateGroups.logicalLeadCount === 0) {
-    response.json({ assignedCount: 0 });
-    return;
+  const group = await resolveActiveLeadDuplicateGroups(leadIds);
+  const leads = await Lead.find({ _id: { $in: group.leadIds }, status: { $ne: "Archived" } }).lean();
+  const expected = request.body.expectedAssignmentRevisions;
+  if (expected !== undefined && (!expected || typeof expected !== "object" || Array.isArray(expected))) {
+    response.status(400).json({ message: "Invalid assignment revisions." }); return;
   }
-
-  if (assignedAgent === "UNASSIGNED") {
-    const actor = getActivityActor(request);
-    const result = await Lead.updateMany(
-      { _id: { $in: duplicateGroups.leadIds }, status: { $ne: "Archived" } },
-      {
-        $set: {
-          assignedAgent: null,
-          assignedAgentName: "",
-          autoAssignedAt: null,
-        },
-        $push: activityPush("Unassigned", `${actor.actorName} unassigned this lead.`, actor),
-      }
-    );
-
-    emitLeadChanged({ action: "bulk-unassigned", leadIds, assignedAgentId: null });
-    response.json({ assignedCount: duplicateGroups.logicalLeadCount, updatedRecordCount: result.modifiedCount });
-    return;
+  if (expected && leads.some(lead => Object.hasOwn(expected, String(lead._id)) &&
+      (!Number.isSafeInteger(expected[String(lead._id)]) || expected[String(lead._id)] !== (lead.assignmentRevision || 0)))) {
+    response.status(409).json({ code: "LEAD_ASSIGNMENT_CHANGED", message: "A selected lead's assignment changed. Refresh before trying again." }); return;
   }
-
-  if (!assignedAgent || !Types.ObjectId.isValid(assignedAgent)) {
-    response.status(400).json({ message: "Valid assignedAgent is required" });
-    return;
+  const changedIds: string[] = [], changedGroups = new Set<string>();
+  let conflictCount = 0;
+  const activityActor: LeadActivityActor = { actorName: actor.name, actorType: "admin" };
+  for (const lead of leads) {
+    const same = String(lead.assignedAgent || "") === String(recipient?._id || "") && (lead.assignedAgentName || "") === (recipient?.name || "");
+    const changed = await writeLeadAssignment(lead, recipient, null,
+      activityPush(recipient ? "Assigned" : "Unassigned", recipient ? `${actor.name} assigned this lead to ${recipient.name}.` : `${actor.name} unassigned this lead.`, activityActor));
+    if (changed) { changedIds.push(String(lead._id)); changedGroups.add(getLeadDedupKey(lead)); }
+    else if (!same) conflictCount++;
   }
-
-  const employee = await Employee.findById(assignedAgent).select("name status role team");
-
-  if (!employee || employee.status === "Archived" || !isSalesAssignableEmployee(employee)) {
-    response.status(400).json({ message: "Select a non-archived employee in Sales" });
-    return;
-  }
-
-  const actor = getActivityActor(request);
-  const result = await Lead.updateMany(
-    { _id: { $in: duplicateGroups.leadIds }, status: { $ne: "Archived" } },
-    {
-      $set: {
-        assignedAgent: new Types.ObjectId(assignedAgent),
-        assignedAgentName: employee.name,
-        autoAssignedAt: null,
-      },
-      $push: activityPush("Assigned", `${actor.actorName} assigned this lead to ${employee.name}.`, actor),
-    }
-  );
-
-  emitLeadChanged({ action: "bulk-assigned", leadIds, assignedAgentId: assignedAgent });
-  response.json({ assignedCount: duplicateGroups.logicalLeadCount, updatedRecordCount: result.modifiedCount });
+  if (changedIds.length) emitLeadChanged({ action: recipient ? "bulk-assigned" : "bulk-unassigned", leadIds: changedIds, assignedAgentId: recipient ? String(recipient._id) : null });
+  response.status(conflictCount ? 409 : 200).json({ assignedCount: changedGroups.size, updatedRecordCount: changedIds.length, conflictCount,
+    ...(conflictCount ? { code: "LEAD_ASSIGNMENT_CHANGED", message: `${changedIds.length} records updated; ${conflictCount} changed concurrently. Refresh before retrying.` } : {}) });
 }
 
 export async function restoreAllArchivedLeads(request: Request, response: Response) {
@@ -4771,6 +4715,10 @@ export async function restoreAllArchivedLeads(request: Request, response: Respon
   }
 
   const actor = getActivityActor(request);
+  if (leadPhoneDedupEnabled()) {
+    const result = await restoreProtectedLeads({ status: "Archived" }, actor);
+    emitLeadChanged({ action: "restore-all" }); response.json(result); return;
+  }
   const result = await Lead.updateMany(
     { status: "Archived" },
     {

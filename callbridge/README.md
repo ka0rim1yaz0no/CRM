@@ -1,5 +1,9 @@
 # Assistly Call Bridge
 
+Version 0.4.2 reports raw audio transitions promptly using 500 ms sampling. The server confirms a call end and anchors the 30-second minimum wait to the first idle observation; a second local debounce is no longer applied. Network, browser and Nextiva scheduling can still add latency, so an exact physical 30.000-second interval is not guaranteed. Two-way Windows audio remains a call-state proxy, not a provider-connected-call event.
+
+Install this version only after the matching server heartbeat fix is activated, and run the updater only when Nextiva calls have finished. The updater restarts the bridge process and retains pairing. It must not be pushed to an employee during a call.
+
 Assistly Call Bridge reports the local NextivaONE desktop app's call state to
 Assistly CRM. It uses the Windows audio-session API and does not read call
 audio, contacts, messages, or Nextiva credentials.

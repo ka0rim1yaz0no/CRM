@@ -26,7 +26,7 @@ import { getAgentLeadDashboard, getEmployeeLeadLogs, getMyLeadCallSummary, getMy
 import { getTasks, type CrmTask, type TaskStatus } from "../api/tasks";
 import { getKnowledgeBaseEntries, type KnowledgeBaseEntry } from "../api/knowledgeBase";
 import { formatPhDate, formatPhDateTime, formatPhTime, formatPhDateTimeInput, parsePhDateTimeInput } from "../lib/dateTime";
-import { isAttendanceTimeOutUndertime } from "../lib/attendanceSlots";
+import { attendanceRecordStatus } from "../lib/attendanceSlots";
 import { getPlainTextFromRichText } from "../lib/richText";
 import { getAuthUser } from "../api/authStorage";
 import { getActiveBusinessId } from "../api/businessStorage";
@@ -840,11 +840,11 @@ function formatAttendanceDuration(milliseconds: number) {
 }
 
 function getAttendanceStatusText(record: AttendanceRecord) {
-    return String(record.attendanceStatus || (isAttendanceTimeOutUndertime(record) ? "Undertime" : "")).trim().toLowerCase();
+    return attendanceRecordStatus(record).toLowerCase();
 }
 
 function getAttendanceStatusLabel(record: AttendanceRecord) {
-    return record.attendanceStatus || (isAttendanceTimeOutUndertime(record) ? "Undertime" : "No status");
+    return attendanceRecordStatus(record) || "No status";
 }
 
 function getBreakReturnSource(source?: AttendanceRecord["source"]) {
@@ -1116,7 +1116,7 @@ function AttendancePanel({ employee, attendance, confirmedStatus, session }: { e
             firstTimeIn: records.find((record) => record.timeIn === day.timeIn && isTimeInSource(record.source)) || null,
             lastTimeOut: records.find((record) => record.timeIn === day.timeOut && isTimeOutSource(record.source)) || null,
             lateRecords: records.filter((record) => record.attendanceStatus === "Late"),
-            underTimeRecords: records.filter((record) => record.attendanceStatus === "Undertime"),
+            underTimeRecords: records.filter((record) => getAttendanceStatusText(record) === "undertime"),
             allowanceLabel: `Break ${day.breakMinutes}m · Lunch ${day.lunchMinutes}m` };
     }) : buildAttendanceShiftRows(sortedAllAttendance), [sortedAllAttendance, session]);
     const selectedShiftRow = allShiftRows.find((row) => row.id === selectedShiftId) || null;

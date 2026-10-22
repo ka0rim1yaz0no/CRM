@@ -8,6 +8,7 @@ import { LiveViewAudit } from "./models/LiveViewAudit";
 import { Message } from "./models/Message";
 import { securityLegacyAuthEnabled } from "./config/rolloutFlags";
 import { signedCrmIdentity, signedEmployeeInBusiness } from "./middleware/legacyAuthentication";
+import { invalidateLeadPhoneSnapshot } from "./services/leadPhoneSnapshotCache";
 
 let socketServer: Server | null = null;
 
@@ -562,5 +563,6 @@ export function emitLeadChanged(payload: {
   leadIds?: string[];
   assignedAgentId?: string | null;
 }) {
+  invalidateLeadPhoneSnapshot(getCurrentBusinessId());
   socketServer?.to(businessRoom(getCurrentBusinessId())).emit("lead:changed", payload);
 }

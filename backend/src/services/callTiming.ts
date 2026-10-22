@@ -18,6 +18,10 @@ export function unconfirmedDialRetryAt(dialStartedAt: Date) {
   return new Date(dialStartedAt.getTime() + POST_CALL_WAIT_MS);
 }
 
+export function hasUnconfirmedCall(schedule: { lastCallStartedAt?: Date | null; lastCallEndedAt?: Date | null }) {
+  return Boolean(schedule.lastCallStartedAt && (!schedule.lastCallEndedAt || schedule.lastCallStartedAt > schedule.lastCallEndedAt));
+}
+
 export function canReserveCall(now: Date, schedule: {
   callLeaseUntil?: Date | null;
   nextCallAllowedAt?: Date | null;
@@ -28,6 +32,6 @@ export function canReserveCall(now: Date, schedule: {
   return (!schedule.callLeaseUntil || schedule.callLeaseUntil <= now) &&
     (!schedule.nextCallAllowedAt || schedule.nextCallAllowedAt <= now) &&
     (!schedule.dialIntentUntil || schedule.dialIntentUntil <= now) &&
-    (!schedule.lastCallStartedAt || (schedule.lastCallEndedAt || new Date(0)) >= schedule.lastCallStartedAt) &&
+    !hasUnconfirmedCall(schedule) &&
     (!bridge || (bridge.fresh && bridge.state === "idle" && bridge.nextivaProcessDetected));
 }

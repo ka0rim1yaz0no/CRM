@@ -46,8 +46,6 @@ export function isAttendanceTimeOutUndertime(
     settings?: AttendanceSlotSettings | null
 ) {
     if (!record || !isAttendanceTimeOutSource(record.source)) return false;
-    if (String(record.attendanceStatus || "").trim().toLowerCase() === "undertime") return true;
-
     const parts = zonedDateParts(record.timeIn, attendanceSlotTimeZone(settings));
     if (!parts) return false;
 
@@ -60,6 +58,13 @@ export function isAttendanceTimeOutUndertime(
     }
 
     return parts.minutes < shiftEndMinutes;
+}
+
+export function attendanceRecordStatus(record?: AttendanceSlotRecord | null, settings?: AttendanceSlotSettings | null) {
+    if (!record) return "";
+    if (isAttendanceTimeOutSource(record.source)) return isAttendanceTimeOutUndertime(record, settings) ? "Undertime" : "";
+    const status = String(record.attendanceStatus || "").trim();
+    return status.toLowerCase() === "undertime" ? "" : status;
 }
 
 export function isAttendanceTimeInLate(

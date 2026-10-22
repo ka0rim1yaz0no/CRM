@@ -1,10 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { FiCheck, FiCopy, FiDownload, FiLink, FiMonitor, FiRefreshCcw, FiWifi, FiWifiOff, FiXCircle } from "react-icons/fi";
 import {
     callBridgeBackendUrl,
     callBridgeBusinessId,
-    callBridgePackageUrl,
+    getCallBridgePackageUrl,
     callTimingV2Enabled,
     createCallBridgePairing,
     getCallBridgeStatus,
@@ -12,12 +12,14 @@ import {
     type CallBridgePairing,
 } from "../../api/callBridge";
 import { getAuthUser } from "../../api/authStorage";
+import { getActiveBusinessId } from "../../api/businessStorage";
 import { getEmployeeSummary, normalizeEmployeeAvailabilityStatus } from "../../api/employees";
 import { getNextAutoCallLead } from "../../api/leads";
 import { getSystemSettings } from "../../api/systemSettings";
 import { getStoredThemeKey, hasAppThemeOverride, setAppTheme } from "../../lib/appTheme";
-import { isWithinAutoCallWindow } from "../../lib/employeeAutoCall";
+import { isWithinAutoCallWindow, isSalesRole } from "../../lib/employeeAutoCall";
 import { defaultThemeKey, themeOptions, type ThemeKey } from "../../lib/themes";
+import { subscribeCredentialContext } from "../../lib/credentialContext";
 import MainLayout from "../layout";
 
 function availabilityLabel(status: ReturnType<typeof normalizeEmployeeAvailabilityStatus>) {
@@ -29,15 +31,17 @@ function availabilityLabel(status: ReturnType<typeof normalizeEmployeeAvailabili
 }
 
 export default function Settings() {
+    const activeBusinessId = useSyncExternalStore(subscribeCredentialContext, getActiveBusinessId);
     const authUser = getAuthUser();
     const employee = authUser?.userType === "employee" ? authUser.user : null;
-    const isSalesEmployee = String(employee?.role || "").toLowerCase().includes("sales");
+    const isSalesEmployee = isSalesRole(employee?.role, employee?.team);
     const [activeThemeKey, setActiveThemeKey] = useState<ThemeKey>(() => getStoredThemeKey());
     const [isPersonalTheme, setIsPersonalTheme] = useState(() => hasAppThemeOverride());
     const [pairing, setPairing] = useState<CallBridgePairing | null>(null);
     const [bridgeActionMessage, setBridgeActionMessage] = useState("");
     const [bridgeActionPending, setBridgeActionPending] = useState(false);
-    const [autoCallNow, setAutoCallNow] = useState(() => new Date());
+    const [autoCallClock, setAutoCallClock] = useState(() => ({ wall: new Date(), monotonic: performance.now() }));
+    const autoCallNow = autoCallClock.wall;
     const pairingDetailsRef = useRef<HTMLDivElement | null>(null);
     const { data: systemSettings, isLoading: systemSettingsLoading } = useQuery({
         queryKey: ["system-settings"],
@@ -48,8 +52,8 @@ export default function Settings() {
         isLoading: bridgeStatusLoading,
         refetch: refetchBridgeStatus,
     } = useQuery({
-        queryKey: ["call-bridge-status", employee?.employeeCode],
-        queryFn: () => getCallBridgeStatus(employee?.employeeCode || ""),
+        queryKey: ["call-bridge-status", activeBusinessId, employee?.employeeCode],
+        queryFn: () => getCallBridgeStatus(employee?.employeeCode || "", { businessId: activeBusinessId, employeeSession: authUser?.attendanceHubSession || undefined }),
         enabled: Boolean(isSalesEmployee && employee?.employeeCode),
         refetchInterval: 5_000,
     });
@@ -57,8 +61,8 @@ export default function Settings() {
         data: currentEmployee,
         isLoading: currentEmployeeLoading,
     } = useQuery({
-        queryKey: ["auto-call-employee", employee?._id],
-        queryFn: () => getEmployeeSummary(employee?._id || ""),
+        queryKey: ["auto-call-employee", activeBusinessId, employee?._id],
+        queryFn: () => getEmployeeSummary(employee?._id || "", { businessId: activeBusinessId, employeeSession: authUser?.attendanceHubSession || undefined }),
         enabled: Boolean(isSalesEmployee && employee?._id),
         refetchInterval: 5_000,
     });
@@ -76,7 +80,10 @@ export default function Settings() {
         [currentEmployee, employee]
     );
     const availabilityStatus = normalizeEmployeeAvailabilityStatus(currentEmployee?.availabilityStatus);
-    const withinAutoCallWindow = isWithinAutoCallWindow(autoCallNow);
+    const estimatedServerNow = bridgeStatus?.serverTime ? +new Date(bridgeStatus.serverTime) +
+        (bridgeStatus.clientReceivedAtMonotonic === undefined ? Math.max(0, autoCallNow.getTime() - (bridgeStatus.clientReceivedAt || autoCallNow.getTime())) :
+            Math.max(0, autoCallClock.monotonic - bridgeStatus.clientReceivedAtMonotonic)) : autoCallNow.getTime();
+    const withinAutoCallWindow = isWithinAutoCallWindow(new Date(estimatedServerNow));
     const canCheckAutoCallLeads = Boolean(
         currentEmployee?._id &&
         availabilityStatus === "ONLINE" &&
@@ -91,12 +98,12 @@ export default function Settings() {
         isLoading: autoCallLeadLoading,
         isError: autoCallLeadError,
     } = useQuery({
-        queryKey: ["auto-call-next-lead", currentEmployee?._id, employeeNames.join("|")],
+        queryKey: ["auto-call-next-lead", activeBusinessId, currentEmployee?._id, employeeNames.join("|")],
         queryFn: () =>
             getNextAutoCallLead({
                 employeeId: currentEmployee?._id || "",
                 employeeNames,
-            }),
+            }, { businessId: activeBusinessId, employeeSession: authUser?.attendanceHubSession || undefined }),
         enabled: canCheckAutoCallLeads,
         refetchInterval: 5_000,
     });
@@ -118,7 +125,7 @@ export default function Settings() {
     }, [pairing]);
 
     useEffect(() => {
-        const intervalId = window.setInterval(() => setAutoCallNow(new Date()), callTimingV2Enabled ? 1_000 : 5_000);
+        const intervalId = window.setInterval(() => setAutoCallClock({ wall: new Date(), monotonic: performance.now() }), callTimingV2Enabled ? 1_000 : 5_000);
         return () => window.clearInterval(intervalId);
     }, []);
 
@@ -184,6 +191,8 @@ export default function Settings() {
     const providerName = "Nextiva";
     const bridgeStatusLabel = bridgeStatusLoading
         ? "Checking"
+        : bridgeStatus?.state === "unknown"
+            ? "Awaiting confirmation"
         : bridgeStatus?.state === "active"
             ? "Active call"
             : bridgeStatus?.state === "calling"
@@ -195,12 +204,17 @@ export default function Settings() {
                     : "Not connected";
     const bridgeStatusTone = bridgeStatus?.state === "active"
         ? "border-rose-400/30 bg-rose-400/10 text-rose-100"
+        : bridgeStatus?.state === "unknown"
+            ? "border-amber-400/30 bg-amber-400/10 text-amber-100"
         : bridgeStatus?.connected && bridgeStatus.nextivaProcessDetected
             ? "border-emerald-400/30 bg-emerald-400/10 text-emerald-100"
             : "border-white/10 bg-white/[0.04] text-white/60";
     const autoCallDisplay = (() => {
         if (bridgeStatusLoading || currentEmployeeLoading) {
             return { label: "Checking", detail: "Checking auto-call requirements.", ready: false };
+        }
+        if (!callTimingV2Enabled || bridgeStatus?.waitCode === "CALL_TIMING_CONFIGURATION_REQUIRED") {
+            return { label: "Configuration required", detail: "Refresh or contact an administrator to enable the approved call timing configuration.", ready: false };
         }
 
         if (!bridgeStatus?.connected) {
@@ -218,30 +232,27 @@ export default function Settings() {
                 ready: false,
             };
         }
+        if (availabilityStatus !== "ONLINE") {
+            return { label: availabilityLabel(availabilityStatus), detail: "Attendance status must be ONLINE for auto call.", ready: false };
+        }
+        if (bridgeStatus.state === "unknown") {
+            return { label: "Waiting for confirmation", detail: bridgeStatus.reason, ready: false };
+        }
 
         if (bridgeStatus.state === "active") {
             return { label: "On a call", detail: "Auto call will wait for the current call to finish.", ready: false };
         }
 
         if (bridgeStatus.state === "calling") {
-            return { label: "Starting call", detail: `A ${providerName} call is being opened.`, ready: false };
+            return { label: "Dial unconfirmed", detail: "Waiting for confirmation of the dial request, not a connected call.", ready: false };
         }
 
         if (callTimingV2Enabled && bridgeStatus.nextCallAllowedAt && bridgeStatus.serverTime) {
-            const serverNow = autoCallNow.getTime() + new Date(bridgeStatus.serverTime).getTime() -
-                (bridgeStatus.clientReceivedAt || autoCallNow.getTime());
-            const secondsLeft = Math.max(0, Math.ceil((new Date(bridgeStatus.nextCallAllowedAt).getTime() - serverNow) / 1_000));
+            const secondsLeft = Math.max(0, Math.ceil((new Date(bridgeStatus.nextCallAllowedAt).getTime() - estimatedServerNow) / 1_000));
             if (secondsLeft > 0) {
-                return { label: `Next call in ${secondsLeft}s`, detail: "Waiting for the server's call-end deadline.", ready: false };
+                return { label: bridgeStatus.waitCode === "DIAL_RETRY_WAIT" ? `Retry eligible in ${secondsLeft}s` : `Next call in ${secondsLeft}s`,
+                    detail: bridgeStatus.waitCode === "DIAL_RETRY_WAIT" ? "Waiting for the server's unconfirmed-attempt retry deadline." : "Waiting for the server's confirmed call-end deadline.", ready: false };
             }
-        }
-
-        if (availabilityStatus !== "ONLINE") {
-            return {
-                label: availabilityLabel(availabilityStatus),
-                detail: "Attendance status must be ONLINE for auto call.",
-                ready: false,
-            };
         }
 
         if (!withinAutoCallWindow) {
@@ -264,9 +275,11 @@ export default function Settings() {
             return { label: "No leads available", detail: "No callable New or Follow up leads are available.", ready: false };
         }
 
-        return nextAutoCallLead.queue === "NEW"
+        return nextAutoCallLead.reason === "SCHEDULED_DUE"
+            ? { label: "Ready: Scheduled follow-up", detail: "The due scheduled callback is next in the server queue.", ready: true }
+            : nextAutoCallLead.queue === "NEW"
             ? { label: "Ready: New lead", detail: "The next New lead can be called.", ready: true }
-            : { label: "Ready: Follow up", detail: "No New leads remain; the next Follow up can be called.", ready: true };
+            : { label: "Ready: Follow up", detail: "The next eligible follow-up in the server queue can be called.", ready: true };
     })();
     const autoCallStatusTone = autoCallDisplay.ready
         ? "border-emerald-400/30 bg-emerald-400/10"
@@ -378,7 +391,7 @@ export default function Settings() {
                         <div className="flex flex-wrap items-center gap-2">
                             <a
                                 className="inline-flex h-10 items-center gap-2 rounded-lg border border-white/10 bg-white/[0.05] px-3 text-sm font-semibold text-white/70 transition hover:bg-white/[0.08] hover:text-white"
-                                href={callBridgePackageUrl}
+                                href={getCallBridgePackageUrl(activeBusinessId)}
                             >
                                 <FiDownload className="size-4" aria-hidden="true" />
                                 Download

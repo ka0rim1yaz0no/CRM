@@ -209,6 +209,7 @@
 
 import { Schema, Types } from "mongoose";
 import { tenantModel } from "../config/tenancy";
+import { installLeadPhoneWriteGuard } from "../services/leadPhoneWriteGuard";
 
 export type LeadCallByEmployee = {
   employee: Types.ObjectId;
@@ -253,6 +254,13 @@ export type LeadDocument = {
   createdByType: "admin" | "employee" | "system";
   assignedAgent: Types.ObjectId | null;
   assignedAgentName: string;
+  assignmentRevision: number;
+  callingDispatchRevision: number;
+  normalizedPhone?: string;
+  activePhoneKey?: string;
+  duplicateOf?: Types.ObjectId;
+  duplicateArchivedAt?: Date;
+  duplicateArchivePlan?: string;
   autoAssignedAt: Date | null;
   assignedTeam: Types.ObjectId | null;
   favoriteByEmployees: Types.ObjectId[];
@@ -447,6 +455,13 @@ const leadSchema = new Schema<LeadDocument>(
       default: "NEW",
     },
 
+    normalizedPhone: { type: String, trim: true },
+    activePhoneKey: { type: String, trim: true },
+    duplicateOf: { type: Schema.Types.ObjectId, ref: "Lead" },
+    duplicateArchivedAt: { type: Date },
+    duplicateArchivePlan: { type: String },
+    assignmentRevision: { type: Number, default: 0, min: 0 },
+    callingDispatchRevision: { type: Number, default: 0, min: 0 },
     assignedAgent: {
       type: Schema.Types.ObjectId,
       ref: "Employee",
@@ -643,5 +658,7 @@ leadSchema.index({ assignedTeam: 1 });
 leadSchema.index({ "callsByEmployee.employee": 1 });
 leadSchema.index({ callCount: -1 });
 leadSchema.index({ lastCallAt: -1 });
+leadSchema.index({ activePhoneKey: 1 }, { unique: true, partialFilterExpression: { activePhoneKey: { $type: "string" } }, name: "active_phone_key_unique" });
+installLeadPhoneWriteGuard(leadSchema);
 
 export const Lead = tenantModel<LeadDocument>("Lead", leadSchema);

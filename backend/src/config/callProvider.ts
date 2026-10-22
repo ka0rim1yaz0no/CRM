@@ -1,15 +1,13 @@
-import { callTimingV2Enabled } from "./rolloutFlags";
+import { CALLING_QUEUE_POLICY_VERSION } from "../../../shared/leadCallingPolicy";
 
 // Historical RingCentral attempt records remain readable; live calls use Nextiva.
 export type CallProvider = "nextiva" | "ringcentral";
 export const autoCallDisabledReason = "Auto-call is temporarily disabled by an administrator.";
-export const requiredAutoCallClientVersion = "2026-10-15-call-timing-v6";
+export const requiredAutoCallClientVersion = CALLING_QUEUE_POLICY_VERSION;
 export const legacyAutoCallClientVersion = "2026-10-02-provider-audit-v3";
-const previousAutoCallClientVersion = "2026-10-14-comment-lock-v5";
 
 export function isSupportedAutoCallClientVersion(value: unknown) {
-  return String(value || "").trim() ===
-    (callTimingV2Enabled() ? requiredAutoCallClientVersion : previousAutoCallClientVersion);
+  return String(value || "").trim() === requiredAutoCallClientVersion;
 }
 export function getCallProvider(): CallProvider {
   return "nextiva";

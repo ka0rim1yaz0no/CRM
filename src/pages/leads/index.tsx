@@ -1,8 +1,7 @@
 import type { FormEvent, UIEvent } from "react";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FiArchive, FiCalendar, FiCheckCircle, FiClock, FiEdit2, FiMail, FiMessageCircle, FiPhone, FiPlus, FiSave, FiSearch, FiStar, FiUserPlus, FiVoicemail, FiX } from "react-icons/fi";
-import { FaWhatsapp } from "react-icons/fa";
 import { useLocation, useSearchParams } from "react-router";
 import MainLayout from "../layout";
 import { getAuthUser } from "../../api/authStorage";
@@ -12,12 +11,18 @@ import { getSystemSettings } from "../../api/systemSettings";
 import { getLatestCallBridgeAttempt } from "../../api/callBridge";
 import { useToast } from "../../lib/toast";
 import { useFeatureFlags } from "../../hooks/useFeatureFlags";
-import { formatCstDate, formatLeadScheduleDate, formatLeadScheduleDateTime, formatLeadScheduleDateTimeInput, getCurrentLeadScheduleDateTimeInput, parseLeadScheduleDateTimeInput, formatPhDateTime } from "../../lib/dateTime";
-import { AUTO_CALL_API_TIMEOUT_MS, clearAutoCallPendingComment, getAutoCallPendingComment, getEmployeeCommentMarker, isLeadEligibleForAutoCall, startAutoCallPendingComment } from "../../lib/employeeAutoCall";
+import { formatLeadScheduleDateTime, formatLeadScheduleDateTimeInput, getCurrentLeadScheduleDateTimeInput, parseLeadScheduleDateTimeInput, formatPhDateTime } from "../../lib/dateTime";
+import { AUTO_CALL_API_TIMEOUT_MS, clearAutoCallPendingComment, getEmployeeCommentMarker, startAutoCallPendingComment, isSalesRole } from "../../lib/employeeAutoCall";
 import { getPhoneCallUrl } from "../../lib/phoneNumber";
 import { socket } from "../../lib/socket";
 import { getActiveBusinessId } from "../../api/businessStorage";
-import { publishDisplayedAutoCallQueue, clearDisplayedAutoCallQueue } from "../../lib/displayedAutoCallQueue";
+import { callingQueueKey, callingProgress, setCallingWork, subscribeCallingWorkflow, trackCallingSave, getLeadNoteDraft, setLeadNoteDraft, clearSavedLeadNoteDraft } from "../../lib/callingWorkflow";
+import { fetchCallingQueue, useCallingQueue } from "../../lib/useCallingQueue";
+import { isEligibleLeadRecipient, leadBelongsToEmployee } from "../../../shared/leadAssignmentPolicy";
+import { reportRequestError } from "../../lib/requestErrorToast";
+import { useEmployeeLeadSelection } from "../../components/EmployeeLeadSelection";
+import { getLeadWorkspaceCapabilities } from "../../api/leads";
+import { latestLead, synchronizeLeadWorkspace } from "../../lib/leadWorkspaceCache";
 
 const tabs: Array<LeadStatus | "ALL"> = [
     "NEW",
@@ -233,179 +238,6 @@ function isLeadFavorite(lead: Lead, employeeId: string) {
     return Boolean(employeeId && (lead.favoriteByEmployees || []).some((favoriteEmployeeId) => String(favoriteEmployeeId) === employeeId));
 }
 
-function parseLeadTime(value?: string | null) {
-    if (!value) return null;
-    const time = new Date(value).getTime();
-    return Number.isNaN(time) ? null : time;
-}
-
-function getManualCommentTime(lead: Lead) {
-    const manualCommentTimes = (lead.comments || [])
-        .filter((comment) => comment.authorName !== "CSV Import")
-        .map((comment) => parseLeadTime(comment.createdAt))
-        .filter((time): time is number => time !== null);
-
-    return manualCommentTimes.length > 0 ? Math.max(...manualCommentTimes) : null;
-}
-
-function getCommentActivityTime(lead: Lead) {
-    const commentActivityTimes = (lead.activity || [])
-        .filter((item) => item.label.toLowerCase() === "comment added")
-        .map((item) => parseLeadTime(item.createdAt))
-        .filter((time): time is number => time !== null);
-
-    return commentActivityTimes.length > 0 ? Math.max(...commentActivityTimes) : null;
-}
-
-function getAssignmentMoveTime(lead: Lead) {
-    const assignmentTimes = (lead.activity || [])
-        .filter((item) => {
-            const label = item.label.toLowerCase();
-            const detail = item.detail.toLowerCase();
-
-            return label === "assigned" || detail.includes(" passed this lead") || detail.includes(" assigned this lead");
-        })
-        .map((item) => parseLeadTime(item.createdAt))
-        .filter((time): time is number => time !== null);
-
-    return assignmentTimes.length > 0 ? Math.max(...assignmentTimes) : null;
-}
-
-function getUpdateActivityTime(lead: Lead) {
-    const updateTimes = (lead.activity || [])
-        .filter((item) => {
-            const label = item.label.toLowerCase();
-            return label === "lead updated" || label === "status updated" || label === "status changed" || label === "follow up scheduled";
-        })
-        .map((item) => parseLeadTime(item.createdAt))
-        .filter((time): time is number => time !== null);
-
-    return updateTimes.length > 0 ? Math.max(...updateTimes) : null;
-}
-
-function getLeadDeprioritizedTime(lead: Lead) {
-    const times = [getManualCommentTime(lead), getCommentActivityTime(lead), getAssignmentMoveTime(lead), getUpdateActivityTime(lead)].filter(
-        (time): time is number => time !== null
-    );
-    return times.length > 0 ? Math.max(...times) : null;
-}
-
-function isScheduledForToday(lead: Lead) {
-    return Boolean(lead.status !== "Qualified" && lead.followUpAt && formatLeadScheduleDate(lead.followUpAt) === formatLeadScheduleDate(new Date()));
-}
-
-function isScheduledDueNow(lead: Lead, now = Date.now()) {
-    if (lead.status === "Qualified") {
-        return false;
-    }
-
-    const followUpTime = parseLeadTime(lead.followUpAt);
-    return followUpTime !== null && followUpTime <= now;
-}
-
-function hasManualCommentToday(lead: Lead) {
-    const today = formatCstDate(new Date());
-    return (lead.comments || []).some(
-        (comment) => comment.authorName !== "CSV Import" && formatCstDate(comment.createdAt) === today
-    ) || (lead.activity || []).some(
-        (item) => item.label.toLowerCase() === "comment added" && formatCstDate(item.createdAt) === today
-    );
-}
-
-function hasContactActivityToday(lead: Lead) {
-    const today = formatCstDate(new Date());
-    const contactActivityLabels = new Set(["comment added", "lead updated", "status updated", "status changed", "follow up scheduled"]);
-
-    return hasManualCommentToday(lead) || (lead.activity || []).some(
-        (item) => contactActivityLabels.has(item.label.toLowerCase()) && formatCstDate(item.createdAt) === today
-    );
-}
-
-function getContactActivityTime(lead: Lead) {
-    const contactActivityLabels = new Set(["comment added", "lead updated", "status updated", "status changed", "follow up scheduled"]);
-    const times = [
-        ...(lead.comments || [])
-            .filter((comment) => comment.authorName !== "CSV Import")
-            .map((comment) => parseLeadTime(comment.createdAt)),
-        ...(lead.activity || [])
-            .filter((item) => contactActivityLabels.has(item.label.toLowerCase()))
-            .map((item) => parseLeadTime(item.createdAt)),
-    ].filter((time): time is number => time !== null);
-
-    return times.length > 0 ? Math.max(...times) : null;
-}
-
-function isHiddenFromEmployeeQueueToday(lead: Lead) {
-    if (!hasContactActivityToday(lead)) {
-        return false;
-    }
-
-    const followUpTime = parseLeadTime(lead.followUpAt);
-
-    if (followUpTime === null || followUpTime > Date.now()) {
-        return true;
-    }
-
-    const contactTime = getContactActivityTime(lead);
-    return contactTime !== null && contactTime >= followUpTime;
-}
-
-function isCallPriorityLead(lead: Lead) {
-    return !isScheduledForToday(lead) && isNewWorkQueueLead(lead) && !hasManualCommentToday(lead);
-}
-
-function getLeadQueueRank(lead: Lead, now = Date.now()) {
-    const scheduledDueNow = isScheduledDueNow(lead, now);
-
-    if (lead.status === "NEW" && isLeadEligibleForAutoCall(lead, new Date(now))) return 0;
-    const scheduledToday = isScheduledForToday(lead);
-    if (lead.status === "NEW" && !scheduledToday) return 1;
-    if (lead.status === "Follow up" && !scheduledToday && !scheduledDueNow) return 2;
-    if (scheduledDueNow && !isHiddenFromEmployeeQueueToday(lead)) return 3;
-    if (scheduledToday) return 5;
-    return 4;
-}
-
-function sortEmployeeLeadsForWorkQueue(leads: Lead[], now = Date.now()) {
-    return [...leads].sort((first, second) => {
-        const firstRank = getLeadQueueRank(first, now);
-        const secondRank = getLeadQueueRank(second, now);
-
-        if (firstRank !== secondRank) {
-            return firstRank - secondRank;
-        }
-
-        if (firstRank === 3 || firstRank === 5) {
-            return (parseLeadTime(first.followUpAt) || 0) - (parseLeadTime(second.followUpAt) || 0);
-        }
-
-        const firstWorkedAt = getLeadDeprioritizedTime(first);
-        const secondWorkedAt = getLeadDeprioritizedTime(second);
-        if (firstWorkedAt !== null || secondWorkedAt !== null) {
-            if (firstWorkedAt === null) return -1;
-            if (secondWorkedAt === null) return 1;
-            const workedAtDelta = firstWorkedAt - secondWorkedAt;
-
-            if (workedAtDelta !== 0) {
-                return workedAtDelta;
-            }
-        }
-
-        const createdAtDelta = (parseLeadTime(second.createdAt) || 0) - (parseLeadTime(first.createdAt) || 0);
-
-        if (createdAtDelta !== 0) {
-            return createdAtDelta;
-        }
-
-        return first._id.localeCompare(second._id);
-    });
-}
-
-function isSalesAgent(employee: Employee) {
-    const role = (employee.role || "").toLowerCase();
-    const department = (employee.team || "").toLowerCase();
-    return role.includes("agent") || role.includes("sales") || department.includes("sales");
-}
 
 function canViewAllLeadQueues(employee?: Employee | null) {
     const role = (employee?.role || "").toLowerCase();
@@ -454,10 +286,19 @@ export default function Leads() {
     const employeeCode = authUser?.userType === "employee"
         ? String(authUser.user.employeeCode || authUser.user._id).trim()
         : "";
-    const displayedQueueOwner = useRef(Symbol("employee-displayed-leads"));
+    const callingWorkOwner = useRef(Symbol("lead-editor"));
     const displayedBusinessId = getActiveBusinessId();
+    const callingScope = { employeeId, businessId: displayedBusinessId };
+    const retainedNoteDraft = getLeadNoteDraft(callingScope);
+    const [draftLead, setDraftLead] = useState<Lead | null>(() => retainedNoteDraft?.lead || null);
+    const employeeTeam = authUser?.userType === "employee" ? authUser.user.team : undefined;
+    const callingQueueQuery = useCallingQueue(callingScope, isSalesRole(String(authUser?.user.role || ""), String(employeeTeam || "")));
+    const authoritativeQueue = callingQueueQuery.data?.callingQueue;
+    const autoCallStatus = useSyncExternalStore(subscribeCallingWorkflow, () => callingProgress(callingScope));
     const requestedLeadId = searchParams.get("lead") || "";
-    const routedAutoCallLead = (location.state as { autoCallLead?: Lead } | null)?.autoCallLead;
+    const routedAutoCallContext = location.state as { autoCallLead?: Lead; autoCallBusinessId?: string; autoCallEmployeeId?: string } | null;
+    const routedAutoCallLead = routedAutoCallContext?.autoCallBusinessId === displayedBusinessId && routedAutoCallContext.autoCallEmployeeId === employeeId
+        ? routedAutoCallContext.autoCallLead : undefined;
     const employeeName = authUser?.userType === "employee" ? authUser.user.name : "Employee";
     const canViewAllLeads = authUser?.userType === "employee" && canViewAllLeadQueues(authUser.user);
     const canViewCompletedLeads = authUser?.userType === "employee" && canViewCompletedLeadQueue(authUser.user);
@@ -478,11 +319,13 @@ export default function Leads() {
     const [debouncedLeadSearch, setDebouncedLeadSearch] = useState("");
     const [leadStateFilter, setLeadStateFilter] = useState("ALL");
     const [isGlobalLeadSearch, setIsGlobalLeadSearch] = useState(false);
-    const [selectedLeadId, setSelectedLeadId] = useState<string | null>(null);
+    const [selectedLeadId, setSelectedLeadId] = useState<string | null>(() => retainedNoteDraft?.lead._id || null);
     const [leadHistoryIds, setLeadHistoryIds] = useState<string[]>([]);
     const [isDetailEditing, setIsDetailEditing] = useState(false);
     const [detailDraft, setDetailDraft] = useState<LeadDetailDraft>(emptyLeadDetailDraft);
-    const [commentDraft, setCommentDraft] = useState("");
+    const [commentDraft, setCommentDraft] = useState(() => retainedNoteDraft?.body || "");
+    const draftScopeKey = JSON.stringify(callingScope);
+    const [previousDraftScopeKey, setPreviousDraftScopeKey] = useState(draftScopeKey);
     const pendingCommentSaveRef = useRef<{ leadId: string; body: string; promise: Promise<Lead> } | null>(null);
     const leadActionPendingRef = useRef<LeadActionName | null>(null);
     const leadListRef = useRef<HTMLDivElement>(null);
@@ -491,7 +334,7 @@ export default function Leads() {
     const leadFetchRetryAtRef = useRef(0);
     const [activeLeadAction, setActiveLeadAction] = useState<LeadActionName | null>(null);
     const [passAgentId, setPassAgentId] = useState("");
-    const [passConfirm, setPassConfirm] = useState<{ lead: Lead; agent: Employee } | null>(null);
+    const [passConfirm, setPassConfirm] = useState<{ lead: Lead; agent: Employee; businessId: string; employeeSession?: string } | null>(null);
     const [followUpDateTime, setFollowUpDateTime] = useState("");
     const [statusDraft, setStatusDraft] = useState<LeadStatus>("NEW");
     const [isLeadModalOpen, setIsLeadModalOpen] = useState(false);
@@ -499,8 +342,16 @@ export default function Leads() {
     const [leadPage, setLeadPage] = useState(1);
     const [hasMoreLeads, setHasMoreLeads] = useState(true);
     const [isFetchingMoreLeads, setIsFetchingMoreLeads] = useState(false);
-    const [queueClock, setQueueClock] = useState(() => Date.now());
+    const [scheduleDirty, setScheduleDirty] = useState(false);
     const [workedLeadHolds, setWorkedLeadHolds] = useState<Lead[]>([]);
+    if (previousDraftScopeKey !== draftScopeKey) {
+        setPreviousDraftScopeKey(draftScopeKey);
+        setDraftLead(retainedNoteDraft?.lead || null);
+        setSelectedLeadId(retainedNoteDraft?.lead._id || null);
+        setCommentDraft(retainedNoteDraft?.body || "");
+        setWorkedLeadHolds([]);
+        setLeadHistoryIds([]);
+    }
     const visibleTabs = useMemo(
         () => tabs.filter((tab) => {
             if (canViewAllLeads && (tab === "NEW" || tab === "Archived" || tab === "ALL")) {
@@ -519,9 +370,10 @@ export default function Leads() {
     const isGlobalLeadSearchActive = isGlobalLeadSearch && Boolean(effectiveLeadSearch);
     const employeeLeadTab = getEmployeeLeadTab(activeTab);
     const requestedEmployeeLeadTab = isGlobalLeadSearchActive ? "all" : employeeLeadTab;
+    const isDefaultCallingView = activeTab === "NEW" && !effectiveLeadSearch && leadStateFilter === "ALL";
     const leadQueryKey = useMemo(
-        () => ["leads", employeeId, employeeLeadNames.join("|"), requestedEmployeeLeadTab, activeTab, effectiveLeadSearch, isGlobalLeadSearchActive, leadStateFilter, displayedBusinessId] as const,
-        [activeTab, effectiveLeadSearch, employeeId, employeeLeadNames, isGlobalLeadSearchActive, leadStateFilter, requestedEmployeeLeadTab, displayedBusinessId]
+        () => isDefaultCallingView ? callingQueueKey({ employeeId, businessId: displayedBusinessId }) : ["leads", employeeId, employeeLeadNames.join("|"), requestedEmployeeLeadTab, activeTab, effectiveLeadSearch, isGlobalLeadSearchActive, leadStateFilter, displayedBusinessId] as const,
+        [isDefaultCallingView, activeTab, effectiveLeadSearch, employeeId, employeeLeadNames, isGlobalLeadSearchActive, leadStateFilter, requestedEmployeeLeadTab, displayedBusinessId]
     );
     const leadPagingScope = JSON.stringify(leadQueryKey);
     const leadPagingScopeRef = useRef<string | null>(leadPagingScope);
@@ -529,9 +381,9 @@ export default function Leads() {
         leadPagingScopeRef.current = leadPagingScope;
         return () => { if (leadPagingScopeRef.current === leadPagingScope) leadPagingScopeRef.current = null; };
     }, [leadPagingScope]);
-    const { data: leadPageData, isLoading, isError, isFetching: isLeadListFetching } = useQuery({
+    const { data: leadPageData, isLoading, isError } = useQuery({
         queryKey: leadQueryKey,
-        queryFn: () =>
+        queryFn: () => isDefaultCallingView ? fetchCallingQueue(callingScope, authUser?.attendanceHubSession || undefined) :
             getMyLeads({
                 employeeId,
                 employeeNames: employeeLeadNames,
@@ -542,29 +394,37 @@ export default function Leads() {
                 searchAll: isGlobalLeadSearchActive || undefined,
                 includeArchived: isGlobalLeadSearchActive || undefined,
                 state: leadStateFilter !== "ALL" ? leadStateFilter : undefined,
-            }),
+                callingQueue: isDefaultCallingView || undefined,
+            }, { businessId: displayedBusinessId, employeeSession: authUser?.attendanceHubSession || undefined }),
         enabled: Boolean(employeeId),
+        refetchInterval: isDefaultCallingView ? false : 30000,
+        refetchOnReconnect: "always",
     });
     const leads = leadPageData?.leads || EMPTY_QUERY_ROWS;
     const leadStateOptions = leadPageData?.stateOptions || EMPTY_QUERY_ROWS;
     const { data: requestedLead } = useQuery({
-        queryKey: ["lead", requestedLeadId],
-        queryFn: () => getLead(requestedLeadId),
+        queryKey: ["lead", displayedBusinessId, requestedLeadId],
+        queryFn: () => getLead(requestedLeadId, { businessId: displayedBusinessId, employeeSession: authUser?.attendanceHubSession || undefined }),
         enabled: Boolean(employeeId && requestedLeadId),
     });
     const { data: leadCounts = {} } = useQuery({
-        queryKey: ["lead-counts", employeeId, employeeLeadNames.join("|"), leadStateFilter],
+        queryKey: ["lead-counts", employeeId, displayedBusinessId, employeeLeadNames.join("|"), leadStateFilter],
         queryFn: () => getMyLeadCounts({ employeeId, employeeNames: employeeLeadNames, state: leadStateFilter !== "ALL" ? leadStateFilter : undefined }),
         enabled: Boolean(employeeId),
     });
     const { data: employees = EMPTY_QUERY_ROWS } = useQuery({
-        queryKey: ["employees"],
-        queryFn: getEmployees,
+        queryKey: ["lead-recipients", displayedBusinessId],
+        queryFn: () => getEmployees({ leadRecipients: true }, { businessId: displayedBusinessId }),
     });
     const { data: systemSettings } = useQuery({
         queryKey: ["system-settings"],
         queryFn: getSystemSettings,
         enabled: Boolean(employeeId),
+    });
+    const { data: leadWorkspaceCapabilities } = useQuery({
+        queryKey: ["lead-workspace-capabilities", displayedBusinessId, employeeId],
+        queryFn: () => getLeadWorkspaceCapabilities({ businessId: displayedBusinessId, employeeSession: authUser?.attendanceHubSession || undefined }),
+        enabled: Boolean(employeeId), staleTime: 10_000, refetchInterval: 10_000,
     });
     const categoryTabs = useMemo(() => {
         const categoryNames = new Map<string, string>();
@@ -623,26 +483,15 @@ export default function Leads() {
                         .toLowerCase()
                         .includes(searchText)
                 );
-        return sortEmployeeLeadsForWorkQueue(searchFilteredLeads, queueClock);
-    }, [activeCategoryTab, activeTab, canUseLeadCategories, effectiveLeadSearch, employeeId, isGlobalLeadSearchActive, leads, queueClock, showFavoritesOnly]);
-    useLayoutEffect(() => {
-        const owner = displayedQueueOwner.current;
-        return () => clearDisplayedAutoCallQueue(owner);
-    }, []);
-    const contactedTodayCount = leadCounts.ContactedToday ?? leads.filter((lead) => isNewWorkQueueLead(lead) && isHiddenFromEmployeeQueueToday(lead)).length;
+        return searchFilteredLeads;
+    }, [activeCategoryTab, activeTab, canUseLeadCategories, effectiveLeadSearch, employeeId, isGlobalLeadSearchActive, leads, showFavoritesOnly]);
+    const contactedTodayCount = leadCounts.ContactedToday ?? 0;
 
-    const routeSelectedLead = requestedLeadId
-        ? leads.find((lead) => lead._id === requestedLeadId) ||
-          workedLeadHolds.find((lead) => lead._id === requestedLeadId) ||
-          (requestedLead?._id === requestedLeadId ? requestedLead : null) ||
-          (routedAutoCallLead?._id === requestedLeadId ? routedAutoCallLead : null)
-        : null;
-    const selectedLead =
-        routeSelectedLead ||
-        leads.find((lead) => lead._id === selectedLeadId) ||
-        workedLeadHolds.find((lead) => lead._id === selectedLeadId) ||
-        filteredLeads[0] ||
-        null;
+    const detailId = requestedLeadId || selectedLeadId;
+    const selectedLead = [routedAutoCallLead, requestedLead, draftLead, authoritativeQueue?.nextLead,
+        workedLeadHolds.find(lead => lead._id === detailId), leads.find(lead => lead._id === detailId)]
+        .filter((lead): lead is Lead => Boolean(lead && lead._id === detailId))
+        .reduce<Lead | null>((current, lead) => latestLead(current, lead), null) || filteredLeads[0] || null;
     const leadHistory = leadHistoryIds
         .map((leadId) => leads.find((lead) => lead._id === leadId) || workedLeadHolds.find((lead) => lead._id === leadId))
         .filter((lead): lead is Lead => Boolean(lead));
@@ -650,10 +499,9 @@ export default function Leads() {
     const isStatusDraftQualified = statusDraft === "Qualified";
     const shouldClearQualifiedFollowUp = Boolean(selectedLead && selectedLead.status === "Qualified" && selectedLead.followUpAt);
     const hasStatusUpdate = Boolean(selectedLead && (statusDraft !== selectedLead.status || (isStatusDraftQualified && selectedLead.followUpAt)));
-    const whatsappPhone = (selectedLead?.phone || "").replace(/\D/g, "");
     const activity = selectedLead ? getLeadActivity(selectedLead) : [];
     const passableAgents = useMemo(
-        () => employees.filter((employee) => employee.status !== "Archived" && employee._id !== employeeId && isSalesAgent(employee)),
+        () => employees.filter((employee) => employee._id !== employeeId && isEligibleLeadRecipient(employee)),
         [employeeId, employees]
     );
     const getTabCount = (tab: LeadStatus | "ALL") => {
@@ -695,12 +543,14 @@ export default function Leads() {
                 searchAll: isGlobalLeadSearchActive || undefined,
                 includeArchived: isGlobalLeadSearchActive || undefined,
                 state: leadStateFilter !== "ALL" ? leadStateFilter : undefined,
-            }, { timeoutMs: AUTO_CALL_API_TIMEOUT_MS });
+                callingQueue: isDefaultCallingView || undefined,
+            }, { timeoutMs: AUTO_CALL_API_TIMEOUT_MS, businessId: displayedBusinessId });
             // A refetch can replace an appended page while this request is pending.
             if (!scopeIsCurrent() || queryClient.getQueryData<MyLeadsPage>(leadQueryKey)?.page !== currentPage.page) return false;
             queryClient.setQueryData<typeof leadPageData>(leadQueryKey, (current) => ({
                 ...(current || nextLeadPage),
                 ...nextLeadPage,
+                receivedAt: performance.now(),
                 leads: mergeLeadPages(current?.leads || [], nextLeadPage.leads),
             }));
             leadPageRef.current = nextPage;
@@ -720,13 +570,7 @@ export default function Leads() {
                 setIsFetchingMoreLeads(false);
             }
         }
-    }, [employeeId, displayedBusinessId, leadPagingScope, hasMoreLeads, employeeLeadNames, requestedEmployeeLeadTab, effectiveLeadSearch, isGlobalLeadSearchActive, leadStateFilter, queryClient, leadQueryKey, showToast]);
-
-    useLayoutEffect(() => {
-        publishDisplayedAutoCallQueue(displayedQueueOwner.current, { employeeId, businessId: displayedBusinessId }, filteredLeads,
-            Boolean(employeeId && !isLoading && !isError && !isLeadListFetching && !isFetchingMoreLeads && leadSearch.trim() === debouncedLeadSearch),
-            hasMoreLeads && (activeTab === "NEW" || activeTab === "Follow up" || activeTab === "ALL") ? fetchMoreLeads : undefined);
-    }, [employeeId, displayedBusinessId, filteredLeads, isLoading, isError, isLeadListFetching, isFetchingMoreLeads, leadSearch, debouncedLeadSearch, hasMoreLeads, activeTab, fetchMoreLeads]);
+    }, [employeeId, displayedBusinessId, leadPagingScope, hasMoreLeads, employeeLeadNames, requestedEmployeeLeadTab, effectiveLeadSearch, isGlobalLeadSearchActive, leadStateFilter, queryClient, leadQueryKey, showToast, isDefaultCallingView]);
 
     const [previousLeadPagingScope1, setPreviousLeadPagingScope1] = useState<readonly unknown[] | null>(null);
     const leadPagingScope1Inputs = [employeeId, employeeLeadNameKey, effectiveLeadSearch, isGlobalLeadSearchActive, leadStateFilter, requestedEmployeeLeadTab];
@@ -778,6 +622,10 @@ export default function Leads() {
     };
 
     const selectLead = (leadId: string) => {
+        if (leadId !== selectedLead?._id && (commentDraft.trim() || activeLeadAction || pendingCommentSaveRef.current || isDetailEditing || scheduleDirty || hasStatusUpdate)) {
+            showToast({ tone: "error", message: "Save or clear the current lead changes before opening another lead." });
+            return;
+        }
         if (requestedLeadId && leadId !== requestedLeadId) {
             const nextSearchParams = new URLSearchParams(searchParams);
             nextSearchParams.delete("lead");
@@ -818,6 +666,7 @@ export default function Leads() {
     const invalidateEmployeeLeads = () => {
         void queryClient.invalidateQueries({ queryKey: ["leads", employeeId] });
         void queryClient.invalidateQueries({ queryKey: ["lead-counts", employeeId] });
+        void queryClient.invalidateQueries({ queryKey: callingQueueKey(callingScope) });
     };
 
     const updateCachedLeadPage = (updateLeads: (current: Lead[]) => Lead[]) => {
@@ -825,6 +674,9 @@ export default function Leads() {
             current ? { ...current, leads: updateLeads(current.leads) } : current
         );
     };
+
+    const synchronizeSavedLead = (lead: Lead, scope = callingScope) => synchronizeLeadWorkspace(queryClient, scope.businessId, { lead },
+        { ...scope, belongsHere: leadBelongsToEmployee(lead, scope.employeeId, employeeLeadNames) });
 
     useEffect(() => {
         if (!employeeId) {
@@ -842,11 +694,8 @@ export default function Leads() {
                     Boolean(current?.leads.some((lead) => lead._id === changedLeadId))
                 )
                 : false;
-            const normalizedEmployeeNames = new Set(employeeLeadNames.map((name) => name.trim().toLowerCase()).filter(Boolean));
-            const isAssignedHere = Boolean(changedLead && (
-                changedLead.assignedAgent?._id === employeeId ||
-                normalizedEmployeeNames.has(String(changedLead.assignedAgentName || "").trim().toLowerCase())
-            ));
+            const queueHasLead = Boolean(changedLeadId && queryClient.getQueryData<MyLeadsPage>(callingQueueKey({ employeeId, businessId: displayedBusinessId }))?.leads.some(lead => lead._id === changedLeadId));
+            const isAssignedHere = Boolean(changedLead && leadBelongsToEmployee(changedLead, String(employeeId), [...employeeLeadNames]));
 
             if (payload.action === "call-outcome-classified" && changedLeadId) {
                 void queryClient.invalidateQueries({ queryKey: ["lead-call-stat", changedLeadId] });
@@ -857,47 +706,20 @@ export default function Leads() {
             // Lead events are broadcast across the business. Ignore another
             // employee's single-lead update instead of multiplying it into a
             // full queue and count refresh in every open browser.
-            if (changedLead && !cachedLeadExists && !isAssignedHere) {
+            if (changedLead && !cachedLeadExists && !queueHasLead && !isAssignedHere) {
                 return;
             }
 
             if (changedLead) {
-                queryClient.setQueriesData<MyLeadsPage>({ queryKey: ["leads", employeeId] }, (current) => {
-                    if (!current) return current;
-
-                    const hasLead = current.leads.some((lead) => lead._id === changedLead._id);
-                    const shouldAddToCurrentPage = isAssignedHere && payload.action !== "call-logged";
-
-                    if (!hasLead && !shouldAddToCurrentPage) {
-                        return current;
-                    }
-
-                    return {
-                        ...current,
-                        leads: hasLead
-                            ? current.leads.map((lead) => (lead._id === changedLead._id ? changedLead : lead))
-                            : mergeLeadPages([changedLead], current.leads),
-                    };
-                });
+                setWorkedLeadHolds(current => current.map(lead => lead._id === changedLead._id ? latestLead(lead, changedLead) : lead));
+                setDraftLead(current => current?._id === changedLead._id ? latestLead(current, changedLead) : current);
             }
-
-            if (changedLeadIds.size > 0) {
-                queryClient.setQueriesData<MyLeadsPage>({ queryKey: ["leads", employeeId] }, (current) => {
-                    if (!current) return current;
-
-                    if (!current.leads.some((lead) => changedLeadIds.has(lead._id))) {
-                        return current;
-                    }
-
-                    return {
-                        ...current,
-                        leads: current.leads.filter((lead) => !payload.leadIds?.includes(lead._id)),
-                    };
-                });
+            if (changedLead || changedLeadIds.size) void synchronizeLeadWorkspace(queryClient, displayedBusinessId, payload,
+                { employeeId, businessId: displayedBusinessId, belongsHere: isAssignedHere });
+            else {
+                void queryClient.invalidateQueries({ queryKey: callingQueueKey({ employeeId, businessId: displayedBusinessId }) });
+                void queryClient.invalidateQueries({ queryKey: ["leads", employeeId] });
             }
-
-            setQueueClock(Date.now());
-            void queryClient.invalidateQueries({ queryKey: ["leads", employeeId] });
             void queryClient.invalidateQueries({ queryKey: ["lead-counts", employeeId] });
         };
 
@@ -912,12 +734,15 @@ export default function Leads() {
 
         socket.on("lead:changed", handleLeadChanged);
         socket.on("lead-call-stat:updated", handleLeadCallStatUpdated);
+        const refresh = () => { void queryClient.invalidateQueries({ queryKey: ["leads", employeeId] }); };
+        socket.on("connect", refresh);
 
         return () => {
             socket.off("lead:changed", handleLeadChanged);
             socket.off("lead-call-stat:updated", handleLeadCallStatUpdated);
+            socket.off("connect", refresh);
         };
-    }, [employeeId, employeeLeadNames, leadQueryKey, leadStateFilter, queryClient]);
+    }, [employeeId, employeeLeadNames, leadQueryKey, leadStateFilter, queryClient, displayedBusinessId]);
 
     const createEmployeeOwnedLeadInput = (lead: LeadInput): LeadInput => ({
         ...lead,
@@ -945,70 +770,44 @@ export default function Leads() {
 
     const addCommentMutation = useMutation({
         mutationFn: ({ id, body }: { id: string; body: string }) =>
-            addLeadComment(id, { body, authorName: employeeName, authorType: "employee" }),
-        onMutate: (variables) => {
-            const pendingAutoCall = getAutoCallPendingComment(employeeCode);
-            clearAutoCallPendingComment(employeeCode, variables.id);
-            const previousLeadPage = queryClient.getQueryData<typeof leadPageData>(leadQueryKey);
-            const optimisticComment = {
-                _id: `pending-${Date.now()}`,
-                authorName: employeeName,
-                authorType: "employee" as const,
-                body: variables.body,
-                createdAt: new Date().toISOString(),
-            };
-
-            updateCachedLeadPage((current) => current.map((lead) =>
-                lead._id === variables.id
-                    ? { ...lead, comments: [...(lead.comments || []), optimisticComment] }
-                    : lead
-            ));
-            setCommentDraft((current) => (current.trim() === variables.body ? "" : current));
-
-            return {
-                previousLeadPage,
-                pendingAutoCall: pendingAutoCall?.leadId === variables.id ? pendingAutoCall : null,
-            };
-        },
-        onSuccess: (updatedLead, variables) => {
-            updateCachedLeadPage((current) => current.map((lead) => (lead._id === updatedLead._id ? updatedLead : lead)));
+            addLeadComment(id, { body, authorName: employeeName, authorType: "employee" }, { businessId: displayedBusinessId, employeeSession: authUser?.attendanceHubSession || undefined }),
+        onMutate: () => ({ businessId: displayedBusinessId, employeeId, employeeCode, queryKey: leadQueryKey }),
+        onSuccess: async (updatedLead, variables, context) => {
+            const savedScope = { employeeId: context.employeeId, businessId: context.businessId };
+            queryClient.setQueryData<MyLeadsPage>(context.queryKey, current => current ? { ...current, leads: current.leads.map(lead => lead._id === updatedLead._id ? updatedLead : lead) } : current);
+            clearAutoCallPendingComment(`${context.businessId}:${context.employeeCode}`, updatedLead._id);
+            clearSavedLeadNoteDraft(savedScope, updatedLead._id, variables.body);
+            void queryClient.invalidateQueries({ queryKey: callingQueueKey(savedScope) });
+            void queryClient.invalidateQueries({ queryKey: ["lead-counts", context.employeeId] });
+            if (getActiveBusinessId() !== context.businessId) return;
             holdWorkedLead(updatedLead);
-            clearAutoCallPendingComment(employeeCode, updatedLead._id);
-            setCommentDraft((current) => (current.trim() === variables.body ? "" : current));
-            void queryClient.invalidateQueries({ queryKey: ["lead-counts", employeeId] });
+            setCommentDraft(current => current.trim() === variables.body ? "" : current);
+            await synchronizeSavedLead(updatedLead, savedScope);
             showToast({ tone: "success", message: "Note added to the lead." });
         },
-        onError: (error, variables, context) => {
-            if (context?.previousLeadPage) {
-                queryClient.setQueryData(leadQueryKey, context.previousLeadPage);
-            }
-            if (context?.pendingAutoCall && !getAutoCallPendingComment(employeeCode)) {
-                startAutoCallPendingComment(
-                    employeeCode,
-                    context.pendingAutoCall.leadId,
-                    context.pendingAutoCall.baselineCommentMarker
-                );
-            }
-            setCommentDraft((current) => current || variables.body);
-            const message =
-                (error as { response?: { data?: { message?: string } } })?.response?.data?.message ||
-                (error instanceof Error ? error.message : "") ||
-                "Could not add the note. Please try again.";
-            showToast({ tone: "error", message });
+        onError: (error, _variables, context) => {
+            if (context && getActiveBusinessId() !== context.businessId) return;
+            const message = (error as { response?: { data?: { message?: string } } })?.response?.data?.message ||
+                (error instanceof Error ? error.message : "") || "Could not add the note. Please try again.";
+            reportRequestError(error, message);
         },
     });
 
     const recordCallMutation = useMutation({
-        mutationFn: (id: string) => recordLeadCall(id, { activityActorName: employeeName, activityActorType: "employee" }),
-        onSuccess: (updatedLead) => {
+        mutationFn: (id: string) => recordLeadCall(id, { activityActorName: employeeName, activityActorType: "employee" }, { businessId: displayedBusinessId, employeeSession: authUser?.attendanceHubSession || undefined }),
+        onMutate: () => ({ scope: callingScope }),
+        onSuccess: async (updatedLead, _variables, context) => {
+            if (getActiveBusinessId() !== context.scope.businessId) { await synchronizeSavedLead(updatedLead, context.scope); return; }
             updateCachedLeadPage((current) => current.map((lead) => (lead._id === updatedLead._id ? updatedLead : lead)));
+            await synchronizeSavedLead(updatedLead, context.scope);
             invalidateEmployeeLeads();
         },
     });
 
     const updateDetailsMutation = useMutation({
         mutationFn: async ({ lead, draft }: { lead: Lead; draft: LeadDetailDraft }) => {
-            const currentLead = await getLead(lead._id);
+            const options = { businessId: displayedBusinessId, employeeSession: authUser?.attendanceHubSession || undefined };
+            const currentLead = await getLead(lead._id, options);
             return updateLead(
                 currentLead._id,
                 toLeadInput(currentLead, {
@@ -1017,13 +816,17 @@ export default function Leads() {
                     category: canUseLeadCategories ? draft.category : currentLead.category,
                     activityActorName: employeeName,
                     activityActorType: "employee",
-                })
+                }), options
             );
         },
-        onSuccess: (updatedLead) => {
+        onMutate: () => ({ scope: callingScope }),
+        onSuccess: async (updatedLead, _variables, context) => {
+            if (getActiveBusinessId() !== context.scope.businessId) { await synchronizeSavedLead(updatedLead, context.scope); return; }
             updateCachedLeadPage((current) => current.map((lead) => (lead._id === updatedLead._id ? updatedLead : lead)));
             setDetailDraft(createLeadDetailDraft(updatedLead));
             setIsDetailEditing(false);
+            holdWorkedLead(updatedLead);
+            await synchronizeSavedLead(updatedLead, context.scope);
             invalidateEmployeeLeads();
         },
         onError: () => {
@@ -1033,54 +836,64 @@ export default function Leads() {
 
     const updateStatusMutation = useMutation({
         mutationFn: ({ id, status }: { id: string; status: LeadStatus }) =>
-            updateLeadStatus(id, status, { activityActorName: employeeName, activityActorType: "employee" }),
-        onSuccess: (updatedLead) => {
+            updateLeadStatus(id, status, { activityActorName: employeeName, activityActorType: "employee" }, { businessId: displayedBusinessId, employeeSession: authUser?.attendanceHubSession || undefined }),
+        onMutate: () => ({ scope: callingScope, queryKey: leadQueryKey }),
+        onSuccess: async (updatedLead, variables, context) => {
+            void queryClient.invalidateQueries({ queryKey: callingQueueKey(context.scope) });
+            if (getActiveBusinessId() !== context.scope.businessId) return;
             updateCachedLeadPage((current) => current.map((lead) => (lead._id === updatedLead._id ? updatedLead : lead)));
             holdWorkedLead(updatedLead);
+            setStatusDraft(current => current === variables.status ? updatedLead.status : current);
             if (updatedLead.status === "Qualified") {
                 setFollowUpDateTime("");
+                setScheduleDirty(false);
             }
+            await synchronizeSavedLead(updatedLead, context.scope);
             invalidateEmployeeLeads();
         },
-        onError: () => {
-            showToast({ tone: "error", message: "Could not update lead status." });
+        onError: (error) => {
+            showToast({ tone: "error", message: (error as { response?: { data?: { message?: string } } }).response?.data?.message || "Could not update lead status." });
         },
     });
 
     const toggleFavoriteMutation = useMutation({
         mutationFn: ({ lead, favorite }: { lead: Lead; favorite: boolean }) =>
-            toggleLeadFavorite(lead._id, { employeeId, favorite }),
+            toggleLeadFavorite(lead._id, { employeeId, favorite }, { businessId: displayedBusinessId, employeeSession: authUser?.attendanceHubSession || undefined }),
         onMutate: ({ lead, favorite }) => {
             const previousLeadPage = queryClient.getQueryData<typeof leadPageData>(leadQueryKey);
-            const previousRequestedLead = queryClient.getQueryData<Lead>(["lead", lead._id]);
+            const previousRequestedLead = queryClient.getQueryData<Lead>(["lead", displayedBusinessId, lead._id]);
             const nextFavoriteEmployeeIds = favorite
                 ? Array.from(new Set([...(lead.favoriteByEmployees || []).map(String), employeeId]))
                 : (lead.favoriteByEmployees || []).map(String).filter((favoriteEmployeeId) => favoriteEmployeeId !== employeeId);
             const optimisticLead = { ...lead, favoriteByEmployees: nextFavoriteEmployeeIds };
 
             updateCachedLeadPage((current) => current.map((item) => (item._id === lead._id ? optimisticLead : item)));
-            queryClient.setQueryData<Lead>(["lead", lead._id], (current) => current ? { ...current, favoriteByEmployees: nextFavoriteEmployeeIds } : current);
+            queryClient.setQueryData<Lead>(["lead", displayedBusinessId, lead._id], (current) => current ? { ...current, favoriteByEmployees: nextFavoriteEmployeeIds } : current);
             setWorkedLeadHolds((current) => current.map((item) => (item._id === lead._id ? optimisticLead : item)));
 
-            return { previousLeadPage, previousRequestedLead };
+            return { previousLeadPage, previousRequestedLead, scope: callingScope, queryKey: leadQueryKey };
         },
-        onSuccess: (updatedLead) => {
+        onSuccess: async (updatedLead, _variables, context) => {
+            await synchronizeSavedLead(updatedLead, context.scope);
+            if (getActiveBusinessId() !== context.scope.businessId) return;
             updateCachedLeadPage((current) => current.map((lead) => (lead._id === updatedLead._id ? updatedLead : lead)));
-            queryClient.setQueryData<Lead>(["lead", updatedLead._id], updatedLead);
+            queryClient.setQueryData<Lead>(["lead", context.scope.businessId, updatedLead._id], updatedLead);
             setWorkedLeadHolds((current) => current.map((lead) => (lead._id === updatedLead._id ? updatedLead : lead)));
         },
         onError: (_error, variables, context) => {
             if (context?.previousLeadPage) {
-                queryClient.setQueryData(leadQueryKey, context.previousLeadPage);
+                queryClient.setQueryData(context.queryKey, context.previousLeadPage);
             }
-            queryClient.setQueryData(["lead", variables.lead._id], context?.previousRequestedLead);
+            queryClient.setQueryData(["lead", context?.scope.businessId, variables.lead._id], context?.previousRequestedLead);
             showToast({ tone: "error", message: "Could not update favorite." });
         },
     });
 
     const archiveLeadMutation = useMutation({
-        mutationFn: (id: string) => archiveLead(id, { activityActorName: employeeName, activityActorType: "employee" }),
-        onSuccess: (updatedLead) => {
+        mutationFn: (id: string) => archiveLead(id, { activityActorName: employeeName, activityActorType: "employee" }, { businessId: displayedBusinessId, employeeSession: authUser?.attendanceHubSession || undefined }),
+        onMutate: () => ({ scope: callingScope }),
+        onSuccess: async (updatedLead, _variables, context) => {
+            if (getActiveBusinessId() !== context.scope.businessId) { await synchronizeSavedLead(updatedLead, context.scope); return; }
             updateCachedLeadPage((current) => {
                 if (activeTab === "Archived") {
                     return mergeLeadPages([updatedLead], current);
@@ -1090,6 +903,7 @@ export default function Leads() {
             });
             setSelectedLeadId(updatedLead._id);
             setActiveTab("Archived");
+            await synchronizeSavedLead(updatedLead, context.scope);
             invalidateEmployeeLeads();
             showToast({ tone: "success", message: "Lead archived." });
         },
@@ -1106,44 +920,93 @@ export default function Leads() {
                 followUpPriority: 100,
                 activityActorName: employeeName,
                 activityActorType: "employee",
-            }),
-        onSuccess: (updatedLead) => {
+            }, { businessId: displayedBusinessId, employeeSession: authUser?.attendanceHubSession || undefined }),
+        onMutate: () => ({ scope: callingScope }),
+        onSuccess: async (updatedLead, _variables, context) => {
+            void queryClient.invalidateQueries({ queryKey: callingQueueKey(context.scope) });
+            if (getActiveBusinessId() !== context.scope.businessId) return;
             updateCachedLeadPage((current) => current.map((lead) => (lead._id === updatedLead._id ? updatedLead : lead)));
             setFollowUpDateTime("");
+            setScheduleDirty(false);
             holdWorkedLead(updatedLead);
+            await synchronizeSavedLead(updatedLead, context.scope);
             invalidateEmployeeLeads();
             showToast({ tone: "success", message: "Follow-up scheduled." });
         },
-        onError: () => {
-            showToast({ tone: "error", message: "Could not schedule follow-up." });
+        onError: (error) => {
+            showToast({ tone: "error", message: (error as { response?: { data?: { message?: string } } }).response?.data?.message || "Could not schedule follow-up." });
         },
     });
 
     const passLeadMutation = useMutation({
-        mutationFn: ({ lead, agent }: { lead: Lead; agent: Employee }) =>
+        mutationFn: ({ lead, agent, businessId, employeeSession }: { lead: Lead; agent: Employee; businessId: string; employeeSession?: string }) =>
             assignLead(
                 lead._id,
                 {
                     assignedAgent: agent._id,
                     assignedAgentName: agent.name,
+                    expectedAssignmentRevision: lead.assignmentRevision || 0,
                     activityActorName: employeeName,
                     activityActorType: "employee",
-                }
+                }, { businessId, employeeSession }
             ),
-        onSuccess: (updatedLead) => {
-            updateCachedLeadPage((current) => mergeLeadPages([updatedLead], current));
-            holdWorkedLead(updatedLead);
+        onSuccess: (updatedLead, variables) => {
+            void queryClient.invalidateQueries({ queryKey: ["calling-queue", variables.businessId] });
+            void queryClient.invalidateQueries({ queryKey: ["lead-counts"] });
+            if (getActiveBusinessId() !== variables.businessId || getAuthUser()?.attendanceHubSession !== variables.employeeSession) return;
+            updateCachedLeadPage(current => current.filter(lead => lead._id !== updatedLead._id));
+            setWorkedLeadHolds(current => current.filter(lead => lead._id !== updatedLead._id));
+            setLeadHistoryIds(current => current.filter(id => id !== updatedLead._id));
+            setSelectedLeadId(null);
+            queryClient.removeQueries({ queryKey: ["lead", variables.businessId, updatedLead._id] });
+            const nextSearch = new URLSearchParams(searchParams);
+            if (nextSearch.get("lead") === updatedLead._id) { nextSearch.delete("lead"); setSearchParams(nextSearch, { replace: true }); }
             setPassAgentId("");
             setPassConfirm(null);
             invalidateEmployeeLeads();
             showToast({ tone: "success", message: `Lead reassigned to ${updatedLead.assignedAgent?.name || updatedLead.assignedAgentName}.` });
         },
-        onError: () => {
-            showToast({ tone: "error", message: "Could not reassign the lead." });
+        onError: (error) => {
+            reportRequestError(error, "Could not reassign the lead.");
+            invalidateEmployeeLeads();
         },
     });
 
+    const bulkSelection = useEmployeeLeadSelection({ businessId: displayedBusinessId, employeeId, employeeNames: employeeLeadNames,
+        employeeSession: authUser?.attendanceHubSession || undefined, leads: filteredLeads,
+        blocked: isDetailEditing || scheduleDirty || Boolean(selectedLead && statusDraft !== selectedLead.status),
+        beforeArchive: operation => runLeadActionAfterComment(selectedLead?._id || "", "archive", operation),
+        onArchived: ids => {
+            const archived = new Set(ids);
+            updateCachedLeadPage(current => current.filter(lead => !archived.has(lead._id)));
+            setWorkedLeadHolds(current => current.filter(lead => !archived.has(lead._id)));
+            setLeadHistoryIds(current => current.filter(id => !archived.has(id)));
+            setDraftLead(current => current && archived.has(current._id) ? null : current);
+            for (const id of ids) queryClient.removeQueries({ queryKey: ["lead", displayedBusinessId, id] });
+            if (selectedLeadId && archived.has(selectedLeadId)) setSelectedLeadId(null);
+            const nextSearch = new URLSearchParams(searchParams);
+            if (archived.has(nextSearch.get("lead") || "")) { nextSearch.delete("lead"); setSearchParams(nextSearch, { replace: true }); }
+            invalidateEmployeeLeads();
+        } });
+    const editingMessage = activeLeadAction || addCommentMutation.isPending || bulkSelection.pending ? "Saving lead changes"
+        : bulkSelection.confirming ? "Confirming archive"
+        : commentDraft.trim() || isDetailEditing || scheduleDirty || (selectedLead && statusDraft !== selectedLead.status) ? "Unsaved lead changes" : "";
+    useLayoutEffect(() => {
+        setCallingWork({ employeeId, businessId: displayedBusinessId }, callingWorkOwner.current, editingMessage);
+    }, [employeeId, displayedBusinessId, editingMessage]);
+    useEffect(() => {
+        if (!editingMessage) return;
+        const protectDraft = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = ""; };
+        window.addEventListener("beforeunload", protectDraft);
+        return () => window.removeEventListener("beforeunload", protectDraft);
+    }, [editingMessage]);
+    useLayoutEffect(() => {
+        const owner = callingWorkOwner.current;
+        return () => setCallingWork({ employeeId, businessId: displayedBusinessId }, owner, "");
+    }, [employeeId, displayedBusinessId]);
+
     const startCommentSave = (leadId: string, body: string) => {
+        setCallingWork(callingScope, callingWorkOwner.current, "Saving lead changes");
         const currentPendingSave = pendingCommentSaveRef.current;
 
         if (currentPendingSave?.leadId === leadId) {
@@ -1151,6 +1014,7 @@ export default function Leads() {
         }
 
         const promise = addCommentMutation.mutateAsync({ id: leadId, body });
+        trackCallingSave(callingScope, promise);
         pendingCommentSaveRef.current = { leadId, body, promise };
         void promise.then(
             () => {
@@ -1173,6 +1037,7 @@ export default function Leads() {
         }
 
         leadActionPendingRef.current = actionName;
+        setCallingWork(callingScope, callingWorkOwner.current, "Saving lead changes");
         setActiveLeadAction(actionName);
 
         try {
@@ -1191,7 +1056,10 @@ export default function Leads() {
                 await startCommentSave(leadId, unsavedComment);
             }
 
-            await action();
+            if (getActiveBusinessId() !== callingScope.businessId || getAuthUser()?.user.employeeCode !== employeeCode) return;
+            const save = action();
+            trackCallingSave(callingScope, save);
+            await save;
         } catch {
             // Each mutation reports its own error and a failed note prevents the queued action.
         } finally {
@@ -1207,7 +1075,8 @@ export default function Leads() {
         (() => {
             setDetailDraft(createLeadDetailDraft(selectedLead));
             setIsDetailEditing(false);
-            setCommentDraft("");
+            const retained = getLeadNoteDraft(callingScope);
+            setCommentDraft(retained && retained.lead._id === selectedLead?._id ? retained.body : "");
             setPassAgentId("");
             setPassConfirm(null);
         })();
@@ -1218,7 +1087,9 @@ export default function Leads() {
     if (previousLeadStatusDraft === null || leadStatusDraftInputs.some((input, index) => !Object.is(input, previousLeadStatusDraft[index]))) {
         setPreviousLeadStatusDraft(leadStatusDraftInputs);
         (() => {
-            setStatusDraft(selectedLead?.status || "NEW");
+            if (previousLeadStatusDraft?.[0] !== selectedLead?._id || statusDraft === previousLeadStatusDraft?.[1]) {
+                setStatusDraft(selectedLead?.status || "NEW");
+            }
         })();
     }
 
@@ -1227,7 +1098,10 @@ export default function Leads() {
     if (previousLeadScheduleDraft === null || leadScheduleDraftInputs.some((input, index) => !Object.is(input, previousLeadScheduleDraft[index]))) {
         setPreviousLeadScheduleDraft(leadScheduleDraftInputs);
         (() => {
-            setFollowUpDateTime(formatLeadScheduleDateTimeInput(selectedLead?.followUpAt) || getCurrentLeadScheduleDateTimeInput());
+            if (!scheduleDirty || previousLeadScheduleDraft?.[0] !== selectedLead?._id) {
+                setFollowUpDateTime(formatLeadScheduleDateTimeInput(selectedLead?.followUpAt) || getCurrentLeadScheduleDateTimeInput());
+                setScheduleDirty(false);
+            }
         })();
     }
 
@@ -1275,14 +1149,6 @@ export default function Leads() {
             }
         })();
     }
-
-    useEffect(() => {
-        const intervalId = window.setInterval(() => {
-            setQueueClock(Date.now());
-        }, 60 * 1000);
-
-        return () => window.clearInterval(intervalId);
-    }, []);
 
     const [previousLeadSearchPermission, setPreviousLeadSearchPermission] = useState<readonly unknown[] | null>(null);
     const leadSearchPermissionInputs = [canSearchLeads, isGlobalLeadSearch];
@@ -1390,7 +1256,7 @@ export default function Leads() {
             return;
         }
 
-        setPassConfirm({ lead: selectedLead, agent });
+        setPassConfirm({ lead: selectedLead, agent, businessId: displayedBusinessId, employeeSession: authUser?.attendanceHubSession || undefined });
     };
 
     const handleScheduleFollowUp = () => {
@@ -1517,6 +1383,10 @@ export default function Leads() {
         }
 
         const assignment = passConfirm;
+        if (assignment.businessId !== getActiveBusinessId() || assignment.employeeSession !== getAuthUser()?.attendanceHubSession || !passableAgents.some(agent => agent._id === assignment.agent._id)) {
+            setPassConfirm(null); setPassAgentId("");
+            showToast({ tone: "error", message: "Business or recipient changed. Select the recipient again." }); return;
+        }
         void runLeadActionAfterComment(assignment.lead._id, "assignment", () =>
             passLeadMutation.mutateAsync(assignment)
         );
@@ -1667,7 +1537,7 @@ export default function Leads() {
                 : callStat.lead?._id;
 
         const leadIdToUpdate = statLeadId || fallbackLeadId;
-        clearAutoCallPendingComment(employeeCode, leadIdToUpdate);
+        clearAutoCallPendingComment(`${displayedBusinessId}:${employeeCode}`, leadIdToUpdate);
 
         queryClient.setQueryData(["lead-call-stat", leadIdToUpdate], callStat);
 
@@ -1951,6 +1821,15 @@ export default function Leads() {
     return (
         <MainLayout>
             <section className="employee-leads-page -m-4 min-h-[calc(100vh-5.5rem)] p-4 2xl:-m-6 2xl:p-6">
+                {isSalesRole(String(authUser?.user.role || ""), String(employeeTeam || "")) && <div className="mb-3 flex min-h-12 flex-wrap items-center justify-between gap-2 border-b border-white/15 pb-3 text-sm" role="status" aria-live="polite">
+                    <div className="min-w-0">
+                        <span className="font-semibold">Next auto-call: </span>
+                        <span>{authoritativeQueue?.nextLead ? authoritativeQueue.nextLead.leadName || authoritativeQueue.nextLead.businessName : callingQueueQuery.isError ? "Queue refresh failed" : callingQueueQuery.isLoading ? "Loading queue" : authoritativeQueue?.waitReason === "REFRESHING_QUEUE" ? "Updating queue" : "No eligible assigned leads"}</span>
+                        {authoritativeQueue?.nextReason && <span className="ml-2 text-xs opacity-70">{authoritativeQueue.nextReason === "SCHEDULED_DUE" ? "Scheduled follow-up due" : authoritativeQueue.nextReason === "NEW" ? "NEW lead" : "Follow-up available"}</span>}
+                        <p className="mt-1 text-xs opacity-70">{editingMessage || (callingQueueQuery.isError ? "Queue refresh failed. Retrying" : autoCallStatus)}</p>
+                    </div>
+                    {authoritativeQueue?.nextLeadId && <button type="button" className="flex h-8 shrink-0 items-center gap-2 rounded-md border border-white/20 px-3 text-xs disabled:opacity-40" disabled={Boolean(editingMessage)} onClick={() => selectLead(authoritativeQueue.nextLeadId!)}><FiPhone aria-hidden="true" />View next lead</button>}
+                </div>}
                 <div className="border-b border-white/10">
                     <div className="flex flex-col gap-3 py-3 xl:flex-row xl:items-end xl:justify-between">
                         <div className="content-scroll flex min-w-0 items-end gap-5 overflow-x-auto">
@@ -2082,6 +1961,7 @@ export default function Leads() {
                             </div>
                         )}
 
+                        {leadWorkspaceCapabilities?.employeeBulkArchive && bulkSelection.toolbar}
                         <div ref={leadListRef} className="content-scroll min-h-0 flex-1 divide-y divide-white/10 overflow-y-auto overscroll-contain [scrollbar-gutter:stable]" onScroll={handleLeadListScroll}>
                             {isLoading && <p className="px-5 py-6 text-sm text-white/45">{canViewAllLeads ? "Loading leads..." : "Loading assigned leads..."}</p>}
                             {isError && <p className="px-5 py-6 text-sm text-red-200">{canViewAllLeads ? "Unable to load leads." : "Unable to load assigned leads."}</p>}
@@ -2090,9 +1970,8 @@ export default function Leads() {
                             )}
                             {filteredLeads.map((lead) => {
                                 const isFavorite = isLeadFavorite(lead, employeeId);
-                                const isCallPriority = isCallPriorityLead(lead);
-                                const isScheduledToday = isScheduledForToday(lead);
-                                const wasCommentedToday = hasManualCommentToday(lead);
+                                const decision = leadPageData?.callingQueue?.entries.find(entry => entry.leadId === lead._id);
+                                const isNext = authoritativeQueue?.nextLeadId === lead._id;
 
                                 return (
                                     <div
@@ -2102,6 +1981,7 @@ export default function Leads() {
                                             selectedLead?._id === lead._id ? "bg-white/[0.07]" : "hover:bg-white/[0.04]",
                                         ].join(" ")}
                                     >
+                                        {leadWorkspaceCapabilities?.employeeBulkArchive && bulkSelection.checkbox(lead)}
                                         <button
                                             className={[
                                                 "flex size-9 shrink-0 items-center justify-center rounded-lg border transition",
@@ -2134,15 +2014,13 @@ export default function Leads() {
                                                 </span>
                                                 <span className="mt-1 grid grid-cols-[0.875rem_minmax(0,1fr)] items-center gap-1.5 text-left text-xs font-semibold text-[#5f27cd]">
                                                     <span className="flex size-3.5 items-center justify-center" aria-hidden="true">
-                                                        {isCallPriority ? (
+                                                        {decision?.callable ? (
                                                             <FiCheckCircle className="size-3.5 text-sky-400" />
-                                                        ) : isScheduledToday ? (
+                                                        ) : decision?.reason === "NOT_DUE" ? (
                                                             <FiClock className="size-3.5 text-red-400" />
-                                                        ) : wasCommentedToday ? (
-                                                            <FiCheckCircle className="size-3.5 text-sky-400" />
                                                         ) : null}
                                                     </span>
-                                                    <span className="truncate">{lead.status}</span>
+                                                    <span className="truncate" title={decision?.reason.replaceAll("_", " ")}>{isNext ? "Next auto-call" : decision && !decision.callable ? decision.reason.replaceAll("_", " ").toLowerCase() : lead.status}</span>
                                                 </span>
                                             </span>
                                         </button>
@@ -2318,7 +2196,7 @@ export default function Leads() {
                                                         if (selectedLead.phone) {
                                                             if (selectedLead.status === "Follow up") {
                                                                 startAutoCallPendingComment(
-                                                                    employeeCode,
+                                                                    `${displayedBusinessId}:${employeeCode}`,
                                                                     selectedLead._id,
                                                                     getEmployeeCommentMarker(selectedLead.comments)
                                                                 );
@@ -2337,13 +2215,6 @@ export default function Leads() {
                                                     aria-label="Email lead"
                                                 >
                                                     <FiMail className="size-4" aria-hidden="true" />
-                                                </a>
-                                                <a
-                                                    className="flex size-9 items-center justify-center rounded-lg border border-[#25d366]/30 bg-[#25d366]/10 text-[#7cf0a4] transition hover:bg-[#25d366]/20"
-                                                    href={`https://wa.me/${whatsappPhone}`}
-                                                    aria-label="WhatsApp lead"
-                                                >
-                                                    <FaWhatsapp className="size-4" aria-hidden="true" />
                                                 </a>
                                             </div>
                                         </div>
@@ -2515,7 +2386,7 @@ export default function Leads() {
                                                 type="datetime-local"
                                                 value={isStatusDraftQualified ? "" : followUpDateTime}
                                                 min={getCurrentLeadScheduleDateTimeInput()}
-                                                onChange={(event) => setFollowUpDateTime(event.target.value)}
+                                                onChange={(event) => { setScheduleDirty(true); setFollowUpDateTime(event.target.value); }}
                                                 disabled={isStatusDraftQualified || Boolean(activeLeadAction)}
                                             />
                                             <button
@@ -2546,6 +2417,7 @@ export default function Leads() {
                                         </div>
                                         <div className="mt-3 grid gap-2 sm:grid-cols-[minmax(0,1fr)_8rem]">
                                             <select
+                                                aria-label="Lead status"
                                                 className="h-11 min-w-0 rounded-lg border border-white/10 bg-[#0d1018] px-3 text-sm font-semibold text-white outline-none transition focus:border-[#842cff] focus:ring-2 focus:ring-[#842cff]/20"
                                                 value={statusDraft}
                                                 onChange={(event) => setStatusDraft(event.target.value as LeadStatus)}
@@ -2632,7 +2504,7 @@ export default function Leads() {
                                             <textarea
                                                 className="min-h-28 w-full resize-y rounded-lg border border-white/10 bg-black/20 px-3 py-3 text-sm font-medium text-white outline-none transition placeholder:text-white/30 focus:border-[#842cff] focus:ring-2 focus:ring-[#842cff]/20"
                                                 value={commentDraft}
-                                                onChange={(event) => setCommentDraft(event.target.value)}
+                                                onChange={(event) => { if (selectedLead) setLeadNoteDraft(callingScope, selectedLead, event.target.value); setDraftLead(selectedLead); setSelectedLeadId(selectedLead?._id || null); setCommentDraft(event.target.value); }}
                                                 onKeyDown={(event) => {
                                                     if (event.ctrlKey && event.key === "Enter") {
                                                         event.preventDefault();
@@ -2794,13 +2666,13 @@ export default function Leads() {
                         }
                     }}
                 >
-                    <section className="w-full max-w-[25rem] rounded-lg border border-white/10 bg-[#0d1018] shadow-2xl shadow-black/40" onPointerDown={(event) => event.stopPropagation()}>
+                    <section role="dialog" aria-modal="true" aria-labelledby="pass-lead-confirm-title" className="w-full max-w-[25rem] rounded-lg border border-white/10 bg-[#0d1018] shadow-2xl shadow-black/40" onPointerDown={(event) => event.stopPropagation()}>
                         <div className="flex items-start gap-3 border-b border-white/10 px-5 py-4">
                             <div className="flex size-9 shrink-0 items-center justify-center rounded-lg border border-[#842cff]/30 bg-[#842cff]/15 text-[#d7c5ff]">
                                 <FiUserPlus className="size-4" aria-hidden="true" />
                             </div>
                             <div>
-                                <h3 className="text-base font-semibold text-white">Confirm Re Assign</h3>
+                                <h3 id="pass-lead-confirm-title" className="text-base font-semibold text-white">Confirm Re Assign</h3>
                                 <p className="mt-1 text-sm leading-6 text-white/50">
                                     Re assign <span className="font-semibold text-white">{passConfirm.lead.leadName || passConfirm.lead.businessName}</span> to{" "}
                                     <span className="font-semibold text-white">{passConfirm.agent.name}</span>?
@@ -2918,6 +2790,7 @@ export default function Leads() {
                     </section>
                 </div>
             )}
+            {bulkSelection.dialog}
         </MainLayout>
     );
 }

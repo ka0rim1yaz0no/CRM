@@ -42,6 +42,7 @@ export type CallBridgeScheduleDocument = {
   reservedAttemptId: string;
   reservedBusinessId: string;
   reservedLeadId: string;
+  reservedPhone?: string;
   reservationTokenHash: string;
   nextCallAllowedAt: Date | null;
   lastReservedAt: Date | null;
@@ -49,6 +50,8 @@ export type CallBridgeScheduleDocument = {
   lastDialStartedAt: Date | null;
   dialIntentUntil: Date | null;
   lastCallStartedAt: Date | null;
+  lastObservedAttemptId?: string;
+  lastObservedLeadId?: string;
 };
 
 export type CallBridgeAttemptPhase =
@@ -159,6 +162,9 @@ const scheduleSchema = new Schema<CallBridgeScheduleDocument>(
     reservedAttemptId: { type: String, trim: true, default: "" },
     reservedBusinessId: { type: String, trim: true, default: "" },
     reservedLeadId: { type: String, trim: true, default: "" },
+    reservedPhone: { type: String, trim: true, default: "" },
+    lastObservedAttemptId: { type: String, trim: true, default: "" },
+    lastObservedLeadId: { type: String, trim: true, default: "" },
     reservationTokenHash: { type: String, trim: true, default: "" },
     nextCallAllowedAt: { type: Date, default: null },
     lastReservedAt: { type: Date, default: null },

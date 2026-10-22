@@ -5,6 +5,23 @@ import { bridgeAvailabilityChangedAt, callDashboardStatus, currentAttendanceShif
 
 const at = (value: string) => new Date(value);
 
+test("explicit OFFLINE attendance cannot be overridden by lingering bridge audio", () => {
+  const shift = { start: at("2026-10-22T15:00:00Z"), end: at("2026-10-23T00:00:00Z") };
+  const now = at("2026-10-22T17:00:00Z");
+  const status = callDashboardStatus({ availabilityStatus: "OFFLINE", now, shift,
+    attendance: [{ source: "Time In", timeIn: shift.start }, { source: "Time Out", timeIn: at("2026-10-22T16:59:00Z") }],
+    devices: [{ bridgeVersion: "0.4.2", state: "active", audioSessionActive: true, nextivaProcessDetected: true,
+      lastSeenAt: now, lastStateChangedAt: at("2026-10-22T16:58:00Z"), lastIdleAt: at("2026-10-22T16:57:00Z") }] });
+  assert.equal(status.status, "OFFLINE");
+});
+
+test("a recorded checkout after the shift boundary overrides an older clipped ONLINE accounting state", () => {
+  const shift = { start: at("2026-10-22T15:00:00Z"), end: at("2026-10-23T00:00:00Z") };
+  const status = callDashboardStatus({ availabilityStatus: "ONLINE", now: at("2026-10-23T02:00:00Z"), shift, devices: [],
+    attendance: [{ source: "Time In", timeIn: shift.start }, { source: "Time Out", timeIn: at("2026-10-23T00:05:00Z") }] });
+  assert.equal(status.status, "OFFLINE");
+});
+
 test("selects the current overnight PH shift before and after midnight", () => {
   const duringEvening = currentAttendanceShift(at("2026-09-15T14:00:00Z"), "Asia/Manila", "23:00", "08:00");
   assert.equal(duringEvening.start.toISOString(), "2026-09-14T15:00:00.000Z");

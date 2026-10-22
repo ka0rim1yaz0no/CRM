@@ -56,6 +56,74 @@ function request(path: string, code = "synthetic-full", business = "auth-a", bod
     ...(token?.sessionToken ? { "X-CRM-Admin-Session": token.sessionToken } : {}), ...(token?.attendanceHubSession ? { "X-CRM-Attendance-Session": token.attendanceHubSession } : {}), ...extra }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
 }
 
+test("employee queues put due scheduled callbacks before NEW leads in each business", async () => {
+  const code = "synthetic-new-first";
+  await setBusinessAccessForEmployeeCode(code, ["auth-a", "auth-b"]);
+  for (const business of ["auth-a", "auth-b"]) await runWithBusiness(business, async () => {
+    const employee = await Employee.create({ employeeCode: code, name: code, status: "Active", role: "Sales", businessAccessIds: ["auth-a", "auth-b"] });
+    const lead = { assignedAgent: employee._id, assignedAgentName: code, comments: [] };
+    const due = await Lead.create({ ...lead, businessName: "Synthetic due schedule", phone: "+12025550121", status: "Follow up", followUpAt: new Date(Date.now() - 60_000) });
+    const fresh = await Lead.create({ ...lead, businessName: "Synthetic new lead", phone: "+12025550122", status: "NEW", followUpAt: new Date(Date.now() - 60000) });
+    const future = await Lead.create({ ...lead, businessName: "Synthetic future schedule", phone: "+12025550123", status: "Follow up", followUpAt: new Date(Date.now() + 3600000) });
+    await Lead.create({ ...lead, businessName: "Synthetic duplicate follow-up", phone: fresh.phone, status: "Follow up" });
+    const headers = { "X-CRM-Attendance-Session": createAttendanceHubSession(code)! };
+    const path = `/my-leads?employeeId=${employee._id}&tab=my&queue=ALL&limit=1&autoCallEligible=true`;
+    for (let refresh = 0; refresh < 2; refresh++) {
+      const response = await request(path, "", business, undefined, headers);
+      assert.equal(response.status, 200);
+      const result = await response.json();
+      assert.equal(result.leads[0]._id, String(due._id), "a due scheduled callback outranks an eligible NEW lead");
+      assert.equal(result.total, 2, "future scheduled leads remain ineligible");
+    }
+    const filtered = await request(path.replace("queue=ALL", "queue=Follow%20up"), "", business, undefined, headers);
+    assert.equal(filtered.status, 200);
+    const filteredLead = (await filtered.json()).leads[0];
+    assert.equal(filteredLead.status, "Follow up", "the employee's selected status filter remains authoritative");
+    assert.notEqual(filteredLead._id, String(fresh._id));
+    await Lead.updateOne({ _id: fresh._id }, { $set: { comments: [{ authorType: "employee", authorName: code, body: "Synthetic completed contact", createdAt: new Date() }] } });
+    const next = await request(path, "", business, undefined, headers);
+    assert.equal(next.status, 200);
+    const remaining = await next.json();
+    assert.equal(remaining.leads[0]._id, String(due._id));
+    assert.ok(remaining.leads.every((row: { _id: string }) => row._id !== String(future._id)));
+  });
+});
+
+test("bounded duplicate-phone summaries preserve comment cooldown, formatting and invalid-date blocking", async () => {
+  const code = "synthetic-phone-summaries";
+  await setBusinessAccessForEmployeeCode(code, ["auth-a", "auth-b"]);
+  for (const business of ["auth-a", "auth-b"]) await runWithBusiness(business, async () => {
+    const employee = await Employee.create({ employeeCode: code, name: code, status: "Active", role: "Sales" });
+    const now = Date.now();
+    const cases = [
+      { recent: true, allowed: false }, { old: true, allowed: true }, { invalid: true, allowed: false },
+      { admin: true, allowed: true }, { due: true, old: true, allowed: true },
+      { due: true, recent: true, allowed: false }, { unrelatedPrefix: true, recent: true, allowed: true },
+    ];
+    const expected: string[] = [];
+    for (const [index, scenario] of cases.entries()) {
+      const phone = `1202555013${index}`;
+      const candidate = await Lead.create({ assignedAgent: employee._id, assignedAgentName: code, phone,
+        businessName: `Synthetic phone summary ${index}`, status: scenario.due ? "Follow up" : "NEW",
+        ...(scenario.due ? { followUpAt: new Date(now - 60_000) } : {}) });
+      const duplicate = await Lead.create({ businessName: `Synthetic phone evidence ${index}`, status: "Qualified",
+        phone: scenario.unrelatedPrefix ? `44${phone.slice(1)}` : `+1 (202) 555-013${index}`,
+        comments: [{ authorType: scenario.admin ? "admin" : "employee", authorName: "Synthetic actor", body: "Synthetic evidence",
+          createdAt: new Date(now - (scenario.old ? 25 * 3600000 : 1000)) }] });
+      if (scenario.invalid) await Lead.collection.updateOne({ _id: duplicate._id }, { $set: { "comments.0.createdAt": null } });
+      if (scenario.allowed) expected.push(String(candidate._id));
+    }
+    const path = `/my-leads?employeeId=${employee._id}&tab=my&queue=ALL&limit=50&autoCallEligible=true`;
+    const headers = { "X-CRM-Attendance-Session": createAttendanceHubSession(code)! };
+    for (let refresh = 0; refresh < 2; refresh++) {
+      const response = await request(path, "", business, undefined, headers);
+      assert.equal(response.status, 200);
+      const result = await response.json();
+      assert.deepEqual(result.leads.map((row: { _id: string }) => row._id).sort(), expected.sort());
+    }
+  });
+});
+
 test("legacy guard denies missing, forged and expired credentials for every private route family", async () => {
   for (const path of ["/employees", "/roles", "/teams", "/tasks", "/leads", "/admin-leads", "/my-leads", "/knowledge-base", "/media", "/features", "/system-settings", "/notices", "/leave-requests", "/evaluations", "/reports/agent-productivity", "/messages/conversations", "/attendance", "/attendance-hub/days", "/call-dashboard", "/dashboard-workspace/summary", "/log/call-stats", "/call-bridge/status"]) {
     const attempts: Record<string, string>[] = [{}, { "X-CRM-User-Type": "admin", "X-CRM-User-Code": "synthetic-full", "X-CRM-Admin-Session": "forged" }];
@@ -119,6 +187,94 @@ test("the real employee dashboard lead endpoints work in both businesses and can
     const logsResponse = await request("/leads/employee-logs?employee=synthetic-other", "synthetic-owner", business);
     assert.equal(logsResponse.status, 200); const logs = await logsResponse.json();
     assert.ok(logs.length > 0); assert.ok(logs.every((row: { employeeName: string }) => row.employeeName === "synthetic-owner"));
+  }
+});
+
+test("sales employees can pass only their own selected lead to active sales in the same business", async () => {
+  const patch = (business: string, lead: string, agent: string, code = "synthetic-owner") => fetch(`${base}/api/leads/${lead}/assign`, {
+    method: "PATCH", headers: { "Content-Type": "application/json", "X-Business-Id": business,
+      "X-CRM-Attendance-Session": tokens[code]?.attendanceHubSession || "", "X-CRM-User-Type": "admin" },
+    body: JSON.stringify({ assignedAgent: agent, activityActorName: "Forged admin", activityActorType: "admin" }),
+  });
+  for (const business of ["auth-a", "auth-b"]) {
+    const [own, other] = ids[business];
+    const leads = await runWithBusiness(business, async () => {
+      const ownLead = await Lead.create({ businessName: `Synthetic pass ${business}`, phone: "+12025550110", assignedAgent: own,
+        assignedAgentName: "synthetic-owner", status: "NEW", comments: [{ authorName: "synthetic-owner", authorType: "employee", body: "Synthetic handoff" }] });
+      const duplicate = await Lead.create({ businessName: `Synthetic other copy ${business}`, phone: "+12025550110", assignedAgent: other,
+        assignedAgentName: "synthetic-other", status: "NEW" });
+      const archived = await Lead.create({ businessName: `Synthetic archived pass ${business}`, assignedAgent: own, status: "Archived" });
+      const inactive = await Employee.create({ employeeCode: `synthetic-inactive-${business}`, name: "Synthetic inactive", status: "Paused", role: "Sales" });
+      const nonSales = await Employee.create({ employeeCode: `synthetic-nonsales-${business}`, name: "Synthetic HR", status: "Active", role: "Human Resources" });
+      return { own: String(ownLead._id), duplicate: String(duplicate._id), archived: String(archived._id),
+        inactive: String(inactive._id), nonSales: String(nonSales._id) };
+    });
+    assert.equal((await patch(business, leads.duplicate, own)).status, 403, "a spoofed header cannot reassign someone else's lead");
+    assert.equal((await patch(business, leads.own, own)).status, 400, "a self-handoff is not a new assignment");
+    assert.equal((await patch(business, leads.own, ids[business === "auth-a" ? "auth-b" : "auth-a"][1])).status, 400, "target must exist in the selected business");
+    assert.equal((await patch(business, leads.own, leads.inactive)).status, 400, "employee cannot pass to inactive sales");
+    assert.equal((await patch(business, leads.own, leads.nonSales)).status, 400, "target must be sales");
+    assert.equal((await patch(business, leads.archived, other)).status, 409, "archived leads cannot be passed");
+    const response = await patch(business, leads.own, other);
+    assert.equal(response.status, 200);
+    const updated = await response.json();
+    assert.equal(String(updated.assignedAgent._id), other);
+    assert.equal(updated.assignedAgentName, "synthetic-other");
+    assert.equal(updated.comments.at(-1).body, "Synthetic handoff");
+    assert.equal(updated.activity.at(-1).actorType, "employee");
+    assert.equal(updated.activity.at(-1).actorName, "synthetic-owner");
+    await runWithBusiness(business, async () => {
+      const duplicate = await Lead.findById(leads.duplicate).lean();
+      assert.equal(String(duplicate!.assignedAgent), other);
+      assert.equal(duplicate!.activity.length, 0, "passing a selected lead must not rewrite another employee's duplicate");
+      assert.equal(String((await Lead.findById(leads.own).lean())!.assignedAgent), other, "the new assignment survives a fresh read");
+    });
+    assert.equal((await patch(business, leads.own, own)).status, 403, "the old owner loses write access immediately");
+  }
+});
+
+test("concurrent employee passes have one winner, preserve history, and do not affect attendance or dashboards", async () => {
+  for (const business of ["auth-a", "auth-b"]) {
+    const [own, other] = ids[business];
+    const lead = await runWithBusiness(business, () => Lead.create({ businessName: `Synthetic race ${business}`,
+      assignedAgent: own, assignedAgentName: "synthetic-owner", status: "NEW", comments: [
+        { authorName: "synthetic-owner", authorType: "employee", body: "Keep this synthetic comment" },
+      ] }));
+    const pass = () => fetch(`${base}/api/leads/${lead._id}/assign`, { method: "PATCH", headers: {
+      "Content-Type": "application/json", "X-Business-Id": business,
+      "X-CRM-Attendance-Session": tokens["synthetic-owner"].attendanceHubSession!,
+    }, body: JSON.stringify({ assignedAgent: other }) });
+    const responses = await Promise.all([pass(), pass()]);
+    assert.equal(responses.filter(response => response.status === 200).length, 1);
+    assert.ok(responses.some(response => [403, 409].includes(response.status)));
+    await runWithBusiness(business, async () => {
+      const saved = await Lead.findById(lead._id).lean();
+      assert.equal(String(saved!.assignedAgent), other);
+      assert.equal(saved!.activity.filter(item => item.label === "Assigned").length, 1);
+      assert.equal(saved!.comments.length, 1);
+      assert.equal(saved!.comments[0].body, "Keep this synthetic comment");
+      const { Attendance } = await import("../models/Attendance");
+      assert.equal(await Attendance.countDocuments(), 0, "lead handoffs never create attendance events");
+    });
+    for (const route of ["/dashboard-workspace/summary?preset=today", "/call-dashboard"]) {
+      assert.equal((await request(route, "synthetic-full", business)).status, 200);
+    }
+    assert.equal((await request(`/employees/${own}/attendance/session`, "synthetic-owner", business)).status, 200);
+  }
+});
+
+test("legacy name-owned passes still work, while employee bulk and automatic reassignment remain forbidden", async () => {
+  for (const business of ["auth-a", "auth-b"]) {
+    const [, other] = ids[business];
+    const lead = await runWithBusiness(business, () => Lead.create({ businessName: `Synthetic name-only ${business}`,
+      assignedAgent: null, assignedAgentName: "synthetic-owner", status: "NEW" }));
+    const headers = { "Content-Type": "application/json", "X-Business-Id": business,
+      "X-CRM-Attendance-Session": tokens["synthetic-owner"].attendanceHubSession! };
+    const response = await fetch(`${base}/api/leads/${lead._id}/assign`, { method: "PATCH", headers, body: JSON.stringify({ assignedAgent: other }) });
+    assert.equal(response.status, 200);
+    for (const path of ["/leads/reassign-new", "/leads/bulk/assign", `/leads/${lead._id}/auto-assign`]) {
+      assert.equal((await fetch(base + "/api" + path, { method: "PATCH", headers, body: JSON.stringify({ assignedAgent: other }) })).status, 403);
+    }
   }
 });
 test("independent transports fail closed without their actual credentials, and the known development extension key is rejected", async () => {

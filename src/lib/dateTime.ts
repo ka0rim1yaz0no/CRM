@@ -176,6 +176,9 @@ export function parseLeadScheduleDateTimeInput(value: string) {
     }
 
     const [, year, month, day, hour, minute] = match;
+    const calendar = new Date(`${year}-${month}-${day}T00:00:00Z`);
+    if (calendar.getUTCFullYear() !== Number(year) || calendar.getUTCMonth() + 1 !== Number(month) || calendar.getUTCDate() !== Number(day) ||
+        Number(hour) > 23 || Number(minute) > 59) return null;
     return zonedDateTimeToUtc(
         Number(year),
         Number(month),

@@ -17,6 +17,7 @@ import { syncCallBridgeBusinessIds } from "../services/callBridgeBusinessService
 import { isTrackerOnlyAdminCode } from "../config/adminUsers";
 import { syncEmployeeCurrentPayrollAcrossBusinesses } from "./payrollController";
 import { syncEmployeeAttendanceAcrossBusinesses } from "../services/employeeAttendanceSyncService";
+import { assignmentActor, leadRecipients, uniquelyOwnedLegacyNames } from "../services/leadAssignment";
 
 function toSalary(value: unknown) {
   const salary = Number(value);
@@ -77,7 +78,7 @@ async function syncEmployeeNameReferences(employeeCode: string, businessAccessId
       if (!employee) return;
       await Promise.all([
         Lead.updateMany(
-          { $or: [{ assignedAgent: employee._id }, { assignedAgentName: previousName }] },
+          { $or: [{ assignedAgent: employee._id }, ...(await uniquelyOwnedLegacyNames(String(employee._id), [previousName])).map(name => ({ assignedAgent: null, assignedAgentName: name }))] },
           { $set: { assignedAgentName: nextName } }
         ),
         Lead.updateMany(
@@ -320,6 +321,12 @@ async function syncSharedEmployeeFields(
 }
 
 export async function listEmployees(request: Request, response: Response) {
+  if (request.query.leadRecipients === "true") {
+    if (!await assignmentActor(request, response)) return;
+    response.set("Cache-Control", "no-store");
+    response.json((await leadRecipients()).map(employee => employeeResponse(employee, { private: false, adminSummary: false })));
+    return;
+  }
   const secure = securityDataMinimizationEnabled();
   const admin = Boolean(verifyAdminDashboardSession(request.header("x-crm-admin-session")));
   const isSummary = secure ? !(admin && String(request.query.summary).toLowerCase() === "false")
