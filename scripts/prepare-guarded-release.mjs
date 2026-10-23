@@ -46,6 +46,8 @@ const additions = ['docs/guarded-online-activation.md', 'scripts/attendance-roll
   'src/components/EmployeeLeadSelection.tsx', 'src/components/EmployeeLeadArchiveDialog.tsx',
   'scripts/current-call-display-browser.mjs', 'scripts/lead-phone-cleanup.mjs',
   'src/lib/attendanceUndo.ts', 'scripts/attendance-undo-ui.test.mjs', 'backend/src/services/attendanceUndo.integration.test.ts',
+  'src/lib/attendanceMissingTimeOut.ts', 'scripts/attendance-missing-time-out.test.mjs', 'scripts/attendance-missing-time-out-browser.mjs',
+  'backend/src/services/attendanceMissingTimeOut.integration.test.ts',
   'src/lib/leadWorkspaceCache.ts', 'scripts/lead-live-workspace.test.mjs', 'scripts/lead-live-workspace-browser.mjs', 'scripts/attendance-undo-browser.mjs'];
 const safe = file => !file.split(/[\\/]/).some(part => ['.git', 'node_modules', 'outputs', 'uploads', 'logs', 'dist'].includes(part) || part.startsWith('.env')) &&
   !/\.(?:pem|key|pfx|p12|bson|archive|gcm|log|zip|rar|7z|tgz)$/i.test(file);
