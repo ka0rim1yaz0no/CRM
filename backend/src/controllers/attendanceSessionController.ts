@@ -145,7 +145,8 @@ export async function getAttendanceHistory(request: Request, response: Response)
     const policy = await attendancePolicy(identity.canonicalBusinessId);
     const snapshot = withAttendanceStatuses(attendanceSnapshot(await readAttendanceLedger(identity)), policy.graceMinutes);
     let records = snapshot.records.map((event) => ({ _id: event.id, employee: identity.employeeId, source: event.source,
-      timeIn: event.at, createdAt: event.recordedAt, eventId: event.id, attendanceStatus: event.attendanceStatus,
+      timeIn: event.at, createdAt: event.recordedAt, eventId: event.id, sequence: event.sequence, attendanceStatus: event.attendanceStatus,
+      ...(event.shiftDayKey ? { shiftDayKey: event.shiftDayKey } : {}),
       ...(event.autoTimeOut ? { autoTimeOut: true } : {}) } )).reverse();
     if (request.query.from) records = records.filter((event) => event.timeIn >= String(request.query.from));
     if (request.query.to) records = records.filter((event) => event.timeIn <= String(request.query.to));
@@ -177,6 +178,7 @@ export async function getScopedAttendanceList(request: Request, response: Respon
       if (!policy) { policy = await attendancePolicy(ledger.canonicalBusinessId); policies.set(ledger.canonicalBusinessId, policy); }
       const projection = projectAttendance(ledger.events, ledger.corrections, ledger.closures);
       records.push(...withAttendanceStatuses({ records: projection.effectiveEvents, sessions: projection.sessions }, policy.graceMinutes).records.map((event) => ({ _id: event.id, employee: String(scope.employee._id), eventId: event.id, source: event.source, timeIn: event.at, createdAt: event.recordedAt, attendanceStatus: event.attendanceStatus,
+        sequence: event.sequence, ...(event.shiftDayKey ? { shiftDayKey: event.shiftDayKey } : {}),
         ...(event.autoTimeOut ? { autoTimeOut: true } : {}) })));
     }
     const from = request.query.from ? new Date(String(request.query.from)) : request.query.all === "true" ? null : new Date(Date.now() - 72 * 3_600_000);

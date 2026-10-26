@@ -19,6 +19,10 @@ import { Employee } from "../models/Employee";
 import type { PayrollItemCategory, PayrollListItemDocument, PayrollPayType, PayrollStatus } from "../models/Payroll";
 import { PayrollListItem, PayrollRecord } from "../models/Payroll";
 import { getCurrencyCode, getSystemSettings } from "./systemSettingsController";
+import { savedPayrollPeriod, isConfiguredSavedPayrollPeriod } from "../../../shared/payrollPeriod";
+import { EmployeePaymentHistoryPolicy } from "../models/EmployeePaymentHistoryPolicy";
+import { payrollReadGroups } from "../services/payrollReadPolicy";
+import { payrollReplicaMismatchDays } from "../services/payrollReplicaEvidence";
 
 const categories: PayrollItemCategory[] = ["Payroll Runs", "Payouts", "Deductions", "Tax Settings"];
 const statuses: PayrollStatus[] = ["Paid", "Pending", "Failed", "Completed", "Review", "Applied", "Enabled"];
@@ -200,7 +204,7 @@ export function scheduledPayDateForPeriod(payPeriod: string, settings?: PayrollC
   return new Date(end.getFullYear(), payDateMonth, clampDay(matchingRange.payDay, end.getFullYear(), payDateMonth));
 }
 
-function currentPeriod(cycle = "Monthly", settings?: PayrollCutoffSettings) {
+export function currentPeriod(cycle = "Monthly", settings?: PayrollCutoffSettings) {
   if (cycle === "Semi-monthly") {
     const cutoff = resolveCurrentCutoff(cycle, settings);
     if (cutoff) return `${formatPeriodDate(cutoff.start)} - ${formatPeriodDate(cutoff.end)}`;
@@ -560,6 +564,13 @@ export function payrollRatesForCutoff(monthlySalaryValue: number, payPeriod: str
 }
 
 export function periodRange(payPeriod: string) {
+  if (/^\d{4}-\d{2}-\d{2}\s+-\s+\d{4}-\d{2}-\d{2}$/.test(payPeriod.trim())) {
+    const period = savedPayrollPeriod(payPeriod);
+    if (!period) throw new PayrollValidationError("Invalid saved payroll cutoff dates; review the record.");
+    const localDate = (key: string) => { const [year, month, day] = key.split("-").map(Number); return new Date(year, month - 1, day); };
+    const end = localDate(period.end); end.setDate(end.getDate() + 1);
+    return { start: localDate(period.start), end };
+  }
   const now = new Date();
   const explicitRange = payPeriod.match(/^([A-Za-z]+ \d{1,2}, \d{4})\s+-\s+([A-Za-z]+ \d{1,2}, \d{4})$/);
   if (explicitRange) {
@@ -811,12 +822,13 @@ async function accurateAttendancePayrollDtr(employeeId: Types.ObjectId, payPerio
       canonical[key] = [...(canonical[key] || []), ...session.events.map(event => ({ source: event.source, timeIn: new Date(event.at), sequence: event.sequence }))];
       if (session.lifecycle === "system-closed" && session.endedAt) closingBoundariesByDay.set(key, [...(closingBoundariesByDay.get(key) || []), new Date(session.endedAt)]);
     }
-    const fingerprint = (items: Array<{ source: string; timeIn: Date }>) => JSON.stringify(items.map(item => [item.source, item.timeIn.toISOString()]));
+    const assignedDays = new Map(projected.sessions.flatMap(item => item.events.map(event => [event.id, item.shift?.dayKey || attendanceSlotKey(item.startedAt, settings)] as const)));
+    const effectiveEvidence = projected.effectiveEvents.map(event => ({ eventId: event.id, source: event.source, timeIn: new Date(event.at),
+      dayKey: assignedDays.get(event.id) || attendanceSlotKey(event.at, settings) }));
     for (const businessId of ledger.businessIds) await runWithBusiness(businessId, async () => {
       const copyEmployee = await Employee.findOne({ employeeCode: employee.employeeCode }, null, session ? { session } : undefined).select("_id").lean();
       if (!copyEmployee) { keys.forEach(key => mismatches.add(key)); return; }
-      const replica = groupPayrollAttendanceBySlot(await readCopy(copyEmployee._id), settings);
-      for (const key of keys) if (fingerprint(replica[key] || []) !== fingerprint(canonical[key] || [])) mismatches.add(key);
+      for (const key of payrollReplicaMismatchDays(effectiveEvidence, await readCopy(copyEmployee._id), keys, at => attendanceSlotKey(at, settings))) mismatches.add(key);
     });
     for (const issue of projected.blockingIssues) {
       const event = ledger.events.find(event => event.id === issue.eventId);
@@ -1314,25 +1326,96 @@ export async function updatePayrollOvertime(request: Request, response: Response
   response.json(responseRecord || sourceRecord);
 }
 
-export async function listPayrollStats(_request: Request, response: Response) {
+async function accuratePayrollReadForPeriod(employeeCodes: string[], payPeriod: string) {
+  const period = savedPayrollPeriod(payPeriod);
+  if (!period) throw new PayrollValidationError("Choose a dated payroll cutoff.");
+  const saved = await PayrollRecord.find({ isArchived: false, employeeId: { $in: employeeCodes } }).maxTimeMS(5000).lean();
+  const groups = payrollReadGroups(saved).groups.filter(group => group.period.start === period.start && group.period.end === period.end);
+  return { records: groups.flatMap(group => group.record ? [{ ...group.record, requiresReview: group.requiresReview }] : []),
+    reviewCount: groups.filter(group => group.requiresReview).length, groups };
+}
+
+export async function payrollCutoffView() {
+  const settings = await getSystemSettings();
+  const currentPayPeriod = currentPeriod(settings.payrollBillingCycle, settings);
+  const policy = await EmployeePaymentHistoryPolicy.findById("employee-payment-history").lean();
+  const employees = await Employee.find({ status: { $ne: "Archived" } }).select("employeeCode").lean();
+  const records = await PayrollRecord.find({ isArchived: false, employeeId: { $in: employees.map(employee => employee.employeeCode) } }).maxTimeMS(5000).lean();
+  const options = new Map<string, { payPeriod: string; start: string; end: string; recordedEmployees: number; visibleEmployees?: number }>();
+  for (const group of payrollReadGroups(records).groups) {
+    if ((policy && group.period.start < policy.fromDate) || !isConfiguredSavedPayrollPeriod(group.period, settings)) continue;
+    const option = options.get(group.period.label) || { payPeriod: group.period.label, start: group.period.start, end: group.period.end, recordedEmployees: 0 };
+    if (group.record) option.recordedEmployees++;
+    options.set(option.payPeriod, option);
+  }
+  const current = savedPayrollPeriod(currentPayPeriod);
+  if (current && (!policy || current.start >= policy.fromDate) && !options.has(current.label)) {
+    options.set(current.label, { payPeriod: current.label, start: current.start, end: current.end, recordedEmployees: 0 });
+  }
+  const items = [...options.values()].sort((a, b) => b.start.localeCompare(a.start) || b.end.localeCompare(a.end));
+  for (const item of items) item.visibleEmployees = item.payPeriod === currentPayPeriod ? employees.length : item.recordedEmployees;
+  return { currentPayPeriod, defaultPayPeriod: currentPayPeriod, historyFrom: policy?.fromDate || null, items };
+}
+
+async function payrollReadPeriod(requested: unknown, settings: Awaited<ReturnType<typeof getSystemSettings>>) {
+  const explicit = String(requested || "").trim();
+  if (!payrollAccuracyEnabled()) return explicit || currentPeriod(settings.payrollBillingCycle, settings);
+  const view = await payrollCutoffView();
+  if (!explicit) return view.defaultPayPeriod;
+  const period = savedPayrollPeriod(explicit);
+  if (!period || !isConfiguredSavedPayrollPeriod(period, settings) || (view.historyFrom && period.start < view.historyFrom)) {
+    throw new PayrollValidationError("Choose a configured payroll cutoff within the saved history boundary.");
+  }
+  return period.label;
+}
+
+export async function listPayrollCutoffs(_request: Request, response: Response) {
+  if (!payrollAccuracyEnabled()) { response.status(404).json({ message: "Payroll accuracy is disabled" }); return; }
+  response.setHeader("Cache-Control", "no-store");
+  response.json(await payrollCutoffView());
+}
+
+export async function listPayrollRosterGaps(request: Request, response: Response) {
+  if (!payrollAccuracyEnabled()) { response.status(404).json({ message: "Payroll accuracy is disabled" }); return; }
+  const settings = await getSystemSettings(), payPeriod = await payrollReadPeriod(request.query.payPeriod, settings);
+  response.setHeader("Cache-Control", "no-store");
+  if (payPeriod !== currentPeriod(settings.payrollBillingCycle, settings)) { response.json([]); return; }
+  const employees = await Employee.find({ status: { $ne: "Archived" } }).select("employeeCode name email team").lean();
+  const read = await accuratePayrollReadForPeriod(employees.map(employee => employee.employeeCode), payPeriod);
+  const savedCodes = new Set(read.records.map(record => record.employeeId));
+  const conflictingCodes = new Set(read.groups.filter(group => !group.record).map(group => group.records[0].employeeId));
+  const term = String(request.query.search || "").trim().toLowerCase(), status = String(request.query.status || "");
+  const rows = employees.filter(employee => !savedCodes.has(employee.employeeCode)).map(employee => ({ employeeId: employee.employeeCode,
+    employeeName: employee.name, email: employee.email || "", department: employee.team || "", payPeriod,
+    state: conflictingCodes.has(employee.employeeCode) ? "conflict" : "not-generated" }));
+  response.json(rows.filter(row => (!term || [row.employeeName, row.employeeId, row.email, row.department].some(value => value.toLowerCase().includes(term))) &&
+    (!status || (status === "Not generated" && row.state === "not-generated") || (status === "Review required" && row.state === "conflict"))));
+}
+
+export async function listPayrollStats(request: Request, response: Response) {
   if (!payrollAccuracyEnabled()) await seedPayroll();
   const settings = await getSystemSettings();
-  const payPeriod = currentPeriod(settings.payrollBillingCycle, settings);
+  const payPeriod = await payrollReadPeriod(request.query.payPeriod, settings);
   await syncEmployeePayrollRecords(payPeriod);
   const activeEmployees = await Employee.find({ status: { $ne: "Archived" } }).select("employeeCode");
   const activeEmployeeCodes = activeEmployees.map((employee) => employee.employeeCode);
-  const records = await PayrollRecord.find({ isArchived: false, employeeId: { $in: activeEmployeeCodes }, payPeriod });
+  const read = payrollAccuracyEnabled() ? await accuratePayrollReadForPeriod(activeEmployeeCodes, payPeriod) : null;
+  const records = read?.records || await PayrollRecord.find({ isArchived: false, employeeId: { $in: activeEmployeeCodes }, payPeriod });
   const totalEmployees = activeEmployeeCodes.length;
   const gross = records.reduce((sum, record) => sum + record.grossPay, 0);
   const deductions = records.reduce((sum, record) => sum + record.deductions, 0);
   const net = records.reduce((sum, record) => sum + record.netPay, 0);
 
   response.json({
+    payPeriod,
+    recordedEmployees: records.length,
+    unrecordedEmployees: Math.max(0, totalEmployees - records.length),
     totalEmployees: totalEmployees || records.length,
     totalPayroll: gross,
     totalDeductions: deductions,
     netPayroll: net,
     paidEmployees: records.filter((record) => record.status === "Paid").length,
+    reviewCount: read?.reviewCount || 0,
   });
 }
 
@@ -1340,7 +1423,7 @@ export async function listPayrollRecords(request: Request, response: Response) {
   if (!payrollAccuracyEnabled()) await seedPayroll();
   const settings = await getSystemSettings();
   const showArchived = String(request.query.archived || "") === "true";
-  const requestedPayPeriod = String(request.query.payPeriod || (showArchived ? "" : currentPeriod(settings.payrollBillingCycle, settings))).trim();
+  const requestedPayPeriod = showArchived ? String(request.query.payPeriod || "").trim() : await payrollReadPeriod(request.query.payPeriod, settings);
 
   if (!showArchived) {
     await syncEmployeePayrollRecords(requestedPayPeriod || currentPeriod(settings.payrollBillingCycle, settings));
@@ -1353,6 +1436,21 @@ export async function listPayrollRecords(request: Request, response: Response) {
   const sortDir = String(request.query.sortDir || "asc") === "desc" ? -1 : 1;
   const sortableFields = new Set(["employeeName", "employeeId", "department", "payType", "grossPay", "deductions", "netPay", "status", "paidOn", "payPeriod"]);
   const filter: Record<string, unknown> = { isArchived: showArchived };
+
+  if (payrollAccuracyEnabled() && ["Not generated", "Review required"].includes(status)) { response.json([]); return; }
+
+  if (payrollAccuracyEnabled() && !showArchived && savedPayrollPeriod(payPeriod)) {
+    const employees = await Employee.find({ status: { $ne: "Archived" } }).select("employeeCode").lean();
+    const read = await accuratePayrollReadForPeriod(employees.map(employee => employee.employeeCode), payPeriod);
+    const term = search.toLowerCase();
+    const records = read.records.filter(record => (!statuses.includes(status as PayrollStatus) || record.status === status || (status === "Pending" && record.status === "Review")) &&
+      (!term || [record.employeeName, record.email, record.employeeId, record.department].some(value => String(value || "").toLowerCase().includes(term))));
+    const key = (sortableFields.has(sortBy) ? sortBy : "employeeId") as keyof typeof records[number];
+    records.sort((a, b) => { const first = a[key], second = b[key];
+      return (typeof first === "number" && typeof second === "number" ? first - second : String(first ?? "").localeCompare(String(second ?? ""))) * sortDir || String(a._id).localeCompare(String(b._id)); });
+    response.setHeader("X-Payroll-Review-Count", String(read.reviewCount));
+    response.json(records); return;
+  }
 
   if (!showArchived) {
     const activeEmployees = await Employee.find({ status: { $ne: "Archived" } }).select("employeeCode");

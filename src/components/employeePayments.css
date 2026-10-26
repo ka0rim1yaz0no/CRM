@@ -1,0 +1,38 @@
+.employee-payments{color:var(--profile-text,var(--text-color,#e8edf5));min-width:0;letter-spacing:0}
+:root[data-theme^=light-] .employee-payments,:root[data-theme^=mail-] .employee-payments{--profile-text:#17202a;--profile-muted:#475569;--profile-border:#748094}
+.profile-v2 .profile-tabs:has(#profile-tab-payments){flex-wrap:wrap;overflow-x:visible}
+.employee-payments-heading{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;padding:16px 0}
+.employee-payments .employee-payments-heading h2{font-size:18px;line-height:1.4;margin:0;font-weight:650}
+.employee-payments p{font-size:13px;line-height:1.6;color:var(--profile-muted,#b8c4d9);overflow-wrap:anywhere}
+.employee-payments-heading p{margin:5px 0 0}.employee-payments-heading p span{padding:0 5px}
+.employee-payments-controls{display:flex;align-items:flex-end;gap:10px;flex-shrink:0}.employee-payments-controls label{font-size:12px;color:var(--profile-muted,#b8c4d9)}.employee-payments-controls select{display:block;min-height:36px;max-width:100%;padding:5px 28px 5px 8px;margin-top:4px;border:1px solid var(--profile-border,#74839c);border-radius:4px;background:var(--panel-bg,#17121e);color:var(--profile-text,#e8edf5);font-size:13px}
+@media(max-width:560px){.employee-payments-heading{flex-wrap:wrap}.employee-payments-controls{max-width:100%}}
+.employee-payments button{width:36px;height:36px;display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--profile-border,#74839c);border-radius:4px;background:var(--panel-bg,#17121e);color:inherit;flex-shrink:0;cursor:pointer}
+.employee-payments button:disabled{opacity:.55;cursor:not-allowed}.employee-payments :focus-visible{outline:2px solid var(--primary-text,#c4b5fd);outline-offset:3px}
+.employee-payments-start{margin:0 0 18px}.employee-payments-empty{padding:28px 0;border-top:1px solid var(--profile-border,#74839c)}
+.employee-payments .employee-payments-error{color:var(--profile-text,#e8edf5);padding:12px;border-left:3px solid #e49a35;background:var(--panel-bg,#17121e);margin-bottom:12px}
+.employee-payment-column-head,.employee-payment summary{display:grid;grid-template-columns:minmax(200px,2fr) repeat(3,minmax(105px,1fr)) minmax(72px,.7fr) 18px;gap:16px;align-items:center}
+.employee-payment-column-head{font-size:12px;color:var(--profile-muted,#b8c4d9);padding:10px 12px;border-bottom:1px solid var(--profile-border,#74839c)}
+.employee-payment-column-head>span:nth-child(n+2):nth-child(-n+4){text-align:right}
+.employee-payment{border-bottom:1px solid var(--profile-border,#74839c);min-width:0}
+.employee-payment summary{font-size:13px;line-height:1.5;padding:18px 12px;cursor:pointer;list-style:none;min-height:72px}
+.employee-payment summary::-webkit-details-marker{display:none}.employee-payment summary:hover{background:var(--panel-bg,#17121e)}
+.employee-payment-cutoff{font-weight:600;overflow-wrap:anywhere;min-width:0}
+.employee-payment-amount{text-align:right;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}.employee-payment-amount small{display:none}
+.employee-payment-status{color:#a54705;background:#fff0d3;border:1px solid #e2bd80;font-size:12px;border-radius:4px;justify-self:start;padding:2px 7px;overflow-wrap:anywhere;max-width:100%}
+.employee-payment-status[data-paid=true]{color:#156345;background:#e0f5e9;border-color:#91bda3}
+.employee-payment-status{display:inline-flex;align-items:center;gap:5px}.employee-payment-status svg{width:13px;height:13px;flex-shrink:0}
+.employee-payment summary>svg{width:16px;height:16px}.employee-payment[open] summary>svg{transform:rotate(180deg)}
+.employee-payment-details{padding:8px 12px 20px;background:var(--surface-bg,#211923);min-width:0}
+.employee-payment-breakdown{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:28px;padding-top:14px}
+.employee-payment-breakdown h3{font-size:14px;font-weight:650;margin:0 0 12px}
+.employee-payment dl{margin:0}.employee-payment-breakdown dl>div{display:flex;align-items:baseline;justify-content:space-between;gap:12px;padding:6px 0;font-size:13px;line-height:1.5}
+.employee-payment dt{color:var(--profile-muted,#b8c4d9);overflow-wrap:anywhere;min-width:0}.employee-payment dt span{font-size:12px;white-space:nowrap;margin-left:4px}
+.employee-payment dd{margin:0;text-align:right;font-variant-numeric:tabular-nums;overflow-wrap:anywhere;min-width:0}
+.employee-payment-total{border-top:1px solid var(--profile-border,#74839c);margin-top:8px;font-weight:650}
+.employee-payment-meta{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:18px 24px;padding:20px 0;border-top:1px solid var(--profile-border,#74839c);margin-top:20px!important;font-size:12px;line-height:1.6}
+.employee-payment-meta dd{text-align:left;font-size:13px;margin-top:3px}
+.employee-payment-net{display:flex;align-items:center;justify-content:space-between;gap:16px;border-top:1px solid var(--profile-border,#74839c);padding-top:16px;font-size:15px}.employee-payment-net strong{font-size:20px;font-variant-numeric:tabular-nums}
+.employee-payment-pagination{display:flex;align-items:center;justify-content:flex-end;gap:14px;font-size:13px;padding:18px 0}
+@media(max-width:1050px){.employee-payment-column-head{display:none}.employee-payment summary{grid-template-columns:repeat(3,minmax(0,1fr)) 18px;gap:12px}.employee-payment-cutoff{grid-column:1/3}.employee-payment-status{grid-column:3;grid-row:1;justify-self:end}.employee-payment summary>svg{grid-column:4;grid-row:1}.employee-payment-amount{grid-row:2;text-align:left}.employee-payment-amount small{display:block;font-weight:400;color:var(--profile-muted,#b8c4d9);font-size:11px;margin-bottom:3px}.employee-payment-breakdown{grid-template-columns:1fr 1fr}.employee-payment-breakdown>section:last-child{grid-column:1/-1}.employee-payment-meta{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:560px){.employee-payment summary{padding:16px 0;column-gap:8px}.employee-payment-details{padding:0 0 18px}.employee-payment-breakdown{grid-template-columns:1fr;gap:22px}.employee-payment-breakdown>section:last-child{grid-column:auto}.employee-payment-meta{gap:14px}.employee-payment-net strong{font-size:18px}.employee-payment-amount{font-size:12px}}

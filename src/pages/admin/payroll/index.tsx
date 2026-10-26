@@ -1,11 +1,14 @@
 import type { FormEvent } from "react";
+import { payrollDeductionRows } from "../../../../shared/payrollPresentation";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { useSearchParams } from "react-router";
 import "./payslip-print.css";
 import { capturePayslipPdf, downloadPayslipPdf, openPayslipPdf } from "../../../lib/payslipPdf";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toPng } from "html-to-image";
 import {
+    FiAlertCircle,
     FiBriefcase,
     FiCheck,
     FiCheckCircle,
@@ -31,6 +34,9 @@ import {
 } from "react-icons/fi";
 import AdminLayout from "../adminLayout";
 import PayrollRecomputeDialog from "../../../components/admin/PayrollRecomputeDialog";
+import PayrollHoursDialog from "../../../components/admin/PayrollHoursDialog";
+import PayrollPaymentDialog from "../../../components/admin/PayrollPaymentDialog";
+import { payrollPaymentStatus } from "../../../../shared/payrollPaymentStatus";
 import {
     archivePayrollItem,
     archivePayrollRecord,
@@ -38,6 +44,8 @@ import {
     getPayrollDtr,
     getPayrollItems,
     getPayrollRecords,
+    getPayrollCutoffs,
+    getPayrollRosterGaps,
     getPayrollStats,
     getPayrollAccuracyConfig,
     markPayrollRecordPaid,
@@ -53,14 +61,17 @@ import {
     type PayrollDtr,
     type PayrollListItem,
     type PayrollRecord,
+    type PayrollRosterGap,
     type PayrollStatus,
 } from "../../../api/payroll";
 import { getEmployees, updateEmployeeBankDetails, type Employee } from "../../../api/employees";
 import { getSystemSettings, type SystemSettings } from "../../../api/systemSettings";
 import { DataTableSortHeader } from "../../../components/admin/DataTable";
 import { formatCurrency } from "../../../lib/currency";
+import { formatPayrollHours } from "../../../lib/payrollFormatting";
 import { createDirectConversation, sendMessage, uploadMessageAttachment } from "../../../api/messages";
 import { getAuthUser } from "../../../api/authStorage";
+import { getActiveBusinessId } from "../../../api/businessStorage";
 
 const payrollTabs = ["Employee Payroll", "Bank Accounts", "Payouts", "Deductions", "Tax Settings", "Archived"] as const;
 const payrollNavigation = [
@@ -73,6 +84,7 @@ const payrollNavigation = [
 ] as const;
 const statusOptions: PayrollStatus[] = ["Pending", "Paid", "Failed", "Completed", "Review", "Applied", "Enabled"];
 const payrollErrorMessage = (error: unknown) => (error as { response?: { data?: { message?: string } } })?.response?.data?.message || "Unable to save payroll. Please refresh and try again.";
+const rosterGapLabel = (state: PayrollRosterGap["state"]) => state === "conflict" ? "Review required" : state === "unavailable" ? "Not ready" : "Not generated";
 
 const emptyBankForm = {
     bankName: "",
@@ -313,25 +325,7 @@ function payslipAmountInWords(value: number) {
     return `${numberToWords(Math.floor(cents / 100))} and ${String(cents % 100).padStart(2, "0")}/100`;
 }
 
-function payslipDeductionRows(record: PayrollRecord) {
-    const rows = [
-        { label: "Late", minutes: record.lateMinutes ?? Math.round((record.lateHours ?? 0) * 60) },
-        { label: "Excess lunch", minutes: record.excessLunchMinutes ?? 0 },
-        { label: "Excess break", minutes: record.excessBreakMinutes ?? 0 },
-        { label: "Undertime", minutes: record.earlyTimeOutMinutes ?? 0 },
-        { label: "Absence", minutes: record.absenceMinutes ?? 0 },
-    ];
-    const totalMinutes = rows.reduce((sum, row) => sum + row.minutes, 0);
-    const cents = Math.round(record.deductions * 100);
-    if (!totalMinutes) return [...rows.map(row => ({ ...row, amount: 0 })), ...(cents ? [{ label: "Other saved deductions", minutes: 0, amount: cents / 100 }] : [])];
-    // Allocate only the saved total, in cents; never recalculate attendance or payroll here.
-    const shares = rows.map((row, index) => ({ index, exact: cents * row.minutes / totalMinutes }));
-    const allocated = shares.map(share => Math.floor(share.exact));
-    const remainder = cents - allocated.reduce((sum, amount) => sum + amount, 0);
-    shares.sort((a, b) => (b.exact - Math.floor(b.exact)) - (a.exact - Math.floor(a.exact)) || a.index - b.index);
-    for (let index = 0; index < remainder; index++) allocated[shares[index].index]++;
-    return rows.map((row, index) => ({ ...row, amount: allocated[index] / 100 }));
-}
+function payslipDeductionRows(record: PayrollRecord) { return payrollDeductionRows(record); }
 
 function payslipOutputReady({ record, dtr, fetching, error, accuracyEnabled }: {
     record: PayrollRecord | null; dtr?: PayrollDtr; fetching: boolean; error: boolean; accuracyEnabled?: boolean;
@@ -628,6 +622,8 @@ function ArchivedPanel({
 
 export default function PayrollPage() {
     const queryClient = useQueryClient();
+    const [searchParams, setSearchParams] = useSearchParams();
+    const businessId = getActiveBusinessId();
     const authUser = getAuthUser();
     const [activeTab, setActiveTab] = useState<(typeof payrollTabs)[number]>("Employee Payroll");
     const [search, setSearch] = useState("");
@@ -647,7 +643,7 @@ export default function PayrollPage() {
     const [itemModalOpen, setItemModalOpen] = useState(false);
     const [itemForm, setItemForm] = useState(emptyItemForm);
     const [deleteTarget, setDeleteTarget] = useState<{ type: "record"; record: PayrollRecord } | { type: "item"; item: PayrollListItem } | null>(null);
-    const [paymentTarget, setPaymentTarget] = useState<{ action: "paid" | "unpaid"; record: PayrollRecord } | null>(null);
+    const [paymentTarget, setPaymentTarget] = useState<{ action: "paid" | "unpaid"; record: PayrollRecord; businessId: string } | null>(null);
     const [selectedRecordIds, setSelectedRecordIds] = useState<string[]>([]);
     const [bankEditEmployee, setBankEditEmployee] = useState<Employee | null>(null);
     const [bankForm, setBankForm] = useState(emptyBankForm);
@@ -658,7 +654,15 @@ export default function PayrollPage() {
     const [workedMinutesInput, setWorkedMinutesInput] = useState("");
     const [workedMinutesError, setWorkedMinutesError] = useState("");
     const [recomputeOpen, setRecomputeOpen] = useState(false);
+    const [recomputePeriod, setRecomputePeriod] = useState("");
+    const [hoursTarget, setHoursTarget] = useState<{ record: PayrollRecord; businessId: string } | null>(null);
     const { data: accuracyConfig } = useQuery({ queryKey: ["payroll-accuracy-config"], queryFn: getPayrollAccuracyConfig });
+    const cutoffQuery = useQuery({ queryKey: ["payroll-cutoffs", businessId], queryFn: getPayrollCutoffs, enabled: accuracyConfig?.cutoffSelectionEnabled === true, refetchOnMount: "always" });
+    const requestedPayPeriod = searchParams.get("payPeriod");
+    const selectedPayPeriod = accuracyConfig?.cutoffSelectionEnabled ? requestedPayPeriod && requestedPayPeriod !== "current" ? requestedPayPeriod : cutoffQuery.data?.currentPayPeriod : undefined;
+    const rosterMode = accuracyConfig?.enabled === true && Boolean(selectedPayPeriod) && selectedPayPeriod === cutoffQuery.data?.currentPayPeriod;
+    const cutoffReady = !accuracyConfig?.cutoffSelectionEnabled || Boolean(selectedPayPeriod);
+    const openRecompute = (payPeriod = "") => { setRecomputePeriod(payPeriod); setRecomputeOpen(true); };
 
     const itemCategory = activeTab === "Employee Payroll" || activeTab === "Bank Accounts" || activeTab === "Archived" ? undefined : (activeTab as PayrollItemCategory);
 
@@ -668,15 +672,23 @@ export default function PayrollPage() {
         sortBy,
         sortDir,
         archived: activeTab === "Archived",
+        payPeriod: activeTab === "Archived" ? undefined : selectedPayPeriod,
     };
 
-    const { data: stats } = useQuery({ queryKey: ["payroll-stats"], queryFn: getPayrollStats });
+    const { data: stats } = useQuery({ queryKey: ["payroll-stats", businessId, selectedPayPeriod], queryFn: () => getPayrollStats(selectedPayPeriod), enabled: cutoffReady });
     const { data: systemSettings } = useQuery({ queryKey: ["system-settings"], queryFn: getSystemSettings });
-    const { data: employees = EMPTY_QUERY_ROWS, isLoading: isPayrollLoading, isError: isPayrollError, error: payrollError } = useQuery({
-        queryKey: ["payroll-records", recordQueryParams],
-        queryFn: () => getPayrollRecords(recordQueryParams),
-        enabled: activeTab === "Employee Payroll" || activeTab === "Archived",
+    const { data: employees = EMPTY_QUERY_ROWS, isLoading: areRecordsLoading, isError: areRecordsError, error: recordsError } = useQuery({
+        queryKey: ["payroll-records", businessId, recordQueryParams],
+        queryFn: () => ["Not generated", "Review required", "Not ready"].includes(statusFilter) ? Promise.resolve<PayrollRecord[]>([]) : getPayrollRecords(recordQueryParams),
+        enabled: (activeTab === "Employee Payroll" && cutoffReady) || activeTab === "Archived",
     });
+    const rosterQuery = useQuery({ queryKey: ["payroll-roster-gaps", businessId, selectedPayPeriod, search, statusFilter],
+        queryFn: () => getPayrollRosterGaps({ payPeriod: selectedPayPeriod, search, status: statusFilter === "All statuses" ? undefined : statusFilter }, { businessId, serverRosterEnabled: accuracyConfig?.employeeRosterEnabled === true }),
+        enabled: activeTab === "Employee Payroll" && rosterMode && cutoffReady });
+    const rosterGaps = rosterMode && activeTab === "Employee Payroll" ? rosterQuery.data || EMPTY_QUERY_ROWS : EMPTY_QUERY_ROWS;
+    const isPayrollLoading = areRecordsLoading || (activeTab === "Employee Payroll" && accuracyConfig?.cutoffSelectionEnabled === true && cutoffQuery.isLoading) || (rosterMode && rosterQuery.isLoading);
+    const isPayrollError = areRecordsError || (activeTab === "Employee Payroll" && cutoffQuery.isError) || (rosterMode && rosterQuery.isError);
+    const payrollError = recordsError || cutoffQuery.error || rosterQuery.error;
     const { data: employeeDtr, isLoading: isDtrLoading, isError: isDtrError, error: dtrError } = useQuery({
         queryKey: ["payroll-dtr", dtrRecord?.employeeId, dtrRecord?.payPeriod],
         queryFn: () => getPayrollDtr(dtrRecord?.employeeId || "", dtrRecord?.payPeriod),
@@ -702,6 +714,8 @@ export default function PayrollPage() {
         queryClient.invalidateQueries({ queryKey: ["payroll-records"] });
         queryClient.invalidateQueries({ queryKey: ["payroll-items"] });
         queryClient.invalidateQueries({ queryKey: ["payroll-stats"] });
+        queryClient.invalidateQueries({ queryKey: ["payroll-cutoffs"] });
+        queryClient.invalidateQueries({ queryKey: ["payroll-roster-gaps"] });
     };
 
     const { data: bankEmployees = EMPTY_QUERY_ROWS, isLoading: areBankEmployeesLoading, isError: areBankEmployeesError } = useQuery({
@@ -875,14 +889,29 @@ export default function PayrollPage() {
     const money = (value = 0) => formatCurrency(value, systemSettings?.currencyCode || "PHP");
     const itemLabels = itemCategory ? payrollItemFieldLabels(itemCategory) : null;
 
-    const totalPages = Math.max(Math.ceil(employees.length / pageSize), 1);
-    const visibleEmployees = useMemo(() => employees.slice((page - 1) * pageSize, page * pageSize), [employees, page, pageSize]);
+    const payrollRows = useMemo(() => {
+        const rows: Array<{ record: PayrollRecord; gap?: never } | { record?: never; gap: PayrollRosterGap }> = [
+            ...employees.map(record => ({ record })), ...rosterGaps.map(gap => ({ gap })),
+        ];
+        return rows.sort((a, b) => {
+            const key = sortBy as keyof PayrollRecord;
+            const left = a.record ? a.record[key] : key === "status" ? rosterGapLabel(a.gap.state) : a.gap[key as keyof PayrollRosterGap];
+            const right = b.record ? b.record[key] : key === "status" ? rosterGapLabel(b.gap.state) : b.gap[key as keyof PayrollRosterGap];
+            if (left === undefined || right === undefined) return left === right ? 0 : left === undefined ? 1 : -1;
+            return (typeof left === "number" && typeof right === "number" ? left - right : String(left).localeCompare(String(right))) * (sortDir === "asc" ? 1 : -1);
+        });
+    }, [employees, rosterGaps, sortBy, sortDir]);
+    const totalPages = Math.max(Math.ceil(payrollRows.length / pageSize), 1);
+    const currentPage = Math.min(page, totalPages);
+    const visiblePayrollRows = useMemo(() => payrollRows.slice((currentPage - 1) * pageSize, currentPage * pageSize), [payrollRows, currentPage, pageSize]);
+    const visibleEmployees = visiblePayrollRows.flatMap(row => row.record ? [row.record] : []);
     const visibleEmployeeIds = visibleEmployees.map((employee) => employee._id);
     const selectedRecordIdSet = new Set(selectedRecordIds);
     const areAllVisibleSelected = visibleEmployeeIds.length > 0 && visibleEmployeeIds.every((id) => selectedRecordIdSet.has(id));
 
     const payrollStats = [
-        { label: "Employees", value: String(stats?.totalEmployees ?? employees.length), icon: FiUsers },
+        { label: "Employees", value: String(rosterMode ? stats?.totalEmployees ?? payrollRows.length : stats?.recordedEmployees ?? stats?.totalEmployees ?? employees.length), icon: FiUsers },
+        ...(rosterMode ? [{ label: "Generated", value: String(stats?.recordedEmployees ?? employees.length), icon: FiFileText }] : []),
         { label: "Gross", value: money(stats?.totalPayroll ?? 0), icon: FiBriefcase },
         { label: "Deductions", value: money(stats?.totalDeductions ?? 0), icon: FiTarget },
         { label: "Net", value: money(stats?.netPayroll ?? 0), icon: FiCreditCard },
@@ -940,6 +969,8 @@ export default function PayrollPage() {
             employee.paidOn,
             employee.payPeriod,
         ]);
+        if (activeTab === "Employee Payroll") rows.push(...rosterGaps.map(gap => [gap.employeeName, gap.email, gap.employeeId, gap.department,
+            "", "", "", "", "", "", "", "", "", "", "", rosterGapLabel(gap.state), "", gap.payPeriod]));
         if (activeTab === "Bank Accounts") {
             header = ["Employee", "Employee ID", "Bank", "Account Name", "Account Number"];
             rows = filteredBankEmployees.map(employee => [employee.name, employee.employeeCode, employee.bankName, employee.bankAccountName, employee.bankAccountNumber]);
@@ -1018,13 +1049,13 @@ export default function PayrollPage() {
     };
 
     const approvePotentialOvertime = () => {
-        if (accuracyConfig?.enabled) { setDtrRecord(null); setRecomputeOpen(true); return; }
+        if (accuracyConfig?.enabled) { setDtrRecord(null); openRecompute(dtrRecord?.payPeriod); return; }
         if (!dtrRecord || !employeeDtr) return;
         updateOvertimeMutation.mutate({ id: dtrRecord._id, overtimeHours: employeeDtr.summary.overtimeHours });
     };
 
     const clearApprovedOvertime = () => {
-        if (accuracyConfig?.enabled) { setDtrRecord(null); setRecomputeOpen(true); return; }
+        if (accuracyConfig?.enabled) { setDtrRecord(null); openRecompute(dtrRecord?.payPeriod); return; }
         if (!dtrRecord) return;
         updateOvertimeMutation.mutate({ id: dtrRecord._id, overtimeHours: 0 });
     };
@@ -1131,7 +1162,7 @@ export default function PayrollPage() {
                             </button>
                             {isFilterOpen && (
                                 <div className="absolute right-0 top-12 z-30 w-full min-w-[12rem] overflow-hidden rounded-lg border border-white/10 bg-[#0d1018] py-1 shadow-2xl shadow-black/40">
-                                    {["All statuses", ...statusOptions].map((status) => (
+                                    {["All statuses", ...statusOptions.filter(status => itemCategory || status !== "Review"), ...(rosterMode && activeTab === "Employee Payroll" ? accuracyConfig?.employeeRosterEnabled ? ["Not generated", "Review required"] : ["Not ready"] : [])].map((status) => (
                                         <button
                                             key={status}
                                             className={["flex h-10 w-full items-center justify-between px-3 text-left text-sm font-semibold transition", statusFilter === status ? "bg-[#842cff] text-white" : "text-white/65 hover:bg-white/[0.06] hover:text-white"].join(" ")}
@@ -1157,7 +1188,7 @@ export default function PayrollPage() {
                                 className="flex h-11 items-center gap-2 rounded-lg bg-[linear-gradient(135deg,#842cff,#4a0ebd)] px-5 text-sm font-semibold text-white transition hover:brightness-110 disabled:opacity-60"
                                 type="button"
                                 disabled={runPayrollMutation.isPending || !accuracyConfig}
-                                onClick={() => accuracyConfig?.enabled ? setRecomputeOpen(true) : runPayrollMutation.mutate(undefined)}
+                                onClick={() => accuracyConfig?.enabled ? openRecompute() : runPayrollMutation.mutate(undefined)}
                             >
                                 <FiPlus className="size-4" aria-hidden="true" />
                                 {runPayrollMutation.isPending ? "Running..." : accuracyConfig?.enabled ? "Generate / Recompute cutoff" : "Run Payroll"}
@@ -1226,6 +1257,15 @@ export default function PayrollPage() {
 
                 {activeTab === "Employee Payroll" && (
                     <>
+                        {accuracyConfig?.cutoffSelectionEnabled && <label className="mb-3 flex min-w-0 flex-wrap items-center gap-2 text-sm font-medium !text-slate-700">
+                            <span>Cutoff</span>
+                            <select aria-label="Payroll cutoff" className="h-9 min-w-0 max-w-full rounded-md border border-slate-200 bg-white px-3 !text-slate-950" value={selectedPayPeriod || ""} disabled={cutoffQuery.isLoading || cutoffQuery.isError}
+                                onChange={event => { const next = new URLSearchParams(searchParams); if (event.target.value === cutoffQuery.data?.currentPayPeriod) next.delete("payPeriod"); else next.set("payPeriod", event.target.value); setSearchParams(next); setPage(1); setSelectedRecordIds([]); }}>
+                                {!cutoffQuery.data && <option value="">{cutoffQuery.isError ? "Cutoffs unavailable" : "Loading cutoffs..."}</option>}
+                                {selectedPayPeriod && !cutoffQuery.data?.items.some(item => item.payPeriod === selectedPayPeriod) && <option value={selectedPayPeriod}>{selectedPayPeriod}</option>}
+                                {cutoffQuery.data?.items.map(item => <option key={item.payPeriod} value={item.payPeriod}>{item.payPeriod} ({item.payPeriod === cutoffQuery.data.currentPayPeriod ? "Current, " : ""}{item.payPeriod === cutoffQuery.data.currentPayPeriod && rosterMode ? stats?.totalEmployees ?? payrollRows.length : item.visibleEmployees ?? item.recordedEmployees})</option>)}
+                            </select>
+                        </label>}
                         <div className="grid gap-2 rounded-lg border border-violet-200/80 bg-white/82 p-2.5 shadow-sm shadow-violet-200/35 lg:grid-cols-[auto_minmax(0,1fr)_auto]">
                             <label className="flex h-9 items-center gap-2 rounded-md border border-slate-200 bg-white px-3 text-sm font-medium !text-slate-700 shadow-sm">
                                 <span>Show</span>
@@ -1236,7 +1276,7 @@ export default function PayrollPage() {
                                 </select>
                                 <span>entries</span>
                             </label>
-                            <div className="grid min-w-0 grid-cols-2 gap-2 sm:grid-cols-3 xl:grid-cols-5">
+                            <div className={`grid min-w-0 grid-cols-2 gap-2 sm:grid-cols-3 ${rosterMode ? "xl:grid-cols-6" : "xl:grid-cols-5"}`}>
                                 {payrollStats.map((stat) => {
                                     const Icon = stat.icon;
 
@@ -1287,8 +1327,20 @@ export default function PayrollPage() {
                                     <tbody className="divide-y divide-slate-200">
                                         {isPayrollLoading && <tr><td className="px-3 py-4 text-sm !text-slate-500" colSpan={9}>Loading payroll...</td></tr>}
                                         {isPayrollError && <tr><td className="px-3 py-4 text-sm text-red-600" colSpan={9}>{(payrollError as { response?: { data?: { message?: string } } })?.response?.data?.message || "Unable to load payroll."}</td></tr>}
-                                        {!isPayrollLoading && !isPayrollError && visibleEmployees.length === 0 && <tr><td className="px-3 py-4 text-sm !text-slate-500" colSpan={9}>No payroll records found.</td></tr>}
-                                        {visibleEmployees.map((employee) => {
+                                        {!isPayrollLoading && !isPayrollError && visiblePayrollRows.length === 0 && <tr><td className="px-3 py-4 text-sm !text-slate-500" colSpan={9}>No payroll records found.</td></tr>}
+                                        {visiblePayrollRows.map((row) => {
+                                            if (row.gap) {
+                                                const gap = row.gap, conflict = gap.state === "conflict", review = gap.state !== "not-generated";
+                                                return <tr key={`gap-${gap.employeeId}`} className="text-sm !text-slate-700">
+                                                    <td className="px-3 py-2.5"><input type="checkbox" disabled aria-label={`Select ${gap.employeeName}`} className="size-4 rounded border-slate-300 opacity-40" /></td>
+                                                    <td className="px-3 py-2.5"><span className="block truncate font-semibold !text-slate-950">{gap.employeeName}</span><span className="block truncate text-xs !text-slate-500">{gap.email}</span></td>
+                                                    <td className="truncate px-3 py-2.5">{gap.employeeId}</td>
+                                                    {["basic", "days", "hours", "net"].map(key => <td key={key} className="px-3 py-2.5 !text-slate-500">--</td>)}
+                                                    <td className="px-3 py-2.5"><span className={`inline-flex rounded px-2 py-1 text-xs font-semibold ${conflict ? "bg-amber-50 !text-amber-800" : "bg-slate-100 !text-slate-600"}`}>{rosterGapLabel(gap.state)}</span></td>
+                                                    <td className="px-3 py-2.5 text-center"><button type="button" className="inline-flex size-8 items-center justify-center rounded-md !text-violet-700 hover:bg-violet-50" onClick={() => openRecompute(gap.payPeriod)} aria-label={`${review ? "Review cutoff" : "Generate payroll"} for ${gap.employeeName}`} title={review ? "Review cutoff" : "Generate payroll"}>{review ? <FiAlertCircle className="size-4" /> : <FiPlus className="size-4" />}</button></td>
+                                                </tr>;
+                                            }
+                                            const employee = row.record;
                                             const initials = employee.employeeName.split(" ").map((part) => part[0]).join("").slice(0, 2).toUpperCase();
 
                                             return (
@@ -1326,9 +1378,9 @@ export default function PayrollPage() {
                                                     <td className="truncate px-3 py-2.5 !text-slate-700">{employee.employeeId}</td>
                                                     <td className="px-3 py-2.5 font-semibold !text-slate-950">{money(employee.basicPay ?? employee.grossPay)}</td>
                                                     <td className="px-3 py-2.5 !text-slate-700">{employee.attendanceDays ?? 0}</td>
-                                                    <td className="px-3 py-2.5 !text-slate-700">{employee.workedHours ?? 0}h</td>
+                                                    <td className="whitespace-nowrap px-3 py-2.5 tabular-nums !text-slate-700">{formatPayrollHours(employee.workedHours)}</td>
                                                     <td className="px-3 py-2.5 font-semibold !text-slate-950">{money(employee.netPay)}</td>
-                                                    <td className="px-3 py-2.5"><StatusBadge status={employee.status} /></td>
+                                                    <td className="px-3 py-2.5"><span className="inline-flex items-center gap-1.5"><StatusBadge status={payrollPaymentStatus(employee.status)} />{employee.requiresReview && <FiAlertCircle className="size-3.5 !text-amber-700" role="img" aria-label="Conflicting saved payroll entries" title="Conflicting saved payroll entries" />}</span></td>
                                                     <td className="px-3 py-2.5 text-center" onClick={(event) => event.stopPropagation()}>
                                                         <div className="flex flex-nowrap justify-center gap-0.5">
                                                             <button className="inline-flex size-7 items-center justify-center rounded-md !text-slate-600 transition hover:bg-slate-100 hover:!text-slate-950" type="button" onClick={() => { setBasicPayTarget(employee); setBasicPayInput(String(employee.calculationSnapshot?.monthlySalary ?? (employee.basicPay ?? employee.grossPay ?? 0) * 2)); }} aria-label={`Edit basic pay for ${employee.employeeName}`} title="Edit monthly salary">
@@ -1348,7 +1400,7 @@ export default function PayrollPage() {
                                                                         : "!text-emerald-600 hover:bg-emerald-100 hover:!text-emerald-700",
                                                                 ].join(" ")}
                                                                 type="button"
-                                                                onClick={() => setPaymentTarget({ action: employee.status === "Paid" ? "unpaid" : "paid", record: employee })}
+                                                                onClick={() => setPaymentTarget({ action: employee.status === "Paid" ? "unpaid" : "paid", record: employee, businessId: getActiveBusinessId() })}
                                                                 aria-label={employee.status === "Paid" ? `Set ${employee.employeeName} unpaid` : `Mark ${employee.employeeName} paid`}
                                                                 title={employee.status === "Paid" ? "Set unpaid" : "Mark paid"}
                                                             >
@@ -1359,12 +1411,13 @@ export default function PayrollPage() {
                                                                 type="button"
                                                                 onClick={() => {
                                                                     setWorkedMinutesError("");
-                                                                    if (accuracyConfig?.enabled) { setRecomputeOpen(true); return; }
+                                                                    if (accuracyConfig?.enabled) { setHoursTarget({ record: employee, businessId: getActiveBusinessId() }); return; }
                                                                     setWorkedMinutesTarget(employee);
                                                                     setWorkedMinutesInput(String(Math.round((employee.workedMinutesOverride ?? (employee.workedHours || 0) * 60))));
                                                                 }}
-                                                                aria-label={accuracyConfig?.enabled ? `Preview cutoff for ${employee.employeeName}` : `Edit worked minutes for ${employee.employeeName}`}
-                                                                title={accuracyConfig?.enabled ? "Preview / recompute cutoff" : "Edit total worked minutes"}
+                                                                disabled={!accuracyConfig || Boolean(accuracyConfig.enabled && !accuracyConfig.workedHoursEditingEnabled)}
+                                                                aria-label={`Edit hours for ${employee.employeeName}`}
+                                                                title="Edit hours"
                                                             >
                                                                 <FiHash className="size-3.5" />
                                                             </button>
@@ -1378,19 +1431,19 @@ export default function PayrollPage() {
                             </div>
 
                             <div className="flex min-h-12 flex-wrap items-center justify-between gap-3 border-t border-slate-200 px-4 py-2.5">
-                                <p className="text-xs !text-slate-500">Showing {employees.length === 0 ? 0 : (page - 1) * pageSize + 1} to {Math.min(page * pageSize, employees.length)} of {employees.length} entries</p>
+                                <p className="text-xs !text-slate-500">Showing {payrollRows.length === 0 ? 0 : (currentPage - 1) * pageSize + 1} to {Math.min(currentPage * pageSize, payrollRows.length)} of {payrollRows.length} entries</p>
                                 <div className="flex items-center gap-2">
-                                    <button className="flex size-8 items-center justify-center rounded-lg border border-slate-200 bg-white !text-slate-500 transition hover:bg-violet-50 hover:!text-violet-700 disabled:opacity-40" type="button" disabled={page === 1} onClick={() => setPage((value) => Math.max(value - 1, 1))} aria-label="Previous page">
+                                    <button className="flex size-8 items-center justify-center rounded-lg border border-slate-200 bg-white !text-slate-500 transition hover:bg-violet-50 hover:!text-violet-700 disabled:opacity-40" type="button" disabled={currentPage === 1} onClick={() => setPage(Math.max(currentPage - 1, 1))} aria-label="Previous page">
                                         <FiChevronLeft className="size-4" />
                                     </button>
                                     {Array.from({ length: Math.min(totalPages, 3) }, (_, index) => index + 1).map((pageNumber) => (
-                                        <button key={pageNumber} className={["flex size-8 items-center justify-center rounded-lg border text-sm font-semibold transition", pageNumber === page ? "border-[#842cff] bg-[#842cff] !text-white" : "border-slate-200 bg-white !text-slate-500 hover:bg-violet-50 hover:!text-violet-700"].join(" ")} type="button" onClick={() => setPage(pageNumber)}>
+                                        <button key={pageNumber} className={["flex size-8 items-center justify-center rounded-lg border text-sm font-semibold transition", pageNumber === currentPage ? "border-[#842cff] bg-[#842cff] !text-white" : "border-slate-200 bg-white !text-slate-500 hover:bg-violet-50 hover:!text-violet-700"].join(" ")} type="button" onClick={() => setPage(pageNumber)}>
                                             {pageNumber}
                                         </button>
                                     ))}
                                     {totalPages > 3 && <span className="px-2 text-sm !text-slate-400">...</span>}
                                     {totalPages > 3 && <button className="flex h-8 min-w-8 items-center justify-center rounded-lg border border-slate-200 bg-white px-2 text-sm font-semibold !text-slate-500 transition hover:bg-violet-50 hover:!text-violet-700" type="button" onClick={() => setPage(totalPages)}>{totalPages}</button>}
-                                    <button className="flex size-8 items-center justify-center rounded-lg border border-slate-200 bg-white !text-slate-500 transition hover:bg-violet-50 hover:!text-violet-700 disabled:opacity-40" type="button" disabled={page === totalPages} onClick={() => setPage((value) => Math.min(value + 1, totalPages))} aria-label="Next page">
+                                    <button className="flex size-8 items-center justify-center rounded-lg border border-slate-200 bg-white !text-slate-500 transition hover:bg-violet-50 hover:!text-violet-700 disabled:opacity-40" type="button" disabled={currentPage === totalPages} onClick={() => setPage(Math.min(currentPage + 1, totalPages))} aria-label="Next page">
                                         <FiChevronRight className="size-4" />
                                     </button>
                                 </div>
@@ -1598,7 +1651,8 @@ export default function PayrollPage() {
                                                 ["Excess Break", `${employeeDtr.summary.excessBreakMinutes} min`],
                                                 ["Absence", `${employeeDtr.summary.absenceMinutes} min`],
                                                 ["Early Time Out", `${employeeDtr.summary.earlyTimeOutMinutes} min`],
-                                                ["Needs Review", employeeDtr.summary.incompleteShiftDays],
+                                                ["Current Attendance Review", employeeDtr.currentAttendanceReviewDays ?? (employeeDtr.storedCutoff ? "Unavailable" : employeeDtr.summary.incompleteShiftDays)],
+                                                ...(employeeDtr.storedCutoff ? [["Saved Cutoff Review Days", employeeDtr.summary.incompleteShiftDays]] : []),
                                                 ["Regular Hours", formatHoursMinutes(employeeDtr.summary.workedHours)],
                                                 ["Potential OT", employeeDtr.currentAttendanceWarning ? "Unavailable" : formatHoursMinutes(employeeDtr.potentialOvertimeHours ?? employeeDtr.summary.overtimeHours)],
                                                 ["Approved OT", formatHoursMinutes(dtrRecord.overtimeHours || 0)],
@@ -1928,7 +1982,7 @@ export default function PayrollPage() {
                     </div>
                 )}
 
-                {paymentTarget && (
+                {paymentTarget && !accuracyConfig?.paymentStatusPreviewEnabled && (
                     <div
                         className="modal-backdrop-enter fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4 backdrop-blur-sm"
                         onMouseDown={(event) => {
@@ -2026,7 +2080,7 @@ export default function PayrollPage() {
                                 <div className="grid grid-cols-2 gap-3">
                                     <div className="rounded-lg border border-white/10 bg-white/[0.035] p-3">
                                         <p className="text-[0.65rem] font-semibold uppercase tracking-[0.12em] text-white/35">Current Total</p>
-                                        <p className="mt-1 text-base font-semibold text-white">{workedMinutesTarget.workedHours ?? 0}h</p>
+                                        <p className="mt-1 text-base font-semibold text-white">{formatPayrollHours(workedMinutesTarget.workedHours)}</p>
                                         <p className="mt-0.5 text-xs text-white/45">{Math.round((workedMinutesTarget.workedMinutesOverride ?? (workedMinutesTarget.workedHours || 0) * 60))} minutes</p>
                                     </div>
                                     <div className="rounded-lg border border-white/10 bg-white/[0.035] p-3">
@@ -2108,7 +2162,10 @@ export default function PayrollPage() {
                         </div>
                     </div>
                 )}
-                {recomputeOpen && <PayrollRecomputeDialog initialPeriod={employees[0]?.payPeriod} currencyCode={systemSettings?.currencyCode} onClose={() => setRecomputeOpen(false)} onSaved={() => {
+                {hoursTarget && <PayrollHoursDialog record={hoursTarget.record} businessId={hoursTarget.businessId} onClose={() => setHoursTarget(null)} />}
+                {paymentTarget && accuracyConfig?.paymentStatusPreviewEnabled && <PayrollPaymentDialog record={paymentTarget.record} businessId={paymentTarget.businessId}
+                    paid={paymentTarget.action === "paid"} currencyCode={systemSettings?.currencyCode} onClose={() => setPaymentTarget(null)} />}
+                {recomputeOpen && <PayrollRecomputeDialog initialPeriod={recomputePeriod || selectedPayPeriod || employees[0]?.payPeriod} currencyCode={systemSettings?.currencyCode} onClose={() => setRecomputeOpen(false)} onSaved={() => {
                     refreshPayroll(); queryClient.invalidateQueries({ queryKey: ["payroll-dtr"] }); queryClient.invalidateQueries({ queryKey: ["payroll-payslip-dtr"] });
                 }} />}
             </section>

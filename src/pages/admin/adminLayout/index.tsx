@@ -17,6 +17,7 @@ import { useClickOutside } from "../../../hooks/useClickOutside";
 import { canSelectSearchResult } from "../../../../shared/workspaceSearch";
 import { emitToast } from "../../../lib/toast";
 import { useMessageNotifications } from "../../../hooks/useMessageNotifications";
+import { useAttendanceWorkspaceRefresh } from "../../../hooks/useAttendanceWorkspaceRefresh";
 import { formatPhDate, formatPhDateTime } from "../../../lib/dateTime";
 import { getEmployeeEvaluationReminders } from "../../../lib/employeeEvaluation";
 import { refreshSocketBusinessContext } from "../../../lib/socket";
@@ -180,6 +181,7 @@ export default function AdminLayout({ children }: Props) {
     }, [isMobileNavOpen]);
     const queryClient = useQueryClient();
     const authUser = getAuthUser();
+    useAttendanceWorkspaceRefresh(authUser?.userType === "admin");
     const isTrackerOnlyAdmin = authUser?.userType === "admin" && authUser.access === "tracker";
     const fullAdmin = authUser?.userType === "admin" && !isTrackerOnlyAdmin;
     const { data: dataCheckConfig } = useQuery({ queryKey: ["data-check-config", getActiveBusinessId()], queryFn: ({ signal }) => getDataCheckConfig(signal), enabled: fullAdmin, staleTime: 60_000, retry: false });

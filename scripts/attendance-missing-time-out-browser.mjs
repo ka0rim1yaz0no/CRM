@@ -3,7 +3,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 const { chromium } = createRequire(process.env.CRM_TEST_RUNTIME_PACKAGE || import.meta.url)('playwright');
-const directory = path.resolve(process.argv[2]), origin = 'http://localhost:5173';
+const directory = path.resolve(process.argv[2]), origin = 'https://attendance-fixture.invalid';
 const browser = await chromium.launch({ channel: 'msedge', headless: true });
 const results = [], errors = [];
 try {
@@ -30,6 +30,7 @@ try {
       localStorage.setItem('authUser', JSON.stringify({ userType: 'admin', user: { _id: 'synthetic-admin', employeeCode: 'synthetic-admin', name: 'Synthetic Admin', role: 'Admin' },
         sessionToken: 'synthetic-session', business: { id: business, name: 'Synthetic Business' }, allowedBusinesses: [{ id: business, name: 'Synthetic Business' }] }));
     }, { business });
+    await context.route('**/*', route => { errors.push('Unexpected external fixture request'); return route.abort(); });
     await context.route(`${origin}/**`, async route => {
       const url = new URL(route.request().url()), requested = path.extname(url.pathname) ? path.resolve(directory, `.${url.pathname}`) : path.join(directory, 'index.html');
       assert.ok(requested.startsWith(`${directory}${path.sep}`));

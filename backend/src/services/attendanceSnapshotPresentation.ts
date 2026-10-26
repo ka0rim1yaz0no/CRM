@@ -6,6 +6,7 @@ export function withAttendanceStatuses<T extends { records: SessionEvent[]; sess
     const { records, sessions, ...rest } = snapshot;
     const shifts = new Map(sessions.flatMap((session) => session.events.map((event) => [event.id, session.shift] as const)));
     const present = (event: SessionEvent) => ({ ...event,
+        ...(shifts.get(event.id)?.dayKey ? { shiftDayKey: shifts.get(event.id)!.dayKey } : {}),
         attendanceStatus: attendanceEventStatus(event.source, new Date(event.at), shifts.get(event.id) || null, graceMinutes) });
     return { ...rest, records: records.map(present),
         sessions: sessions.map((session) => ({ ...session, events: session.events.map(present) })) };

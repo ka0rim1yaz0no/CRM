@@ -14,6 +14,9 @@ import { roundMoney, PayrollValidationError } from "./payrollAccuracy";
 import { serverReadTime, withReadSnapshot } from "./readSnapshot";
 import { attendanceIntegrityEnabled } from "../config/rolloutFlags";
 import { lockPayrollAttendance, payrollAttendanceFenceKeys } from "./payrollAttendanceFence";
+import { payrollReadGroups } from "./payrollReadPolicy";
+import { savedPayrollPeriod } from "../../../shared/payrollPeriod";
+import { adjustedPayrollHours } from "../../../shared/payrollWorkedHours";
 
 const fail = (statusCode: number, message: string) => Object.assign(new Error(message), { statusCode });
 const fingerprint = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -24,12 +27,18 @@ export async function calculatePayrollCandidate(employee: { _id: Types.ObjectId;
   const rates = payrollRatesForCutoff(employee.salary, payPeriod, settings, policy);
   const dtr = await attendancePayrollDtr(employee._id, payPeriod, session);
   const record = await PayrollRecord.findOne({ employeeId: employee.employeeCode, payPeriod, isArchived: false }, null, session ? { session } : undefined).lean();
+  let hoursAdjustment = {};
+  if (record?.workedMinutesOverride !== null && record?.workedMinutesOverride !== undefined) {
+    try { hoursAdjustment = adjustedPayrollHours(dtr.summary, record.workedMinutesOverride); }
+    catch (error) { throw new PayrollValidationError((error as Error).message); }
+  }
+  const summary = { ...dtr.summary, ...hoursAdjustment };
   const approvedOvertimeHours = overtimeOverride ?? (record?.overtimeApproved ? record.overtimeHours : 0);
   if (!Number.isFinite(approvedOvertimeHours) || approvedOvertimeHours < 0 || approvedOvertimeHours > dtr.summary.overtimeHours) {
     throw new PayrollValidationError("Approved overtime exceeds verified completed weekend work; review the cutoff");
   }
   const grossPay = roundMoney(rates.cutoffBasePay + approvedOvertimeHours * rates.hourlyRate);
-  const deductions = Math.min(grossPay, roundMoney(dtr.summary.deductibleMinutes * rates.minuteRate));
+  const deductions = Math.min(grossPay, roundMoney(summary.deductibleMinutes * rates.minuteRate));
   const payDate = scheduledPayDateForPeriod(payPeriod, settings);
   const ledger = await AttendanceLedger.findOne({ employeeCode: employee.employeeCode, businessIds: getCurrentBusinessId() }, null, session ? { session } : undefined).select("revision events corrections closures businessIds migrationRequired").lean();
   const evidence = ledger && !ledger.migrationRequired ? projectAttendance(ledger.events, ledger.corrections, ledger.closures).sessions.flatMap(item => item.events)
@@ -40,15 +49,15 @@ export async function calculatePayrollCandidate(employee: { _id: Types.ObjectId;
   const evidenceStart = Date.parse(firstDay) - 86_400_000, evidenceEnd = Date.parse(lastDay) + 2 * 86_400_000;
   const value = { employeeName: employee.name, email: employee.email || "", employeeId: employee.employeeCode,
     department: employee.team || employee.role || "General", payType: "Semi-monthly" as const,
-    ...dtr.summary, basicPay: rates.cutoffBasePay, workingDays: rates.monthlyWorkingDays,
+    ...summary, basicPay: rates.cutoffBasePay, workingDays: rates.monthlyWorkingDays,
     paidHoursPerDay: rates.paidHoursPerDay, hourlyRate: rates.hourlyRate, minuteRate: rates.minuteRate,
     grossPay, deductions, netPay: roundMoney(Math.max(0, grossPay - deductions)),
-    overtimeHours: approvedOvertimeHours, overtimeApproved: approvedOvertimeHours > 0, workedMinutesOverride: null,
+    overtimeHours: approvedOvertimeHours, overtimeApproved: approvedOvertimeHours > 0, workedMinutesOverride: record?.workedMinutesOverride ?? null,
     calculationVersion: "duration-payroll-v1", status: dtr.summary.incompleteShiftDays ? "Review" as const : "Pending" as const,
     paidOn: record?.paidOn || payDate?.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }) || "-", payPeriod, isArchived: false,
     calculationSnapshot: { settings: { officialShiftStartTime: settings.officialShiftStartTime, officialShiftEndTime: settings.officialShiftEndTime },
       policy: { breakMinutes: policy.breakMinutes, lunchMinutes: policy.lunchMinutes, graceMinutes: policy.graceMinutes, revision: policy.revision },
-      ...rates, attendanceRevision: ledger?.revision ?? null,
+      ...rates, workedMinutesOverride: record?.workedMinutesOverride ?? null, attendanceRevision: ledger?.revision ?? null,
       attendanceFingerprint: fingerprint(ledger ? { events: ledger.events, corrections: ledger.corrections, closures: ledger.closures } : dtr.rows),
       evidence: evidence.filter(item => Date.parse(item.at) >= evidenceStart && Date.parse(item.at) < evidenceEnd),
       days: dtr.rows.map(item => ({ dayKey: item.dateKey, status: item.status, lateMinutes: item.lateMinutes, earlyTimeOutMinutes: item.earlyTimeOutMinutes,
@@ -62,7 +71,7 @@ function calculationFingerprint(candidate: Awaited<ReturnType<typeof calculatePa
   const snapshot = value.calculationSnapshot;
   // Replica ObjectIds and business-specific labels are not payroll inputs.
   return fingerprint({ summary: dtr.summary, rows: dtr.rows, rates, ...moneyFields(value),
-    approvedOvertimeHours: value.overtimeHours, payType: value.payType, payPeriod: value.payPeriod, paidOn: value.paidOn,
+    approvedOvertimeHours: value.overtimeHours, workedMinutesOverride: value.workedMinutesOverride, payType: value.payType, payPeriod: value.payPeriod, paidOn: value.paidOn,
     settings: snapshot.settings, policy: snapshot.policy, rounding: snapshot.rounding,
     evidence: snapshot.evidence.map(event => ({ source: event.source, at: event.at, shift: "shift" in event ? event.shift ?? null : null })) });
 }
@@ -80,6 +89,7 @@ export async function getAccuratePayrollDtr(employee: Parameters<typeof calculat
     }
     return { employee: { _id: employee._id, name: saved.employeeName, employeeCode: saved.employeeId, department: saved.department },
       payPeriod, payDate: saved.paidOn, payType: saved.payType, storedCutoff: true, currentAttendanceWarning,
+      currentAttendanceReviewDays: current?.summary.incompleteShiftDays ?? null,
       potentialOvertimeHours: current?.summary.overtimeHours ?? 0,
       summary: { ...saved, paidHoursPerDay: saved.paidHoursPerDay ?? null, hourlyRate: saved.hourlyRate ?? saved.minuteRate * 60,
         workingDays: current?.summary.workingDays ?? null, monthlyWorkingDays: saved.workingDays, missingHours: saved.missingHours ?? saved.deductibleMinutes / 60 },
@@ -88,7 +98,7 @@ export async function getAccuratePayrollDtr(employee: Parameters<typeof calculat
   const candidate = await calculatePayrollCandidate(employee, payPeriod);
   return { employee: { _id: employee._id, name: employee.name, employeeCode: employee.employeeCode, department: employee.team || employee.role || "General" },
     payPeriod, payDate: candidate.value.paidOn, payType: candidate.value.payType,
-    storedCutoff: false, potentialOvertimeHours: candidate.dtr.summary.overtimeHours,
+    storedCutoff: false, currentAttendanceReviewDays: candidate.dtr.summary.incompleteShiftDays, potentialOvertimeHours: candidate.dtr.summary.overtimeHours,
     summary: { ...candidate.dtr.summary, ...candidate.rates, ...candidate.value, workingDays: candidate.dtr.summary.workingDays },
     rows: candidate.dtr.rows.filter(row => row.status !== "Scheduled") };
 }
@@ -232,6 +242,12 @@ export async function setAccuratePayrollPaid(request: Request, paid: boolean) {
       const currentSource = await PayrollRecord.findById(source._id).session(session).lean();
       if (fingerprint(currentSource) !== fingerprint(source)) throw fail(409, "Payroll changed during payment confirmation. Refresh and try again.");
       for (const businessId of businessIds) await runWithBusiness(businessId, async () => {
+        const selectedPeriod = savedPayrollPeriod(source.payPeriod);
+        const savedCutoffs = await PayrollRecord.find({ employeeId: source.employeeId, isArchived: false }).session(session).lean();
+        const group = payrollReadGroups(savedCutoffs).groups.find(item => item.period.start === selectedPeriod?.start && item.period.end === selectedPeriod?.end);
+        if (!selectedPeriod || !group || group.records.length !== 1 || group.requiresReview) {
+          throw new PayrollValidationError("Saved cutoff aliases require payroll review; payment status was not changed.");
+        }
         const records = await PayrollRecord.find({ employeeId: source.employeeId, payPeriod: source.payPeriod, isArchived: false }).session(session).lean();
         if (records.length !== 1 || fingerprint(moneyFields(records[0])) !== fingerprint(moneyFields(source))) throw new PayrollValidationError("Payroll mirror mismatch; payment status was not changed");
         if (records[0].payrollOwnerBusinessId !== source.payrollOwnerBusinessId || fingerprint(records[0].calculationSnapshot?.businessIds ?? null) !== fingerprint(frozenBusinessIds ?? null)) {

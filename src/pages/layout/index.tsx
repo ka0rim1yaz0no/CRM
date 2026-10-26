@@ -7,7 +7,8 @@ import "./employeeWorkspace.css";
 import { useQueryClient } from "@tanstack/react-query";
 import { getAuthUser } from "../../api/authStorage";
 import { connectAuthenticatedSocket, socket } from "../../lib/socket";
-import { refreshAttendanceWorkspace, refreshEmployeeWorkspace } from "../../lib/employeeWorkspaceCache";
+import { refreshEmployeeWorkspace } from "../../lib/employeeWorkspaceCache";
+import { useAttendanceWorkspaceRefresh } from "../../hooks/useAttendanceWorkspaceRefresh";
 
 type Props = {
     children: ReactNode;
@@ -17,6 +18,7 @@ export default function MainLayout({ children }: Props) {
     const queryClient = useQueryClient();
     const auth = getAuthUser();
     const employeeId = auth?.userType === "employee" ? auth.user._id : "";
+    useAttendanceWorkspaceRefresh(Boolean(employeeId), employeeId);
     useEffect(() => {
         if (!employeeId) return;
         let timer: number | undefined;
@@ -25,7 +27,7 @@ export default function MainLayout({ children }: Props) {
             timer = window.setTimeout(() => refreshEmployeeWorkspace(queryClient, employeeId), 250);
         };
         const ownUpdate = (payload: { employeeId?: string }) => {
-            if (payload.employeeId === employeeId) { refresh(); void refreshAttendanceWorkspace(queryClient); }
+            if (payload.employeeId === employeeId) refresh();
         };
         const visible = () => { if (document.visibilityState === "visible") refresh(); };
         socket.on("employee:availability-updated", ownUpdate);

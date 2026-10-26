@@ -102,6 +102,7 @@ function guardAttendanceActionCutoff(input: AttendanceCommand, session: ReturnTy
 export function attendanceSnapshot(ledger: AttendanceLedgerDocument, now = new Date(), cutoffContext?: AttendanceCutoffContext) {
   const projection = projectAttendance(ledger.events, ledger.corrections, ledger.closures);
   const session = projection.active;
+  const eventDays = new Map(projection.sessions.flatMap(item => item.events.map(event => [event.id, item.shift?.dayKey] as const)));
   const last = projection.sessions.at(-1);
   const sequence = ledger.events.reduce((max, event) => Math.max(max, event.sequence), -1) + 1;
   const allowedActions = ledger.migrationRequired || projection.blockingIssues.length ||
@@ -123,7 +124,8 @@ export function attendanceSnapshot(ledger: AttendanceLedgerDocument, now = new D
     openIntervals: session && session.mode !== "ONLINE" ? [{ mode: session.mode, startedAt: session.modeSince }] : [],
     reviewState: ledger.migrationRequired ? "migration-review" : projection.blockingIssues.length ? "needs-correction" : "verified", review,
     historyReviewRequired: projection.issues.some((issue) => issue.historical) || Boolean(ledger.legacyAdoption?.businessStreamsDiffer), serverTime: now.toISOString(),
-    sessions: projection.sessions.map((item) => ({ ...item, time: sessionTime(item, now) })), records: projection.effectiveEvents, audit: ledger.audit,
+    sessions: projection.sessions.map((item) => ({ ...item, time: sessionTime(item, now) })),
+    records: projection.effectiveEvents.map(event => ({ ...event, ...(eventDays.get(event.id) ? { shiftDayKey: eventDays.get(event.id) } : {}) })), audit: ledger.audit,
     time: session ? sessionTime(session, now) : null, syncPending: ledger.jobs.some((job) => !job.done),
     systemClosure: last?.closure || null, ...(attendanceDurationModelEnabled() ? { derived: ledger.derived } : {}) };
 }

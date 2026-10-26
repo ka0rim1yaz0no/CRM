@@ -15,6 +15,10 @@ function adminAttendanceHeaders() {
 
 export type AttendanceRecord = {
     sequence?: number;
+    eventId?: string;
+    shiftDayKey?: string;
+    derived?: { dayKey: string; eventIds: string[] };
+    autoTimeOut?: boolean;
     _id: string;
     employee: string;
     timeIn: string;
@@ -63,8 +67,9 @@ export async function getEmployeeAttendance(employeeId: string, params: Attendan
     return response.data;
 }
 
-export async function getEmployeesAttendance(employeeIds: string[], params: Pick<AttendanceQuery, "all" | "from" | "to"> = {}) {
+export async function getEmployeesAttendance(employeeIds: string[], params: Pick<AttendanceQuery, "all" | "from" | "to"> = {}, signal?: AbortSignal) {
     const response = await api.get<AttendanceRecord[]>("/attendance", {
+        signal,
         headers: attendanceSessionHeaders(),
         params: { employeeIds: employeeIds.join(","), ...params },
     });

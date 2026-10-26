@@ -559,7 +559,7 @@ export default function AdminHr() {
     );
     const attendanceQuery = useQuery({
         queryKey: ["employee-attendance", "batch", attendanceEmployeeIds, attendanceRequestParams],
-        queryFn: () => getEmployeesAttendance(attendanceEmployeeIds, attendanceRequestParams),
+        queryFn: ({ signal }) => getEmployeesAttendance(attendanceEmployeeIds, attendanceRequestParams, signal),
         enabled: activeTab === "Attendance" && attendanceEmployeeIds.length > 0,
         refetchInterval: activeTab === "Attendance"
             ? attendanceRequestParams.all
@@ -598,7 +598,8 @@ export default function AdminHr() {
             ),
         [attendanceDateFrom, attendanceDateTo, attendanceEmployees, attendanceFilterDateKeys, attendanceRecordsByEmployee, attendanceSingleDate, attendanceTableSettings]
     );
-    const attendanceTableLoading = employeesLoading || attendanceQuery.isLoading || attendanceQuery.isFetching;
+    const attendanceTableLoading = employeesLoading || attendanceQuery.isLoading;
+    const attendanceTableRefreshing = attendanceTableLoading || attendanceQuery.isFetching;
     const attendanceTableError = employeesError || attendanceQuery.isError;
     const attendanceTotalPages = Math.max(1, Math.ceil(attendanceTableRows.length / attendancePageSize));
     const currentAttendancePage = Math.min(attendancePage, attendanceTotalPages);
@@ -1027,10 +1028,10 @@ export default function AdminHr() {
                                 className="h-10 rounded-lg border border-slate-300 bg-white px-3 text-sm font-semibold !text-black transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
                                 type="button"
                                 onClick={refreshAttendance}
-                                disabled={attendanceTableLoading}
+                                disabled={attendanceTableRefreshing}
                             >
                                 <span className="inline-flex items-center gap-2">
-                                    <FiRefreshCw className={attendanceTableLoading ? "size-4 animate-spin" : "size-4"} />
+                                    <FiRefreshCw className={attendanceTableRefreshing ? "size-4 animate-spin" : "size-4"} />
                                     Refresh
                                 </span>
                             </button>
@@ -1105,7 +1106,7 @@ export default function AdminHr() {
                                     <th className="w-[11%] px-2 py-2">Actions</th>
                                 </tr>
                             </thead>
-                            <tbody className="divide-y divide-slate-300 bg-white">
+                            <tbody aria-busy={attendanceTableRefreshing} className="divide-y divide-slate-300 bg-white">
                                 {attendanceTableLoading && <EmptyRow colSpan={10} text="Loading attendance..." />}
                                 {attendanceTableError && <EmptyRow colSpan={10} text="Unable to load attendance." danger />}
                                 {!attendanceTableLoading && !attendanceTableError && pagedAttendanceRows.map((record) => (

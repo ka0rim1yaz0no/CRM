@@ -9,7 +9,7 @@ export const attendanceIntegrityEnabled = import.meta.env.VITE_CRM_ATTENDANCE_IN
 export const attendanceDurationModelEnabled = import.meta.env.VITE_CRM_ATTENDANCE_DURATION_MODEL === "true";
 export type SessionEvent = { id: string; source: "Login" | "Logout" | "Time In" | "Time Out" | "Break Out" | "Break In" |
     "Lunch Break Out" | "Lunch Break In" | "Off the Phone Out" | "Off the Phone In"; at: string; commandId: string; sequence: number; sessionId?: string;
-    attendanceStatus?: "On time" | "Late" | "Undertime" | ""; autoTimeOut?: boolean };
+    attendanceStatus?: "On time" | "Late" | "Undertime" | ""; autoTimeOut?: boolean; shiftDayKey?: string };
 export type AttendanceSessionSnapshot = {
     dashboardDays?: DashboardAttendanceDay[];
     currentShiftDay?: string;
@@ -88,7 +88,8 @@ export async function performAttendanceAction(employeeId: string, source: Sessio
     }
 }
 export function sessionEventRecord(event: SessionEvent, employeeId: string): AttendanceRecord {
-    return { _id: event.id, employee: employeeId, timeIn: event.at, source: event.source, createdAt: event.at, sequence: event.sequence, attendanceStatus: event.attendanceStatus };
+    return { _id: event.id, eventId: event.id, employee: employeeId, timeIn: event.at, source: event.source, createdAt: event.at,
+        sequence: event.sequence, attendanceStatus: event.attendanceStatus, shiftDayKey: event.shiftDayKey, autoTimeOut: event.autoTimeOut };
 }
 export async function getAttendancePolicy() {
     return (await api.get<AttendancePolicy>("/attendance-policy", { headers: attendanceSessionHeaders() })).data;

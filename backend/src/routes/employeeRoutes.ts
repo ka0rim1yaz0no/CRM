@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { getEmployeePayments } from "../controllers/employeePaymentsController";
 import {
   archiveEmployee,
   createEmployee,
@@ -13,6 +14,7 @@ import {
 export const employeeRouter = Router();
 
 employeeRouter.get("/", listEmployees);
+employeeRouter.get("/:id/payments", getEmployeePayments);
 employeeRouter.get("/:id", getEmployee);
 employeeRouter.post("/", createEmployee);
 employeeRouter.patch("/:id/profile", updateEmployeeProfile);

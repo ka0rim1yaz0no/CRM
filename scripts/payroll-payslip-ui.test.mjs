@@ -14,9 +14,12 @@ const names = new Set(["numberWordsUnderTwenty", "numberWordsTens", "monthNames"
     "countWeekdays", "clampCalendarDay", "workingDaysForPayPeriod", "PayslipDocument", "payslipAmountInWords", "payslipDeductionRows", "payslipOutputReady", "payrollCsv", "payrollMatchesSearch"]);
 const declarations = ast.statements.filter(node => node.name && names.has(node.name.text) || ts.isVariableStatement(node) && node.declarationList.declarations.some(item => names.has(item.name.getText(ast))));
 const exports = {};
+const presentation = {};
+runInNewContext(ts.transpileModule(readFileSync(new URL("../shared/payrollPresentation.ts", import.meta.url), "utf8"),
+    { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText, { exports: presentation });
 runInNewContext(ts.transpileModule('import { jsx, jsxs } from "react/jsx-runtime";\n' + declarations.map(node => node.getText(ast)).join("\n") +
     "\nexports.document = PayslipDocument; exports.words = payslipAmountInWords; exports.rows = payslipDeductionRows; exports.ready = payslipOutputReady; exports.csv = payrollCsv; exports.search = payrollMatchesSearch;",
-    { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX } }).outputText, { require, exports });
+    { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX } }).outputText, { require, exports, payrollDeductionRows: presentation.payrollDeductionRows });
 
 const record = { employeeName: "Synthetic Payroll", employeeId: "90000002", department: "Studio", payType: "Semi-monthly",
     payPeriod: "Oct 6, 2026 - Oct 20, 2026", paidOn: "Oct 25, 2026", grossPay: 15000, basicPay: 15000,
@@ -82,7 +85,7 @@ test("export action downloads the currently filtered section, not stale payroll 
     const bank = { name: "Synthetic Bank Employee", employeeCode: "90000003", bankName: "Fake Bank", bankAccountName: "Test", bankAccountNumber: "00123" };
     for (const activeTab of ["Employee Payroll", "Bank Accounts", "Deductions", "Archived"]) {
         let blob, clicked = false; const link = { click() { clicked = true; } };
-        const action = pageAction("exportCsv", { activeTab, isExportUnavailable: false, employees: [employee], filteredBankEmployees: [bank], filteredPayrollItems: [item], filteredArchivedItems: [item],
+        const action = pageAction("exportCsv", { activeTab, isExportUnavailable: false, employees: [employee], rosterGaps: [], filteredBankEmployees: [bank], filteredPayrollItems: [item], filteredArchivedItems: [item],
             itemCategory: activeTab === "Deductions" ? "Deductions" : undefined, itemLabels: { name: "Deduction", second: "Amount", third: "Description", fourth: "Frequency" },
             Blob, URL: { createObjectURL(value) { blob = value; return "blob:synthetic"; }, revokeObjectURL() {} }, document: { createElement: () => link } });
         action(); assert.equal(clicked, true); const csv = await blob.text();

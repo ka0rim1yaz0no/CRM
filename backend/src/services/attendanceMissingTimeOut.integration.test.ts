@@ -27,6 +27,9 @@ const { resolveAttendanceIdentity } = await import("./attendanceLedgerService");
 const { deliverAttendanceLedger } = await import("./attendanceLedgerOutbox");
 const { assignAttendanceShift } = await import("./attendanceShift");
 const { attendancePayrollDtr } = await import("../controllers/payrollController");
+const { getAccuratePayrollDtr } = await import("./payrollRecomputeService");
+const { PayrollRecord } = await import("../models/Payroll");
+const { executeAttendanceCommand, autoTimeOutCommandId } = await import("./attendanceLedgerService");
 let mongo: MongoMemoryReplSet, server: http.Server, base = "";
 before(async () => {
     mongo = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
@@ -63,6 +66,15 @@ test("adding a reviewed historical checkout updates all six replicas, deductions
             ["Break In", "2026-10-21T16:16:01Z"], ["Lunch Break Out", "2026-10-21T18:00:00Z"], ["Lunch Break In", "2026-10-21T19:01:00Z"],
             ["Time In", "2026-10-22T15:00:00Z"], ["Break Out", "2026-10-22T17:00:00Z"]]);
         const before = await (await data.request(0, data.endpoint(0, "session"))).json();
+        const cutoff = "Oct 21, 2026 - Oct 21, 2026", originalPayroll: unknown[] = [];
+        for (let index = 0; index < businesses.length; index++) originalPayroll.push(await runWithBusiness(businesses[index], async () => {
+            await PayrollRecord.create({ employeeName: "Synthetic Missing Checkout", employeeId: data.code, department: "Synthetic",
+                payType: "Semi-monthly", payPeriod: cutoff, grossPay: 15000, deductions: 50, netPay: 14950,
+                status: "Review", paidOn: "-", incompleteShiftDays: 1 });
+            return await PayrollRecord.findOne({ employeeId: data.code }).lean();
+        }));
+        const priorDtr = await runWithBusiness(businesses[0], async () => getAccuratePayrollDtr((await Employee.findById(data.people[0]._id).lean())!, cutoff));
+        assert.equal(priorDtr.currentAttendanceReviewDays, 1);
         const command = { commandId: crypto.randomUUID(), expectedRevision: before.revision, fingerprint: before.fingerprint,
             operation: "correct", reason: "Synthetic reviewed missing checkout", changes: [{ source: "Time Out", at: "2026-10-21T23:50:00Z" }] };
         assert.equal((await data.request(0, data.endpoint(0, "preview"), command, true)).status, 403);
@@ -77,6 +89,17 @@ test("adding a reviewed historical checkout updates all six replicas, deductions
         for (let index = 0; index < 6; index++) {
             const fresh = await (await data.request(index, data.endpoint(index, "session"))).json();
             assert.equal(fresh.revision, saved.revision); assert.equal(fresh.state, "BREAK"); assert.equal(fresh.syncPending, false);
+            for (let refresh = 0; refresh < 2; refresh++) {
+                for (const route of [`/attendance?all=true&employeeIds=${data.people[index]._id}`, `/employees/${data.people[index]._id}/attendance?all=true`]) {
+                    const response = await data.request(index, route); assert.equal(response.status, 200);
+                    const history = await response.json();
+                    for (const record of history) {
+                        const canonical = fresh.records.find((event: { id: string }) => event.id === record.eventId);
+                        assert.ok(canonical); assert.equal(record.sequence, canonical.sequence);
+                        assert.equal(record.shiftDayKey, canonical.shiftDayKey, "HR must retain canonical overnight ownership, including late added checkouts");
+                    }
+                }
+            }
             const day = fresh.dashboardDays.find((item: { dayKey: string }) => item.dayKey === "2026-10-21");
             assert.deepEqual([day.milliseconds.late, day.milliseconds.overBreak, day.milliseconds.overLunch, day.milliseconds.underTime].map((n: number) => n / 60000), [5, 2, 1, 10]);
             const hubResponse = await data.request(index, `/attendance-hub/days?shiftView=date&shiftDate=2026-10-21&employee=${data.code}&business=${businesses[index]}`);
@@ -91,6 +114,14 @@ test("adding a reviewed historical checkout updates all six replicas, deductions
                 const replicas = await Attendance.find({ employee: data.people[index]._id, source: "Time Out", isEffective: true }).lean();
                 assert.equal(replicas.length, 1); assert.equal(replicas[0].attendanceStatus, "Undertime");
                 assert.equal((await Employee.findById(data.people[index]._id).lean())?.availabilityStatus, "BREAK");
+                for (let refresh = 0; refresh < 2; refresh++) {
+                    const dtr = await getAccuratePayrollDtr((await Employee.findById(data.people[index]._id).lean())!, cutoff);
+                    assert.equal(dtr.currentAttendanceReviewDays, 0, "the resolved checkout must not retain a stale current review flag");
+                    assert.equal(dtr.summary.incompleteShiftDays, 1, "saved cutoff history remains unchanged until approved recompute");
+                    assert.deepEqual([dtr.summary.grossPay, dtr.summary.deductions, dtr.summary.netPay], [15000, 50, 14950]);
+                    assert.equal(dtr.rows[0].deductibleMinutes, 18);
+                }
+                assert.deepEqual(await PayrollRecord.findOne({ employeeId: data.code }).lean(), originalPayroll[index]);
             });
         }
         const replay = await data.request(2, data.endpoint(2, "commands"), command); assert.equal((await replay.json()).revision, saved.revision);
@@ -100,6 +131,48 @@ test("adding a reviewed historical checkout updates all six replicas, deductions
         const ledger = await AttendanceLedger.findById(data.identity.key).lean();
         assert.deepEqual(ledger!.events.slice(0, data.events.length), data.events); assert.equal(ledger!.audit.at(-1)?.reason, command.reason);
     } finally { context.mock.timers.reset(); }
+});
+
+test("08:05 automatic checkout is owned by the original weekday or weekend shift after refresh in all six businesses", async context => {
+    context.mock.timers.enable({ apis: ["Date"], now: new Date("2026-10-25T01:00:00Z") });
+    const flag = process.env.CRM_ATTENDANCE_AUTO_TIMEOUT;
+    process.env.CRM_ATTENDANCE_AUTO_TIMEOUT = "true";
+    try {
+        for (const day of ["2026-10-23", "2026-10-24"]) {
+            const next = new Date(`${day}T00:00:00Z`); next.setUTCDate(next.getUTCDate() + 1);
+            const nextDay = next.toISOString().slice(0, 10), checkoutAt = `${nextDay}T00:05:00.000Z`;
+            const data = await seed(`synthetic-automatic-${day}`, [["Time In", `${day}T15:00:05Z`], ["Break Out", `${day}T23:45:00Z`]]);
+            const session = await (await data.request(0, data.endpoint(0, "session"))).json();
+            const command = { operation: "auto-time-out" as const, commandId: autoTimeOutCommandId(session.sessionId),
+                expectedRevision: session.revision, sessionId: session.sessionId, reason: "Synthetic automatic overnight checkout" };
+            await runWithBusiness(businesses[0], () => executeAttendanceCommand(data.identity, command,
+                { role: "system", code: "attendance-auto-time-out" }, new Date(checkoutAt)));
+            await deliverAttendanceLedger(data.identity.key);
+            for (let index = 0; index < businesses.length; index++) for (let refresh = 0; refresh < 2; refresh++) {
+                const fresh = await (await data.request(index, data.endpoint(index, "session"))).json();
+                assert.equal(fresh.state, "OFFLINE");
+                const out = fresh.records.find((event: { source: string }) => event.source === "Time Out");
+                assert.equal(out.at, checkoutAt); assert.equal(out.autoTimeOut, true); assert.equal(out.shiftDayKey, day);
+                const history = await (await data.request(index, `/attendance?all=true&employeeIds=${data.people[index]._id}`)).json();
+                const hrOut = history.find((event: { eventId: string }) => event.eventId === out.id);
+                assert.equal(hrOut.shiftDayKey, day); assert.equal(hrOut.sequence, out.sequence); assert.equal(hrOut.autoTimeOut, true);
+                assert.equal(fresh.dashboardDays.filter((item: { timeIn: string | null }) => item.timeIn).length, 1);
+                assert.equal(fresh.dashboardDays.find((item: { dayKey: string }) => item.dayKey === day).timeOut, checkoutAt);
+                const hub = await (await data.request(index, `/attendance-hub/days?shiftView=date&shiftDate=${day}&employee=${data.code}&business=${businesses[index]}`)).json();
+                assert.equal(hub.rows[0].timeOut, checkoutAt); assert.equal(hub.rows[0].dayKey, day);
+                const dtr = await runWithBusiness(businesses[index], () => attendancePayrollDtr(data.people[index]._id, "Oct 21, 2026 - Nov 5, 2026"));
+                const row = dtr.rows.find(item => item.dateKey === day)!;
+                assert.notEqual(row.status, "Needs Review"); assert.equal(row.recordCount, 4);
+                assert.equal(dtr.rows.find(item => item.dateKey === nextDay)!.recordCount, 0);
+                const dashboard = await (await data.request(index, "/call-dashboard")).json();
+                assert.equal(dashboard.employees.find((item: { employeeCode: string }) => item.employeeCode === data.code).status, "OFFLINE");
+            }
+            const count = (await AttendanceLedger.findById(data.identity.key).lean())!.events.length;
+            await runWithBusiness(businesses[0], () => executeAttendanceCommand(data.identity, command,
+                { role: "system", code: "attendance-auto-time-out" }, new Date(checkoutAt)));
+            assert.equal((await AttendanceLedger.findById(data.identity.key).lean())!.events.length, count);
+        }
+    } finally { process.env.CRM_ATTENDANCE_AUTO_TIMEOUT = flag; context.mock.timers.reset(); }
 });
 
 test("open break, lunch and off-phone intervals require an explicit paired return and retain deductions in all businesses", async context => {
