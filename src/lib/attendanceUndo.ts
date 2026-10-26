@@ -17,12 +17,13 @@ export function attendanceUndoAvailability(snapshot: AttendanceSessionSnapshot |
     const group = snapshot.records.filter(event => event.commandId === current.commandId);
     if (group.some(event => !visibleIds.has(event.id))) return blocked("This recorded action includes another shift. Use a reviewed attendance correction instead.");
     const audit = snapshot.audit.find(item => item.commandId === current.commandId);
-    if (!audit || audit.operation !== "action" || audit.actor.role !== "employee" || group.some(event => event.autoTimeOut)) {
+    const addedTimeOut = audit?.operation === "add-time-out" && audit.actor.role === "admin";
+    if (!addedTimeOut && (!audit || audit.operation !== "action" || audit.actor.role !== "employee" || group.some(event => event.autoTimeOut))) {
         return blocked("Imported, automatic and administratively corrected events require a reviewed attendance correction, not Undo.");
     }
     const session = snapshot.sessions.find(item => item.events.some(event => group.some(member => member.id === event.id)));
     if (session?.lifecycle === "system-closed") return blocked("This session was closed by the system. Use a reviewed attendance correction instead.");
-    if (group.some(event => event.source === "Time Out" || event.source === "Logout") &&
+    if (!addedTimeOut && group.some(event => event.source === "Time Out" || event.source === "Logout") &&
         (!session || snapshot.sessions.at(-1)?.id !== session.id || (session.shift && Date.parse(snapshot.serverTime) >= Date.parse(session.shift.resetDeadline)))) {
         return blocked("This checkout cannot reopen an old session. Use a reviewed attendance correction instead.");
     }
@@ -37,16 +38,16 @@ export function attendanceUndoPlan(snapshot: AttendanceSessionSnapshot, target: 
     const current = snapshot.records.find(event => event.id === target.id)!;
     const group = snapshot.records.filter(event => event.commandId === current.commandId);
     const session = snapshot.sessions.find(item => item.events.some(event => event.id === current.id));
-    const pairs = [["Break Out", "Break In"], ["Lunch Break Out", "Lunch Break In"], ["Off the Phone Out", "Off the Phone In"]];
+    const pairs = [["Break Out", "Break In"], ["Lunch Break Out", "Lunch Break In"], ["Off the Phone Out", "Off the Phone In", "Non-Billable Off the Phone Out"]];
     const pair = pairs.find(sources => sources.includes(current.source));
     const isLatest = snapshot.records.at(-1)?.commandId === current.commandId;
     if (!session || !pair || group.length !== 1 || (current.source === pair[1] && isLatest)) {
         return { events: group, paired: false };
     }
     const index = session.events.findIndex(event => event.id === current.id);
-    const candidates = current.source === pair[0] ? session.events.slice(index + 1) : session.events.slice(0, index).reverse();
+    const candidates = current.source !== pair[1] ? session.events.slice(index + 1) : session.events.slice(0, index).reverse();
     const other = candidates.find(event => pair.includes(event.source));
-    if (!other || other.source === current.source) return { events: group, paired: false };
+    if (!other || (other.source === pair[1]) === (current.source === pair[1])) return { events: group, paired: false };
     const otherGroup = snapshot.records.filter(event => event.commandId === other.commandId);
     if (otherGroup.length !== 1 || !attendanceUndoAvailability(snapshot, other, dayKey).allowed) {
         return { events: group, paired: false };

@@ -1002,7 +1002,7 @@ function AttendanceShiftDetailsModal({ row, onClose }: { row: AttendanceShiftRow
                                 <article key={session.id} className="rounded-lg border border-sky-200 bg-white px-3 py-3 text-sm text-sky-800">
                                     <div className="flex flex-wrap items-start justify-between gap-3">
                                         <div>
-                                            <p className="font-semibold">Off the Phone for {formatAttendanceDuration(session.durationMs)}</p>
+                                            <p className="font-semibold">{session.nonBillable ? "Non-Billable Off the Phone" : "Off the Phone"} for {formatAttendanceDuration(session.durationMs)}</p>
                                             <p className="mt-1 text-xs text-slate-600">
                                                 {formatPhDateTime(session.startedAt)} to {session.endedAt ? formatPhDateTime(session.endedAt) : "Still off the phone"}
                                             </p>

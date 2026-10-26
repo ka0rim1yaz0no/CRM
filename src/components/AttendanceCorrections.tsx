@@ -41,7 +41,7 @@ export default function AttendanceCorrections({ employeeId, businessId = getActi
     const lastUndo = attendanceUndoAvailability(query.data, lastEvent, dayKey);
     const missingSessions = missingTimeOutSessions(query.data, dayKey);
     const timeOutDraft = mode === "add-time-out" && query.data && missingSessions.some(session => session.id === timeOutSessionId)
-        ? missingTimeOutDraft(query.data, dayKey, timeOutSessionId) : null;
+        ? missingTimeOutDraft(query.data, dayKey, timeOutSessionId, at) : null;
     const begin = (next: "correct" | "undo", selected: SessionEvent | null) => {
         if (!query.data) return;
         const event = next === "undo" ? selected || lastEvent || null : selected;
@@ -69,16 +69,20 @@ export default function AttendanceCorrections({ employeeId, businessId = getActi
             }
             const replacement = mode === "correct" && !remove ? (at === attendanceInputValue(target?.at) ? target!.at : new Date(`${at}+08:00`).toISOString()) : undefined;
             const undo = mode === "undo" ? attendanceUndoPlan(query.data, target!, dayKey) : null;
+            const checkoutChanges = mode === "add-time-out" ? missingTimeOutChanges(query.data, dayKey, timeOutSessionId, at, closeRest) : null;
+            if (checkoutChanges?.some(change => change.remove) && !query.data.timeOutOverrideEnabled) throw new Error("Refresh CRM after the updated attendance server is available before replacing later actions.");
             const command: AttendanceCommand = { commandId: crypto.randomUUID(), expectedRevision: baseline.revision,
-                fingerprint: baseline.fingerprint, operation: mode === "add-time-out" || undo?.paired ? "correct" : mode!, reason: reason.trim(),
+                fingerprint: baseline.fingerprint, operation: mode === "add-time-out" ? query.data.timeOutOverrideEnabled ? "add-time-out" : "correct" : undo?.paired ? "correct" : mode!, reason: reason.trim(),
                 ...(mode === "undo" ? undo!.paired ? { changes: undo!.events.map(event => ({ targetId: event.id, remove: true })) } : { targetCommandId: target?.commandId }
-                    : { changes: mode === "add-time-out" ? missingTimeOutChanges(query.data, dayKey, timeOutSessionId, at, closeRest)
+                    : mode === "add-time-out" && query.data.timeOutOverrideEnabled ? { sessionId: timeOutSessionId, timeOutAt: checkoutChanges!.at(-1)!.at, closeRest }
+                    : { changes: mode === "add-time-out" ? checkoutChanges!
                         : [{ targetId: target!.id, ...(remove ? { remove: true } : { source, at: replacement }) }] }) };
             const result = await previewAttendanceCommand(employeeId, command, businessId);
             const used = (state: typeof result.before, bucket: string) => `${Math.round((state.time?.actual[bucket] || 0) / 6000) / 10}m`;
             const timerStart = result.after.stateSince ? `${new Date(result.after.stateSince).toLocaleString("en-US", { timeZone: "Asia/Manila" })} PH` : "none";
             const description = undo?.paired ? `Reverse this completed rest interval: ${undo.events.map(event => `${event.source} at ${new Date(event.at).toLocaleString("en-US", { timeZone: "Asia/Manila" })} PH`).join(" and ")}. Unrelated newer actions stay unchanged.`
-                : mode === "add-time-out" ? `Add ${command.changes!.map(change => `${change.source} at ${new Date(change.at!).toLocaleString("en-US", { timeZone: "Asia/Manila" })} PH`).join(" and ")}. Existing actions stay unchanged.`
+                : mode === "add-time-out" ? `Add ${checkoutChanges!.filter(change => !change.remove).map(change => `${change.source} at ${new Date(change.at!).toLocaleString("en-US", { timeZone: "Asia/Manila" })} PH`).join(" and ")}. Reverse ${checkoutChanges!.filter(change => change.remove).length} later action(s) in this session. Other sessions stay unchanged.`
+                : mode === "undo" && query.data.audit.some(item => item.commandId === target?.commandId && item.operation === "add-time-out") ? "Undo the added Time Out and restore the actions it replaced."
                 : target ? `${target.source} at ${new Date(target.at).toLocaleString("en-US", { timeZone: "Asia/Manila" })} PH.` : "Latest eligible action.";
             setPreview({ command, employeeId, businessId, dayKey, text: `Employee ${employeeId}. ${description} ${result.before.state} -> ${result.after.state}, timer starts ${timerStart}. Break used ${used(result.before, "break")} -> ${used(result.after, "break")}; lunch used ${used(result.before, "lunch")} -> ${used(result.after, "lunch")}. ${result.targets.length} original event(s) affected in ${result.businessIds.join(", ")}. ${result.payrollImpact}` });
             setError("");
@@ -106,10 +110,11 @@ export default function AttendanceCorrections({ employeeId, businessId = getActi
                 </select></label>}
                 <label>PH Time Out<input aria-label="PH Time Out" type="datetime-local" step="1" value={at} required min={timeOutDraft?.min} max={timeOutDraft?.max}
                     onChange={event => { setAt(event.target.value); setPreview(null); }} /></label>
+                {!!timeOutDraft?.replaced.length && <p role="status">{timeOutDraft.replaced.length} later action(s) in this session will be reversed. Original history will be retained.</p>}
                 {timeOutDraft?.returnSource && <label><input type="checkbox" checked={closeRest} onChange={event => { setCloseRest(event.target.checked); setPreview(null); }} />
                     Add {timeOutDraft.returnSource} at the same time</label>}
             </>}
-            {mode === "correct" && <><label>Action<select value={source} onChange={(event) => { setSource(event.target.value as SessionEvent["source"]); setPreview(null); }}>{["Time In", "Time Out", "Break Out", "Break In", "Lunch Break Out", "Lunch Break In", "Off the Phone Out", "Off the Phone In", "Login", "Logout"].map((item) => <option key={item}>{item}</option>)}</select></label><label>PH time<input type="datetime-local" step="1" value={at} required={!remove} disabled={remove} onChange={(event) => { setAt(event.target.value); setPreview(null); }} /></label>
+            {mode === "correct" && <><label>Action<select value={source} onChange={(event) => { setSource(event.target.value as SessionEvent["source"]); setPreview(null); }}>{["Time In", "Time Out", "Break Out", "Break In", "Lunch Break Out", "Lunch Break In", "Off the Phone Out", "Non-Billable Off the Phone Out", "Off the Phone In", "Login", "Logout"].map((item) => <option key={item}>{item}</option>)}</select></label><label>PH time<input type="datetime-local" step="1" value={at} required={!remove} disabled={remove} onChange={(event) => { setAt(event.target.value); setPreview(null); }} /></label>
                 <label><input type="checkbox" checked={remove} onChange={(event) => { setRemove(event.target.checked); setPreview(null); }} /> Explicitly reverse this event without replacement</label></>}
             <label>Reason<textarea aria-label="Reason" value={reason} required maxLength={1000} onChange={(event) => { setReason(event.target.value); setPreview(null); }} /></label>
             <button type="submit">{reviewing ? "Reviewing..." : "Review change"}</button><button type="button" onClick={() => { setMode(null); setPreview(null); }}>Cancel</button>

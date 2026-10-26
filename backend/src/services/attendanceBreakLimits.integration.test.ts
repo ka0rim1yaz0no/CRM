@@ -9,7 +9,7 @@ import type { AttendanceSource } from "../models/Attendance";
 
 process.env.NODE_ENV = "test";
 const prefix = `att_break_${crypto.randomUUID().replaceAll("-", "").slice(0, 16)}`;
-const businesses = ["test-a", "test-b", "test-c"];
+const businesses = Array.from({ length: 6 }, (_, index) => `test-${index}`);
 process.env.BUSINESS_DATABASES = JSON.stringify(businesses.map((id, index) => ({ id,
   name: `Synthetic break limits ${index}`, databaseName: `${prefix}_${index}` })));
 process.env.DEFAULT_BUSINESS_ID = businesses[0];
@@ -138,6 +138,65 @@ async function rejectAction(person: Person, source: AttendanceSource, seconds: n
   if (message) assert.equal(rejected.message, message);
   assert.equal(await core(person), before, `${source} rejection must not write attendance, revision, audit, outbox, payroll, or availability`);
 }
+
+test("HTTP: non-billable off-phone is exclusive, idempotent, closes on checkout and refreshes in six businesses", async () => {
+  const person = await fixture();
+  await action(person, "Time In", 0);
+  await action(person, "Non-Billable Off the Phone Out", 60);
+  const current = await session(person);
+  const command = { commandId: crypto.randomUUID(), expectedRevision: current.revision, fingerprint: current.fingerprint, operation: "action", source: "Off the Phone In" };
+  await rejectAction(person, "Break Out", 61);
+  await rejectAction(person, "Off the Phone Out", 62);
+  await rejectAction(person, "Non-Billable Off the Phone Out", 63);
+  mock.timers.setTime(start + 121000);
+  const returned = await request<Snapshot>(person, 0, `/employees/${person.ids[0]}/attendance/commands`, { body: command });
+  const replay = await request<Snapshot>(person, 0, `/employees/${person.ids[0]}/attendance/commands`, { body: command });
+  assert.equal(returned.revision, replay.revision);
+  await action(person, "Off the Phone Out", 180);
+  await action(person, "Off the Phone In", 1200);
+  await action(person, "Non-Billable Off the Phone Out", 1800);
+  await action(person, "Time Out", 1861);
+  for (const index of businesses.keys()) {
+    for (let refresh = 0; refresh < 2; refresh++) {
+      const view = await session(person, index);
+      assert.equal(view.state, "OFFLINE"); assert.equal(view.reviewState, "verified"); assert.equal(view.syncPending, false);
+      assert.equal(view.derived[0].nonBillableOffPhoneMinutes, 4);
+      assert.equal(view.records.filter(event => event.source === "Non-Billable Off the Phone Out").length, 2);
+      assert.deepEqual(view.records.slice(-2).map(event => event.source), ["Off the Phone In", "Time Out"]);
+      const hub = await request<{ rows: Array<{ nonBillableOffPhoneMinutes: number; review: string[] }> }>(person, index,
+        `/attendance-hub/days?preset=custom&from=${shiftDay}&to=${shiftDay}&employee=${person.code}`, { admin: true });
+      assert.equal(hub.rows[0].nonBillableOffPhoneMinutes, 4);
+      assert.deepEqual(hub.rows[0].review, []);
+    }
+  }
+  const beforeUndo = await session(person);
+  const undo = await request<Snapshot>(person, 0, `/employees/${person.ids[0]}/attendance/commands`, { admin: true, body: {
+    commandId: crypto.randomUUID(), operation: "correct", expectedRevision: beforeUndo.revision, fingerprint: beforeUndo.fingerprint,
+    reason: "Reverse the first synthetic non-billable interval while retaining all later actions",
+    changes: beforeUndo.records.slice(1, 3).map(event => ({ targetId: event.id, remove: true })),
+  } });
+  assert.equal(undo.state, "OFFLINE"); assert.equal(undo.derived[0].nonBillableOffPhoneMinutes, 2);
+  for (const index of businesses.keys()) assert.equal((await session(person, index)).derived[0].nonBillableOffPhoneMinutes, 2);
+  const audit = await AttendanceLedger.findOne({ employeeCode: person.code }).lean();
+  assert.equal(audit!.events.filter(event => event.source === "Non-Billable Off the Phone Out").length, 2, "undo preserves original evidence");
+});
+
+test("HTTP: automatic 08:05 checkout caps non-billable time at 08:00 on its original overnight shift", async () => {
+  const { runAttendanceAutoTimeOutCycle } = await import("./attendanceAutoTimeOutWorker");
+  const old = process.env.CRM_ATTENDANCE_AUTO_TIMEOUT;
+  process.env.CRM_ATTENDANCE_AUTO_TIMEOUT = "true";
+  try {
+    const person = await fixture(); await action(person, "Time In", 0);
+    await action(person, "Non-Billable Off the Phone Out", 8 * 3600 + 55 * 60);
+    mock.timers.setTime(start + 9 * 3600000 + 6 * 60000);
+    const result = await runAttendanceAutoTimeOutCycle(new Date()); assert.equal(result.failed, 0);
+    for (const index of businesses.keys()) {
+      const view = await session(person, index);
+      assert.equal(view.state, "OFFLINE"); assert.equal(view.derived[0].dayKey, shiftDay);
+      assert.equal(view.derived[0].nonBillableOffPhoneMinutes, 5);
+    }
+  } finally { if (old === undefined) delete process.env.CRM_ATTENDANCE_AUTO_TIMEOUT; else process.env.CRM_ATTENDANCE_AUTO_TIMEOUT = old; }
+});
 
 test("HTTP: delivery health is admin-only, business-scoped and read-only", async () => {
   const person = await fixture();
@@ -273,7 +332,7 @@ test("HTTP: accuracy rounding is 15:00 = 0, 15:01 = 1, and 15:30 = 1 minute afte
   }
 });
 
-test("HTTP: correcting business A recalculates both over-breaks, a 61-minute lunch, hub, stored replicas and payroll in all three businesses", async () => {
+test("HTTP: correcting business A recalculates both over-breaks, a 61-minute lunch, hub, stored replicas and payroll in all six businesses", async () => {
   const person = await fixture();
   for (const [source, seconds] of [["Time In", 300], ["Break Out", 3600], ["Break In", 4530],
     ["Break Out", 7200], ["Break In", 8220], ["Lunch Break Out", 10800], ["Lunch Break In", 14460], ["Time Out", 32400]] as const) {

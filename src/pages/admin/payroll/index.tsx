@@ -36,6 +36,8 @@ import AdminLayout from "../adminLayout";
 import PayrollRecomputeDialog from "../../../components/admin/PayrollRecomputeDialog";
 import PayrollHoursDialog from "../../../components/admin/PayrollHoursDialog";
 import PayrollPaymentDialog from "../../../components/admin/PayrollPaymentDialog";
+import PayrollDraftPreviewDialog from "../../../components/admin/PayrollDraftPreviewDialog";
+import PayrollGenerationDialog from "../../../components/admin/PayrollGenerationDialog";
 import { payrollPaymentStatus } from "../../../../shared/payrollPaymentStatus";
 import {
     archivePayrollItem,
@@ -654,10 +656,11 @@ export default function PayrollPage() {
     const [workedMinutesInput, setWorkedMinutesInput] = useState("");
     const [workedMinutesError, setWorkedMinutesError] = useState("");
     const [recomputeOpen, setRecomputeOpen] = useState(false);
+    const [generationOpen, setGenerationOpen] = useState(false);
     const [recomputePeriod, setRecomputePeriod] = useState("");
     const [hoursTarget, setHoursTarget] = useState<{ record: PayrollRecord; businessId: string } | null>(null);
     const { data: accuracyConfig } = useQuery({ queryKey: ["payroll-accuracy-config"], queryFn: getPayrollAccuracyConfig });
-    const cutoffQuery = useQuery({ queryKey: ["payroll-cutoffs", businessId], queryFn: getPayrollCutoffs, enabled: accuracyConfig?.cutoffSelectionEnabled === true, refetchOnMount: "always" });
+    const cutoffQuery = useQuery({ queryKey: ["payroll-cutoffs", businessId], queryFn: getPayrollCutoffs, enabled: accuracyConfig?.cutoffSelectionEnabled === true, refetchOnMount: "always", refetchInterval: 60_000, refetchIntervalInBackground: false });
     const requestedPayPeriod = searchParams.get("payPeriod");
     const selectedPayPeriod = accuracyConfig?.cutoffSelectionEnabled ? requestedPayPeriod && requestedPayPeriod !== "current" ? requestedPayPeriod : cutoffQuery.data?.currentPayPeriod : undefined;
     const rosterMode = accuracyConfig?.enabled === true && Boolean(selectedPayPeriod) && selectedPayPeriod === cutoffQuery.data?.currentPayPeriod;
@@ -716,6 +719,9 @@ export default function PayrollPage() {
         queryClient.invalidateQueries({ queryKey: ["payroll-stats"] });
         queryClient.invalidateQueries({ queryKey: ["payroll-cutoffs"] });
         queryClient.invalidateQueries({ queryKey: ["payroll-roster-gaps"] });
+        queryClient.invalidateQueries({ queryKey: ["payroll-current-previews"] });
+        queryClient.invalidateQueries({ queryKey: ["payroll-compute"] });
+        queryClient.invalidateQueries({ queryKey: ["employee-payments"] });
     };
 
     const { data: bankEmployees = EMPTY_QUERY_ROWS, isLoading: areBankEmployeesLoading, isError: areBankEmployeesError } = useQuery({
@@ -763,6 +769,7 @@ export default function PayrollPage() {
             lateMinutes: payslipDtr.summary.lateMinutes,
             excessLunchMinutes: payslipDtr.summary.excessLunchMinutes,
             excessBreakMinutes: payslipDtr.summary.excessBreakMinutes,
+            nonBillableOffPhoneMinutes: payslipDtr.summary.nonBillableOffPhoneMinutes,
             absenceMinutes: payslipDtr.summary.absenceMinutes,
             earlyTimeOutMinutes: payslipDtr.summary.earlyTimeOutMinutes,
             deductibleMinutes: payslipDtr.summary.deductibleMinutes,
@@ -1184,6 +1191,9 @@ export default function PayrollPage() {
                             Export
                         </button>
                         {activeTab !== "Archived" && (
+                            <>{activeTab === "Employee Payroll" && rosterMode && accuracyConfig?.automaticPreviewsEnabled && selectedPayPeriod &&
+                                <PayrollDraftPreviewDialog key={`${businessId}:${selectedPayPeriod}`} businessId={businessId} payPeriod={selectedPayPeriod} currencyCode={systemSettings?.currencyCode || "PHP"} />}
+                            {rosterMode && accuracyConfig?.missingGenerationEnabled && <button type="button" onClick={() => setGenerationOpen(true)} className="inline-flex h-11 items-center gap-2 rounded-lg border border-white/10 px-4 text-sm font-semibold"><FiPlus />Generate missing</button>}
                             <button
                                 className="flex h-11 items-center gap-2 rounded-lg bg-[linear-gradient(135deg,#842cff,#4a0ebd)] px-5 text-sm font-semibold text-white transition hover:brightness-110 disabled:opacity-60"
                                 type="button"
@@ -1193,6 +1203,7 @@ export default function PayrollPage() {
                                 <FiPlus className="size-4" aria-hidden="true" />
                                 {runPayrollMutation.isPending ? "Running..." : accuracyConfig?.enabled ? "Generate / Recompute cutoff" : "Run Payroll"}
                             </button>
+                            </>
                         )}
                     </div>
                 </div>
@@ -1302,7 +1313,7 @@ export default function PayrollPage() {
 
                         <section className="mt-3 flex min-h-[24rem] flex-1 flex-col overflow-hidden rounded-lg border border-violet-200/80 bg-white/90 shadow-xl shadow-violet-200/35">
                             <div role="region" aria-label="Employee payroll records" tabIndex={0} className="content-scroll min-h-0 max-w-full flex-1 overflow-auto bg-[linear-gradient(to_bottom,#ffffff_0,#ffffff_3.25rem,transparent_3.25rem)] [scrollbar-gutter:stable]">
-                                <table className="w-full min-w-[64rem] table-fixed border-separate border-spacing-0 text-left">
+                                <table className="w-full min-w-[68rem] table-fixed border-separate border-spacing-0 text-left">
                                     <thead className="sticky top-0 z-10 bg-white text-[0.74rem] font-medium !text-slate-600 shadow-[12px_0_0_#ffffff]">
                                         <tr>
                                             <th className="w-[4%] px-3 py-3">
@@ -1314,14 +1325,14 @@ export default function PayrollPage() {
                                                     onChange={toggleAllVisibleRecords}
                                                 />
                                             </th>
-                                            <th className="w-[22%] px-3 py-3"><DataTableSortHeader field="employeeName" sortBy={sortBy} sortDir={sortDir} onSort={changeSort}>Employee</DataTableSortHeader></th>
+                                            <th className="w-[21%] px-3 py-3"><DataTableSortHeader field="employeeName" sortBy={sortBy} sortDir={sortDir} onSort={changeSort}>Employee</DataTableSortHeader></th>
                                             <th className="w-[11%] px-3 py-3"><DataTableSortHeader field="employeeId" sortBy={sortBy} sortDir={sortDir} onSort={changeSort}>Employee ID</DataTableSortHeader></th>
                                             <th className="w-[11%] px-3 py-3">Basic Pay</th>
                                             <th className="w-[5%] px-3 py-3">Days</th>
-                                            <th className="w-[6%] px-3 py-3">Hours</th>
-                                            <th className="w-[11%] px-3 py-3"><DataTableSortHeader field="netPay" sortBy={sortBy} sortDir={sortDir} onSort={changeSort}>Net Pay</DataTableSortHeader></th>
+                                            <th className="w-[8%] px-3 py-3">Hours</th>
+                                            <th className="w-[12%] px-3 py-3"><DataTableSortHeader field="netPay" sortBy={sortBy} sortDir={sortDir} onSort={changeSort}>Net Pay</DataTableSortHeader></th>
                                             <th className="w-[10%] px-3 py-3"><DataTableSortHeader field="status" sortBy={sortBy} sortDir={sortDir} onSort={changeSort}>Status</DataTableSortHeader></th>
-                                            <th className="w-[20%] px-3 py-3 text-center">Actions</th>
+                                            <th className="w-[18%] px-3 py-3 text-center">Actions</th>
                                         </tr>
                                     </thead>
                                     <tbody className="divide-y divide-slate-200">
@@ -1337,7 +1348,7 @@ export default function PayrollPage() {
                                                     <td className="truncate px-3 py-2.5">{gap.employeeId}</td>
                                                     {["basic", "days", "hours", "net"].map(key => <td key={key} className="px-3 py-2.5 !text-slate-500">--</td>)}
                                                     <td className="px-3 py-2.5"><span className={`inline-flex rounded px-2 py-1 text-xs font-semibold ${conflict ? "bg-amber-50 !text-amber-800" : "bg-slate-100 !text-slate-600"}`}>{rosterGapLabel(gap.state)}</span></td>
-                                                    <td className="px-3 py-2.5 text-center"><button type="button" className="inline-flex size-8 items-center justify-center rounded-md !text-violet-700 hover:bg-violet-50" onClick={() => openRecompute(gap.payPeriod)} aria-label={`${review ? "Review cutoff" : "Generate payroll"} for ${gap.employeeName}`} title={review ? "Review cutoff" : "Generate payroll"}>{review ? <FiAlertCircle className="size-4" /> : <FiPlus className="size-4" />}</button></td>
+                                                    <td className="px-3 py-2.5 text-center"><button type="button" className="inline-flex size-8 items-center justify-center rounded-md !text-violet-700 hover:bg-violet-50" onClick={() => !review && accuracyConfig?.missingGenerationEnabled ? setGenerationOpen(true) : openRecompute(gap.payPeriod)} aria-label={`${review ? "Review cutoff" : "Generate payroll"} for ${gap.employeeName}`} title={review ? "Review cutoff" : "Generate payroll"}>{review ? <FiAlertCircle className="size-4" /> : <FiPlus className="size-4" />}</button></td>
                                                 </tr>;
                                             }
                                             const employee = row.record;
@@ -1649,6 +1660,7 @@ export default function PayrollPage() {
                                                 ["Late", `${employeeDtr.summary.lateMinutes} min`],
                                                 ["Excess Lunch", `${employeeDtr.summary.excessLunchMinutes} min`],
                                                 ["Excess Break", `${employeeDtr.summary.excessBreakMinutes} min`],
+                                                ["Non-billable Off the Phone", `${employeeDtr.summary.nonBillableOffPhoneMinutes ?? 0} min`],
                                                 ["Absence", `${employeeDtr.summary.absenceMinutes} min`],
                                                 ["Early Time Out", `${employeeDtr.summary.earlyTimeOutMinutes} min`],
                                                 ["Current Attendance Review", employeeDtr.currentAttendanceReviewDays ?? (employeeDtr.storedCutoff ? "Unavailable" : employeeDtr.summary.incompleteShiftDays)],
@@ -1684,6 +1696,7 @@ export default function PayrollPage() {
                                                             <th className="px-3 py-3 text-right">Late</th>
                                                             <th className="px-3 py-3 text-right">Lunch Over</th>
                                                             <th className="px-3 py-3 text-right">Break Over</th>
+                                                            <th className="px-3 py-3 text-right">Non-billable Off Phone</th>
                                                             <th className="px-3 py-3 text-right">Absent</th>
                                                             <th className="px-3 py-3 text-right">Early Out</th>
                                                         </tr>
@@ -1708,6 +1721,7 @@ export default function PayrollPage() {
                                                                 <td className="px-3 py-3 text-right font-semibold text-rose-700">{formatHoursMinutes(row.lateHours)}</td>
                                                                 <td className="px-3 py-3 text-right font-semibold text-amber-700">{row.excessLunchMinutes} min</td>
                                                                 <td className="px-3 py-3 text-right font-semibold text-amber-700">{row.excessBreakMinutes} min</td>
+                                                                <td className="px-3 py-3 text-right font-semibold text-red-700">{row.nonBillableOffPhoneMinutes ?? 0} min</td>
                                                                 <td className="px-3 py-3 text-right font-semibold text-rose-700">{row.absenceMinutes} min</td>
                                                                 <td className="px-3 py-3 text-right font-semibold text-rose-700">{row.earlyTimeOutMinutes} min</td>
                                                             </tr>
@@ -2165,6 +2179,7 @@ export default function PayrollPage() {
                 {hoursTarget && <PayrollHoursDialog record={hoursTarget.record} businessId={hoursTarget.businessId} onClose={() => setHoursTarget(null)} />}
                 {paymentTarget && accuracyConfig?.paymentStatusPreviewEnabled && <PayrollPaymentDialog record={paymentTarget.record} businessId={paymentTarget.businessId}
                     paid={paymentTarget.action === "paid"} currencyCode={systemSettings?.currencyCode} onClose={() => setPaymentTarget(null)} />}
+                {generationOpen && selectedPayPeriod && <PayrollGenerationDialog key={`${businessId}:${selectedPayPeriod}`} businessId={businessId} payPeriod={selectedPayPeriod} currencyCode={systemSettings?.currencyCode || "PHP"} onClose={() => setGenerationOpen(false)} onSaved={refreshPayroll} />}
                 {recomputeOpen && <PayrollRecomputeDialog initialPeriod={recomputePeriod || selectedPayPeriod || employees[0]?.payPeriod} currencyCode={systemSettings?.currencyCode} onClose={() => setRecomputeOpen(false)} onSaved={() => {
                     refreshPayroll(); queryClient.invalidateQueries({ queryKey: ["payroll-dtr"] }); queryClient.invalidateQueries({ queryKey: ["payroll-payslip-dtr"] });
                 }} />}

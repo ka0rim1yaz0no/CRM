@@ -26,7 +26,7 @@ const totals = (value: RecordValue) => ({ workedHours: value.workedHours, grossP
 function mirrorSignature(record: RecordValue) {
     return hash([record.employeeId, record.payPeriod, record.payType, totals(record), record.basicPay, record.minuteRate, record.hourlyRate,
         record.paidHoursPerDay, record.workingDays, record.scheduledHours, record.workedMinutesOverride, record.incompleteShiftDays,
-        record.excessBreakMinutes, record.excessLunchMinutes, record.lateMinutes, record.earlyTimeOutMinutes, record.absenceMinutes,
+        record.excessBreakMinutes, record.excessLunchMinutes, record.nonBillableOffPhoneMinutes ?? 0, record.lateMinutes, record.earlyTimeOutMinutes, record.absenceMinutes,
         record.attendanceDays, record.absentDays, record.lateDays, record.absentHours, record.lateHours, record.overtimeHours, record.overtimeApproved,
         record.payrollOwnerBusinessId, record.calculationSnapshot?.businessIds]);
 }
@@ -74,7 +74,7 @@ async function buildHoursPlan(id: string, workedMinutes: unknown, session?: Clie
             const value = { ...adjusted, deductions, netPay: roundMoney(record.grossPay - deductions),
                 calculationSnapshot: { ...record.calculationSnapshot, workedHoursAdjustment: {
                     workedMinutes, scheduledMinutes: Math.round(record.scheduledHours * 60), minuteRate: rate,
-                    formula: "Scheduled minutes minus total worked minutes, plus saved excess break and lunch once; gross pay and payment status unchanged.",
+                    formula: "Scheduled minutes minus total worked minutes (including non-billable off-phone shortfall once), plus saved excess break and lunch; gross pay and payment status unchanged.",
                 } } };
             return { businessId, id: String(record._id), beforeHash: hash(record), value,
                 attendanceHash: hash({ summary: attendance.summary, rows: attendance.rows, ledger: currentLedger }) };

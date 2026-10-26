@@ -2,6 +2,28 @@
 
 Date: 2026-10-23, Asia/Manila.
 
+## Earlier Checkout Update (2026-10-27)
+
+The new reviewed Add Time Out command supersedes the original last-action limit
+described below. Administrators can select any timestamp from the session's Time
+In through the current server time, strictly before a newer session begins. Later
+actions in that session are reversed together, not deleted. The preview identifies
+the number of affected actions. A rest active at the chosen checkout requires an
+explicit paired return at that exact time. Other sessions remain unchanged.
+
+The server derives the replacement plan from the revision-checked authoritative
+timeline. Original events, correction reasons and audit entries remain intact.
+Both Undo buttons can reverse this added checkout and restore its displaced
+actions. A restoration that would conflict with a newer session is rejected in
+preview, not silently forced. Existing generic and automatic correction safeguards
+remain in place.
+
+Shared business copies, HR, employee attendance, dashboards and current DTR
+calculations use the same effective timeline. Previously saved payroll amounts and
+payment statuses remain protected; changing those still needs the established
+payroll preview and confirmation. No historical or production records are changed
+just by deploying this code.
+
 ## Feature
 
 Administrators can open Attendance, select a shift, open Edit attendance, and use

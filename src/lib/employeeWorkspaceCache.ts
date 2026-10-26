@@ -4,7 +4,7 @@ export function refreshAttendanceWorkspace(client: QueryClient) {
     // Tenant copies have different employee IDs. Invalidate views, never copy one tenant's payload into another.
     return Promise.all(["attendance-session", "employee-attendance", "employee-dashboard-attendance",
         "attendance-hub", "attendance-hub-day", "attendance-hub-live", "employees-attendance",
-        "payroll", "payroll-records", "payroll-stats", "payroll-cutoffs", "payroll-roster-gaps", "payroll-dtr", "payroll-payslip-dtr", "employee-payments",
+        "payroll", "payroll-records", "payroll-stats", "payroll-cutoffs", "payroll-roster-gaps", "payroll-current-previews", "payroll-dtr", "payroll-payslip-dtr", "payroll-compute", "employee-payments",
         "admin-dashboard-attendance-records", "admin-call-dashboard", "agent-lead-dashboard", "dashboard-quick-view", "employees"].map((key) =>
         client.invalidateQueries({ queryKey: [key] })));
 }

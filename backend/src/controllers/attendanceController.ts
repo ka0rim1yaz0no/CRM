@@ -26,6 +26,7 @@ const attendanceSources: AttendanceSource[] = [
   "Lunch Break Out",
   "Lunch Break In",
   "Off the Phone Out",
+  "Non-Billable Off the Phone Out",
   "Off the Phone In",
 ];
 const timeInSources: AttendanceSource[] = ["Login", "Time In"];
@@ -651,7 +652,7 @@ export async function timeOutEmployee(request: Request, response: Response) {
     updatedEmployee.availabilityStatusReason
   );
 
-  const offPhoneOutCount = countAttendanceSource(activeSlot.records, "Off the Phone Out");
+  const offPhoneOutCount = countAttendanceSource(activeSlot.records, "Off the Phone Out") + countAttendanceSource(activeSlot.records, "Non-Billable Off the Phone Out");
   const offPhoneInCount = countAttendanceSource(activeSlot.records, "Off the Phone In");
 
   if (!attendanceV2Enabled() && offPhoneInCount < offPhoneOutCount) {
@@ -1062,7 +1063,7 @@ export async function recordEmployeeActivity(request: Request, response: Respons
   const attendanceRecords = [];
 
   if (activeSlot.timeIn && !activeSlot.timeOut) {
-    const offPhoneOutCount = countAttendanceSource(activeSlot.records, "Off the Phone Out");
+    const offPhoneOutCount = countAttendanceSource(activeSlot.records, "Off the Phone Out") + countAttendanceSource(activeSlot.records, "Non-Billable Off the Phone Out");
     const offPhoneInCount = countAttendanceSource(activeSlot.records, "Off the Phone In");
 
     if (nextStatus === "OFF THE PHONE" && offPhoneOutCount <= offPhoneInCount) {

@@ -1,6 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import AdminLayout from "../adminLayout";
 import { getPayrollDtr, getPayrollRecords, type PayrollDtr, type PayrollRecord } from "../../../api/payroll";
+import { getActiveBusinessId } from "../../../api/businessStorage";
 
 type PayrollComputeRow = {
     record: PayrollRecord;
@@ -92,6 +93,7 @@ function renderRecord({ record, dtr }: PayrollComputeRow) {
         `Absent = ${record.absentDays || 0} day(s), ${hours(record.absentHours || 0)}`,
         `Late = ${record.lateDays || 0} day(s), ${hours(record.lateHours || 0)}`,
         `Worked regular hours = ${hours(record.workedHours || 0)}`,
+        `Non-billable Off the Phone = ${record.nonBillableOffPhoneMinutes ?? 0} min (included in saved deductions)`,
         "Late time is shown for audit. Salary deduction follows the attendance deduction hours above.",
         dtrSummary
             ? [
@@ -118,7 +120,7 @@ function renderRecord({ record, dtr }: PayrollComputeRow) {
 
 export default function PayrollComputePage() {
     const { data = [], isLoading, isError } = useQuery({
-        queryKey: ["payroll-compute"],
+        queryKey: ["payroll-compute", getActiveBusinessId()],
         queryFn: async () => {
             const records = await getPayrollRecords({ archived: false });
             const dtrs = await Promise.all(records.map((record) => getPayrollDtr(record.employeeId, record.payPeriod).catch(() => null)));

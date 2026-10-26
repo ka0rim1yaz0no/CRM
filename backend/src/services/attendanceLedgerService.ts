@@ -14,17 +14,18 @@ import { attendanceAutoTimeOutCutoff } from "./attendanceAutoTimeOut";
 import { attendanceDerivedDaysDueForRefresh, deriveAttendanceDays } from "./attendanceDerived";
 import { attendanceDerivedAuditDelta, replayAttendanceDerived, sameAttendanceDerivedValues, type AttendanceDerivedAuditDelta } from "./attendanceDerivedAudit";
 import { attendancePayrollTransaction, lockPayrollAttendance } from "./payrollAttendanceFence";
+import { attendanceTimeOutPlan } from "../../../shared/attendanceTimeOut";
 
 export class AttendanceCommandError extends Error {
   constructor(public status: number, public code: string, message: string, public details?: unknown) { super(message); }
 }
 export type AttendanceIdentity = { key: string; code: string; businessIds: string[]; canonicalBusinessId: string; employeeId: string };
 export type AttendanceNoteReference = { businessId: string; dayKey: string; noteRevision: number; contentHash: string };
-export type AttendanceCommand = { commandId: string; expectedRevision: number; fingerprint?: string; operation: "action" | "correct" | "undo" | "recover" | "auto-time-out" | "recalculate" | "recalculate-policy" | "confirm-note";
+export type AttendanceCommand = { commandId: string; expectedRevision: number; fingerprint?: string; operation: "action" | "correct" | "undo" | "add-time-out" | "recover" | "auto-time-out" | "recalculate" | "recalculate-policy" | "confirm-note";
   source?: SessionEvent["source"]; changes?: Array<{ targetId?: string; source?: SessionEvent["source"]; at?: string; remove?: boolean }>;
-  sessionId?: string; dayKey?: string; targetCommandId?: string; reason?: string; previewRevision?: number; policyRevision?: number; noteReference?: AttendanceNoteReference };
+  sessionId?: string; timeOutAt?: string; closeRest?: boolean; dayKey?: string; targetCommandId?: string; reason?: string; previewRevision?: number; policyRevision?: number; noteReference?: AttendanceNoteReference };
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const supportedSources = new Set(["Login", "Logout", "Time In", "Time Out", "Break Out", "Break In", "Lunch Break Out", "Lunch Break In", "Off the Phone Out", "Off the Phone In"]);
+const supportedSources = new Set(["Login", "Logout", "Time In", "Time Out", "Break Out", "Break In", "Lunch Break Out", "Lunch Break In", "Off the Phone Out", "Non-Billable Off the Phone Out", "Off the Phone In"]);
 const hash = (value: unknown) => crypto.createHash("sha256").update(JSON.stringify(value)).digest("hex");
 export function recoveryCommandId(sessionId: string) {
   const hex = hash(`attendance-recovery:${sessionId}`);
@@ -118,7 +119,7 @@ export function attendanceSnapshot(ledger: AttendanceLedgerDocument, now = new D
   if (ledger.legacyAdoption?.businessStreamsDiffer) review.push("Historical business copies differed. Their original evidence was backed up and retained during reviewed adoption.");
   if (ledger.migrationRequired) review.push("Legacy history is readable, but adoption requires a reviewed migration and backup. No historical records were changed.");
   if (session?.shift?.ambiguous) review.push("Early clock-in assignment needs review. Automatic recovery is disabled for this ambiguous shift.");
-  return { sessionId: session?.id || null, revision: ledger.revision, fingerprint: hash(ledger.events),
+  return { timeOutOverrideEnabled: true, sessionId: session?.id || null, revision: ledger.revision, fingerprint: hash(ledger.events),
     state: session?.mode || "OFFLINE", stateSince: session?.modeSince || last?.modeSince || null,
     lifecycle: session?.lifecycle || last?.lifecycle || "none", assignedShift: session?.shift || null, allowedActions,
     openIntervals: session && session.mode !== "ONLINE" ? [{ mode: session.mode, startedAt: session.modeSince }] : [],
@@ -184,6 +185,21 @@ function applyAttendanceCommand(ledger: AttendanceLedgerDocument, input: Attenda
     guardAttendanceActionCutoff(input, before.active, policy, now);
     if (input.source === "Time Out" && before.active?.mode === "OFF THE PHONE") append("Off the Phone In", now.toISOString());
     append(input.source, now.toISOString());
+  } else if (input.operation === "add-time-out") {
+    if (actor.role !== "admin" || !input.reason?.trim()) throw new AttendanceCommandError(403, "ADMIN_REASON_REQUIRED", "An administrator and correction reason are required.");
+    if (typeof input.sessionId !== "string" || typeof input.timeOutAt !== "string" || (input.closeRest !== undefined && typeof input.closeRest !== "boolean") || input.changes || input.source || input.targetCommandId) {
+      throw new AttendanceCommandError(422, "INVALID_CHECKOUT", "Select one missing-checkout session and its Time Out.");
+    }
+    const session = before.sessions.find(item => item.id === input.sessionId);
+    if (!session?.shift || session.lifecycle === "system-closed") throw new AttendanceCommandError(409, "CHECKOUT_SESSION_CHANGED", "Select a session with a missing Time Out. System-closed sessions require a reviewed correction.");
+    let plan: ReturnType<typeof attendanceTimeOutPlan>;
+    try { plan = attendanceTimeOutPlan(before.sessions, input.sessionId, input.timeOutAt, now.toISOString()); }
+    catch (error) { throw new AttendanceCommandError(422, "INVALID_CHECKOUT", (error as Error).message); }
+    if (plan.returnSource && !input.closeRest) throw new AttendanceCommandError(422, "CHECKOUT_RETURN_REQUIRED", "Confirm closing the open break, lunch or off-phone interval at the same time.");
+    targets.push(...plan.replaced.map(event => event.id));
+    if (plan.returnSource) append(plan.returnSource as SessionEvent["source"], plan.at);
+    append("Time Out", plan.at);
+    corrections.push({ commandId: input.commandId, targets, reason: input.reason, actor: actor.code, at: now.toISOString() });
   } else if (input.operation === "correct") {
     if (actor.role !== "admin" || !input.reason?.trim()) throw new AttendanceCommandError(403, "ADMIN_REASON_REQUIRED", "An administrator and correction reason are required.");
     if (!input.changes?.length || input.changes.length > 30) throw new AttendanceCommandError(422, "INVALID_CHANGES", "Provide 1 to 30 intentional changes.");
@@ -214,13 +230,24 @@ function applyAttendanceCommand(ledger: AttendanceLedgerDocument, input: Attenda
     const eligible = before.effectiveEvents.filter((event) => event.commandId === target);
     if (!eligible.length) throw new AttendanceCommandError(409, "ALREADY_REVERSED", "This action has already been reversed or is not eligible.");
     targets.push(...eligible.map((event) => event.id));
-    if (ledger.audit.some((audit) => audit.commandId === target && audit.operation !== "action") || before.sessions.some((session) => session.lifecycle === "system-closed" && session.events.some((event) => targets.includes(event.id)))) {
+    const addedTimeOut = ledger.audit.some(audit => audit.commandId === target && audit.operation === "add-time-out" && audit.actor.role === "admin");
+    if (ledger.audit.some((audit) => audit.commandId === target && audit.operation !== "action" && !addedTimeOut) || before.sessions.some((session) => session.lifecycle === "system-closed" && session.events.some((event) => targets.includes(event.id)))) {
       throw new AttendanceCommandError(409, "REVIEWED_CORRECTION_REQUIRED", "Administrative corrections and system-closed sessions require a reviewed HR correction.");
     }
-    if (eligible.some((event) => event.source === "Time Out" || event.source === "Logout")) {
+    if (!addedTimeOut && eligible.some((event) => event.source === "Time Out" || event.source === "Logout")) {
       const session = before.sessions.find((item) => item.events.some((event) => targets.includes(event.id)));
       if (!session || before.sessions.at(-1)?.id !== session.id || (session.shift && now >= new Date(session.shift.resetDeadline))) {
         throw new AttendanceCommandError(409, "HISTORICAL_CORRECTION_REQUIRED", "This checkout cannot reopen an old session. Use a reviewed HR correction.");
+      }
+    }
+    if (addedTimeOut) {
+      const replaced = ledger.corrections.find(correction => correction.commandId === target);
+      if (!replaced) throw new AttendanceCommandError(409, "CHECKOUT_CORRECTION_CHANGED", "The checkout correction changed. Refresh and review it again.");
+      for (const original of ledger.events.filter(event => replaced.targets.includes(event.id)).sort((a, b) => a.at.localeCompare(b.at) || a.sequence - b.sequence)) {
+        const restored = append(original.source, original.at, original.shift, original.sessionId);
+        if (original.legacyReviewed) restored.legacyReviewed = true;
+        if (original.legacyBoundary) restored.legacyBoundary = true;
+        if (original.autoTimeOut) restored.autoTimeOut = true;
       }
     }
     corrections.push({ commandId: input.commandId, targets, reason: input.reason, actor: actor.code, at: now.toISOString() });

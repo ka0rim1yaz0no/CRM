@@ -13,6 +13,7 @@ export type AttendanceSource =
   | "Lunch Break Out"
   | "Lunch Break In"
   | "Off the Phone Out"
+  | "Non-Billable Off the Phone Out"
   | "Off the Phone In";
 export type AttendanceStatus = "On time" | "Late" | "Undertime" | "";
 
@@ -48,6 +49,7 @@ const attendanceSchema = new Schema<AttendanceDocument>(
         "Lunch Break Out",
         "Lunch Break In",
         "Off the Phone Out",
+        "Non-Billable Off the Phone Out",
         "Off the Phone In",
       ],
       default: "Time In",

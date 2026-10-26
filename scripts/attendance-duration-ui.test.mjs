@@ -152,5 +152,7 @@ test("duration layout puts Off the Phone on its own row below Break and Lunch wi
     const layout = page.slice(page.indexOf("const displayedMessage ="));
     assert.match(layout, /attendanceDurationModelEnabled \? actionButtons\.filter\(\(button\) => button\.key !== "OFF THE PHONE"\) : actionButtons/);
     assert.ok(layout.indexOf('aria-label="Break and lunch"') < layout.indexOf('aria-label="Off the Phone"'));
-    assert.match(layout, /aria-label="Off the Phone">\s*\{actionButtons\.filter\(\(button\) => button\.key === "OFF THE PHONE"\)\}/);
+    assert.match(layout, /aria-label="Off the Phone">\s*\{attendanceDurationModelEnabled && actionButtons\.filter\(\(button\) => button\.key === "OFF THE PHONE"\)\}/);
+    assert.match(layout, /data-attendance-action="NON_BILLABLE_OFF_PHONE"/);
+    assert.match(layout, /border-red-600 bg-red-600/);
 });

@@ -7,6 +7,7 @@ export type HubBreakSession = { startedAt: string; endedAt: string | null; durat
 export type HubDay = {
     dayKey: string; shiftStart: string; shiftEnd: string; timeIn: string | null; timeOut: string | null;
     autoTimeOut?: boolean;
+    nonBillableOffPhoneMinutes?: number;
     employeeCode: string; employeeId: string; employeeName: string; role: string; team: string; scopeKey: string;
     businessId: string; businessName: string; status: string; inProgress: boolean; excused: boolean; absent: boolean;
     mismatch: boolean; issues: string[]; review: string[]; note: string; leave: string | null;
@@ -15,7 +16,7 @@ export type HubDay = {
     breakSessions: HubBreakSession[];
     noteRevisions: Array<{ reason: string; excused: boolean; by: string; at: string }>;
     audit: Array<{ _id: string; occurredAt: string; description: string; metadata?: Record<string, string> }>;
-    milliseconds: Record<"online" | "break" | "lunch" | "offPhone" | "offline" | "late" | "underTime" | "overBreak" | "overLunch" | "overtime", number>;
+    milliseconds: Record<"online" | "break" | "lunch" | "offPhone" | "offline" | "late" | "underTime" | "overBreak" | "overLunch" | "overtime", number> & { nonBillableOffPhone?: number };
     events: HubEvent[];
     timeline: Array<{ bucket: string; start: string; end: string }>;
     businesses: Array<{ businessId: string; businessName: string; status: string; issues: string[]; milliseconds: HubDay["milliseconds"]; events: HubEvent[]; breakSessions: HubBreakSession[]; mismatch: boolean }>;
@@ -32,7 +33,7 @@ export type HubResponse = {
     range: { from: string; to: string }; serverTime: string;
     autoTimeOutEnabled?: boolean;
     summary: { daysWorked: number; employeesPresent: number; online: number; break: number; lunch: number;
-        offPhone: number; lateCount: number; late: number; overBreakCount: number; overBreak: number;
+        offPhone: number; nonBillableOffPhoneMinutes?: number; lateCount: number; late: number; overBreakCount: number; overBreak: number;
         overLunchCount: number; overLunch: number; underTimeCount: number; underTime: number;
         overtime: number; absent: number; needsReview: number; onTimeRate: number };
     thresholds: { breakMinutes: number; lunchMinutes: number; timezone: string };

@@ -23,7 +23,7 @@ import { payrollAccuracyEnabled } from "../config/rolloutFlags";
 import { dataCheckVerdict, type DataCheckReport, type DataCheckRow, type DataCheckSample, type DataCheckSection } from "../../../shared/dataCheck";
 
 type WorkspaceView = { dashboard: { summary: Record<string, number> }; attendance: Record<string, number>; calls: Array<{ count: number; seconds: number }>; overdueTotal: number; previous: Record<string, number>; deltas: Record<string, number | null> };
-type HubRow = { employeeCode: string; employeeName: string; milliseconds: Record<string, number>; breakSessions: Array<{ durationMs: number }>; excused: boolean; mismatch?: boolean; review?: string[] };
+type HubRow = { employeeCode: string; employeeName: string; milliseconds: Record<string, number>; nonBillableOffPhoneMinutes?: number; breakSessions: Array<{ durationMs: number }>; excused: boolean; mismatch?: boolean; review?: string[] };
 type HubView = { rows: HubRow[]; total: number; totalRows?: number; totalDays?: number; pages?: number; pageCount?: number };
 type RawCall = { _id: string; employee: Types.ObjectId; at: Date; seconds: number; outcome: string };
 type ScopeSnapshot = { business: string; policy: CheckPolicy; rows: Map<string, AuditPunch[]>; codes: string[] };
@@ -130,7 +130,7 @@ async function inspectAttendance(request: Request, business: BusinessConfig, dat
       const record = recordById.get(event.id);
       if (!record) continue;
       const derived = record.derived;
-      if (!derived || derived.dayKey !== date || derived.lateMinutes !== audit.late || derived.excessBreakMinutes !== audit.overBreak || derived.excessLunchMinutes !== audit.overLunch) {
+      if (!derived || derived.dayKey !== date || derived.lateMinutes !== audit.late || derived.excessBreakMinutes !== audit.overBreak || derived.excessLunchMinutes !== audit.overLunch || (derived.nonBillableOffPhoneMinutes ?? 0) !== audit.nonBillableOffPhoneMinutes) {
         stale++; if (staleSamples.length < 10) staleSamples.push({ recordId: String(record._id), employeeCode: person.employeeCode, timestamp: record.timeIn.toISOString() });
       }
     }
@@ -145,18 +145,18 @@ async function inspectAttendance(request: Request, business: BusinessConfig, dat
       const label = new Intl.DateTimeFormat("en-US", { timeZone: "UTC", month: "short", day: "numeric", year: "numeric" }).format(new Date(Date.UTC(y, mo - 1, d)));
       const dtr = await bounded(attendancePayrollDtr(person._id, `${label} - ${label}`), 4000);
       const day = dtr.rows.find(row => row.dateKey === date);
-      const dtrMinutes = day ? day.lateMinutes + day.excessBreakMinutes + day.excessLunchMinutes + day.earlyTimeOutMinutes : null;
+      const dtrMinutes = day ? day.lateMinutes + day.excessBreakMinutes + day.excessLunchMinutes + day.earlyTimeOutMinutes + (day.nonBillableOffPhoneMinutes ?? 0) : null;
       const reviewExcluded = payrollAccuracyEnabled() && (audit.open || audit.unclosedRests > 0 || audit.starts.break > 2 || audit.starts.lunch > 1 ||
         Boolean(view?.mismatch || view?.review?.length) || Boolean(audit.firstIn && now < end));
       checks.push(compareCheck(`${person.employeeCode}-dtr`, "Consistency", business.id, `${prefix}: DTR vs attendance deductible minutes`, dtrMinutes,
-        reviewExcluded ? 0 : view ? (view.milliseconds.late + view.milliseconds.overBreak + view.milliseconds.overLunch + view.milliseconds.underTime) / 60_000 : null,
+        reviewExcluded ? 0 : view ? (view.milliseconds.late + view.milliseconds.overBreak + view.milliseconds.overLunch + view.milliseconds.underTime) / 60_000 + (view.nonBillableOffPhoneMinutes ?? 0) : null,
         reviewExcluded ? "The independent event audit finds an unresolved/in-progress shift, excess rest attempts, or a hub review/mismatch. Accuracy payroll must finalize zero deductible minutes until resolution; observational hub issue minutes remain visible. No past payroll is changed." :
           "Existing read-only DTR row compared with the attendance hub in identical units. Weekend waivers, excuses, schedules or replica/canonical disagreement can explain a difference; no salary or bank fields are read or returned.", events.map(sample), true));
     } catch { checks.push(compareCheck(`${person.employeeCode}-dtr`, "Consistency", business.id, `${prefix}: DTR`, null, null, "DTR evidence was not available within its read budget.")); }
   }
   const summaryPairs: Array<[string, string, number]> = [["present", "employeesPresent", totals.present], ["late-count", "lateCount", totals.lateCount], ["late-minutes", "late", totals.late * 60_000], ["deductible-minutes", "deductible", totals.deductible]];
   for (const [id, key, actual] of summaryPairs) checks.push(compareCheck(id, "Attendance", business.id, `${id.replaceAll("-", " ")}${key === "late" ? " (ms)" : ""}`,
-    key === "deductible" ? summary ? (summary.late + summary.overBreak + summary.overLunch + summary.underTime) / 60_000 : null : summary?.[key], actual,
+    key === "deductible" ? summary ? (summary.late + summary.overBreak + summary.overLunch + summary.underTime) / 60_000 + summary.nonBillableOffPhoneMinutes : null : summary?.[key], actual,
     "Attendance hub range totals versus independently counted raw punches. Present requires a Time In inside [shift start, shift end). Cross-business conflicts and excuses may intentionally suppress hub totals.", raw.events.filter(event => ["Time In", "Login"].includes(event.source)).map(sample)));
   checks.push(compareCheck("stale-rows", "Attendance", business.id, "Stored attendance rows with stale or missing minutes", 0, stale, "Each effective replica's saved derived late/break/lunch fields is checked against a fresh independent recomputation. Missing legacy derivatives count as stale, not a repair instruction.", staleSamples, false, true));
   if (summary && workspace) for (const key of ["employeesPresent", "lateCount", "late", "overBreak", "overLunch", "underTime", "online"]) checks.push(compareCheck(`workspace-hub-${key}`, "Consistency", business.id, `Dashboard vs attendance hub: ${key}`, workspace.attendance?.[key], summary[key], "Both screen paths reuse the attendance hub and one internal server-time snapshot, including open sessions. Same-code, weaker proof: parity cannot independently validate the shared calculation. Concurrent attendance edits may still require a rerun.", [], true));

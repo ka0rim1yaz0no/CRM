@@ -1,5 +1,7 @@
 import { isTrustedBridgeActiveSignal } from "./callBridgeActiveSignal";
 import { callDashboardV2Enabled } from "../config/rolloutFlags";
+import { bucketForAttendanceSource } from "./timeAccounting";
+import type { AttendanceSource } from "../models/Attendance";
 
 export type CallDashboardAttendanceEvent = {
   source: string;
@@ -51,7 +53,7 @@ export function offPhoneDashboardClock(input: {
   shiftEnd: Date;
   now: Date;
 }) {
-  const activeStartedAt = input.state === "offPhone" ? input.stateSince : null;
+  const activeStartedAt = input.state === "offPhone" && input.now < input.shiftEnd ? input.stateSince : null;
   const activeMs = activeStartedAt
     ? Math.max(0, Math.min(input.now.getTime(), input.shiftEnd.getTime()) - activeStartedAt.getTime()) : 0;
   return { completedMs: Math.max(0, input.totalMs - activeMs), activeStartedAt };
@@ -102,7 +104,7 @@ export function offPhoneTimeInShift(events: CallDashboardAttendanceEvent[], shif
   for (const event of [...events].sort((a, b) => a.timeIn.getTime() - b.timeIn.getTime())) {
     const time = event.timeIn.getTime();
     if (time > end) break;
-    if (event.source === "Off the Phone Out") {
+    if (["Off the Phone Out", "Non-Billable Off the Phone Out"].includes(event.source)) {
       if (openAt !== null) completedMs += Math.max(0, time - Math.max(openAt, start));
       openAt = time;
     } else if (["Off the Phone In", "Time Out", "Logout"].includes(event.source) && openAt !== null) {
@@ -144,11 +146,14 @@ export function callDashboardStatus(input: {
 }) {
   const { devices, schedule, attendance, offPhoneStartedAt, now, shift } = input;
   const sortedEvents = [...attendance].filter(event => event.timeIn <= now).sort((a, b) => a.timeIn.getTime() - b.timeIn.getTime());
-  // Duration totals stop at the shift boundary. A later recorded checkout still
-  // determines current presence and must not inherit the old online bucket.
+  // Duration totals stop at the shift boundary. A newer action still determines
+  // current presence, including an early Time In before the next call shift.
   const latestTransition = [...sortedEvents].reverse().find(event => event.timeIn >= shift.start &&
-    ["Time In", "Login", "Break In", "Lunch Break In", "Off the Phone In", "Time Out", "Logout", "Break Out", "Lunch Break Out", "Off the Phone Out"].includes(event.source));
-  const availabilityStatus = latestTransition && ["Time Out", "Logout"].includes(latestTransition.source) ? "OFFLINE" : input.availabilityStatus;
+    ["Time In", "Login", "Break In", "Lunch Break In", "Off the Phone In", "Time Out", "Logout", "Break Out", "Lunch Break Out", "Off the Phone Out", "Non-Billable Off the Phone Out"].includes(event.source));
+  const latestBucket = latestTransition ? bucketForAttendanceSource(latestTransition.source as AttendanceSource) : null;
+  const laterPresence = latestBucket === "offPhone" ? "OFF THE PHONE" : latestBucket?.toUpperCase();
+  const availabilityStatus = latestTransition && ["Time Out", "Logout"].includes(latestTransition.source) ? "OFFLINE"
+    : latestTransition && latestTransition.timeIn >= shift.end && laterPresence ? laterPresence : input.availabilityStatus;
   const providerName = input.provider === "ringcentral" ? "RingCentral" : "Nextiva";
   const inShift = now >= shift.start && now < shift.end;
   const withinShift = (date: Date | null | undefined) => date && inShift
@@ -212,7 +217,7 @@ export function callDashboardStatus(input: {
     ? authoritativeDevice
     : undefined;
   const lastOnlineAt = latestAttendanceTransition(sortedEvents, ["Time In", "Login", "Break In", "Lunch Break In", "Off the Phone In"]);
-  const lastOfflineAt = latestAttendanceTransition(sortedEvents, ["Time Out", "Logout", "Break Out", "Lunch Break Out", "Off the Phone Out"]);
+  const lastOfflineAt = latestAttendanceTransition(sortedEvents, ["Time Out", "Logout", "Break Out", "Lunch Break Out", "Off the Phone Out", "Non-Billable Off the Phone Out"]);
   const onlineAt = lastOnlineAt && (!lastOfflineAt || lastOnlineAt >= lastOfflineAt) ? lastOnlineAt : null;
   const offlineAt = lastOfflineAt && (!lastOnlineAt || lastOfflineAt >= lastOnlineAt) ? lastOfflineAt : null;
 

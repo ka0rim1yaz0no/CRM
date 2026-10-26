@@ -26,6 +26,7 @@ export type PayrollRecordDocument = {
   lateMinutes: number;
   excessLunchMinutes: number;
   excessBreakMinutes: number;
+  nonBillableOffPhoneMinutes?: number;
   absenceMinutes: number;
   earlyTimeOutMinutes: number;
   deductibleMinutes: number;
@@ -79,6 +80,7 @@ const payrollRecordSchema = new Schema<PayrollRecordDocument>(
     lateMinutes: { type: Number, min: 0, default: 0 },
     excessLunchMinutes: { type: Number, min: 0, default: 0 },
     excessBreakMinutes: { type: Number, min: 0, default: 0 },
+    nonBillableOffPhoneMinutes: { type: Number, min: 0 },
     absenceMinutes: { type: Number, min: 0, default: 0 },
     earlyTimeOutMinutes: { type: Number, min: 0, default: 0 },
     deductibleMinutes: { type: Number, min: 0, default: 0 },

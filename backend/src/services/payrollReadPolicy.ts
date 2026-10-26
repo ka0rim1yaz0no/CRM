@@ -3,7 +3,7 @@ import { savedPayrollPeriod } from "../../../shared/payrollPeriod";
 type SavedPayroll = { _id: unknown; employeeId: string; payPeriod: string; grossPay: number; deductions: number; netPay: number; status: string };
 const detailFields = ["basicPay", "minuteRate", "hourlyRate", "paidHoursPerDay", "workingDays", "attendanceDays", "absentDays", "workedHours",
     "scheduledHours", "workedMinutesOverride", "overtimeHours", "overtimeApproved", "deductibleMinutes", "incompleteShiftDays", "paidOn"];
-const minuteFields = ["excessLunchMinutes", "excessBreakMinutes", "earlyTimeOutMinutes", "absenceMinutes"];
+const minuteFields = ["excessLunchMinutes", "excessBreakMinutes", "nonBillableOffPhoneMinutes", "earlyTimeOutMinutes", "absenceMinutes"];
 function signature(record: SavedPayroll) {
     const fields = record as SavedPayroll & Record<string, unknown>;
     return JSON.stringify([record.grossPay, record.deductions, record.netPay, record.status,

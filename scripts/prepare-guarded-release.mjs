@@ -48,8 +48,31 @@ const additions = ['docs/guarded-online-activation.md', 'scripts/attendance-roll
   'src/lib/attendanceUndo.ts', 'scripts/attendance-undo-ui.test.mjs', 'backend/src/services/attendanceUndo.integration.test.ts',
   'src/lib/attendanceMissingTimeOut.ts', 'scripts/attendance-missing-time-out.test.mjs', 'scripts/attendance-missing-time-out-browser.mjs',
   'backend/src/services/attendanceMissingTimeOut.integration.test.ts',
-  'src/lib/leadWorkspaceCache.ts', 'scripts/lead-live-workspace.test.mjs', 'scripts/lead-live-workspace-browser.mjs', 'scripts/attendance-undo-browser.mjs'];
-const safe = file => !file.split(/[\\/]/).some(part => ['.git', 'node_modules', 'outputs', 'uploads', 'logs', 'dist'].includes(part) || part.startsWith('.env')) &&
+  'backend/src/services/callDashboardPresence.integration.test.ts',
+  'shared/employeePayments.ts', 'shared/payrollPresentation.ts', 'shared/attendanceOffPhone.ts', 'shared/attendanceTimeOut.ts',
+  'backend/src/services/attendanceNonBillable.test.ts', 'scripts/non-billable-off-phone-browser.mjs', 'docs/non-billable-off-phone.md',
+  'shared/payrollPeriod.ts', 'shared/payrollSavedRates.ts',
+  'backend/src/services/payrollReadPolicy.ts', 'backend/src/services/payrollReadPolicy.test.ts',
+  'backend/src/services/payrollReplicaEvidence.ts', 'backend/src/services/payrollReplicaEvidence.test.ts',
+  'backend/src/services/payrollReplicaEvidence.integration.test.ts', 'scripts/attendance-shift-grouping.test.mjs',
+  'backend/src/models/EmployeePaymentHistoryPolicy.ts', 'backend/src/services/employeePayments.ts',
+  'backend/src/controllers/employeePaymentsController.ts', 'backend/src/scripts/initializeEmployeePayments.ts',
+  'backend/src/services/employeePayments.integration.test.ts',
+  'src/api/employeePayments.ts', 'src/components/EmployeePayments.tsx', 'src/components/employeePayments.css',
+  'scripts/employee-payments.test.mjs', 'scripts/employee-payments-browser.mjs', 'docs/employee-payments.md',
+  'src/lib/leadWorkspaceCache.ts', 'scripts/lead-live-workspace.test.mjs', 'scripts/lead-live-workspace-browser.mjs', 'scripts/attendance-undo-browser.mjs',
+  'src/lib/attendanceWorkspaceLive.ts', 'src/hooks/useAttendanceWorkspaceRefresh.ts', 'scripts/attendance-workspace-live.test.mjs',
+  'src/lib/payrollFormatting.ts', 'scripts/payroll-hours-format.test.mjs',
+  'src/components/admin/PayrollHoursDialog.tsx', 'scripts/payroll-hours-editor-browser.mjs',
+  'shared/payrollWorkedHours.ts', 'backend/src/services/payrollWorkedHoursService.ts', 'backend/src/services/payrollWorkedHours.integration.test.ts',
+  'shared/payrollDraftPreview.ts', 'backend/src/services/payrollDraftPreview.ts', 'src/components/admin/PayrollDraftPreviewDialog.tsx', 'docs/payroll-automatic-previews.md',
+  'shared/payrollGeneration.ts', 'backend/src/models/PayrollGenerationPolicy.ts', 'backend/src/services/payrollMissingGeneration.ts',
+  'backend/src/services/payrollGenerationWorker.ts', 'backend/src/services/payrollMissingGeneration.integration.test.ts',
+  'src/components/admin/PayrollGenerationDialog.tsx', 'docs/payroll-missing-generation.md',
+  'scripts/payroll-missing-generation-browser.mjs',
+  'shared/payrollPaymentStatus.ts', 'backend/src/services/payrollPaymentStatusService.ts', 'src/components/admin/PayrollPaymentDialog.tsx', 'scripts/payroll-payment-status-browser.mjs'];
+const privateNotes = new Set(['docs/online-activation-20261022.md', 'docs/online-activation-20261023.md']);
+const safe = file => !privateNotes.has(file) && !file.split(/[\\/]/).some(part => ['.git', 'node_modules', 'outputs', 'uploads', 'logs', 'dist'].includes(part) || part.startsWith('.env')) &&
   !/\.(?:pem|key|pfx|p12|bson|archive|gcm|log|zip|rar|7z|tgz)$/i.test(file);
 const names = [...new Set([...tracked, ...additions])].filter(file => safe(file) && !removed.has(file)).sort();
 const files = [];

@@ -255,7 +255,7 @@ async function loadHub(actor: Actor, filters: ReturnType<typeof assertQuery>, no
 }
 
 function totals(rows: Awaited<ReturnType<typeof loadHub>>["rows"]) {
-  const total = { daysWorked: 0, employeesPresent: 0, online: 0, break: 0, lunch: 0, offPhone: 0,
+  const total = { daysWorked: 0, employeesPresent: 0, online: 0, break: 0, lunch: 0, offPhone: 0, nonBillableOffPhoneMinutes: 0,
     lateCount: 0, late: 0, overBreakCount: 0, overBreak: 0, overLunchCount: 0, overLunch: 0,
     underTimeCount: 0, underTime: 0, overtime: 0, absent: 0, needsReview: 0, onTimeRate: 0 };
   const present = new Set<string>();
@@ -263,6 +263,7 @@ function totals(rows: Awaited<ReturnType<typeof loadHub>>["rows"]) {
     if (row.review.length || row.mismatch) total.needsReview += 1;
     if (row.mismatch) continue;
     if (row.timeIn) { total.daysWorked += 1; present.add(row.scopeKey); }
+    total.nonBillableOffPhoneMinutes += row.nonBillableOffPhoneMinutes;
     for (const bucket of ["online", "break", "lunch", "offPhone", "late", "overBreak", "overLunch", "underTime", "overtime"] as const) total[bucket] += row.milliseconds[bucket];
     if (row.milliseconds.late) total.lateCount += 1;
     if (row.milliseconds.overBreak) total.overBreakCount += 1;
@@ -333,11 +334,11 @@ async function handleHubRead(request: Request, response: Response, mode: "days" 
       const settings = `Break allowance: ${loaded.thresholds.breakMinutes} min per break, Lunch allowance: ${loaded.thresholds.lunchMinutes} min; shift and grace are listed per row`;
       const lines = [["Attendance", filters.from, filters.to, hubTimeZone], [settings],
         ["Employee code", "Employee", "Shift day", "Business", "Shift start", "Shift end", "Grace minutes", "Status", "Time In", "Time Out", "Online minutes", "Break minutes", "Lunch minutes", "Off-phone minutes", "Late minutes", "Over break minutes", "Over lunch minutes", "Under time minutes", "Overtime minutes", "Issues", "Needs review", "Note",
-          "1st break out (UTC)", "1st break in (UTC)", "1st break duration seconds", "1st break open", "2nd break out (UTC)", "2nd break in (UTC)", "2nd break duration seconds", "2nd break open"],
+          "1st break out (UTC)", "1st break in (UTC)", "1st break duration seconds", "1st break open", "2nd break out (UTC)", "2nd break in (UTC)", "2nd break duration seconds", "2nd break open", "Non-billable off-phone deduction minutes"],
         ...matching.map((row) => [row.employeeCode, row.employeeName, row.dayKey, row.businessName, row.shiftStart, row.shiftEnd, row.graceMinutes, row.status, row.timeIn, row.timeOut,
           ...(["online", "break", "lunch", "offPhone", "late", "overBreak", "overLunch", "underTime", "overtime"] as const).map((field) => Math.round(row.milliseconds[field] / 60_000)),
           row.issues.join("; "), row.review.join("; "), row.note,
-          ...[0, 1].flatMap((index) => { const entry = row.breakSessions[index]; return entry ? [entry.startedAt, entry.endedAt, Math.floor(entry.durationMs / 1000), entry.isOpen] : ["", "", "", ""]; })])];
+          ...[0, 1].flatMap((index) => { const entry = row.breakSessions[index]; return entry ? [entry.startedAt, entry.endedAt, Math.floor(entry.durationMs / 1000), entry.isOpen] : ["", "", "", ""]; }), row.nonBillableOffPhoneMinutes])];
       response.type("text/csv").set("Content-Disposition", `attachment; filename="attendance-${filters.from}-${filters.to}.csv"`)
         .send(`\uFEFF${lines.map((line) => line.map(quoted).join(",")).join("\r\n")}`);
       return;

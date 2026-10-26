@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { verifiedAdminOnly } from "../middleware/businessAccess";
-import { payrollAccuracyConfig, previewPayroll, confirmPayroll, previewWorkedHours, confirmWorkedHours, previewPaymentStatus, confirmPaymentStatus } from "../controllers/payrollAccuracyController";
+import { payrollAccuracyConfig, payrollDraftPreviews, previewMissingPayrollRecords, confirmMissingPayrollRecords, previewPayroll, confirmPayroll, previewWorkedHours, confirmWorkedHours, previewPaymentStatus, confirmPaymentStatus } from "../controllers/payrollAccuracyController";
 import {
   archivePayrollItem,
   archivePayrollRecord,
@@ -26,6 +26,9 @@ import {
 export const payrollRouter = Router();
 payrollRouter.use(verifiedAdminOnly);
 payrollRouter.get("/accuracy-config", payrollAccuracyConfig);
+payrollRouter.get("/current-previews", payrollDraftPreviews);
+payrollRouter.post("/missing/preview", previewMissingPayrollRecords);
+payrollRouter.post("/missing/confirm", confirmMissingPayrollRecords);
 payrollRouter.post("/recompute/preview", previewPayroll);
 payrollRouter.post("/recompute/confirm", confirmPayroll);
 

@@ -244,6 +244,7 @@ function attendanceSourceLabel(source?: AttendanceRecord["source"]) {
     if (source === "Lunch Break Out") return "Lunch";
     if (source === "Lunch Break In") return "Back Online";
     if (source === "Off the Phone Out") return "Off the Phone";
+    if (source === "Non-Billable Off the Phone Out") return "Non-Billable Off the Phone";
     if (source === "Off the Phone In") return "Back on Phone";
     return source || "Attendance";
 }

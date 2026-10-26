@@ -35,7 +35,7 @@ function paymentDto(record: PayrollRecordDocument & { _id: unknown }, settings: 
     if (!range || required.some(value => savedNumber(value) === null) ||
         Math.round(record.grossPay * 100) - Math.round(record.deductions * 100) !== Math.round(record.netPay * 100)) return null;
     const scheduled = scheduledPayDateForPeriod(range.label, settings);
-    const minuteKeys = ["lateMinutes", "excessLunchMinutes", "excessBreakMinutes", "earlyTimeOutMinutes", "absenceMinutes"] as const;
+    const minuteKeys = ["lateMinutes", "excessLunchMinutes", "excessBreakMinutes", "nonBillableOffPhoneMinutes", "earlyTimeOutMinutes", "absenceMinutes"] as const;
     if (minuteKeys.some(key => record[key] !== undefined && savedNumber(record[key]) === null)) return null;
     return {
         id: String(record._id), payPeriod: record.payPeriod, cutoffStart: range.start, cutoffEnd: range.end,
@@ -48,6 +48,7 @@ function paymentDto(record: PayrollRecordDocument & { _id: unknown }, settings: 
         workedMinutesOverride: record.workedMinutesOverride ?? null,
         lateMinutes: record.lateMinutes, lateHours: savedNumber(record.lateHours) ?? undefined,
         excessLunchMinutes: record.excessLunchMinutes, excessBreakMinutes: record.excessBreakMinutes,
+        nonBillableOffPhoneMinutes: record.nonBillableOffPhoneMinutes,
         earlyTimeOutMinutes: record.earlyTimeOutMinutes, absenceMinutes: record.absenceMinutes,
         status: record.status, paidOn: record.status === "Paid" && record.paidOn && record.paidOn !== "-" ? record.paidOn : null,
         requiresReview: false,
@@ -68,7 +69,7 @@ export async function employeePayments(employeeCode: string, page = 1, view: "cu
     const records = await PayrollRecord.find({ employeeId: employeeCode, isArchived: false }).select(
         "employeeId payPeriod payType department grossPay basicPay deductions netPay calculationVersion calculationSnapshot.monthlySalary hourlyRate minuteRate paidHoursPerDay " +
         "workingDays attendanceDays absentDays workedHours workedMinutesOverride scheduledHours overtimeHours overtimeApproved deductibleMinutes incompleteShiftDays " +
-        "lateMinutes lateHours excessLunchMinutes excessBreakMinutes earlyTimeOutMinutes absenceMinutes status paidOn updatedAt"
+        "lateMinutes lateHours excessLunchMinutes excessBreakMinutes nonBillableOffPhoneMinutes earlyTimeOutMinutes absenceMinutes status paidOn updatedAt"
     ).maxTimeMS(5000).lean();
     const { groups } = payrollReadGroups(records);
     const current = savedPayrollPeriod(result.currentPayPeriod);

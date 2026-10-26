@@ -297,6 +297,65 @@ test("an unpaid zero-value monthly draft does not falsely block a dated cutoff, 
     }
 });
 
+test("non-billable off-phone deductions survive reviewed generation, repeated reads, Payments and six business mirrors", async () => {
+    const ledger = await AttendanceLedger.findById("synthetic-hours").lean(); assert.ok(ledger);
+    const originalPayroll = await Promise.all(businesses.map(business => saved(business)));
+    const first = ledger.events[0];
+    const events: SessionEvent[] = [first,
+        { ...first, id: "nb-start", commandId: "nb-start", sequence: 1, source: "Non-Billable Off the Phone Out", at: "2026-10-15T16:00:00.000Z" },
+        { ...first, id: "nb-return", commandId: "nb-return", sequence: 2, source: "Off the Phone In", at: "2026-10-15T16:10:01.000Z" },
+        { ...first, id: "paid-start", commandId: "paid-start", sequence: 3, source: "Off the Phone Out", at: "2026-10-15T17:00:00.000Z" },
+        { ...first, id: "paid-return", commandId: "paid-return", sequence: 4, source: "Off the Phone In", at: "2026-10-15T18:00:00.000Z" },
+        { ...first, id: "checkout", commandId: "checkout", sequence: 5, source: "Time Out", at: "2026-10-16T00:00:00.000Z" }];
+    await AttendanceLedger.updateOne({ _id: ledger._id }, { $set: { events, revision: 2 } });
+    for (const business of businesses) await runWithBusiness(business, async () => {
+        const employee = await Employee.findOne({ employeeCode: code }).lean(); assert.ok(employee);
+        await Attendance.deleteMany({ employee: employee._id });
+        await Attendance.insertMany(events.map(event => ({ employee: employee._id, source: event.source, timeIn: new Date(event.at), eventId: event.id,
+            sequence: event.sequence, ledgerIdentity: ledger._id, ledgerRevision: 2, isEffective: true })));
+        await SystemSettings.updateOne({ key: "system" }, { payrollBillingCycle: "Semi-monthly" });
+    });
+    for (const [index, business] of businesses.entries()) {
+        const candidate = await runWithBusiness(business, async () => calculatePayrollCandidate((await Employee.findOne({ employeeCode: code }).lean())!, period));
+        assert.equal(candidate.value.nonBillableOffPhoneMinutes, 11);
+        const row = candidate.dtr.rows.find(item => item.dateKey === "2026-10-15")!;
+        assert.equal(row.nonBillableOffPhoneMinutes, 11); assert.equal(row.deductibleMinutes, 11);
+        assert.equal(row.regularHours, 8 - 11 / 60);
+        assert.equal(candidate.value.deductions, Math.round(candidate.value.deductibleMinutes * candidate.value.minuteRate * 100) / 100);
+        assert.deepEqual(await saved(business), originalPayroll[index], "preview must not rewrite existing amounts or status");
+    }
+    const proposed = await request("/payroll/recompute/preview", { payPeriod: period, overtimeApprovals: {} });
+    assert.equal(proposed.status, 200, JSON.stringify(proposed.data)); assert.equal(proposed.data.canApply, true);
+    const details = proposed.data.rows[0].nonBillableOffPhone;
+    assert.equal(details.before.minutes, 0); assert.equal(details.before.amount, 0);
+    assert.equal(details.after.minutes, 11);
+    const proposedCandidate = await runWithBusiness(businesses[0], async () => calculatePayrollCandidate((await Employee.findOne({ employeeCode: code }).lean())!, period));
+    assert.equal(details.minuteRate, proposedCandidate.value.minuteRate);
+    assert.equal(details.after.amount, payrollDeductionRows(proposedCandidate.value).find(item => item.label === "Non-billable Off the Phone")?.amount);
+    for (const [index, business] of businesses.entries()) assert.deepEqual(await saved(business), originalPayroll[index]);
+    const applied = await request("/payroll/recompute/confirm", { token: proposed.data.token, payPeriod: period, overtimeApprovals: {}, confirm: true, reason: "Synthetic reviewed non-billable off-phone deduction" });
+    assert.equal(applied.status, 200, JSON.stringify(applied.data));
+    for (const business of businesses) {
+        const current = await saved(business); assert.ok(current); assert.equal(current.nonBillableOffPhoneMinutes, 11);
+        for (let refresh = 0; refresh < 2; refresh++) {
+            const dtr = await request(`/payroll/dtr/${code}?payPeriod=${encodeURIComponent(period)}`, undefined, business);
+            assert.equal(dtr.status, 200); assert.equal(dtr.data.summary.nonBillableOffPhoneMinutes, 11);
+            assert.equal(dtr.data.summary.deductions, current.deductions); assert.equal(dtr.data.summary.netPay, current.netPay);
+            const login = await request("/auth/login", { employeeCode: code }, business); assert.equal(login.status, 200);
+            const response = await fetch(`${base}/employees/${login.data.user._id}/payments?view=history`, { headers: { "X-Business-Id": business, "X-CRM-Attendance-Session": login.data.attendanceHubSession } });
+            const payments = await response.json(); assert.equal(response.status, 200);
+            assert.equal(payments.items[0].nonBillableOffPhoneMinutes, 11); assert.equal(payments.items[0].netPay, current.netPay);
+            assert.equal(payments.items[0].status, current.status);
+            const rows = payrollDeductionRows(payments.items[0]); assert.equal(rows.find(item => item.label === "Non-billable Off the Phone")?.minutes, 11);
+            assert.equal(rows.reduce((sum, item) => sum + Math.round(item.amount * 100), 0), Math.round(current.deductions * 100));
+        }
+        assert.deepEqual(await saved(business), current, "refresh must not modify saved payroll");
+    }
+    const refreshedPreview = await request("/payroll/recompute/preview", { payPeriod: period, overtimeApprovals: {} });
+    assert.equal(refreshedPreview.status, 200);
+    assert.deepEqual(refreshedPreview.data.rows[0].nonBillableOffPhone.before, details.after);
+});
+
 test("current cutoff opens with the full roster, distinguishing missing payroll from saved records after refresh in six businesses", async context => {
     context.mock.timers.enable({ apis: ["Date"], now: new Date("2026-10-26T08:00:00Z") });
     context.after(() => context.mock.timers.reset());
@@ -372,4 +431,59 @@ test("ambiguous current cutoff aliases stay visible as conflicts, never as gener
         assert.equal((await request("/payroll/roster-gaps?status=Not%20generated", undefined, business)).data.length, 0);
         assert.equal(JSON.stringify(await PayrollRecord.find().sort({ _id: 1 }).lean()), before);
     });
+});
+
+test("automatic current-cutoff previews include non-billable deductions, exclude saved aliases and paid records, and never write across six businesses", async context => {
+    context.mock.timers.enable({ apis: ["Date"], now: new Date("2026-10-20T08:00:00Z") });
+    context.after(() => context.mock.timers.reset());
+    const previousToken = token; token = createAdminDashboardSession("90000001")!; context.after(() => { token = previousToken; });
+    const ledger = await AttendanceLedger.findById("synthetic-hours").lean(); assert.ok(ledger);
+    const first = ledger.events[0];
+    const events: SessionEvent[] = [first,
+        { ...first, id: "auto-nb", commandId: "auto-nb", source: "Non-Billable Off the Phone Out", sequence: 1, at: "2026-10-15T16:00:00Z" },
+        { ...first, id: "auto-back", commandId: "auto-back", source: "Off the Phone In", sequence: 2, at: "2026-10-15T16:10:01Z" },
+        { ...first, id: "auto-end", commandId: "auto-end", source: "Time Out", sequence: 3, at: "2026-10-16T00:00:00Z" }];
+    await AttendanceLedger.updateOne({ _id: ledger._id }, { events, revision: 2 });
+    const originals: string[] = [];
+    for (const business of businesses) await runWithBusiness(business, async () => {
+        const original = await saved(business); assert.ok(original);
+        const { _id, ...value } = original; void _id;
+        await PayrollRecord.deleteMany({});
+        for (const [employeeCode, status, isArchived, payPeriod] of [["90000004", "Paid", false, period], ["90000005", "Pending", false, "October 6, 2026 - October 20, 2026"],
+            ["90000006", "Paid", true, "2026-10-06 - 2026-10-20"]] as const) {
+            await Employee.create({ employeeCode, name: `Synthetic Saved ${employeeCode}`, role: "Sales", status: "Active", salary: 30000 });
+            await PayrollRecord.create({ ...value, employeeId: employeeCode, status, isArchived, payPeriod });
+        }
+        await SystemSettings.updateOne({ key: "system" }, { payrollBillingCycle: "Semi-monthly" });
+        const employee = await Employee.findOne({ employeeCode: code }).lean(); assert.ok(employee);
+        await Attendance.deleteMany({ employee: employee._id });
+        await Attendance.insertMany(events.map(event => ({ employee: employee._id, source: event.source, timeIn: new Date(event.at), eventId: event.id,
+            sequence: event.sequence, ledgerIdentity: ledger._id, ledgerRevision: 2, isEffective: true })));
+        originals.push(JSON.stringify(await PayrollRecord.find().sort({ _id: 1 }).lean()));
+    });
+    const originalLedger = JSON.stringify(await AttendanceLedger.find().lean());
+    for (const [index, business] of businesses.entries()) {
+        for (let refresh = 0; refresh < 2; refresh++) {
+            const result = await request("/payroll/current-previews", undefined, business);
+            assert.equal(result.status, 200, JSON.stringify(result.data));
+            assert.equal(result.data.previewOnly, true); assert.equal(result.data.businessId, business); assert.equal(result.data.payPeriod, period);
+            assert.equal(result.data.rows.length, 1); const row = result.data.rows[0], value = row.calculation;
+            assert.equal(row.employeeCode, code); assert.equal(value.nonBillableOffPhoneMinutes, 11); assert.ok(value.scheduledDays > 0);
+            assert.ok(row.warnings.some((message: string) => message.includes("Cutoff in progress")));
+            assert.equal(Math.round(value.grossPay * 100) - Math.round(value.deductions * 100), Math.round(value.netPay * 100));
+            assert.equal(value.deductionDetails.reduce((sum: number, item: { amount: number }) => sum + Math.round(item.amount * 100), 0), Math.round(value.deductions * 100));
+            assert.equal(value.nonBillableOffPhoneDeduction, value.deductionDetails.find((item: { label: string }) => item.label === "Non-billable Off the Phone").amount);
+            assert.equal("token" in result.data, false); assert.equal("status" in row, false); assert.equal("_id" in row, false);
+        }
+        assert.equal(JSON.stringify(await runWithBusiness(business, () => PayrollRecord.find().sort({ _id: 1 }).lean())), originals[index]);
+    }
+    assert.equal((await request("/payroll/current-previews?payPeriod=Sep%2021,%202026%20-%20Oct%205,%202026")).status, 422);
+    assert.equal((await request("/payroll/current-previews", undefined, businesses[0], "forged")).status, 401);
+    assert.equal((await fetch(`${base}/payroll/current-previews`, { method: "POST", headers: { "X-Business-Id": businesses[0], "X-CRM-Admin-Session": token } })).status, 404);
+    context.mock.timers.setTime(Date.parse("2026-10-26T08:00:00Z")); token = createAdminDashboardSession("90000001")!;
+    const next = await request("/payroll/current-previews"); assert.equal(next.status, 200);
+    assert.equal(next.data.payPeriod, "Oct 21, 2026 - Nov 5, 2026"); assert.ok(next.data.rows.some((row: { employeeCode: string }) => row.employeeCode === code));
+    assert.equal((await request(`/payroll/current-previews?payPeriod=${encodeURIComponent(period)}`)).status, 422);
+    for (const [index, business] of businesses.entries()) assert.equal(JSON.stringify(await runWithBusiness(business, () => PayrollRecord.find().sort({ _id: 1 }).lean())), originals[index]);
+    assert.equal(JSON.stringify(await AttendanceLedger.find().lean()), originalLedger);
 });

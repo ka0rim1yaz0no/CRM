@@ -55,6 +55,8 @@ export function deriveAttendanceDays(ledger: AttendanceDerivedLedger, policy: At
     ));
     const breakSessions = perSession.flatMap((item) => item.breakSessions);
     const lunchSessions = perSession.flatMap((item) => item.lunchSessions);
+    const nonBillableOffPhoneSessions = perSession.flatMap(item => item.nonBillableOffPhoneSessions);
+    const nonBillableOffPhoneMinutes = nonBillableOffPhoneSessions.reduce((total, item) => total + item.minutes, 0);
     const excessBreakMinutes = breakSessions.reduce((total, item) => total + item.excessMinutes, 0);
     const excessLunchMinutes = lunchSessions.reduce((total, item) => total + item.excessMinutes, 0);
     const hasOpenSession = sessions.some((session) => session.lifecycle === "open");
@@ -63,6 +65,7 @@ export function deriveAttendanceDays(ledger: AttendanceDerivedLedger, policy: At
     if (excessBreakMinutes) issues.push("OVER BREAK");
     if (excessLunchMinutes) issues.push("OVER LUNCH");
     if (summary.earlyTimeOutMinutes) issues.push("UNDER TIME");
+    if (nonBillableOffPhoneMinutes) issues.push("NON-BILLABLE OFF PHONE");
     if (hasOpenSession) issues.push("OPEN SESSION");
     if (attendanceAccuracyFixesEnabled()) {
       if (breakSessions.some(item => item.notReturned)) issues.push("BREAK NOT RETURNED");
@@ -70,8 +73,8 @@ export function deriveAttendanceDays(ledger: AttendanceDerivedLedger, policy: At
     }
     if (sessions.some((session) => session.lifecycle === "system-closed")) issues.push("SYSTEM CLOSED");
     if (projection.issues.some((issue) => events.some((event) => event.id === issue.eventId))) issues.push("TIMELINE REVIEW");
-    return { ...summary, breakSessions, lunchSessions, excessBreakMinutes, excessLunchMinutes, hasOpenSession, issues,
-      deductibleMinutes: deductionComponents({ ...summary, excessBreakMinutes, excessLunchMinutes }).deductibleMinutes,
+    return { ...summary, breakSessions, lunchSessions, nonBillableOffPhoneSessions, nonBillableOffPhoneMinutes, excessBreakMinutes, excessLunchMinutes, hasOpenSession, issues,
+      deductibleMinutes: deductionComponents({ ...summary, excessBreakMinutes, excessLunchMinutes, nonBillableOffPhoneMinutes }).deductibleMinutes,
       dayKey, shiftStart: shift.start, shiftEnd: shift.end, sessionIds: sessions.map((session) => session.id),
       eventIds: [...new Set(events.map((event) => event.id))],
       status: summary.lateMinutes ? "Late" : summary.earlyTimeOutMinutes ? "Undertime" : "On time",

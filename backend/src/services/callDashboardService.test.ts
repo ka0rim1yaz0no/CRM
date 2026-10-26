@@ -2,8 +2,41 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { bridgeAvailabilityChangedAt, callDashboardStatus, currentAttendanceShift,
   offPhoneDashboardClock, offPhoneTimeInShift } from "./callDashboardService";
+import { accountTime, bucketForAttendanceSource } from "./timeAccounting";
 
 const at = (value: string) => new Date(value);
+
+test("a new early Time In overrides the prior shift's clipped off-phone state without changing its totals", () => {
+  const shift = { start: at("2026-10-22T15:00:00Z"), end: at("2026-10-23T00:00:00Z") };
+  const now = at("2026-10-23T14:58:00Z");
+  const attendance = [
+    { source: "Time In" as const, timeIn: shift.start },
+    { source: "Off the Phone Out" as const, timeIn: at("2026-10-22T23:52:25Z") },
+    { source: "Time In" as const, timeIn: at("2026-10-23T13:31:58Z") },
+  ];
+  const accounted = accountTime(attendance.map(event => ({ at: event.timeIn, bucket: bucketForAttendanceSource(event.source)! })), shift.start, shift.end, now);
+  assert.equal(accounted.state, "offPhone", "the previous shift's accounting window remains unchanged");
+  assert.equal(accounted.milliseconds.offPhone, 455000);
+  const status = callDashboardStatus({ availabilityStatus: "OFF THE PHONE", devices: [], attendance, shift, now });
+  assert.equal(status.status, "ONLINE"); assert.equal(status.statusStartedAt, null); assert.equal(status.transitionUntil, null);
+  assert.equal(status.detail, "Outside call shift", "an early Time In must not enable calling outside the call window");
+  const clock = offPhoneDashboardClock({ totalMs: accounted.milliseconds.offPhone, state: accounted.state,
+    stateSince: accounted.stateSince, shiftEnd: shift.end, now });
+  assert.equal(clock.activeStartedAt, null); assert.equal(clock.completedMs, 455000);
+});
+
+test("post-shift presence follows the latest real action, not a clipped state or a future action", () => {
+  const shift = { start: at("2026-10-22T15:00:00Z"), end: at("2026-10-23T00:00:00Z") };
+  const now = at("2026-10-23T14:58:00Z");
+  for (const [source, expected] of [["Time In", "ONLINE"], ["Login", "ONLINE"], ["Break In", "ONLINE"],
+    ["Lunch Break In", "ONLINE"], ["Off the Phone In", "ONLINE"], ["Break Out", "BREAK"],
+    ["Lunch Break Out", "LUNCH"], ["Off the Phone Out", "OFF THE PHONE"], ["Time Out", "OFFLINE"], ["Logout", "OFFLINE"]]) {
+    const status = callDashboardStatus({ availabilityStatus: "OFFLINE", devices: [], shift, now,
+      attendance: [{ source: "Time In", timeIn: shift.start }, { source, timeIn: at("2026-10-23T13:31:58Z") },
+        { source: "Time Out", timeIn: at("2026-10-23T15:05:00Z") }] });
+    assert.equal(status.status, expected, source); assert.equal(status.statusStartedAt, null);
+  }
+});
 
 test("explicit OFFLINE attendance cannot be overridden by lingering bridge audio", () => {
   const shift = { start: at("2026-10-22T15:00:00Z"), end: at("2026-10-23T00:00:00Z") };

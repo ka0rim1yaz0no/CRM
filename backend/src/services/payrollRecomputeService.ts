@@ -17,6 +17,7 @@ import { lockPayrollAttendance, payrollAttendanceFenceKeys } from "./payrollAtte
 import { payrollReadGroups } from "./payrollReadPolicy";
 import { savedPayrollPeriod } from "../../../shared/payrollPeriod";
 import { adjustedPayrollHours } from "../../../shared/payrollWorkedHours";
+import { payrollDeductionRows, type SavedDeductionSource } from "../../../shared/payrollPresentation";
 
 const fail = (statusCode: number, message: string) => Object.assign(new Error(message), { statusCode });
 const fingerprint = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -61,12 +62,13 @@ export async function calculatePayrollCandidate(employee: { _id: Types.ObjectId;
       attendanceFingerprint: fingerprint(ledger ? { events: ledger.events, corrections: ledger.corrections, closures: ledger.closures } : dtr.rows),
       evidence: evidence.filter(item => Date.parse(item.at) >= evidenceStart && Date.parse(item.at) < evidenceEnd),
       days: dtr.rows.map(item => ({ dayKey: item.dateKey, status: item.status, lateMinutes: item.lateMinutes, earlyTimeOutMinutes: item.earlyTimeOutMinutes,
+        nonBillableOffPhoneMinutes: item.nonBillableOffPhoneMinutes ?? 0,
         excessBreakMinutes: item.excessBreakMinutes, excessLunchMinutes: item.excessLunchMinutes, absenceMinutes: item.absenceMinutes, deductibleMinutes: item.deductibleMinutes })),
       rounding: "Each completed break/lunch excess rounds up; lateness uses minute boundaries after grace; early-out rounds up; money rounds once per total." } };
   return { record, value, dtr, rates };
 }
 
-function calculationFingerprint(candidate: Awaited<ReturnType<typeof calculatePayrollCandidate>>) {
+export function calculationFingerprint(candidate: Awaited<ReturnType<typeof calculatePayrollCandidate>>) {
   const { value, dtr, rates } = candidate;
   const snapshot = value.calculationSnapshot;
   // Replica ObjectIds and business-specific labels are not payroll inputs.
@@ -103,8 +105,13 @@ export async function getAccuratePayrollDtr(employee: Parameters<typeof calculat
     rows: candidate.dtr.rows.filter(row => row.status !== "Scheduled") };
 }
 
+function nonBillableDeduction(record: SavedDeductionSource | null) {
+  const row = record && payrollDeductionRows(record).find(item => item.label === "Non-billable Off the Phone");
+  return { minutes: row?.minutes ?? 0, amount: row?.amount ?? 0 };
+}
 type PlanRow = { employeeCode: string; employeeName: string; ownerBusinessId: string; businessIds: string[];
-  before: ReturnType<typeof moneyFields>; after: ReturnType<typeof moneyFields>; difference: number; reviewDays: number; potentialOvertimeHours: number; approvedOvertimeHours: number };
+  before: ReturnType<typeof moneyFields>; after: ReturnType<typeof moneyFields>; difference: number; reviewDays: number; potentialOvertimeHours: number; approvedOvertimeHours: number;
+  nonBillableOffPhone: { before: ReturnType<typeof nonBillableDeduction>; after: ReturnType<typeof nonBillableDeduction>; minuteRate: number } };
 type Target = { businessId: string; id: string; beforeHash: string; before: Record<string, unknown> | null; value: Record<string, unknown> };
 export async function previewPayrollCutoff(payPeriod: string, overtimeApprovals: unknown = {}) {
   return withReadSnapshot(serverReadTime(), () => buildPayrollCutoff(payPeriod, overtimeApprovals));
@@ -165,7 +172,8 @@ async function buildPayrollCutoff(payPeriod: string, overtimeApprovals: unknown,
     }
     rows.push({ employeeCode: employee.employeeCode, employeeName: employee.name, ownerBusinessId, businessIds,
       before: moneyFields(candidate.record), after: moneyFields(candidate.value), difference: roundMoney(candidate.value.netPay - (candidate.record?.netPay || 0)), reviewDays,
-      potentialOvertimeHours: candidate.dtr.summary.overtimeHours, approvedOvertimeHours: candidate.value.overtimeHours });
+      potentialOvertimeHours: candidate.dtr.summary.overtimeHours, approvedOvertimeHours: candidate.value.overtimeHours,
+      nonBillableOffPhone: { before: nonBillableDeduction(candidate.record), after: nonBillableDeduction(candidate.value), minuteRate: candidate.value.minuteRate } });
   }
   const token = fingerprint({ payPeriod, targets });
   return { payPeriod, token, rows, totalDifference: roundMoney(rows.reduce((sum, row) => sum + row.difference, 0)),

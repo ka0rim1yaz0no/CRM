@@ -3,10 +3,24 @@ import { payrollAccuracyEnabled } from "../config/rolloutFlags";
 import { applyPayrollCutoff, previewPayrollCutoff } from "../services/payrollRecomputeService";
 import { applyPayrollWorkedHours, previewPayrollWorkedHours } from "../services/payrollWorkedHoursService";
 import { confirmPayrollPaymentStatus, previewPayrollPaymentStatus } from "../services/payrollPaymentStatusService";
+import { currentPayrollDraftPreviews } from "../services/payrollDraftPreview";
+import { previewMissingPayroll, confirmMissingPayroll } from "../services/payrollMissingGeneration";
 
 export function payrollAccuracyConfig(_request: Request, response: Response) {
   response.setHeader("Cache-Control", "no-store");
-  response.json({ enabled: payrollAccuracyEnabled(), workedHoursEditingEnabled: payrollAccuracyEnabled(), paymentStatusPreviewEnabled: payrollAccuracyEnabled(), cutoffSelectionEnabled: payrollAccuracyEnabled(), employeeRosterEnabled: payrollAccuracyEnabled() });
+  response.json({ enabled: payrollAccuracyEnabled(), workedHoursEditingEnabled: payrollAccuracyEnabled(), paymentStatusPreviewEnabled: payrollAccuracyEnabled(), cutoffSelectionEnabled: payrollAccuracyEnabled(), employeeRosterEnabled: payrollAccuracyEnabled(), automaticPreviewsEnabled: payrollAccuracyEnabled(), missingGenerationEnabled: payrollAccuracyEnabled() });
+}
+export async function previewMissingPayrollRecords(request: Request, response: Response) {
+  response.setHeader("Cache-Control", "no-store");
+  response.json(await previewMissingPayroll(String(request.body.payPeriod || "")));
+}
+export async function confirmMissingPayrollRecords(request: Request, response: Response) {
+  response.json(await confirmMissingPayroll(request));
+}
+export async function payrollDraftPreviews(request: Request, response: Response) {
+  if (!payrollAccuracyEnabled()) { response.status(404).json({ message: "Payroll accuracy is disabled" }); return; }
+  response.setHeader("Cache-Control", "no-store");
+  response.json(await currentPayrollDraftPreviews(String(request.query.payPeriod || "")));
 }
 export async function previewPayroll(request: Request, response: Response) {
   if (!payrollAccuracyEnabled()) { response.status(404).json({ message: "Payroll accuracy is disabled" }); return; }

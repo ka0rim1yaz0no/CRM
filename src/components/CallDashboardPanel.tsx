@@ -197,7 +197,7 @@ export default function CallDashboardPanel({ businessId, businessName }: { busin
                                     </div>
                                 </td>
                                 <td className="px-4 py-2.5">
-                                    <span title={visible.detail} className={`inline-flex whitespace-nowrap rounded-md border px-2 py-1 text-xs font-semibold ${statusClasses(visible.status)}`}>{visible.status}</span>
+                                    <span title={visible.detail} className={`inline-flex rounded-md border px-2 py-1 text-xs font-semibold ${statusClasses(visible.status)}`}>{visible.status === "OFF THE PHONE" && row.offPhoneNonBillable ? "NON-BILLABLE OFF PHONE" : visible.status}</span>
                                 </td>
                                 <td className="px-4 py-2.5 text-right font-mono text-sm tabular-nums" title={statusTimeTitle}>{statusTime}</td>
                                 <td className="px-4 py-2.5 text-right font-mono text-sm tabular-nums">{offPhoneTime}</td>
@@ -222,8 +222,8 @@ export default function CallDashboardPanel({ businessId, businessName }: { busin
                                     <p className="break-words text-xs text-slate-500">{[row.role, row.team, businessName || row.businessName].filter(Boolean).join(" · ")}</p>
                                 </div>
                             </div>
-                            <span title={visible.detail} className={`inline-flex shrink-0 whitespace-nowrap rounded-md border px-2 py-1 text-xs font-semibold ${statusClasses(visible.status)}`}>
-                                {visible.status}
+                            <span title={visible.detail} className={`inline-flex max-w-[9rem] shrink-0 rounded-md border px-2 py-1 text-xs font-semibold ${statusClasses(visible.status)}`}>
+                                {visible.status === "OFF THE PHONE" && row.offPhoneNonBillable ? "NON-BILLABLE OFF PHONE" : visible.status}
                             </span>
                         </div>
                         <dl className="mt-3 grid grid-cols-2 gap-3 rounded-md border border-slate-200 bg-slate-50 p-3">

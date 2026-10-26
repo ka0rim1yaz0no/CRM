@@ -10,7 +10,7 @@ export type AttendanceBackfillEmployee = {
   employeeCode?: string;
   records: AttendanceBackfillRecord[]; ledger?: AttendanceDerivedLedger & { derived?: AttendanceDerivedDay[] };
 };
-const minuteFields = ["lateMinutes", "excessBreakMinutes", "excessLunchMinutes", "earlyTimeOutMinutes", "deductibleMinutes"] as const;
+const minuteFields = ["lateMinutes", "excessBreakMinutes", "excessLunchMinutes", "nonBillableOffPhoneMinutes", "earlyTimeOutMinutes", "deductibleMinutes"] as const;
 const comparisonFields = [...minuteFields, "status", "hasOpenSession", "breakSessions", "lunchSessions", "issues", "shiftStart", "shiftEnd", "eventIds", "sessionIds"] as const;
 const totals = () => Object.fromEntries(minuteFields.map((field) => [field, 0])) as Record<typeof minuteFields[number], number>;
 const comparable = (value: unknown): unknown => JSON.parse(JSON.stringify(value ?? null));

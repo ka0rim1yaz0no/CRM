@@ -1732,7 +1732,7 @@ function buildAttendanceHistoryRows(records: AttendanceRecord[], settings?: Syst
                     .map((session) => {
                         const startedAt = formatTimeInTimeZone(session.startedAt, timeZone) || "00:00:00";
                         const endedAt = session.endedAt ? formatTimeInTimeZone(session.endedAt, timeZone) || "00:00:00" : "Open";
-                        return `${startedAt} - ${endedAt}`;
+                        return `${session.nonBillable ? "Non-billable: " : ""}${startedAt} - ${endedAt}`;
                     })
                     .join("; ")
                 : "-";

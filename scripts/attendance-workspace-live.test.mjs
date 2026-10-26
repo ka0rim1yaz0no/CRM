@@ -23,7 +23,7 @@ function fixture(employeeId) {
         emit: (name, payload) => handlers.get(name)?.(payload), flush: async () => { for (const [id, callback] of [...timers]) { timers.delete(id); callback(); } await new Promise(resolve => setImmediate(resolve)); } };
 }
 const required = ['attendance-session', 'employee-attendance', 'attendance-hub', 'attendance-hub-day', 'attendance-hub-live',
-    'payroll-records', 'payroll-stats', 'payroll-dtr', 'payroll-payslip-dtr', 'employee-payments',
+    'payroll-records', 'payroll-stats', 'payroll-current-previews', 'payroll-dtr', 'payroll-payslip-dtr', 'employee-payments',
     'admin-dashboard-attendance-records', 'admin-call-dashboard', 'agent-lead-dashboard', 'dashboard-quick-view', 'employees'];
 
 test('attendance events refresh all connected attendance/payroll/payment/dashboard queries in every business', async () => {

@@ -4,10 +4,11 @@ import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 import ts from 'typescript';
 import { attendanceInputValue, buildAttendanceDraftChanges } from '../src/lib/attendanceCommandDraft.ts';
+import { attendanceTimeOutPlan } from '../shared/attendanceTimeOut.ts';
 const source = readFileSync(new URL('../src/lib/attendanceMissingTimeOut.ts', import.meta.url), 'utf8');
 const exports = {};
 runInNewContext(ts.transpileModule(source.replace(/^import .*;\r?\n/gm, ''), { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText,
-    { exports, attendanceInputValue, buildAttendanceDraftChanges });
+    { exports, attendanceInputValue, buildAttendanceDraftChanges, attendanceTimeOutPlan });
 const { missingTimeOutSessions, missingTimeOutDraft, missingTimeOutChanges } = exports;
 const day = '2026-10-22';
 const event = (source, at, id = source) => ({ id, source, at, commandId: id, sequence: 0 });
@@ -40,8 +41,24 @@ test('historical repair cannot consume a newer session, future timestamp or earl
     const data = snapshot([session, current]);
     assert.throws(() => missingTimeOutChanges(data, day, 'old', '2026-10-23T08:30:00', false), /before the next session/);
     assert.throws(() => missingTimeOutChanges(data, day, 'old', '2026-10-23T10:00:00', false), /future/);
-    assert.throws(() => missingTimeOutChanges(data, day, 'old', '2026-10-22T22:59:00', false), /last action/);
+    assert.throws(() => missingTimeOutChanges(data, day, 'old', '2026-10-22T22:59:00', false), /Time In/);
     assert.equal(missingTimeOutChanges(data, day, 'old', '2026-10-23T08:00:00', false).length, 1);
     const active = { ...snapshot(), serverTime: `${day}T18:00:00Z` };
     assert.equal(missingTimeOutDraft(active, day, 'old').value, '2026-10-23T02:00:00');
+});
+
+test('an earlier checkout reverses only later selected-session actions and closes the rest active at the cutoff', () => {
+    for (const [out, incoming] of [['Break Out','Break In'],['Lunch Break Out','Lunch Break In'],['Off the Phone Out','Off the Phone In'],['Non-Billable Off the Phone Out','Off the Phone In']]) {
+        const selected = { ...session, events: [...session.events, event(out, `${day}T16:00:00Z`, 'start'), event(incoming, `${day}T17:00:00Z`, 'return'), event('Break Out', `${day}T18:00:00Z`, 'later')] };
+        const next = { ...session, id: 'next', startedAt:'2026-10-23T15:00:00Z',events:[event('Time In','2026-10-23T15:00:00Z','new-in')] };
+        const data = {...snapshot([selected,next]),serverTime:'2026-10-23T18:00:00Z'};
+        const changes = missingTimeOutChanges(data, day, 'old', '2026-10-23T00:30:00', true);
+        assert.deepEqual(Array.from(changes, change => change.targetId).filter(Boolean), ['return','later']);
+        assert.deepEqual(Array.from(changes.slice(-2), change => [change.source,change.at]), [[incoming,`${day}T16:30:00.000Z`],['Time Out',`${day}T16:30:00.000Z`]]);
+        assert.equal(missingTimeOutDraft(data,day,'old','2026-10-23T00:30:00').returnSource,incoming);
+        assert.equal(missingTimeOutDraft(data,day,'old').min,'2026-10-22T23:00:00');
+        const beforeRest = missingTimeOutChanges(data,day,'old','2026-10-22T23:30:00',false);
+        assert.equal(beforeRest.filter(change=>change.remove).length,3);
+        assert.equal(beforeRest.filter(change=>!change.remove).length,1);
+    }
 });

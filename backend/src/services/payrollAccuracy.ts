@@ -2,6 +2,7 @@ import { calculateSlotAttendance, accountTime, bucketForAttendanceSource, deduct
 import { projectAttendance, type SessionEvent } from "./attendanceSessionState";
 import type { AttendanceSource } from "../models/Attendance";
 import { attendanceAccuracyFixesEnabled } from "../config/rolloutFlags";
+import { nonBillableOffPhoneIntervals } from "../../../shared/attendanceOffPhone";
 
 export type PayrollShiftSettings = { officialShiftStartTime?: string | null; officialShiftEndTime?: string | null };
 export class PayrollValidationError extends Error {
@@ -53,8 +54,10 @@ export function accuratePayrollDay(records: Array<{ source: string; timeIn: Date
     return bucket ? [{ at: item.timeIn, bucket }] : [];
   }), weekend && first ? first.timeIn : policy.shiftStart, weekend && final && !unfinished ? final.timeIn : policy.shiftEnd, now);
   const grossHours = (activity.milliseconds.online + activity.milliseconds.break + activity.milliseconds.lunch + activity.milliseconds.offPhone) / 3_600_000;
+  const overtimeNonBillableMinutes = weekend && first ? nonBillableOffPhoneIntervals(records, first.timeIn, final?.timeIn || now, now)
+    .reduce((sum, interval) => sum + interval.minutes, 0) : 0;
   return { status, review, calculated, components, grossHours, lunchHours: activity.milliseconds.lunch / 3_600_000,
     regularHours: weekend || status === "Scheduled" || review ? 0 : Math.max(0, paidHours - components.deductibleMinutes / 60),
-    overtimeHours: weekend && !review ? Math.max(0, grossHours - activity.milliseconds.lunch / 3_600_000) : 0,
+    overtimeHours: weekend && !review ? Math.max(0, grossHours - activity.milliseconds.lunch / 3_600_000 - overtimeNonBillableMinutes / 60) : 0,
     missingHours: components.deductibleMinutes / 60 };
 }

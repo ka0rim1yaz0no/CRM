@@ -1,5 +1,6 @@
 import { api } from "../lib/api";
 import type { Employee } from "./employees";
+import type { PayrollDraftPreviews } from "../../shared/payrollDraftPreview";
 
 export type PayrollStatus = "Paid" | "Pending" | "Failed" | "Completed" | "Review" | "Applied" | "Enabled";
 export type PayrollItemCategory = "Payroll Runs" | "Payouts" | "Deductions" | "Tax Settings";
@@ -24,6 +25,7 @@ export type PayrollRecord = {
     lateMinutes?: number;
     excessLunchMinutes?: number;
     excessBreakMinutes?: number;
+    nonBillableOffPhoneMinutes?: number;
     absenceMinutes?: number;
     earlyTimeOutMinutes?: number;
     deductibleMinutes?: number;
@@ -84,6 +86,7 @@ export type PayrollDtrRow = {
     lateMinutes: number;
     excessLunchMinutes: number;
     excessBreakMinutes: number;
+    nonBillableOffPhoneMinutes?: number;
     absenceMinutes: number;
     earlyTimeOutMinutes: number;
     grossHours: number;
@@ -130,6 +133,7 @@ export type PayrollDtr = {
         lateMinutes: number;
         excessLunchMinutes: number;
         excessBreakMinutes: number;
+        nonBillableOffPhoneMinutes?: number;
         absenceMinutes: number;
         earlyTimeOutMinutes: number;
         deductibleMinutes: number;
@@ -143,8 +147,24 @@ export type PayrollDtr = {
 export type PayrollPreview = { payPeriod: string; token: string; totalDifference: number; canApply: boolean;
     rows: Array<{ employeeCode: string; employeeName: string; ownerBusinessId: string; businessIds: string[]; reviewDays: number;
         before: { grossPay: number; deductions: number; netPay: number }; after: { grossPay: number; deductions: number; netPay: number };
-        difference: number; potentialOvertimeHours: number; approvedOvertimeHours: number }> };
-export async function getPayrollAccuracyConfig() { return (await api.get<{ enabled: boolean; workedHoursEditingEnabled?: boolean; paymentStatusPreviewEnabled?: boolean; cutoffSelectionEnabled?: boolean; employeeRosterEnabled?: boolean }>("/payroll/accuracy-config")).data; }
+        difference: number; potentialOvertimeHours: number; approvedOvertimeHours: number;
+        nonBillableOffPhone?: { before: { minutes: number; amount: number }; after: { minutes: number; amount: number }; minuteRate: number } }> };
+export async function getPayrollAccuracyConfig() { return (await api.get<{ enabled: boolean; workedHoursEditingEnabled?: boolean; paymentStatusPreviewEnabled?: boolean; cutoffSelectionEnabled?: boolean; employeeRosterEnabled?: boolean; automaticPreviewsEnabled?: boolean; missingGenerationEnabled?: boolean }>("/payroll/accuracy-config")).data; }
+export async function previewMissingPayroll(payPeriod: string, businessId: string, signal?: AbortSignal) {
+    const result = (await api.post<import("../../shared/payrollGeneration").PayrollGenerationPlan>("/payroll/missing/preview", { payPeriod }, { headers: { "X-Business-Id": businessId }, signal })).data;
+    if (result.businessId !== businessId || result.payPeriod !== payPeriod) throw new Error("Payroll context changed. Refresh Payroll.");
+    return result;
+}
+export async function confirmMissingPayroll(preview: import("../../shared/payrollGeneration").PayrollGenerationPlan, reason: string, enableFuture: boolean) {
+    return (await api.post<{ created: number; mirrors: number; automaticEnabled: boolean }>("/payroll/missing/confirm", {
+        payPeriod: preview.payPeriod, token: preview.token, confirm: true, reason, enableFuture,
+    }, { headers: { "X-Business-Id": preview.businessId } })).data;
+}
+export async function getCurrentPayrollPreviews(payPeriod: string, businessId: string, signal?: AbortSignal) {
+    const result = (await api.get<PayrollDraftPreviews>("/payroll/current-previews", { params: { payPeriod }, headers: { "X-Business-Id": businessId }, signal })).data;
+    if (result.businessId !== businessId || result.payPeriod !== payPeriod || result.previewOnly !== true) throw new Error("Payroll preview context changed. Refresh Payroll.");
+    return result;
+}
 export type PayrollCutoffs = { currentPayPeriod: string; defaultPayPeriod: string; historyFrom: string | null;
     items: Array<{ payPeriod: string; start: string; end: string; recordedEmployees: number; visibleEmployees?: number }> };
 export async function getPayrollCutoffs() { return (await api.get<PayrollCutoffs>("/payroll/cutoffs")).data; }

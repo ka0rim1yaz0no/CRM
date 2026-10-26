@@ -67,3 +67,15 @@ test('validation messages include actionable dependency details without exposing
   ] } } });
   assert.equal(text, 'The resulting timeline is invalid. No open BREAK matches this return.'); assert.ok(!text.includes('private-event-id'));
 });
+
+test('both Undo entry points preserve the entire reviewed Add Time Out command for server restoration', () => {
+  const back=event('returned','Lunch Break In','checkout'),out=event('checkout','Time Out','checkout'),data=snapshot([event('in','Time In'),back,out]);
+  data.audit.find(row=>row.commandId==='checkout').operation='add-time-out';
+  data.audit.find(row=>row.commandId==='checkout').actor.role='admin';
+  data.serverTime='2026-10-25T18:00:00Z';
+  for(const target of [attendanceEventsForDay(data,'2026-10-22').at(-1),back,out]){
+    assert.equal(attendanceUndoAvailability(data,target,'2026-10-22').allowed,true);
+    const plan=attendanceUndoPlan(data,target,'2026-10-22');assert.equal(plan.paired,false);
+    assert.deepEqual(plan.events.map(row=>row.id),['returned','checkout']);
+  }
+});

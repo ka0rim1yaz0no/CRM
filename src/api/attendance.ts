@@ -32,6 +32,7 @@ export type AttendanceRecord = {
         | "Lunch Break Out"
         | "Lunch Break In"
         | "Off the Phone Out"
+        | "Non-Billable Off the Phone Out"
         | "Off the Phone In";
     attendanceStatus?: "On time" | "Late" | "Undertime" | "";
     isArchived?: boolean;
@@ -141,11 +142,12 @@ export async function lunchBreakInEmployee(employeeId: string) {
     return response.data;
 }
 
-export async function reportEmployeeActivity(employeeId: string, state: "active" | "idle", options: { idleStartedAt?: string; reason?: string } = {}) {
+export async function reportEmployeeActivity(employeeId: string, state: "active" | "idle", options: { idleStartedAt?: string; reason?: string; nonBillable?: boolean } = {}) {
     if (attendanceIntegrityEnabled) {
-        const record = await runSessionAction(employeeId, state === "idle" ? "Off the Phone Out" : "Off the Phone In");
+        const record = await runSessionAction(employeeId, state === "idle" ? options.nonBillable ? "Non-Billable Off the Phone Out" : "Off the Phone Out" : "Off the Phone In");
         return { availabilityStatus: record.sessionSnapshot!.state, attendanceRecords: [record] };
     }
+    if (options.nonBillable) throw new Error("Non-billable Off the Phone requires the updated attendance service.");
     const response = await api.post<{ availabilityStatus: string; attendanceRecords?: AttendanceRecord[] }>(`/employees/${employeeId}/activity`, { state, ...options }, { headers: attendanceSessionHeaders() });
     return response.data;
 }

@@ -3,6 +3,7 @@ import type { AttendanceSource } from "../models/Attendance";
 import { accountTime, breakAllowanceMs, bucketForAttendanceSource, lunchAllowanceMs, excessClickedSessionMilliseconds, clickedSessionIntervals, calculateSlotAttendance, recordsWithClosingBoundaries } from "./timeAccounting";
 import { attendanceDurationModelEnabled, attendanceAccuracyFixesEnabled } from "../config/rolloutFlags";
 import { projectAttendance } from "./attendanceSessionState";
+import { isOffPhoneStart, nonBillableOffPhoneIntervals } from "../../../shared/attendanceOffPhone";
 
 export type HubEvent = { id: string; source: AttendanceSource; at: Date; eventId?: string; createdAt?: Date; sequence?: number; autoTimeOut?: boolean };
 export type HubSettings = { officialShiftStartTime: string; officialShiftEndTime: string; lateGraceMinutes: number; attendanceTimeZone: string; breakMinutes?: number; lunchMinutes?: number };
@@ -91,7 +92,7 @@ export function calculateHubDay(dayKey: string, sourceEvents: HubEvent[], settin
     } else if (event.source === "Lunch Break In") {
       if (!active.lunch) review.push("Lunch In without Lunch Out");
       delete active.lunch;
-    } else if (event.source === "Off the Phone Out") {
+    } else if (isOffPhoneStart(event.source)) {
       if (active.offPhone) review.push("Off the Phone Out without In");
       active.offPhone = event.at;
     } else if (event.source === "Off the Phone In") {
@@ -120,10 +121,14 @@ export function calculateHubDay(dayKey: string, sourceEvents: HubEvent[], settin
   if (lunchOverMs > 0) issues.push("OVER LUNCH");
   if (underTimeMs > 0) issues.push("UNDER TIME");
   if (hasOpenSession) issues.push("OPEN SESSION");
+  const nonBillable = nonBillableOffPhoneIntervals(clickedRecords, start, end, now);
+  const nonBillableOffPhoneMinutes = nonBillable.reduce((total, interval) => total + interval.minutes, 0);
+  if (nonBillableOffPhoneMinutes && !excused) issues.push("NON-BILLABLE OFF PHONE");
   if (excused) issues.push("EXCUSED");
   return {
     dayKey, shiftStart: start.toISOString(), shiftEnd: end.toISOString(), autoTimeOut: events.some((event) => event.autoTimeOut),
     breakMinutes: breakLimit / 60_000, lunchMinutes: lunchLimit / 60_000,
+    nonBillableOffPhoneMinutes: excused ? 0 : nonBillableOffPhoneMinutes,
     breakSessions: accuracy && calculated ? calculated.breakSessions.map(item => ({ startedAt: item.start.toISOString(),
       endedAt: item.open ? null : item.end.toISOString(), durationMs: item.milliseconds, isOpen: item.open,
       ...(item.notReturned ? { notReturned: true, chargedMinutes: excused ? 0 : item.excessMinutes } : {}) })) : breakSessions,
@@ -132,6 +137,7 @@ export function calculateHubDay(dayKey: string, sourceEvents: HubEvent[], settin
     inProgress: isInProgress, excused, issues: excused ? issues.filter((issue) => issue === "EXCUSED" || issue === "OPEN SESSION") : issues,
     review: Array.from(new Set(review)),
     milliseconds: { ...buckets.milliseconds, late: excused ? 0 : lateMs, underTime: excused ? 0 : underTimeMs,
+      nonBillableOffPhone: nonBillable.reduce((total, interval) => total + interval.milliseconds, 0),
       overBreak: excused ? 0 : breakOverMs, overLunch: excused ? 0 : lunchOverMs, overtime },
     status: events.length ? (isInProgress ? "In progress" : hasOpenSession || !timeIn ? "Needs review" : "Present") : "No record",
     events: events.map((event) => ({ id: event.id, source: event.source, at: event.at.toISOString(), eventId: event.eventId || null, autoTimeOut: event.autoTimeOut || undefined })),

@@ -9,6 +9,7 @@ export function attendanceEventPresentation(source?: string) {
         case "Lunch Break Out": return { label: "LUNCH", kind: "lunch" as const };
         case "Lunch Break In": return { label: "Lunch ended", kind: "lunch" as const };
         case "Off the Phone Out": return { label: "Off the Phone", kind: "off-phone" as const };
+        case "Non-Billable Off the Phone Out": return { label: "Non-Billable Off the Phone", kind: "off-phone" as const };
         case "Off the Phone In": return { label: "Off the phone ended", kind: "off-phone" as const };
         default: return { label: "No attendance yet", kind: "unknown" as const };
     }

@@ -8,7 +8,7 @@ export const attendanceIntegrityEnabled = import.meta.env.VITE_CRM_ATTENDANCE_IN
     (import.meta.env.DEV && import.meta.env.VITE_CRM_ATTENDANCE_INTEGRITY !== "false");
 export const attendanceDurationModelEnabled = import.meta.env.VITE_CRM_ATTENDANCE_DURATION_MODEL === "true";
 export type SessionEvent = { id: string; source: "Login" | "Logout" | "Time In" | "Time Out" | "Break Out" | "Break In" |
-    "Lunch Break Out" | "Lunch Break In" | "Off the Phone Out" | "Off the Phone In"; at: string; commandId: string; sequence: number; sessionId?: string;
+    "Lunch Break Out" | "Lunch Break In" | "Off the Phone Out" | "Non-Billable Off the Phone Out" | "Off the Phone In"; at: string; commandId: string; sequence: number; sessionId?: string;
     attendanceStatus?: "On time" | "Late" | "Undertime" | ""; autoTimeOut?: boolean; shiftDayKey?: string };
 export type AttendanceSessionSnapshot = {
     dashboardDays?: DashboardAttendanceDay[];
@@ -21,6 +21,7 @@ export type AttendanceSessionSnapshot = {
     allowedActions?: SessionEvent["source"][];
     autoTimeOutEnabled?: boolean;
     policySyncPending?: boolean;
+    timeOutOverrideEnabled?: boolean;
     sessions: Array<{ id: string; startedAt: string; endedAt: string | null; mode: string; modeSince: string; lifecycle: string;
         events: SessionEvent[]; shift: AttendanceSessionSnapshot["assignedShift"]; time?: { scheduled: { online: number } } }>;
     audit: Array<{ commandId: string; actor: { code: string; role: string }; reason: string; operation: string; at: string; targetIds: string[] }>;
@@ -39,7 +40,8 @@ export type AttendancePolicy = { revision: number; graceMinutes: number; breakMi
     shiftStart: string; shiftEnd: string; recoveryEnabled: boolean; recoveryTime: string; autoTimeOutTime?: string;
     autoTimeOutEnabled?: boolean; policySyncPending?: boolean };
 export type AttendanceCommand = { commandId: string; expectedRevision: number; fingerprint?: string;
-    operation: "action" | "correct" | "undo"; source?: SessionEvent["source"]; reason?: string;
+    operation: "action" | "correct" | "undo" | "add-time-out"; source?: SessionEvent["source"]; reason?: string;
+    sessionId?: string; timeOutAt?: string; closeRest?: boolean;
     targetCommandId?: string; changes?: Array<{ targetId?: string; source?: SessionEvent["source"]; at?: string; remove?: boolean }> };
 export function attendanceSessionHeaders() {
     const auth = getAuthUser();

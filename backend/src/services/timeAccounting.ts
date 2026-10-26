@@ -1,10 +1,12 @@
 import type { AttendanceSource } from "../models/Attendance";
 import { payrollAccuracyEnabled, attendanceAccuracyFixesEnabled } from "../config/rolloutFlags";
+import { isOffPhoneStart, nonBillableOffPhoneIntervals } from "../../../shared/attendanceOffPhone";
 
-export function deductionComponents(values: { lateMinutes?: number; earlyTimeOutMinutes?: number; excessBreakMinutes?: number; excessLunchMinutes?: number; absenceMinutes?: number }, excluded = false) {
+export function deductionComponents(values: { lateMinutes?: number; earlyTimeOutMinutes?: number; excessBreakMinutes?: number; excessLunchMinutes?: number; absenceMinutes?: number; nonBillableOffPhoneMinutes?: number }, excluded = false) {
   const clean = (value?: number) => excluded ? 0 : Math.max(0, Number.isFinite(value) ? value! : 0);
   const result = { lateMinutes: clean(values.lateMinutes), earlyTimeOutMinutes: clean(values.earlyTimeOutMinutes),
-    excessBreakMinutes: clean(values.excessBreakMinutes), excessLunchMinutes: clean(values.excessLunchMinutes), absenceMinutes: clean(values.absenceMinutes) };
+    excessBreakMinutes: clean(values.excessBreakMinutes), excessLunchMinutes: clean(values.excessLunchMinutes), absenceMinutes: clean(values.absenceMinutes),
+    nonBillableOffPhoneMinutes: clean(values.nonBillableOffPhoneMinutes) };
   return { ...result, deductibleMinutes: Object.values(result).reduce((sum, value) => sum + value, 0) };
 }
 // Accuracy rollout: charge each completed excess interval up to the next minute, then sum once.
@@ -42,6 +44,8 @@ export function calculateSlotAttendance(records: CalculationRecord[], policy: Sl
     });
   const breakSessions = intervals("Break Out", "Break In", policy.breakMinutes);
   const lunchSessions = intervals("Lunch Break Out", "Lunch Break In", policy.lunchMinutes);
+  const nonBillableOffPhoneSessions = nonBillableOffPhoneIntervals(ordered, policy.shiftStart, policy.shiftEnd, now);
+  const nonBillableOffPhoneMinutes = nonBillableOffPhoneSessions.reduce((total, interval) => total + interval.minutes, 0);
   const first = ordered.find((record) => record.source === "Time In" || record.source === "Login");
   const final = ordered.at(-1);
   const hasOpenSession = Boolean(first && final && final.source !== "Time Out" && final.source !== "Logout");
@@ -62,6 +66,7 @@ export function calculateSlotAttendance(records: CalculationRecord[], policy: Sl
   if (excessBreakMinutes) issues.push("OVER BREAK");
   if (excessLunchMinutes) issues.push("OVER LUNCH");
   if (earlyTimeOutMinutes) issues.push("UNDER TIME");
+  if (nonBillableOffPhoneMinutes) issues.push("NON-BILLABLE OFF PHONE");
   if (hasOpenSession) issues.push("OPEN SESSION");
   if (attendanceAccuracyFixesEnabled()) {
     if (breakSessions.some(item => item.notReturned)) issues.push("BREAK NOT RETURNED");
@@ -71,9 +76,9 @@ export function calculateSlotAttendance(records: CalculationRecord[], policy: Sl
     const unreturned = sessions.filter(item => item.notReturned);
     return unreturned.length ? [`${label} not returned: ${unreturned.reduce((sum, item) => sum + item.excessMinutes, 0)} min excess`] : [];
   });
-  return { breakSessions, lunchSessions, lateMinutes, excessBreakMinutes, excessLunchMinutes, earlyTimeOutMinutes,
+  return { breakSessions, lunchSessions, nonBillableOffPhoneSessions, nonBillableOffPhoneMinutes, lateMinutes, excessBreakMinutes, excessLunchMinutes, earlyTimeOutMinutes,
     ...(attendanceAccuracyFixesEnabled() ? { restWarnings } : {}),
-    deductibleMinutes: deductionComponents({ lateMinutes, excessBreakMinutes, excessLunchMinutes, earlyTimeOutMinutes }).deductibleMinutes, hasOpenSession, issues };
+    deductibleMinutes: deductionComponents({ lateMinutes, excessBreakMinutes, excessLunchMinutes, earlyTimeOutMinutes, nonBillableOffPhoneMinutes }).deductibleMinutes, hasOpenSession, issues };
 }
 
 export function clickedSessionIntervals<T extends { source: string; timeIn: Date }>(records: T[], outSource: string, inSource: string, asOf?: Date, cutoff?: Date) {
@@ -119,7 +124,7 @@ export function bucketForAttendanceSource(source: AttendanceSource): TimeBucket 
   if (source === "Logout" || source === "Time Out") return "offline";
   if (source === "Break Out") return "break";
   if (source === "Lunch Break Out") return "lunch";
-  if (source === "Off the Phone Out") return "offPhone";
+  if (isOffPhoneStart(source)) return "offPhone";
   return null;
 }
 

@@ -65,6 +65,7 @@ type PayrollAttendanceSummary = {
   lateMinutes: number;
   excessLunchMinutes: number;
   excessBreakMinutes: number;
+  nonBillableOffPhoneMinutes?: number;
   absenceMinutes: number;
   earlyTimeOutMinutes: number;
   deductibleMinutes: number;
@@ -77,6 +78,7 @@ type PayrollCalculatedAttendance = PayrollAttendanceSummary & {
 
 type PayrollDtrRow = {
   restWarnings?: string[];
+  nonBillableOffPhoneMinutes?: number;
   deductibleMinutes?: number;
   dateKey: string;
   date: string;
@@ -373,7 +375,7 @@ export function payrollAttendanceWithWorkedMinutes(
     return { ...attendance, effectiveWorkedMinutes };
   }
 
-  const shiftShortfallMinutes = Math.max(0, scheduledMinutes - effectiveWorkedMinutes);
+  const shiftShortfallMinutes = Math.max(0, scheduledMinutes - effectiveWorkedMinutes, attendance.nonBillableOffPhoneMinutes || 0);
   const deductibleMinutes = shiftShortfallMinutes + attendance.excessLunchMinutes + attendance.excessBreakMinutes;
   return {
     ...attendance,
@@ -738,12 +740,13 @@ export async function attendancePayrollDtr(employeeId: Types.ObjectId, payPeriod
       lateMinutes,
       excessLunchMinutes,
       excessBreakMinutes,
+      nonBillableOffPhoneMinutes: calculated?.nonBillableOffPhoneMinutes || 0,
       absenceMinutes,
       earlyTimeOutMinutes,
       grossHours: roundHours(grossHours),
       lateHours: roundHours(lateHours),
-      regularHours: roundHours(regularHours),
-      overtimeHours: roundHours(overtimeHours),
+      regularHours: roundHours(Math.max(0, regularHours - (isWeekendSlot ? 0 : calculated?.nonBillableOffPhoneMinutes || 0) / 60)),
+      overtimeHours: roundHours(Math.max(0, overtimeHours - (isWeekendSlot ? calculated?.nonBillableOffPhoneMinutes || 0 : 0) / 60)),
       missingHours: roundHours(missingHours),
       scheduledHours: roundHours(scheduledHours),
       recordCount: dayRecords.length,
@@ -767,9 +770,10 @@ export async function attendancePayrollDtr(employeeId: Types.ObjectId, payPeriod
     lateMinutes: filteredRows.reduce((sum, row) => sum + row.lateMinutes, 0),
     excessLunchMinutes: filteredRows.reduce((sum, row) => sum + row.excessLunchMinutes, 0),
     excessBreakMinutes: filteredRows.reduce((sum, row) => sum + row.excessBreakMinutes, 0),
+    nonBillableOffPhoneMinutes: filteredRows.reduce((sum, row) => sum + (row.nonBillableOffPhoneMinutes || 0), 0),
     absenceMinutes: filteredRows.reduce((sum, row) => sum + row.absenceMinutes, 0),
     earlyTimeOutMinutes: filteredRows.reduce((sum, row) => sum + row.earlyTimeOutMinutes, 0),
-    deductibleMinutes: filteredRows.reduce((sum, row) => sum + row.lateMinutes + row.excessLunchMinutes + row.excessBreakMinutes + row.absenceMinutes + row.earlyTimeOutMinutes, 0),
+    deductibleMinutes: filteredRows.reduce((sum, row) => sum + row.lateMinutes + row.excessLunchMinutes + row.excessBreakMinutes + row.absenceMinutes + row.earlyTimeOutMinutes + (row.nonBillableOffPhoneMinutes || 0), 0),
     incompleteShiftDays: filteredRows.filter((row) => row.status === "Needs Review").length,
   };
 
@@ -858,6 +862,7 @@ async function accurateAttendancePayrollDtr(employeeId: Types.ObjectId, payPerio
     workingDays: countWorkingDays(start, end), workedHours: sum("regularHours"), overtimeHours: sum("overtimeHours"), missingHours: sum("missingHours"),
     scheduledHours: sum("scheduledHours"), lateMinutes: sum("lateMinutes"), excessBreakMinutes: sum("excessBreakMinutes"), excessLunchMinutes: sum("excessLunchMinutes"),
     absenceMinutes: sum("absenceMinutes"), earlyTimeOutMinutes: sum("earlyTimeOutMinutes"), deductibleMinutes: sum("deductibleMinutes"),
+    nonBillableOffPhoneMinutes: sum("nonBillableOffPhoneMinutes"),
     incompleteShiftDays: rows.filter(row => row.status === "Needs Review").length };
   return { rows, summary };
 }
@@ -939,6 +944,7 @@ export async function syncEmployeePayrollRecords(payPeriod = "", payDate = "", e
         existingRecord.lateMinutes = attendance.lateMinutes;
         existingRecord.excessLunchMinutes = attendance.excessLunchMinutes;
         existingRecord.excessBreakMinutes = attendance.excessBreakMinutes;
+        existingRecord.nonBillableOffPhoneMinutes = attendance.nonBillableOffPhoneMinutes;
         existingRecord.absenceMinutes = attendance.absenceMinutes;
         existingRecord.earlyTimeOutMinutes = attendance.earlyTimeOutMinutes;
         existingRecord.deductibleMinutes = attendance.deductibleMinutes;
@@ -983,6 +989,7 @@ export async function syncEmployeePayrollRecords(payPeriod = "", payDate = "", e
         lateMinutes: attendance.lateMinutes,
         excessLunchMinutes: attendance.excessLunchMinutes,
         excessBreakMinutes: attendance.excessBreakMinutes,
+        nonBillableOffPhoneMinutes: attendance.nonBillableOffPhoneMinutes,
         absenceMinutes: attendance.absenceMinutes,
         earlyTimeOutMinutes: attendance.earlyTimeOutMinutes,
         deductibleMinutes: attendance.deductibleMinutes,
@@ -1308,6 +1315,7 @@ export async function updatePayrollOvertime(request: Request, response: Response
         lateMinutes: attendance.lateMinutes,
         excessLunchMinutes: attendance.excessLunchMinutes,
         excessBreakMinutes: attendance.excessBreakMinutes,
+        nonBillableOffPhoneMinutes: attendance.nonBillableOffPhoneMinutes,
         absenceMinutes: attendance.absenceMinutes,
         earlyTimeOutMinutes: attendance.earlyTimeOutMinutes,
         deductibleMinutes: attendance.deductibleMinutes,

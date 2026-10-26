@@ -12,6 +12,7 @@ import { startAttendanceIntegrityWorker } from "./services/attendanceRecoveryWor
 import { assertCredentialEncryptionConfiguration } from "./services/credentialEncryption";
 import { assertAttendanceFlagConfiguration } from "./config/attendanceFlags";
 import { applyLeadWorkspaceSwitch } from "./config/leadWorkspaceRuntime";
+import { startPayrollGenerationWorker } from "./services/payrollGenerationWorker";
 
 assertAttendanceFlagConfiguration();
 const port = Number(process.env.PORT || 4000);
@@ -35,6 +36,7 @@ const startWorkers = () => {
   startHempSurveyLeadQueueWorker();
   startAttendanceReconciliationWorker();
   startAttendanceIntegrityWorker();
+  startPayrollGenerationWorker();
 };
 if (process.env.CRM_LEAD_WORKSPACE_SWITCH_FILE) {
   await applyLeadWorkspaceSwitch(startWorkers);

@@ -54,7 +54,7 @@ export default function PayrollHoursDialog({ record, businessId, onClose }: {
         setBusy(true); setError("");
         try {
             await confirmPayrollWorkedHours(preview, reason.trim(), businessId);
-            await Promise.all(["payroll-records", "payroll-stats", "payroll-dtr", "payroll-payslip-dtr", "employee-payments"].map(key =>
+            await Promise.all(["payroll-records", "payroll-stats", "payroll-dtr", "payroll-payslip-dtr", "payroll-compute", "employee-payments"].map(key =>
                 queryClient.invalidateQueries({ queryKey: [key] })));
             if (mounted.current) onClose();
         } catch (failure) { if (mounted.current) showError(failure); }

@@ -30,6 +30,14 @@ test("payslip amount in words retains centavos and handles carry rounding", () =
     assert.equal(exports.words(0.01), "Zero and 01/100");
     assert.equal(exports.words(19.999), "Twenty and 00/100");
 });
+
+test("non-billable Off the Phone is included in the saved payslip breakdown exactly once", () => {
+    const value = { ...record, lateMinutes: 1, nonBillableOffPhoneMinutes: 11 };
+    const rows = exports.rows(value);
+    assert.equal(rows.filter(row => row.label === "Non-billable Off the Phone").length, 1);
+    assert.equal(rows.find(row => row.label === "Non-billable Off the Phone").minutes, 11);
+    assert.equal(rows.reduce((sum, row) => sum + Math.round(row.amount * 100), 0), Math.round(value.deductions * 100));
+});
 test("section searches and CSV exports preserve values without spreadsheet formula execution", () => {
     assert.equal(exports.search(["Synthetic Employee", "90000002", undefined], "  employee  "), true);
     assert.equal(exports.search(["Synthetic Employee"], "missing"), false);

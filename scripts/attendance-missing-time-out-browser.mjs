@@ -2,22 +2,29 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { createRequire } from 'node:module';
+import { attendanceTimeOutPlan } from '../shared/attendanceTimeOut.ts';
 const { chromium } = createRequire(process.env.CRM_TEST_RUNTIME_PACKAGE || import.meta.url)('playwright');
 const directory = path.resolve(process.argv[2]), origin = 'https://attendance-fixture.invalid';
+const earlier = process.argv[3] === '--early';
 const browser = await chromium.launch({ channel: 'msedge', headless: true });
 const results = [], errors = [];
 try {
   for (let index = 0; index < 6; index++) {
     const business = `synthetic-${index}`, employeeId = `synthetic-person-${index}`, dayKey = '2026-10-21';
     const shift = { dayKey, start: `${dayKey}T15:00:00Z`, end: '2026-10-22T00:00:00Z', resetDeadline: '2026-10-22T14:59:00Z' };
-    const now = '2026-10-22T01:00:00Z', out = [null, 'Break Out', 'Lunch Break Out', 'Off the Phone Out', null, null][index];
+    const now = '2026-10-22T01:00:00Z', out = [null, 'Break Out', 'Lunch Break Out', 'Off the Phone Out', earlier ? 'Non-Billable Off the Phone Out' : null, null][index];
     const event = (id, source, at, sequence) => ({ id, commandId: id, source, at, sequence });
     let records = [event('in', 'Time In', shift.start, 0), ...(out ? [event('out', out, `${dayKey}T23:30:00Z`, 1)] : [])];
+    if (earlier) records = [event('in','Time In',shift.start,0), ...(out ? [event('out',out,`${dayKey}T22:00:00Z`,1),
+      event('return',out==='Break Out'?'Break In':out==='Lunch Break Out'?'Lunch Break In':'Off the Phone In',`${dayKey}T23:30:00Z`,2)] : [event('later','Break Out',`${dayKey}T23:30:00Z`,1)])];
+    const originalRecords = structuredClone(records);
+    let addedCommand, replaced = [], undoCommand;
     let revision = records.length, writes = 0, previews = 0, rejected = false;
     const closed = () => records.some(event => event.source === 'Time Out');
-    const state = () => closed() ? 'OFFLINE' : out === 'Break Out' ? 'BREAK' : out === 'Lunch Break Out' ? 'LUNCH' : out === 'Off the Phone Out' ? 'OFF THE PHONE' : 'ONLINE';
+    const state = () => closed() ? 'OFFLINE' : records.at(-1).source === 'Break Out' ? 'BREAK' : records.at(-1).source === 'Lunch Break Out' ? 'LUNCH' : ['Off the Phone Out','Non-Billable Off the Phone Out'].includes(records.at(-1).source) ? 'OFF THE PHONE' : 'ONLINE';
     const snapshot = () => ({ revision, fingerprint: `synthetic-${revision}`, state: state(), serverTime: now, receivedAt: Date.now(), records, syncPending: false,
-      stateSince: records.at(-1).at, time: { actual: { break: 0, lunch: 0 } }, audit: [], sessions: [{ id: 'session', startedAt: shift.start,
+      timeOutOverrideEnabled: earlier, stateSince: records.at(-1).at, time: { actual: { break: 0, lunch: 0 } },
+      audit: [...new Set(records.map(row=>row.commandId))].map(commandId=>({commandId,operation:commandId===addedCommand?'add-time-out':commandId===undoCommand?'undo':'action',actor:{role:commandId===addedCommand||commandId===undoCommand?'admin':'employee'}})), sessions: [{ id: 'session', startedAt: shift.start,
         endedAt: closed() ? records.at(-1).at : null, mode: state(), lifecycle: closed() ? 'manually-closed' : 'open', shift, events: records }] });
     const day = () => ({ employeeId, employeeCode: 'synthetic-code', employeeName: 'Synthetic Employee', team: 'Fixture', role: 'Test', scopeKey: 'synthetic-code',
       businessId: business, businessName: 'Synthetic Business', dayKey, shiftStart: shift.start, shiftEnd: shift.end, timeIn: shift.start,
@@ -48,15 +55,29 @@ try {
       if (pathname.endsWith('/attendance/session')) return send(snapshot());
       if (pathname.endsWith('/attendance/preview')) {
         previews++; const input = request.postDataJSON();
-        assert.equal(input.operation, 'correct'); assert.equal(input.changes.at(-1).source, 'Time Out');
-        assert.ok(input.changes.every(change => !change.targetId && !change.remove), 'add must not overwrite original events');
+        if (earlier) {
+          assert.ok(['add-time-out','undo'].includes(input.operation));
+          if(input.operation==='add-time-out'){assert.equal(input.sessionId,'session');assert.equal(input.timeOutAt,`${dayKey}T23:00:00.000Z`);assert.equal(input.changes,undefined);}
+          else assert.equal(input.targetCommandId,addedCommand);
+        } else {
+          assert.equal(input.operation, 'correct'); assert.equal(input.changes.at(-1).source, 'Time Out');
+          assert.ok(input.changes.every(change => !change.targetId && !change.remove), 'ordinary add retains original events');
+        }
         assert.equal(input.expectedRevision, revision);
         if (index === 0 && !rejected) { rejected = true; return send({ code: 'STALE_REVISION', message: 'Synthetic preview changed. Review again.' }, 409); }
         return send({ before: snapshot(), after: { ...snapshot(), state: 'OFFLINE' }, targets: [], businessIds: [business], payrollImpact: 'Pending payroll recalculates; finalized payroll remains finalized.' });
       }
       if (pathname.endsWith('/attendance/commands')) {
         writes++; const input = request.postDataJSON(); assert.equal(input.expectedRevision, revision);
-        records = [...records, ...input.changes.map((change, i) => ({ ...event(`added-${i}`, change.source, change.at, records.length + i), commandId: input.commandId }))];
+        if(earlier&&input.operation==='add-time-out'){
+          const plan=attendanceTimeOutPlan(snapshot().sessions,input.sessionId,input.timeOutAt,now);
+          replaced=records.filter(row=>plan.replaced.some(item=>item.id===row.id));
+          records=records.filter(row=>!replaced.includes(row));addedCommand=input.commandId;
+          for(const source of [...(plan.returnSource?[plan.returnSource]:[]),'Time Out'])records.push({...event(`added-${records.length}`,source,plan.at,records.length),commandId:input.commandId});
+        } else if(earlier&&input.operation==='undo'){
+          assert.equal(input.targetCommandId,addedCommand);undoCommand=input.commandId;
+          records=[...records.filter(row=>row.commandId!==addedCommand),...replaced.map((row,index)=>({...row,id:'restored-'+index,commandId:input.commandId}))].sort((a,b)=>Date.parse(a.at)-Date.parse(b.at)||a.sequence-b.sequence);
+        }else records = [...records, ...input.changes.map((change, i) => ({ ...event(`added-${i}`, change.source, change.at, records.length + i), commandId: input.commandId }))];
         revision++; return send(snapshot());
       }
       if (pathname === '/attendance-hub/days') return send({ rows: [day()], total: 1, page: 1, pageSize: 25, employees: [day()], history: { today: '2026-10-22', page: 1, hasOlder: false, hasNewer: false },
@@ -81,7 +102,8 @@ try {
     let editor = await open();
     await editor.getByRole('button', { name: 'Add Time Out', exact: true }).click();
     assert.equal(await editor.getByLabel('PH Time Out', { exact: true }).inputValue(), '2026-10-22T08:00');
-    if (index === 0) await editor.getByLabel('PH Time Out', { exact: true }).fill('2026-10-22T07:50');
+    if (earlier) await editor.getByLabel('PH Time Out', { exact: true }).fill('2026-10-22T07:00');
+    else if (index === 0) await editor.getByLabel('PH Time Out', { exact: true }).fill('2026-10-22T07:50');
     if (out) await editor.getByRole('checkbox').check();
     await editor.getByLabel('Reason', { exact: true }).fill('Synthetic reviewed missing checkout');
     await editor.getByRole('button', { name: 'Review change', exact: true }).click();
@@ -99,7 +121,19 @@ try {
     await editor.getByRole('button', { name: 'Close attendance editor', exact: true }).click(); await page.reload();
     editor = await open(); assert.equal(await editor.getByRole('button', { name: 'Add Time Out', exact: true }).isEnabled(), false);
     assert.equal(records.filter(event => event.source === 'Time Out').length, 1);
-    results.push({ business, viewport: page.viewportSize(), missingCheckoutSaved: true, refreshVerified: true, pairedRest: out, writes, previews });
+    if(earlier){
+      assert.ok(records.every(row=>Date.parse(row.at)<=Date.parse(`${dayKey}T23:00:00Z`)));
+      await editor.getByRole('button',{name:index%2?'Undo Time Out':'Undo last action',exact:true}).click();
+      await editor.getByLabel('Reason',{exact:true}).fill('Synthetic reviewed undo of earlier checkout');
+      await editor.getByRole('button',{name:'Review change',exact:true}).click();
+      await editor.getByRole('alertdialog',{name:'Confirm attendance change'}).waitFor();
+      await editor.getByRole('button',{name:'Confirm change',exact:true}).click();
+      await editor.getByText('Saved and synchronized.',{exact:true}).waitFor();assert.equal(writes,2);
+      assert.deepEqual(records.map(row=>[row.source,row.at]),originalRecords.map(row=>[row.source,row.at]));
+      await editor.getByRole('button',{name:'Close attendance editor',exact:true}).click();await page.reload();
+      editor=await open();assert.equal(await editor.getByRole('button',{name:'Add Time Out',exact:true}).isEnabled(),true);
+    }
+    results.push({ business, viewport: page.viewportSize(), missingCheckoutSaved: true, refreshVerified: true, pairedRest: out, earlierCheckout:earlier,undoRestoresReplacedActions:earlier,writes, previews });
     await context.close();
   }
   assert.deepEqual(errors, []); console.log(JSON.stringify({ origin, fixtureOnly: true, productionWrites: 0, results, errors }));

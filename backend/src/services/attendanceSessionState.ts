@@ -17,6 +17,7 @@ const returns: Partial<Record<AttendanceSource, AttendanceMode>> = {
 };
 const outgoing: Partial<Record<AttendanceSource, AttendanceMode>> = {
   "Break Out": "BREAK", "Lunch Break Out": "LUNCH", "Off the Phone Out": "OFF THE PHONE",
+  "Non-Billable Off the Phone Out": "OFF THE PHONE",
 };
 export function projectAttendance(events: SessionEvent[], corrections: SessionCorrection[] = [], closures: SystemClosure[] = [], accounting?: { allowUnreturnedCheckout: boolean }) {
   const reversed = new Set(corrections.flatMap((correction) => correction.targets));

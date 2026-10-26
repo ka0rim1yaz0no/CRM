@@ -39,7 +39,7 @@ test("payroll uses one disjoint late/early total, independent rests, absence and
     const records = [punch("Time In", 5), punch("Break Out", 75), punch("Break In", 90, 1), punch("Break Out", 120), punch("Break In", 135),
       punch("Lunch Break Out", 200), punch("Lunch Break In", 261), punch("Time Out", 530)];
     const day = accuratePayrollDay(records, policy, end, paidHoursPerDay(settings, policy), false);
-    assert.deepEqual(day.components, { lateMinutes: 5, earlyTimeOutMinutes: 10, excessBreakMinutes: 1, excessLunchMinutes: 1, absenceMinutes: 0, deductibleMinutes: 17 });
+    assert.deepEqual(day.components, { lateMinutes: 5, earlyTimeOutMinutes: 10, excessBreakMinutes: 1, excessLunchMinutes: 1, absenceMinutes: 0, nonBillableOffPhoneMinutes: 0, deductibleMinutes: 17 });
     assert.equal(day.missingHours * 60, day.components.deductibleMinutes);
     for (const [first, last, late, early] of [[5, 540, 5, 0], [0, 530, 0, 10], [-60, -30, 0, 540], [600, 610, 540, 0]]) {
       const item = calculateSlotAttendance([punch("Time In", first), punch("Time Out", last)], policy, new Date(+end + 3_600_000));

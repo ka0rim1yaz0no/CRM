@@ -40,3 +40,20 @@ test("payroll uses saved backend rates and a preview, never a frontend eight-hou
     const hub = readFileSync(new URL("../src/components/AttendanceHub.tsx", import.meta.url), "utf8");
     assert.doesNotMatch(hub, /<h3>Breaks<\/h3>/); assert.match(hub, /firstBreak: "1st Break", secondBreak: "2nd Break"/);
 });
+
+test("payroll approval displays explicit non-billable minutes, included deduction and the backend rate without inventing legacy data", () => {
+    const details = { before: { minutes: 0, amount: 0 }, after: { minutes: 11, amount: 29.92 }, minuteRate: 2.72 };
+    const html = render({ preview: { ...preview, rows: [{ ...preview.rows[0], nonBillableOffPhone: details }] } });
+    for (const label of ["Non-billable Off the Phone", "Minutes old / new", "Included deduction old / new", "Deduction rate / min", "0 / 11 min", "PHP 29.92", "PHP 2.72"]) assert.ok(html.includes(label), label);
+    assert.doesNotMatch(html, /<th[^>]*>Non-billable Off the Phone<\/th>/);
+    assert.match(html, /PHP 20\.00 \/ PHP 10\.00<\/span><dl[^>]*><dt[^>]*>Non-billable Off the Phone/);
+    assert.ok(render({ preview }).includes("Not available"), "old preview responses must not pretend the missing breakdown is zero");
+});
+
+test("the payroll roster has no separate non-billable column and leaves the deduction calculation intact", () => {
+    const page = readFileSync(new URL("../src/pages/admin/payroll/index.tsx", import.meta.url), "utf8");
+    const roster = page.slice(page.indexOf('aria-label="Employee payroll records"'), page.indexOf('</table>', page.indexOf('aria-label="Employee payroll records"')));
+    assert.doesNotMatch(roster, /Non-billable|nonBillable/);
+    assert.match(roster, /colSpan=\{9\}/);
+    assert.match(page, /function payslipDeductionRows\(record: PayrollRecord\) \{ return payrollDeductionRows\(record\); \}/);
+});

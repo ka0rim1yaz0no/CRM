@@ -1,5 +1,6 @@
 import type { AttendanceRecord } from "../api/attendance";
 import { compareAttendanceRecords } from "./attendancePresentation";
+import { isOffPhoneStart, nonBillableOffPhoneSource } from "../../shared/attendanceOffPhone";
 
 export type OffPhoneAttendanceSession = {
     id: string;
@@ -7,6 +8,7 @@ export type OffPhoneAttendanceSession = {
     endedAt: string | null;
     durationMs: number;
     isOpen: boolean;
+    nonBillable: boolean;
     startRecord: AttendanceRecord;
     endRecord: AttendanceRecord | null;
 };
@@ -39,6 +41,7 @@ export function buildOffPhoneAttendanceSessions(
             endedAt: endRecord?.timeIn || (isOpen ? null : new Date(safeEndTime).toISOString()),
             durationMs: Math.max(0, safeEndTime - startedAt),
             isOpen,
+            nonBillable: openRecord.source === nonBillableOffPhoneSource,
             startRecord: openRecord,
             endRecord,
         });
@@ -48,7 +51,7 @@ export function buildOffPhoneAttendanceSessions(
     chronologicalRecords.forEach((record) => {
         const recordTime = attendanceTimestamp(record);
 
-        if (record.source === "Off the Phone Out") {
+        if (isOffPhoneStart(record.source)) {
             if (openRecord) {
                 closeOpenSession(record, recordTime, false);
             }

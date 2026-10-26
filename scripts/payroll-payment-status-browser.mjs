@@ -11,11 +11,12 @@ try{
   const olderRosterApi=index===5,gapAction=olderRosterApi?'Review cutoff':'Generate payroll',gapLabel=olderRosterApi?'Not ready':'Not generated';
   const saved={_id:`payroll-${index}`,employeeId:person.employeeCode,employeeName:person.name,department:'Synthetic',payPeriod:'Oct 6, 2026 - Oct 20, 2026',
    payType:'Semi-monthly',status:'Review',paidOn:'-',grossPay:15000,basicPay:15000,deductions:51.63,netPay:14948.37,minuteRate:2.72,hourlyRate:163.04,
-   paidHoursPerDay:8,workedHours:87.65,scheduledHours:88,attendanceDays:11,incompleteShiftDays:1,requiresReview:true};
+   paidHoursPerDay:8,workedHours:87.65,scheduledHours:88,attendanceDays:11,incompleteShiftDays:1,requiresReview:true,
+   ...(index===5?{}:{nonBillableOffPhoneMinutes:11,lateMinutes:8})};
   const frozen=JSON.stringify([saved.grossPay,saved.deductions,saved.netPay,saved.workedHours,saved.incompleteShiftDays]);
   const second={...saved,_id:`second-${index}`,employeeId:`second-code-${index}`,employeeName:'Second Synthetic Employee'};
   const nextPeriod='Oct 21, 2026 - Nov 5, 2026',next={...saved,_id:`next-${index}`,payPeriod:nextPeriod,status:'Pending'};
-  let previews=0,saves=0,unexpectedWrites=0,staleRejected=false,conflict=false,currentSaved=true;
+  let previews=0,saves=0,unexpectedWrites=0,staleRejected=false,conflict=false,currentSaved=true,draftReads=0;
   const context=await browser.newContext({viewport:index%2?{width:390,height:844}:{width:1440,height:1000}});
   await context.addInitScript(({business})=>{
    localStorage.setItem('activeBusinessId',business);localStorage.setItem('authUser',JSON.stringify({userType:'admin',sessionToken:'synthetic-only-admin',
@@ -34,6 +35,13 @@ try{
   await context.route('**/api/**',async route=>{
    const request=route.request(),url=new URL(request.url()),endpoint=url.pathname.slice(4),send=(body,status=200)=>route.fulfill({status,contentType:'application/json',body:JSON.stringify(body)});
    assert.equal(request.headers()['x-business-id'],business);
+   if(endpoint==='/payroll/recompute/preview'){
+    const input=request.postDataJSON();assert.equal(input.payPeriod,nextPeriod);
+    return send({payPeriod:nextPeriod,token:'synthetic-read-only-recompute',totalDifference:0,canApply:true,rows:[{
+     employeeCode:person.employeeCode,employeeName:person.name,ownerBusinessId:business,businessIds:[business],before:saved,after:saved,
+     difference:0,reviewDays:0,potentialOvertimeHours:0,approvedOvertimeHours:0,
+     ...(index===5?{}:{nonBillableOffPhone:{before:{minutes:0,amount:0},after:{minutes:11,amount:29.89},minuteRate:30000/23/8/60}})}]});
+   }
    if(endpoint.endsWith('/payment-status/preview')){
     assert.equal(endpoint,`/payroll/records/${saved._id}/payment-status/preview`);const input=request.postDataJSON();assert.equal(typeof input.paid,'boolean');previews++;
     return send({id:saved._id,payPeriod:saved.payPeriod,paid:input.paid,paidOn:input.paid?'Oct 26, 2026':'-',token:`fixture-${previews}`,businessIds:[business],
@@ -47,7 +55,15 @@ try{
     saves++;Object.assign(saved,{status:input.paid?'Paid':'Pending',paidOn:input.paid?'Oct 26, 2026':'-'});return send({applied:true,businesses:1,records:2});
    }
    if(request.method()!=='GET'){unexpectedWrites++;return send({message:'Unexpected fixture write'},500);}
-   if(endpoint==='/payroll/accuracy-config')return send({enabled:true,workedHoursEditingEnabled:true,paymentStatusPreviewEnabled:true,cutoffSelectionEnabled:true,employeeRosterEnabled:!olderRosterApi});
+   if(endpoint==='/payroll/accuracy-config')return send({enabled:true,workedHoursEditingEnabled:true,paymentStatusPreviewEnabled:true,cutoffSelectionEnabled:true,employeeRosterEnabled:!olderRosterApi,automaticPreviewsEnabled:!olderRosterApi});
+   if(endpoint==='/payroll/current-previews'){
+    assert.equal(olderRosterApi,false);assert.equal(url.searchParams.get('payPeriod'),nextPeriod);draftReads++;
+    return send({previewOnly:true,businessId:business,payPeriod:nextPeriod,asOf:'2026-10-26T20:00:00Z',rows:[{
+     employeeCode:second.employeeId,employeeName:second.employeeName,department:'Synthetic',warnings:['Cutoff in progress: future shift days are not final deductions.'],
+     calculation:{basicPay:15000,monthlySalary:30000,grossPay:15000,deductions:51.63,netPay:14948.37,hourlyRate:30000/23/8,minuteRate:30000/23/8/60,
+      paidHoursPerDay:8,attendanceDays:3,workedHours:23.65,nonBillableOffPhoneMinutes:11,nonBillableOffPhoneDeduction:29.89,incompleteShiftDays:0,scheduledDays:8,
+      deductionDetails:[{label:'Late',minutes:8,amount:21.74},{label:'Non-billable Off the Phone',minutes:11,amount:29.89}]}}]});
+   }
    if(endpoint==='/payroll/cutoffs')return send({defaultPayPeriod:nextPeriod,currentPayPeriod:nextPeriod,historyFrom:'2026-10-06',items:[
     {payPeriod:nextPeriod,start:'2026-10-21',end:'2026-11-05',recordedEmployees:currentSaved?1:0,visibleEmployees:2},{payPeriod:saved.payPeriod,start:'2026-10-06',end:'2026-10-20',recordedEmployees:2,visibleEmployees:2}]});
    const period=url.searchParams.get('payPeriod')||nextPeriod,records=period===nextPeriod?(currentSaved?[next]:[]):[saved,second];
@@ -68,6 +84,27 @@ try{
   await page.goto(origin+'/admin/payroll');await page.getByRole('combobox',{name:'Payroll cutoff',exact:true}).waitFor();
   await page.getByRole('button',{name:`${gapAction} for Second Synthetic Employee`,exact:true}).waitFor();assert.equal(await page.locator('tbody tr').count(),2);
   assert.equal(await page.getByRole('combobox',{name:'Payroll cutoff',exact:true}).inputValue(),nextPeriod);
+  assert.equal(await page.getByRole('columnheader',{name:'Non-billable Off Phone',exact:true}).count(),0);
+  const savedRow=page.locator('tbody tr').filter({hasText:person.name});
+  assert.equal(await savedRow.locator('td').count(),9);
+  if(!olderRosterApi){
+   await page.getByRole('button',{name:'Unsaved previews (1)',exact:true}).click();
+   const drafts=page.getByRole('dialog',{name:'Unsaved payroll previews',exact:true});
+   await drafts.getByText(second.employeeName,{exact:true}).waitFor();
+   assert.equal(await drafts.locator('tbody tr').count(),1);assert.equal(await drafts.getByText(person.name,{exact:true}).count(),0);
+   assert.equal(await drafts.getByRole('columnheader',{name:'Non-billable Off Phone',exact:true}).count(),0);
+   const deductions=drafts.locator('tbody tr td').nth(2);await deductions.getByText('Deduction breakdown',{exact:true}).click();
+   await deductions.getByText('Non-billable Off the Phone (11 min)',{exact:true}).waitFor();assert.match(await deductions.innerText(),/29\.89/);
+   assert.equal(await drafts.getByRole('button',{name:/Confirm|Mark.*paid|Save/}).count(),0,'automatic previews must never have a saving or payment action');
+   await drafts.getByText('Provisional / review',{exact:true}).click();await drafts.getByText('Cutoff in progress: future shift days are not final deductions.',{exact:true}).waitFor();
+   await drafts.getByText('Paid hours / day',{exact:true}).waitFor();await drafts.getByText('8h',{exact:true}).waitFor();
+   const readsBefore=draftReads;await drafts.getByRole('button',{name:'Refresh unsaved previews',exact:true}).click();
+   await page.waitForFunction(()=>!document.querySelector('[aria-label="Refresh unsaved previews"]').disabled);assert.ok(draftReads>readsBefore);
+   assert.ok(await drafts.evaluate(element=>element.scrollWidth<=element.clientWidth+1));
+   if(index<2){await fs.mkdir('outputs/payroll-auto-preview-browser',{recursive:true});await page.screenshot({path:`outputs/payroll-auto-preview-browser/${index?'mobile':'desktop'}.png`,fullPage:true});}
+   await drafts.getByRole('button',{name:'Close unsaved previews',exact:true}).click();
+   assert.equal(saves,0);assert.equal(unexpectedWrites,0);
+  }
   const gapRow=page.locator('tbody tr').filter({hasText:second.employeeName});assert.match(await gapRow.innerText(),new RegExp(gapLabel));assert.doesNotMatch(await gapRow.innerText(),/15,000|14,948|\b0h\b/);
   assert.equal(await gapRow.getByRole('checkbox').isEnabled(),false);assert.equal(await gapRow.getByRole('button',{name:/paid|payslip|Edit hours/}).count(),0);
   await page.getByRole('combobox',{name:'Payroll cutoff',exact:true}).selectOption(saved.payPeriod);
@@ -77,6 +114,16 @@ try{
   await page.getByRole('combobox',{name:'Payroll cutoff',exact:true}).selectOption(nextPeriod);
   await page.getByRole('button',{name:`${gapAction} for Second Synthetic Employee`,exact:true}).waitFor();assert.equal(new URL(page.url()).searchParams.has('payPeriod'),false);
   await page.reload();await page.getByRole('button',{name:`${gapAction} for Second Synthetic Employee`,exact:true}).waitFor();assert.equal(await page.locator('tbody tr').count(),2);
+  await page.getByRole('button',{name:'Generate / Recompute cutoff',exact:true}).click();
+  const recompute=page.getByRole('dialog',{name:'Generate / Recompute cutoff',exact:true});
+  await recompute.getByRole('button',{name:'Preview differences',exact:true}).click();
+  assert.equal(await recompute.getByRole('columnheader',{name:'Non-billable Off the Phone',exact:true}).count(),0);
+  if(index!==5){const deductionCell=recompute.locator('tbody tr td').nth(2);await deductionCell.getByText('0 / 11 min',{exact:true}).waitFor();await deductionCell.getByText('Included deduction old / new',{exact:true}).waitFor();}
+  else await recompute.getByText('Not available',{exact:true}).waitFor();
+  assert.equal(await recompute.getByRole('button',{name:'Confirm cutoff',exact:true}).isEnabled(),false);
+  assert.ok(await recompute.evaluate(element=>element.scrollWidth<=element.clientWidth+1));
+  if(index<2){await fs.mkdir('outputs/payroll-nonbillable-browser',{recursive:true});await page.screenshot({path:`outputs/payroll-nonbillable-browser/${index?'mobile':'desktop'}-preview.png`,fullPage:true});}
+  await recompute.getByRole('button',{name:'Close payroll preview',exact:true}).click();
   await page.getByRole('button',{name:'All statuses',exact:true}).click();await page.getByRole('button',{name:gapLabel,exact:true}).click();
   await page.getByText(/Showing\s+1\s+to\s+1\s+of\s+1\s+entries/).waitFor();assert.equal(await page.locator('tbody tr').count(),1);
   await page.getByRole('button',{name:gapLabel,exact:true}).click();await page.getByRole('button',{name:'All statuses',exact:true}).click();

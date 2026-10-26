@@ -66,7 +66,7 @@ export async function submitAttendanceCommand(request: Request, response: Respon
       (input.changes !== undefined && (!Array.isArray(input.changes) || input.changes.some((change) => !change || typeof change !== "object")))) {
       throw new AttendanceCommandError(422, "INVALID_COMMAND", "Provide a valid attendance command and reason.");
     }
-    if (!["action", "correct", "undo"].includes(input.operation)) throw new AttendanceCommandError(422, "INVALID_OPERATION", "Unsupported attendance command.");
+    if (!["action", "correct", "undo", "add-time-out"].includes(input.operation)) throw new AttendanceCommandError(422, "INVALID_OPERATION", "Unsupported attendance command.");
     if (actor.role === "employee" && input.operation !== "action") throw new AttendanceCommandError(403, "ADMIN_ONLY", "Only administrators can correct attendance.");
     if (actor.role === "admin" && input.operation === "action") throw new AttendanceCommandError(403, "EMPLOYEE_BUTTON_ONLY", "Use a reviewed correction to change employee attendance.");
     const policy = await attendancePolicy(identity.canonicalBusinessId);

@@ -30,6 +30,7 @@ const { attendancePayrollDtr } = await import("../controllers/payrollController"
 const { getAccuratePayrollDtr } = await import("./payrollRecomputeService");
 const { PayrollRecord } = await import("../models/Payroll");
 const { executeAttendanceCommand, autoTimeOutCommandId } = await import("./attendanceLedgerService");
+const { employeePayments, initializeEmployeePaymentHistory } = await import("./employeePayments");
 let mongo: MongoMemoryReplSet, server: http.Server, base = "";
 before(async () => {
     mongo = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
@@ -242,6 +243,96 @@ test("a current-shift checkout refreshes the actual call dashboard and employee 
             const day = dtr.rows.find(row => row.dateKey === "2026-10-22")!;
             assert.deepEqual([day.earlyTimeOutMinutes, day.excessBreakMinutes, day.deductibleMinutes], [370, 5, 375]);
             assert.notEqual(day.status, "Needs Review");
+        }
+    } finally { context.mock.timers.reset(); }
+});
+
+test("earlier Add Time Out replaces later actions in one session, and Undo restores them across six businesses", async context => {
+    context.mock.timers.enable({ apis: ["Date"], now: new Date("2026-10-22T18:00:00Z") });
+    try {
+        await initializeEmployeePaymentHistory(true);
+        const data = await seed("synthetic-early-checkout", [["Time In", "2026-10-21T15:00:00Z"], ["Break Out", "2026-10-21T16:00:00Z"],
+            ["Break In", "2026-10-21T16:20:00Z"], ["Lunch Break Out", "2026-10-21T18:00:00Z"], ["Lunch Break In", "2026-10-21T19:01:00Z"],
+            ["Non-Billable Off the Phone Out", "2026-10-21T20:00:00Z"], ["Off the Phone In", "2026-10-21T20:05:01Z"],
+            ["Time In", "2026-10-22T15:00:00Z"], ["Break Out", "2026-10-22T17:00:00Z"]]);
+        const originalSaved: unknown[] = [];
+        for (let index = 0; index < 6; index++) originalSaved.push(await runWithBusiness(businesses[index], async () => {
+            const payPeriod = (await employeePayments(data.code)).currentPayPeriod;
+            await PayrollRecord.create({ employeeId: data.code, employeeName: "Synthetic Missing Checkout", department: "Fixture", payType: "Semi-monthly",
+                payPeriod, grossPay: 15000, deductions: 50, netPay: 14950, status: index % 2 ? "Paid" : "Pending", paidOn: index % 2 ? "Oct 22, 2026" : "-" });
+            return PayrollRecord.findOne({ employeeId: data.code }).lean();
+        }));
+        const before = await (await data.request(0, data.endpoint(0, "session"))).json();
+        const command = { operation: "add-time-out", commandId: crypto.randomUUID(), expectedRevision: before.revision, fingerprint: before.fingerprint,
+            sessionId: before.sessions[0].id, timeOutAt: "2026-10-21T18:30:00Z", closeRest: true, reason: "Synthetic reviewed earlier checkout" };
+        assert.equal((await data.request(0, data.endpoint(0, "commands"), command, true)).status, 403);
+        const preview = await data.request(0, data.endpoint(0, "preview"), command);
+        assert.equal(preview.status, 200, JSON.stringify(await preview.clone().json()));
+        assert.deepEqual((await preview.json()).targets, data.events.slice(4, 7).map(event => event.id));
+        assert.equal((await AttendanceLedger.findById(data.identity.key).lean())!.revision, before.revision);
+        const response = await data.request(1, data.endpoint(1, "commands"), command);
+        assert.equal(response.status, 200, JSON.stringify(await response.clone().json()));
+        const saved = await response.json();
+        assert.equal(saved.state, "BREAK"); assert.equal(saved.sessionId, before.sessionId);
+        const verify = async (reversed: boolean) => {
+            for (let index = 0; index < 6; index++) for (let refresh = 0; refresh < 2; refresh++) {
+                const fresh = await (await data.request(index, data.endpoint(index, "session"))).json();
+                assert.equal(fresh.state, "BREAK"); assert.equal(fresh.sessionId, before.sessionId); assert.equal(fresh.syncPending, false);
+                assert.deepEqual(fresh.sessions[1].events.map((event: { id: string }) => event.id), before.sessions[1].events.map((event: { id: string }) => event.id));
+                const events = fresh.sessions[0].events;
+                if (reversed) assert.deepEqual(events.map((event: { source: string; at: string }) => [event.source, Date.parse(event.at)]), data.events.slice(0, 7).map(event => [event.source, Date.parse(event.at)]));
+                else {
+                    assert.deepEqual(events.slice(-2).map((event: { source: string }) => event.source), ["Lunch Break In", "Time Out"]);
+                    assert.ok(events.every((event: { at: string }) => Date.parse(event.at) <= Date.parse(command.timeOutAt)));
+                }
+                const dtr = await runWithBusiness(businesses[index], () => attendancePayrollDtr(data.people[index]._id, "Oct 21, 2026 - Nov 5, 2026"));
+                const day = dtr.rows.find(row => row.dateKey === "2026-10-21")!;
+                if (!reversed) assert.deepEqual([day.excessBreakMinutes, day.excessLunchMinutes, day.nonBillableOffPhoneMinutes, day.earlyTimeOutMinutes, day.deductibleMinutes], [5, 0, 0, 330, 335]);
+                const history = await (await data.request(index, `/attendance?all=true&employeeIds=${data.people[index]._id}`)).json();
+                assert.ok(history.filter((row: { isEffective?: boolean }) => row.isEffective !== false).every((row: { eventId: string }) => fresh.records.some((event: { id: string }) => row.eventId === event.id)));
+                await runWithBusiness(businesses[index], async () => {
+                    assert.deepEqual(await PayrollRecord.findOne({ employeeId: data.code }).lean(), originalSaved[index]);
+                    const payments = await employeePayments(data.code);
+                    assert.equal(payments.items.length, 1);
+                    assert.deepEqual([payments.items[0].grossPay, payments.items[0].deductions, payments.items[0].netPay, payments.items[0].status], [15000, 50, 14950, index % 2 ? "Paid" : "Pending"]);
+                    assert.equal((await Employee.findById(data.people[index]._id).lean())?.availabilityStatus, "BREAK");
+                });
+            }
+        };
+        await verify(false);
+        const replay = await data.request(2, data.endpoint(2, "commands"), command); assert.equal((await replay.json()).revision, saved.revision);
+        const undo = { operation: "undo", targetCommandId: command.commandId, expectedRevision: saved.revision, commandId: crypto.randomUUID(), reason: "Synthetic undo earlier checkout" };
+        const undoPreview = await data.request(0, data.endpoint(0, "preview"), undo); assert.equal(undoPreview.status, 200, JSON.stringify(await undoPreview.clone().json()));
+        const undone = await data.request(3, data.endpoint(3, "commands"), undo); assert.equal(undone.status, 200, JSON.stringify(await undone.clone().json()));
+        await verify(true);
+        const ledger = await AttendanceLedger.findById(data.identity.key).lean(); assert.deepEqual(ledger!.events.slice(0, data.events.length), data.events);
+        assert.equal((await data.request(0, data.endpoint(0, "commands"), { ...undo, commandId: crypto.randomUUID() })).status, 409);
+    } finally { context.mock.timers.reset(); }
+});
+
+test("earlier current checkout goes OFFLINE and rejects stale, cross-session and future corrections", async context => {
+    context.mock.timers.enable({ apis: ["Date"], now: new Date("2026-10-22T18:00:00Z") });
+    try {
+        for (const [index, outgoing] of (["Break Out", "Lunch Break Out", "Off the Phone Out", "Non-Billable Off the Phone Out"] as const).entries()) {
+            const data = await seed(`synthetic-early-current-${index}`, [["Time In", "2026-10-22T15:00:00Z"], [outgoing, "2026-10-22T16:00:00Z"],
+                [outgoing === "Break Out" ? "Break In" : outgoing === "Lunch Break Out" ? "Lunch Break In" : "Off the Phone In", "2026-10-22T17:00:00Z"]]);
+            const before = await (await data.request(0, data.endpoint(0, "session"))).json();
+            const command = { operation: "add-time-out", commandId: crypto.randomUUID(), expectedRevision: before.revision, sessionId: before.sessionId,
+                timeOutAt: "2026-10-22T16:30:01Z", closeRest: true, reason: "Synthetic earlier current checkout" };
+            for (const invalid of [{ timeOutAt: "2026-10-22T14:59:59Z" }, { timeOutAt: "2026-10-22T18:00:01Z" }, { closeRest: false }, { sessionId: "another-session" }]) {
+                assert.ok([409, 422].includes((await data.request(0, data.endpoint(0, "preview"), { ...command, ...invalid })).status));
+            }
+            const saved = await data.request(0, data.endpoint(0, "commands"), command); assert.equal(saved.status, 200, JSON.stringify(await saved.clone().json()));
+            const after = await saved.json(); assert.equal(after.state, "OFFLINE");
+            for (let business = 0; business < 6; business++) {
+                const snapshot = await (await data.request(business, data.endpoint(business, "session"))).json(); assert.equal(snapshot.state, "OFFLINE");
+                const dashboard = await (await data.request(business, "/call-dashboard")).json();
+                assert.equal(dashboard.employees.find((item: { employeeCode: string }) => item.employeeCode === data.code).status, "OFFLINE");
+            }
+            assert.equal((await data.request(0, data.endpoint(0, "commands"), { ...command, commandId: crypto.randomUUID() })).status, 409);
+            const undo = { operation: "undo", targetCommandId: command.commandId, expectedRevision: after.revision, commandId: crypto.randomUUID(), reason: "Synthetic undo current checkout" };
+            const undone = await data.request(0, data.endpoint(0, "commands"), undo); assert.equal(undone.status, 200, JSON.stringify(await undone.clone().json()));
+            assert.equal((await undone.json()).state, "ONLINE");
         }
     } finally { context.mock.timers.reset(); }
 });

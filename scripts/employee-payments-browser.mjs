@@ -12,7 +12,7 @@ try {
         const employee = { _id: employeeId, name: 'Synthetic Payment Employee', employeeCode: 'synthetic-payment-code', role: 'Designer', team: 'Fixture', status: 'Active', availabilityStatus: 'OFFLINE' };
         const item = { id: `synthetic-pay-${index}`, payPeriod: 'Oct 6, 2026 - Oct 20, 2026', cutoffStart: '2026-10-06', cutoffEnd: '2026-10-20',
             payType: 'Semi-monthly', department: 'Fixture', grossPay: 15000, basicPay: 15000, deductions: 48.91, netPay: 14951.09,
-            lateMinutes: 12, excessBreakMinutes: 6, excessLunchMinutes: 0, earlyTimeOutMinutes: 0, absenceMinutes: 0, deductibleMinutes: 18,
+            lateMinutes: 1, excessBreakMinutes: 6, nonBillableOffPhoneMinutes: 11, excessLunchMinutes: 0, earlyTimeOutMinutes: 0, absenceMinutes: 0, deductibleMinutes: 18,
             monthlySalary: null, hourlyRate: null, minuteRate: 30000 / 23 / 8 / 60, paidHoursPerDay: null, workingDays: 23, attendanceDays: 11, absentDays: 0,
             workedHours: 87.7, scheduledHours: 88, overtimeHours: 0, overtimeApproved: false, incompleteShiftDays: 0,
             status: 'Pending', paidOn: null, scheduledPayDate: '2026-10-25', updatedAt: '2026-10-23T13:00:00Z' };
@@ -50,7 +50,7 @@ try {
                 const view = url.searchParams.get('view') || 'current';
                 let items = [{ ...item, ...(paid ? { status: 'Paid', paidOn: 'Oct 25, 2026' } : {}),
                     ...(zeroRate ? { basicPay: 0, grossPay: 0, deductions: 0, netPay: 0, minuteRate: 0, deductibleMinutes: 0,
-                        lateMinutes: 0, excessBreakMinutes: 0, workedHours: 0 } : {}) },
+                        lateMinutes: 0, excessBreakMinutes: 0, nonBillableOffPhoneMinutes: 0, workedHours: 0 } : {}) },
                     { ...item, id: 'future', payPeriod: 'Oct 21, 2026 - Nov 5, 2026', cutoffStart: '2026-10-21', cutoffEnd: '2026-11-05' },
                     { ...item, id: 'monthly', payPeriod: 'Oct 6, 2026 - Nov 5, 2026', cutoffEnd: '2026-11-05' },
                     { ...item, id: 'old', payPeriod: 'Sep 21, 2026 - Oct 5, 2026', cutoffStart: '2026-09-21', cutoffEnd: '2026-10-05' }];
@@ -84,6 +84,7 @@ try {
         await ledger.getByText('Oct 21, 2026 - Nov 5, 2026', { exact: true }).waitFor({ state: 'hidden' });
         await ledger.locator('summary').click();
         await ledger.getByRole('heading', { name: 'Deductions', exact: true }).waitFor();
+        await ledger.getByText('Non-billable Off the Phone', { exact: false }).waitFor();
         for (const label of ['Basic pay (monthly)', 'Hourly rate', 'Paid hours / day']) await ledger.getByText(label, { exact: true }).waitFor();
         assert.equal(await ledger.getByText('Not recorded', { exact: true }).count(), 0, 'complete saved pay inputs must yield calculated rates');
         const amounts = await ledger.locator('section[aria-label="Deductions"] dd').allTextContents();

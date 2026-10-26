@@ -16,6 +16,7 @@ export type CallDashboardRow = {
     offPhoneCompletedMs: number;
     offPhoneActiveStartedAt: string | null;
     offPhoneTotalMs: number;
+    offPhoneNonBillable?: boolean;
     timeBucketsMs?: { online: number; break: number; lunch: number; offPhone: number; offline: number };
     breakRemainingMs?: number | null;
     lunchRemainingMs?: number | null;
