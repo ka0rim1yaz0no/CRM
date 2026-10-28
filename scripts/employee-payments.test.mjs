@@ -57,5 +57,5 @@ test("Payments follows Notices and includes URL refresh and four-tab keyboard na
     const component = readFileSync(new URL("../src/components/EmployeePayments.tsx", import.meta.url), "utf8");
     assert.match(component, /queryKey: \["employee-payments", businessId, employeeId, view, page\]/);
     assert.match(component, /gcTime: 0/); assert.doesNotMatch(component, /keepPreviousData|placeholderData/);
-    assert.match(component, /payrollDeductionRows\(item\)/); assert.match(component, /refetchInterval: 30000/);
+    assert.match(component, /payrollDeductionDisplayRows\(item\)/); assert.match(component, /refetchInterval: 30000/);
 });

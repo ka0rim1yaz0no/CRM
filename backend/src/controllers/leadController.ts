@@ -2867,11 +2867,13 @@ export async function readAgentLeadDashboard(request: Request, response: Respons
   const callLogStart = new Date(Math.min(callDateStart.getTime(), selectedDateRange.start.getTime()));
   const callLogEnd = new Date(Math.max(callDateEnd.getTime(), selectedDateRange.end.getTime()));
   const now = Date.now();
+  const leadFilter: Record<string, unknown> = {};
+  await restrictToCanonicalPhones(leadFilter, new Date(now));
   const [employees, leads, callLogs] = await Promise.all([
     Employee.find({ status: { $ne: "Archived" } })
       .select("name employeeCode aliases role team status availabilityStatus")
       .lean() as unknown as Promise<AgentDashboardEmployee[]>,
-    Lead.find({})
+    Lead.find(leadFilter)
       .select("leadName businessName businessAddress email phone website googlePlaceId providerPlaceId placeProvider source category status assignedAgent assignedAgentName comments activity followUpAt updatedAt createdAt")
       .sort({ updatedAt: -1, createdAt: -1 })
       .lean() as unknown as Promise<AgentDashboardLead[]>,
@@ -3080,6 +3082,8 @@ export async function readAgentLeadDashboard(request: Request, response: Respons
   let unassignedLeads = 0;
   let qualifiedLeads = 0;
   let negotiationLeads = 0;
+  let newLeads = 0;
+  let followUps = 0;
 
   canonicalLeads.forEach((lead) => {
     const status = lead.status || "NEW";
@@ -3088,6 +3092,9 @@ export async function readAgentLeadDashboard(request: Request, response: Respons
     const assignedRow = resolveAssignedRow(lead);
     const leadAddedAt = getDashboardLeadAddedAt(lead);
     const leadCreatedMonth = getPhMonthKey(leadAddedAt);
+
+    if (status === "NEW") newLeads += 1;
+    if (status === "Follow up") followUps += 1;
 
     if (leadCreatedMonth) {
       monthlyOptions.add(leadCreatedMonth);
@@ -3243,6 +3250,7 @@ export async function readAgentLeadDashboard(request: Request, response: Respons
 
   response.json({
     generatedAt: new Date(),
+    pipeline: { newLeads, followUps, qualified: qualifiedLeads },
     business: {
       id: String(request.business?.id || ""),
       name: String(request.business?.name || "Current business"),

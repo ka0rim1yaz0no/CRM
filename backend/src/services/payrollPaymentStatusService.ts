@@ -15,6 +15,11 @@ import { payrollReadGroups } from "./payrollReadPolicy";
 import { PayrollValidationError } from "./payrollAccuracy";
 import { lockPayrollAttendance, payrollAttendanceFenceKeys } from "./payrollAttendanceFence";
 import { withReadSnapshot, serverReadTime } from "./readSnapshot";
+import { currentEarnedPayrollRecords } from "./payrollEarningsRead";
+import { currentPeriod } from "../controllers/payrollController";
+import { getSystemSettings } from "../controllers/systemSettingsController";
+import { earnedPayrollEnabled } from "../config/payrollEarnings";
+import { hubShiftBounds } from "./attendanceHubMath";
 
 const fail = (statusCode: number, message: string) => Object.assign(new Error(message), { statusCode });
 const hash = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -38,6 +43,13 @@ async function buildPaymentPlan(id: string, paid: unknown, session?: ClientSessi
     const businessIds = [...new Set<string>(frozen === undefined ? [...access, ...(ledger?.businessIds || []), getCurrentBusinessId()] : frozen as string[])].sort();
     if (!businessIds.includes(getCurrentBusinessId()) || businessIds.some(id => !getBusinessById(id))) throw new PayrollValidationError("Cutoff business membership needs review.");
     const blockers: string[] = [], warnings: string[] = [];
+    if (paid && !["Paid", "Completed"].includes(source.status)) {
+        const settings = await getSystemSettings(session);
+        if (earnedPayrollEnabled(source.payPeriod) && serverReadTime() < hubShiftBounds(period.end, settings).end) blockers.push("This cutoff is still in progress. Earned pay is provisional until the final shift ends.");
+        const shown = (await currentEarnedPayrollRecords([source], currentPeriod(settings.payrollBillingCycle, settings), session))[0];
+        if (shown.earningsUnavailable) blockers.push("Current earned pay cannot be verified. Review attendance before payment.");
+        else if (shown.settlementRequired) blockers.push("Earned pay changed. Preview and confirm Recompute cutoff before marking the saved payroll Paid.");
+    }
     const rows: PaymentRow[] = [], targets: PaymentTarget[] = [];
     const paidOn = paid ? serverReadTime().toLocaleDateString("en-US", { timeZone: "Asia/Manila", month: "short", day: "numeric", year: "numeric" }) : "-";
     for (const businessId of businessIds) await runWithBusiness(businessId, async () => {

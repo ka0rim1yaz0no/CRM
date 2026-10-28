@@ -6,6 +6,8 @@ import { PayrollRecord, type PayrollRecordDocument } from "../models/Payroll";
 import type { EmployeePayment, EmployeePayments } from "../../../shared/employeePayments";
 import { savedPayrollPeriod, isConfiguredSavedPayrollPeriod } from "../../../shared/payrollPeriod";
 import { payrollReadGroups } from "./payrollReadPolicy";
+import { currentEarnedPayrollRecords } from "./payrollEarningsRead";
+import type { PayrollEarningsView } from "../../../shared/payrollEarnings";
 
 const policyId = "employee-payment-history";
 export function payrollDateKey(date: Date) {
@@ -29,7 +31,7 @@ export async function initializeEmployeePaymentHistory(apply = false) {
 
 function savedNumber(value: unknown) { return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null; }
 
-function paymentDto(record: PayrollRecordDocument & { _id: unknown }, settings: Awaited<ReturnType<typeof getSystemSettings>>): EmployeePayment | null {
+function paymentDto(record: PayrollRecordDocument & PayrollEarningsView & { _id: unknown }, settings: Awaited<ReturnType<typeof getSystemSettings>>): EmployeePayment | null {
     const range = savedPayrollPeriod(record.payPeriod);
     const required = [record.grossPay, record.deductions, record.netPay];
     if (!range || required.some(value => savedNumber(value) === null) ||
@@ -38,6 +40,8 @@ function paymentDto(record: PayrollRecordDocument & { _id: unknown }, settings: 
     const minuteKeys = ["lateMinutes", "excessLunchMinutes", "excessBreakMinutes", "nonBillableOffPhoneMinutes", "earlyTimeOutMinutes", "absenceMinutes"] as const;
     if (minuteKeys.some(key => record[key] !== undefined && savedNumber(record[key]) === null)) return null;
     return {
+        earnedToDate: record.earnedToDate, earningsAsOf: record.earningsAsOf, earningsUnavailable: record.earningsUnavailable,
+        settlementRequired: record.settlementRequired, savedAmounts: record.savedAmounts,
         id: String(record._id), payPeriod: record.payPeriod, cutoffStart: range.start, cutoffEnd: range.end,
         payType: record.payType, department: record.department, grossPay: record.grossPay, deductions: record.deductions, netPay: record.netPay,
         basicPay: savedNumber(record.basicPay), monthlySalary: savedNumber(record.calculationSnapshot?.monthlySalary),
@@ -77,7 +81,8 @@ export async function employeePayments(employeeCode: string, page = 1, view: "cu
     for (const group of groups) {
         if (group.period.start < policy.fromDate || !isConfiguredSavedPayrollPeriod(group.period, settings)) continue;
         if (view === "current" && (!current || group.period.start !== current.start || group.period.end !== current.end)) continue;
-        const item = group.record ? paymentDto(group.record, settings) : null;
+        const projected = group.record ? (await currentEarnedPayrollRecords([{ ...group.record, requiresReview: group.requiresReview }], result.currentPayPeriod))[0] : null;
+        const item = projected ? paymentDto(projected, settings) : null;
         if (group.requiresReview || !item) result.reviewCount++;
         if (item) items.push({ ...item, requiresReview: group.requiresReview });
     }

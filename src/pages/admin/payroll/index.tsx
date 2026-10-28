@@ -1,5 +1,6 @@
 import type { FormEvent } from "react";
-import { payrollDeductionRows } from "../../../../shared/payrollPresentation";
+import { payrollDeductionDisplayRows } from "../../../../shared/payrollPresentation";
+import { isEarnedPayrollVersion } from "../../../../shared/payrollEarnings";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useSearchParams } from "react-router";
@@ -327,12 +328,12 @@ function payslipAmountInWords(value: number) {
     return `${numberToWords(Math.floor(cents / 100))} and ${String(cents % 100).padStart(2, "0")}/100`;
 }
 
-function payslipDeductionRows(record: PayrollRecord) { return payrollDeductionRows(record); }
+function payslipDeductionRows(record: PayrollRecord) { return payrollDeductionDisplayRows(record); }
 
 function payslipOutputReady({ record, dtr, fetching, error, accuracyEnabled }: {
     record: PayrollRecord | null; dtr?: PayrollDtr; fetching: boolean; error: boolean; accuracyEnabled?: boolean;
 }) {
-    if (!record || !dtr || fetching || error || accuracyEnabled === undefined || (accuracyEnabled && !dtr.storedCutoff)) return false;
+    if (!record || !dtr || record.earningsUnavailable || dtr.summary?.earningsUnavailable || fetching || error || accuracyEnabled === undefined || (accuracyEnabled && !dtr.storedCutoff)) return false;
     if (record.employeeId !== dtr.employee.employeeCode || record.payPeriod !== dtr.payPeriod) return false;
     const amounts = [record.grossPay, record.deductions, record.netPay];
     return amounts.every(amount => Number.isFinite(amount) && amount >= 0) &&
@@ -429,10 +430,12 @@ function PayslipDocument({
     const absentDays = record.absentDays ?? Math.max(workingDays - attendanceDays, 0);
     const lateHours = record.lateHours ?? 0;
     const overtimeHours = record.overtimeHours ?? 0;
-    const basePay = record.basicPay ?? record.grossPay;
+    const earnedBasis = isEarnedPayrollVersion(record.calculationVersion);
+    const savedBasePay = record.basicPay ?? record.grossPay;
     const minuteRate = record.minuteRate ?? (record.hourlyRate !== undefined ? record.hourlyRate / 60 : 0);
     const hourlyRate = record.hourlyRate ?? minuteRate * 60;
-    const overtimePay = Math.max(0, Math.round((record.grossPay - basePay) * 100) / 100);
+    const overtimePay = earnedBasis ? Math.round(overtimeHours * hourlyRate * 100) / 100 : Math.max(0, Math.round((record.grossPay - savedBasePay) * 100) / 100);
+    const basePay = earnedBasis ? Math.round((record.grossPay - overtimePay) * 100) / 100 : savedBasePay;
     const deductionRows = payslipDeductionRows(record);
 
     return (
@@ -441,7 +444,8 @@ function PayslipDocument({
                 <div className="flex items-start justify-between gap-6 bg-slate-950 px-6 py-5 text-[#ffffff]">
                     <div>
                         <p className="text-[0.62rem] font-semibold uppercase tracking-[0.24em] text-[#ddd6fe]">Assistly Payroll</p>
-                        <h1 className="mt-2 text-2xl font-bold tracking-tight text-[#ffffff]">Payslip</h1>
+                        <h1 className="mt-2 text-2xl font-bold tracking-tight text-[#ffffff]">{record.earnedToDate ? "Provisional Payslip" : "Payslip"}</h1>
+                        {record.earnedToDate && record.earningsAsOf && <p className="mt-1 text-xs">Earned as of {new Date(record.earningsAsOf).toLocaleString("en-PH", { timeZone: "Asia/Manila" })} PH</p>}
                         <p className="mt-2 max-w-[28rem] text-[0.68rem] leading-5 text-[#e5e7eb]">3rd FL Our Lady of Lourdes Bldg. 7 Harrison Rd, Carantes St, Claudio, Baguio, Benguet</p>
                     </div>
                     <div className="min-w-[11rem] rounded-lg border border-white/15 bg-white/10 p-4 text-right">
@@ -457,7 +461,7 @@ function PayslipDocument({
                         ["Employee ID", record.employeeId],
                         ["Department", record.department || "-"],
                         ["Pay Type", record.payType],
-                        ["Pay Date", payDate],
+                        [record.status === "Paid" ? "Pay Date" : "Scheduled Pay Date", payDate],
                         ["Pay Period", record.payPeriod],
                     ].map(([label, value]) => (
                         <div key={label} className="border-r border-t border-slate-300 px-4 py-3 first:border-t-0">
@@ -493,7 +497,7 @@ function PayslipDocument({
                         </thead>
                         <tbody>
                             <tr>
-                                <td className="border border-slate-200 px-3 py-2">Basic Pay</td>
+                                <td className="border border-slate-200 px-3 py-2">{earnedBasis ? "Earned Regular Pay" : "Basic Pay"}</td>
                                 <td className="border border-slate-200 px-3 py-2 text-right font-semibold">{money(basePay)}</td>
                             </tr>
                             {overtimePay > 0 && (
@@ -519,8 +523,8 @@ function PayslipDocument({
                         <tbody>
                             {deductionRows.map((item) => (
                                 <tr key={item.label}>
-                                    <td className="border border-slate-200 px-3 py-2">{item.label}{item.label !== "Other saved deductions" && ` (${item.minutes} min)`}</td>
-                                    <td className="border border-slate-200 px-3 py-2 text-right font-semibold">{money(item.amount)}</td>
+                                    <td className="border border-slate-200 px-3 py-2">{item.label}{item.label !== "Other saved deductions" && ` (${item.minutes} min)`}{item.note && <small className="mt-0.5 block text-[0.62rem] leading-snug text-slate-600">{item.note}</small>}</td>
+                                    <td className="border border-slate-200 px-3 py-2 text-right font-semibold">{item.amount === null ? "--" : money(item.amount)}</td>
                                 </tr>
                             ))}
                             <tr className="bg-slate-50">
@@ -678,12 +682,14 @@ export default function PayrollPage() {
         payPeriod: activeTab === "Archived" ? undefined : selectedPayPeriod,
     };
 
-    const { data: stats } = useQuery({ queryKey: ["payroll-stats", businessId, selectedPayPeriod], queryFn: () => getPayrollStats(selectedPayPeriod), enabled: cutoffReady });
+    const { data: stats } = useQuery({ queryKey: ["payroll-stats", businessId, selectedPayPeriod], queryFn: () => getPayrollStats(selectedPayPeriod), enabled: cutoffReady,
+        refetchInterval: 30_000, refetchIntervalInBackground: false });
     const { data: systemSettings } = useQuery({ queryKey: ["system-settings"], queryFn: getSystemSettings });
     const { data: employees = EMPTY_QUERY_ROWS, isLoading: areRecordsLoading, isError: areRecordsError, error: recordsError } = useQuery({
         queryKey: ["payroll-records", businessId, recordQueryParams],
         queryFn: () => ["Not generated", "Review required", "Not ready"].includes(statusFilter) ? Promise.resolve<PayrollRecord[]>([]) : getPayrollRecords(recordQueryParams),
         enabled: (activeTab === "Employee Payroll" && cutoffReady) || activeTab === "Archived",
+        refetchInterval: query => query.state.data?.some(row => row.earnedToDate) ? 30_000 : false,
     });
     const rosterQuery = useQuery({ queryKey: ["payroll-roster-gaps", businessId, selectedPayPeriod, search, statusFilter],
         queryFn: () => getPayrollRosterGaps({ payPeriod: selectedPayPeriod, search, status: statusFilter === "All statuses" ? undefined : statusFilter }, { businessId, serverRosterEnabled: accuracyConfig?.employeeRosterEnabled === true }),
@@ -748,6 +754,10 @@ export default function PayrollPage() {
 
         return {
             ...payslipRecord,
+            earnedToDate: payslipDtr.summary.earnedToDate,
+            earningsAsOf: payslipDtr.summary.earningsAsOf,
+            earningsUnavailable: payslipDtr.summary.earningsUnavailable,
+            calculationVersion: payslipDtr.summary.calculationVersion || payslipRecord.calculationVersion,
             department: payslipDtr.employee.department,
             payType: payslipDtr.payType,
             grossPay: payslipDtr.summary.grossPay,
@@ -1390,7 +1400,7 @@ export default function PayrollPage() {
                                                     <td className="px-3 py-2.5 font-semibold !text-slate-950">{money(employee.basicPay ?? employee.grossPay)}</td>
                                                     <td className="px-3 py-2.5 !text-slate-700">{employee.attendanceDays ?? 0}</td>
                                                     <td className="whitespace-nowrap px-3 py-2.5 tabular-nums !text-slate-700">{formatPayrollHours(employee.workedHours)}</td>
-                                                    <td className="px-3 py-2.5 font-semibold !text-slate-950">{money(employee.netPay)}</td>
+                                                    <td className="px-3 py-2.5 font-semibold !text-slate-950" title={employee.earningsAsOf ? `Earned as of ${new Date(employee.earningsAsOf).toLocaleString("en-PH", { timeZone: "Asia/Manila" })} PH` : undefined}>{employee.earningsUnavailable ? "Unavailable" : money(employee.netPay)}{employee.earnedToDate && <small className="block text-[10px] font-normal text-slate-600">Earned to date</small>}</td>
                                                     <td className="px-3 py-2.5"><span className="inline-flex items-center gap-1.5"><StatusBadge status={payrollPaymentStatus(employee.status)} />{employee.requiresReview && <FiAlertCircle className="size-3.5 !text-amber-700" role="img" aria-label="Conflicting saved payroll entries" title="Conflicting saved payroll entries" />}</span></td>
                                                     <td className="px-3 py-2.5 text-center" onClick={(event) => event.stopPropagation()}>
                                                         <div className="flex flex-nowrap justify-center gap-0.5">
@@ -1647,7 +1657,7 @@ export default function PayrollPage() {
                                 {isDtrError && <p className="rounded-lg border border-rose-300 bg-rose-50 p-4 text-sm font-semibold text-rose-700">{(dtrError as { response?: { data?: { message?: string } } })?.response?.data?.message || "Unable to load DTR."}</p>}
                                 {employeeDtr && (
                                     <div className="space-y-4">
-                                        {accuracyConfig?.enabled && employeeDtr.storedCutoff && <p className="rounded-md border border-sky-200 bg-sky-50 p-3 text-sm !text-sky-900">Totals are the saved cutoff. {employeeDtr.currentAttendanceWarning ? "Current attendance is unavailable." : "Attendance rows reflect current evidence; preview a recompute to compare changes."}</p>}
+                                        {accuracyConfig?.enabled && employeeDtr.storedCutoff && <p className="rounded-md border border-sky-200 bg-sky-50 p-3 text-sm !text-sky-900">{employeeDtr.summary.earningsUnavailable ? "Current earnings are unavailable. Saved payroll is unchanged." : employeeDtr.summary.earnedToDate ? "Earned-to-date amounts. Payment status is unchanged." : `Totals are the saved cutoff. ${employeeDtr.currentAttendanceWarning ? "Current attendance is unavailable." : "Attendance rows reflect current evidence; preview a recompute to compare changes."}`}</p>}
                                         {employeeDtr.currentAttendanceWarning && <p role="alert" className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm !text-amber-900">{employeeDtr.currentAttendanceWarning}. Saved pay has not changed.</p>}
                                         <div className="grid gap-3 md:grid-cols-4">
                                             {[
@@ -1675,11 +1685,20 @@ export default function PayrollPage() {
                                             ].map(([label, value]) => (
                                                 <div key={label} className="rounded-lg border border-slate-300 bg-slate-50 px-3 py-2.5">
                                                     <p className="text-[0.62rem] font-semibold uppercase tracking-[0.12em] !text-slate-500">{label}</p>
-                                                    <p className="mt-1 text-sm font-semibold !text-black">{value}</p>
+                                                    <p className="mt-1 text-sm font-semibold !text-black">{employeeDtr.summary.earningsUnavailable && ["Net Pay", "Deductions", "Regular Hours"].includes(String(label)) ? "Unavailable" : value}</p>
                                                 </div>
                                             ))}
                                         </div>
 
+                                        {!employeeDtr.summary.earningsUnavailable && <section aria-label="Deduction breakdown" className="border-t border-slate-200 pt-4">
+                                            <h3 className="text-sm font-semibold !text-black">Deduction breakdown</h3>
+                                            <dl className="mt-2 grid gap-x-6 gap-y-2 sm:grid-cols-2">
+                                                {payrollDeductionDisplayRows(employeeDtr.summary).map(row => <div key={row.label} className="flex items-start justify-between gap-4 border-b border-slate-100 py-2 text-sm !text-black">
+                                                    <dt>{row.label} ({row.minutes} min){row.note && <small className="mt-0.5 block text-xs text-slate-600">{row.note}</small>}</dt>
+                                                    <dd className="shrink-0 font-semibold tabular-nums">{row.amount === null ? "--" : money(row.amount)}</dd>
+                                                </div>)}
+                                            </dl>
+                                        </section>}
                                         <div className="overflow-hidden rounded-lg border border-slate-300">
                                             <div className="max-h-[46vh] overflow-auto">
                                                 <table className="w-full min-w-[58rem] text-left text-sm">
@@ -1746,7 +1765,7 @@ export default function PayrollPage() {
                     </div>
                 )}
 
-                {payslipRecord && payslipPreviewRecord && createPortal(
+                {payslipRecord && payslipPreviewRecord && !payslipPreviewRecord.earningsUnavailable && createPortal(
                     <div ref={payslipPrintRef} className="payroll-print-root" aria-hidden="true" data-payroll-print-sheet>
                         <PayslipDocument record={payslipPreviewRecord} money={money} payrollRunDay={systemSettings?.payrollRunDay} />
                     </div>, document.body
@@ -1872,7 +1891,7 @@ export default function PayrollPage() {
                                 </div>
 
                                 {isPayslipDtrError && <p role="alert" className="mt-3 rounded-md border border-red-200 bg-red-50 p-3 text-sm !text-red-800">{payrollErrorMessage(payslipDtrError)}</p>}
-                                {accuracyConfig?.enabled && payslipDtr?.storedCutoff && <p className="mt-3 text-sm text-white/80">Saved cutoff amounts. Attendance edits require an approved recompute before this payslip changes.</p>}
+                                {accuracyConfig?.enabled && payslipDtr?.storedCutoff && <p className="mt-3 text-sm text-white/80">{payslipDtr.summary.earningsUnavailable ? "Current earnings need review. Printing and sending are unavailable." : payslipDtr.summary.earnedToDate ? "Provisional earned-to-date pay. Saved payroll and payment status are unchanged." : "Saved cutoff amounts. Attendance edits require an approved recompute before this payslip changes."}</p>}
                                 {accuracyConfig?.enabled && payslipDtr && !payslipDtr.storedCutoff && <p role="alert" className="mt-3 text-sm text-white/80">Preview only. Approve this cutoff before printing or sending its payslip.</p>}
                                 {payslipDeliveryStatus && (
                                     <p className="mt-3 rounded-lg border border-white/10 bg-white/[0.06] px-3 py-2 text-sm font-semibold text-white/80">{payslipDeliveryStatus}</p>
@@ -1886,14 +1905,14 @@ export default function PayrollPage() {
                                     ].map(([label, value]) => (
                                         <div key={label} className="rounded-lg border border-white/10 bg-white/[0.055] px-4 py-3">
                                             <p className="text-[0.65rem] font-semibold uppercase tracking-[0.14em] text-white/35">{label}</p>
-                                            <p className="mt-1 text-lg font-bold text-white">{value}</p>
+                                            <p className="mt-1 text-lg font-bold text-white">{payslipPreviewRecord.earningsUnavailable ? "Unavailable" : value}</p>
                                         </div>
                                     ))}
                                 </div>
                             </div>
                             <div className="content-scroll min-h-0 flex-1 overflow-auto bg-slate-200 p-6">
                                 <div ref={payslipImageRef} className="mx-auto w-[49rem] shrink-0 overflow-hidden rounded-xl shadow-2xl shadow-black/25">
-                                    <PayslipDocument record={payslipPreviewRecord} money={money} payrollRunDay={systemSettings?.payrollRunDay} />
+                                    {!payslipPreviewRecord.earningsUnavailable && <PayslipDocument record={payslipPreviewRecord} money={money} payrollRunDay={systemSettings?.payrollRunDay} />}
                                 </div>
                             </div>
                         </section>

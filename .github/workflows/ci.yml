@@ -38,6 +38,10 @@ jobs:
       - name: Install backend dependencies
         run: npm ci --prefix backend
 
+      - name: Package Call Bridge for download tests
+        shell: pwsh
+        run: ./callbridge/package-call-bridge.ps1
+
       - name: Build frontend
         run: npm run build
 

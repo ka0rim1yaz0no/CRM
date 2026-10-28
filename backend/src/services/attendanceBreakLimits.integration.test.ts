@@ -40,6 +40,7 @@ const shiftDay = "2026-10-19";
 const start = Date.parse(`${shiftDay}T15:00:00Z`);
 const at = (seconds: number) => new Date(start + seconds * 1000).toISOString();
 type Snapshot = { revision: number; fingerprint: string; state: string; reviewState: string; syncPending: boolean;
+  offPhoneBilling?: import("../../../shared/attendanceOffPhone").OffPhoneBillingSnapshot;
   records: Array<{ id: string; source: AttendanceSource; at: string }>;
   derived: AttendanceDerivedDay[]; allowances: { breakMinutes: number; lunchMinutes: number };
   dashboardDays: Array<{ dayKey: string; milliseconds: Record<string, number> }> };
@@ -138,6 +139,49 @@ async function rejectAction(person: Person, source: AttendanceSource, seconds: n
   if (message) assert.equal(rejected.message, message);
   assert.equal(await core(person), before, `${source} rejection must not write attendance, revision, audit, outbox, payroll, or availability`);
 }
+
+test("HTTP: one off-phone budget survives refresh, checkout, new Time In, automatic non-billable excess and Undo in all six businesses", async () => {
+  const oldLimit = process.env.CRM_OFF_PHONE_PAID_LIMIT_FROM;
+  process.env.CRM_OFF_PHONE_PAID_LIMIT_FROM = new Date(start).toISOString();
+  try {
+    const person = await fixture();
+    for (const business of businesses) await runWithBusiness(business, () => Employee.updateOne({ employeeCode: person.code }, { role: "Sales" }));
+    await action(person, "Time In", 0); await action(person, "Off the Phone Out", 60); await action(person, "Off the Phone In", 660);
+    await action(person, "Time Out", 900); await action(person, "Time In", 1200); await action(person, "Off the Phone Out", 1800);
+    mock.timers.setTime(start + 2400 * 1000);
+    for (const index of businesses.keys()) {
+      const view = await session(person, index);
+      assert.equal(view.offPhoneBilling?.remainingPaidMs, 0);
+      assert.equal(view.offPhoneBilling?.active?.nonBillableFrom, at(2400));
+      assert.equal(view.dashboardDays[0].milliseconds.nonBillableOffPhone, 0);
+    }
+    mock.timers.setTime(start + 2401 * 1000);
+    const unchanged = await core(person);
+    for (const index of businesses.keys()) for (let refresh = 0; refresh < 2; refresh++) {
+      const view = await session(person, index);
+      assert.equal(view.state, "OFF THE PHONE"); assert.equal(view.offPhoneBilling?.remainingPaidMs, 0);
+      assert.equal(view.dashboardDays[0].milliseconds.nonBillableOffPhone, 1000);
+      const hub = await request<{ rows: Array<{ nonBillableOffPhoneMinutes: number }> }>(person, index,
+        `/attendance-hub/days?preset=custom&from=${shiftDay}&to=${shiftDay}&employee=${person.code}`, { admin: true });
+      assert.equal(hub.rows[0].nonBillableOffPhoneMinutes, 1);
+      const dashboard = await request<{ employees: Array<{ employeeCode: string; offPhoneNonBillable: boolean }> }>(person, index, "/call-dashboard", { admin: true });
+      assert.equal(dashboard.employees.find(row => row.employeeCode === person.code)?.offPhoneNonBillable, true);
+    }
+    assert.equal(await core(person), unchanged, "boundary reads cannot manufacture attendance events or change payroll");
+    await action(person, "Off the Phone In", 2401); await action(person, "Off the Phone Out", 2500); await action(person, "Off the Phone In", 2501);
+    await action(person, "Time Out", 2600);
+    const beforeUndo = await session(person);
+    assert.equal(beforeUndo.derived[0].nonBillableOffPhoneMinutes, 2);
+    assert.equal(beforeUndo.records.filter(event => event.source === "Non-Billable Off the Phone Out").length, 0, "automatic billing retains original punches");
+    const result = await request<Snapshot>(person, 0, `/employees/${person.ids[0]}/attendance/commands`, { admin: true, body: {
+      commandId: crypto.randomUUID(), operation: "correct", expectedRevision: beforeUndo.revision, fingerprint: beforeUndo.fingerprint,
+      reason: "Reverse the first synthetic paid off-phone interval without changing later actions",
+      changes: beforeUndo.records.slice(1, 3).map(event => ({ targetId: event.id, remove: true })),
+    } });
+    assert.equal(result.state, "OFFLINE");
+    for (const index of businesses.keys()) assert.equal((await session(person, index)).derived[0].nonBillableOffPhoneMinutes, 0);
+  } finally { if (oldLimit === undefined) delete process.env.CRM_OFF_PHONE_PAID_LIMIT_FROM; else process.env.CRM_OFF_PHONE_PAID_LIMIT_FROM = oldLimit; }
+});
 
 test("HTTP: non-billable off-phone is exclusive, idempotent, closes on checkout and refreshes in six businesses", async () => {
   const person = await fixture();

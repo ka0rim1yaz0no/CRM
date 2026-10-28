@@ -133,12 +133,13 @@ export default function CallDashboardPanel({ businessId, businessName }: { busin
         unverified: rows.filter(({ visible }) => visible.status === "UNVERIFIED").length,
     };
     const displayRows = rows.map(({ row, visible }) => {
-        const startedAt = visible.startedAt;
+        const nonBillable = displayNow < shiftEnd && (row.offPhoneNonBillable || Boolean(row.offPhoneNonBillableFrom && displayNow >= Date.parse(row.offPhoneNonBillableFrom)));
+        const startedAt = visible.status === "OFF THE PHONE" && nonBillable && row.offPhoneNonBillableFrom ? Date.parse(row.offPhoneNonBillableFrom) : visible.startedAt;
         const activeOffPhoneAt = row.offPhoneActiveStartedAt ? new Date(row.offPhoneActiveStartedAt).getTime() : 0;
         const offPhoneMs = row.offPhoneCompletedMs + (activeOffPhoneAt ? Math.max(0, Math.min(displayNow, shiftEnd) - activeOffPhoneAt) : 0);
 
         return {
-            row,
+            row: { ...row, offPhoneNonBillable: nonBillable },
             visible,
             statusTime: startedAt ? duration(Math.min(displayNow, shiftEnd) - Math.max(startedAt, shiftStart)) : "--:--:--",
             statusTimeTitle: startedAt ? formatPhTime(new Date(startedAt)) : "No recorded status transition",

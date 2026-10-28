@@ -54,7 +54,7 @@ before(async () => {
 });
 
 after(async () => {
-  await new Promise<void>(resolve => { server?.close(() => resolve()); server?.closeAllConnections(); });
+  if (server) await new Promise<void>(resolve => { server.close(() => resolve()); server.closeAllConnections(); });
   await mongoose.disconnect();
   await mongo?.stop();
 });

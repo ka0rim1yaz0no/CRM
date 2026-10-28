@@ -11,6 +11,8 @@ import { accountTime, bucketForAttendanceSource } from "../services/timeAccounti
 import { verifyAdminDashboardSession } from "../config/adminDashboardSession";
 import { CallBridgeObservation } from "../models/CallBridgeObservation";
 import { groupDashboardSnapshots, type DashboardSnapshot } from "../services/callDashboardAggregation";
+import { offPhoneNonBillableAt, offPhoneShiftBilling } from "../../../shared/attendanceOffPhone";
+import { offPhoneLimitPolicy } from "../config/payrollEarnings";
 
 async function getCallDashboardForBusiness(request: Request, response: Response) {
   const admin = verifyAdminDashboardSession(request.header("x-crm-admin-session"));
@@ -82,12 +84,14 @@ async function getCallDashboardForBusiness(request: Request, response: Response)
     const latestDevice = [...employeeDevices].sort((a, b) => b.lastSeenAt.getTime() - a.lastSeenAt.getTime())[0];
     const heartbeatAgeMs = latestDevice ? Math.max(0, now.getTime() - latestDevice.lastSeenAt.getTime()) : null;
     const employeeCalls = observations.filter((observation) => observation.employeeCode === code);
+    const billing = offPhoneShiftBilling(events, shift.start, shift.end, now, offPhoneLimitPolicy());
     return {
       employeeId: String(group.employee._id), employeeCode: code, name: group.employee.name || code,
       businessId: group.businesses[0]?.id || "", businessName: group.businesses[0]?.name || "",
       businesses: group.businesses, businessBreakdown, role: group.employee.role, team: group.employee.team,
       ...status, timeBucketsMs: accounted.milliseconds,
-      offPhoneNonBillable: status.status === "OFF THE PHONE" && [...events].reverse().find(event => event.timeIn <= now)?.source === "Non-Billable Off the Phone Out",
+      offPhoneNonBillable: status.status === "OFF THE PHONE" && offPhoneNonBillableAt(billing, +now),
+      offPhoneNonBillableFrom: status.status === "OFF THE PHONE" ? billing.active?.nonBillableFrom ?? null : null,
       offPhoneCompletedMs: offPhone.completedMs, offPhoneActiveStartedAt: offPhone.activeStartedAt,
       offPhoneTotalMs: accounted.milliseconds.offPhone,
       breakRemainingMs: accounted.remainingBreakMs, lunchRemainingMs: accounted.remainingLunchMs,
@@ -215,6 +219,7 @@ export async function getCallDashboard(request: Request, response: Response) {
       status.status === "ONLINE" && status.detail === "Ready to dial"
       ? { ...status, detail: autoCallDisabledReason }
       : status;
+    const billing = offPhoneShiftBilling(employeeAttendance, shift.start, shift.end, now, offPhoneLimitPolicy());
 
     return {
       employeeId: String(employee._id),
@@ -225,7 +230,8 @@ export async function getCallDashboard(request: Request, response: Response) {
       role: employee.role,
       team: employee.team,
       ...dashboardStatus,
-      offPhoneNonBillable: dashboardStatus.status === "OFF THE PHONE" && [...employeeAttendance].reverse().find(event => event.timeIn <= now)?.source === "Non-Billable Off the Phone Out",
+      offPhoneNonBillable: dashboardStatus.status === "OFF THE PHONE" && offPhoneNonBillableAt(billing, +now),
+      offPhoneNonBillableFrom: dashboardStatus.status === "OFF THE PHONE" ? billing.active?.nonBillableFrom ?? null : null,
       offPhoneCompletedMs: offPhone.completedMs,
       offPhoneActiveStartedAt: offPhone.activeStartedAt,
       offPhoneTotalMs: offPhone.totalMs,

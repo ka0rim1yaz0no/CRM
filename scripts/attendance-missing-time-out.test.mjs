@@ -3,12 +3,16 @@ import test from 'node:test';
 import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 import ts from 'typescript';
-import { attendanceInputValue, buildAttendanceDraftChanges } from '../src/lib/attendanceCommandDraft.ts';
-import { attendanceTimeOutPlan } from '../shared/attendanceTimeOut.ts';
+import { attendanceTimeOutPlan, timeOutBeforeTimeInMessage, validateTimeOutOrder } from '../shared/attendanceTimeOut.ts';
+const draft = {};
+runInNewContext(ts.transpileModule(readFileSync(new URL('../src/lib/attendanceCommandDraft.ts', import.meta.url), 'utf8'),
+    { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText,
+    { exports: draft, Error, require: name => { assert.equal(name, '../../shared/attendanceTimeOut'); return { validateTimeOutOrder }; } });
+const { attendanceInputValue, buildAttendanceDraftChanges } = draft;
 const source = readFileSync(new URL('../src/lib/attendanceMissingTimeOut.ts', import.meta.url), 'utf8');
 const exports = {};
 runInNewContext(ts.transpileModule(source.replace(/^import .*;\r?\n/gm, ''), { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText,
-    { exports, attendanceInputValue, buildAttendanceDraftChanges, attendanceTimeOutPlan });
+    { exports, Error, attendanceInputValue, buildAttendanceDraftChanges, attendanceTimeOutPlan });
 const { missingTimeOutSessions, missingTimeOutDraft, missingTimeOutChanges } = exports;
 const day = '2026-10-22';
 const event = (source, at, id = source) => ({ id, source, at, commandId: id, sequence: 0 });
@@ -20,6 +24,14 @@ test('missing checkout uses server-assigned overnight shift end, never browser t
     const custom = { ...session, shift: { ...session.shift, end: '2026-10-22T22:00:00Z' } };
     assert.equal(missingTimeOutDraft(snapshot([custom]), day, 'old').value, '2026-10-23T06:00:00');
     assert.equal(missingTimeOutSessions(snapshot(), '2026-10-21').length, 0);
+});
+
+test('Add Time Out shows explicit date and AM/PM guidance before submission', () => {
+    const data = snapshot();
+    const draft = missingTimeOutDraft(data, day, 'old', '2026-10-22T11:38:00');
+    assert.equal(draft.validationError, timeOutBeforeTimeInMessage);
+    assert.throws(() => missingTimeOutChanges(data, day, 'old', '2026-10-22T11:38:00', false), { message: timeOutBeforeTimeInMessage });
+    assert.equal(missingTimeOutDraft(data, day, 'old', '2026-10-23T08:00:00').validationError, '');
 });
 test('existing manual, automatic and legacy checkouts are not offered as missing', () => {
     for (const source of ['Time Out', 'Logout']) {

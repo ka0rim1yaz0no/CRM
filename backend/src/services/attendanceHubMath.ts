@@ -4,6 +4,7 @@ import { accountTime, breakAllowanceMs, bucketForAttendanceSource, lunchAllowanc
 import { attendanceDurationModelEnabled, attendanceAccuracyFixesEnabled } from "../config/rolloutFlags";
 import { projectAttendance } from "./attendanceSessionState";
 import { isOffPhoneStart, nonBillableOffPhoneIntervals } from "../../../shared/attendanceOffPhone";
+import { offPhoneLimitPolicy } from "../config/payrollEarnings";
 
 export type HubEvent = { id: string; source: AttendanceSource; at: Date; eventId?: string; createdAt?: Date; sequence?: number; autoTimeOut?: boolean };
 export type HubSettings = { officialShiftStartTime: string; officialShiftEndTime: string; lateGraceMinutes: number; attendanceTimeZone: string; breakMinutes?: number; lunchMinutes?: number };
@@ -74,6 +75,7 @@ export function calculateHubDay(dayKey: string, sourceEvents: HubEvent[], settin
   let lunchAttempts = 0;
   let lastSource = "";
   for (const event of events) {
+    if (event.source === "Time Out" || event.source === "Logout") delete active.offPhone;
     if (event.source === "Time In" || event.source === "Login") { lunchAttempts = 0; }
     if (event.source === lastSource) review.push(`Duplicate ${event.source}`);
     lastSource = event.source;
@@ -121,7 +123,7 @@ export function calculateHubDay(dayKey: string, sourceEvents: HubEvent[], settin
   if (lunchOverMs > 0) issues.push("OVER LUNCH");
   if (underTimeMs > 0) issues.push("UNDER TIME");
   if (hasOpenSession) issues.push("OPEN SESSION");
-  const nonBillable = nonBillableOffPhoneIntervals(clickedRecords, start, end, now);
+  const nonBillable = nonBillableOffPhoneIntervals(clickedRecords, start, end, now, offPhoneLimitPolicy());
   const nonBillableOffPhoneMinutes = nonBillable.reduce((total, interval) => total + interval.minutes, 0);
   if (nonBillableOffPhoneMinutes && !excused) issues.push("NON-BILLABLE OFF PHONE");
   if (excused) issues.push("EXCUSED");

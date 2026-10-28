@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { excessClickedSessionMinutes, calculateSlotAttendance, accountTime, bucketForAttendanceSource } from "../services/timeAccounting";
 import { attendanceDurationModelEnabled, payrollAccuracyEnabled, attendanceAccuracyFixesEnabled } from "../config/rolloutFlags";
 import { accuratePayrollRates, accuratePayrollDay, paidHoursPerDay, PayrollValidationError, type PayrollShiftSettings } from "../services/payrollAccuracy";
+import { earnedPayrollEnabled, earnedAllDeductionsEnabled } from "../config/payrollEarnings";
 import { legacyPayrollPolicy } from "../services/payrollLegacyPolicy";
 import { AttendanceLedger, AttendancePolicy } from "../models/AttendanceLedger";
 import { SystemSettings } from "../models/SystemSettings";
@@ -51,6 +52,7 @@ type PayrollCutoffPeriod = {
 };
 
 type PayrollAttendanceSummary = {
+  earnedGrossHours?: number;
   paidHoursPerDay?: number;
   attendanceDays: number;
   absentDays: number;
@@ -77,6 +79,8 @@ type PayrollCalculatedAttendance = PayrollAttendanceSummary & {
 };
 
 type PayrollDtrRow = {
+  earnedGrossHours?: number;
+  earnedDeductibleMinutes?: number;
   restWarnings?: string[];
   nonBillableOffPhoneMinutes?: number;
   deductibleMinutes?: number;
@@ -807,6 +811,8 @@ async function accurateAttendancePayrollDtr(employeeId: Types.ObjectId, payPerio
   const keys = periodDateKeys(start, end);
   if (!keys.length || keys.length > 93) throw new PayrollValidationError("Payroll range must contain between 1 and 93 shift days");
   const now = serverReadTime();
+  const earned = earnedPayrollEnabled(payPeriod);
+  const allEarnedDeductions = earnedAllDeductionsEnabled(payPeriod);
   const employee = await Employee.findById(employeeId, null, session ? { session } : undefined).select("employeeCode").lean();
   if (!employee) throw new PayrollValidationError("Employee not found");
   const firstBound = new Date(hubShiftBounds(keys[0], settings).start.getTime() - 86_400_000);
@@ -846,24 +852,34 @@ async function accurateAttendancePayrollDtr(employeeId: Types.ObjectId, payPerio
     const bounds = hubShiftBounds(key, settings);
     const weekend = isWeekendDateKey(key);
     const day = accuratePayrollDay(records, { ...policy, shiftStart: bounds.start, shiftEnd: bounds.end,
-      closingBoundaries: closingBoundariesByDay.get(key) }, now, paidHours, weekend, mismatches.has(key));
+      closingBoundaries: closingBoundariesByDay.get(key) }, now, paidHours, weekend, mismatches.has(key), allEarnedDeductions);
     const timeIn = firstRecord(records, ["Time In", "Login"]), timeOut = lastRecord(records, ["Time Out", "Logout"]);
-    return { dateKey: key, date: formatDtrDate(key), day: formatDtrDay(key), status: day.status as PayrollDtrRow["status"], isWeekend: weekend,
+    const status = earned && day.review && !day.integrityReview && now < bounds.end ? "In Progress" : day.status;
+    return { dateKey: key, date: formatDtrDate(key), day: formatDtrDay(key), status: status as PayrollDtrRow["status"], isWeekend: weekend,
       timeIn: formatDtrTime(timeIn?.timeIn), timeOut: formatDtrTime(day.calculated.hasOpenSession ? null : timeOut?.timeIn),
       lunchHours: day.lunchHours, ...day.components, grossHours: day.grossHours, lateHours: day.components.lateMinutes / 60,
-      regularHours: day.regularHours, overtimeHours: day.overtimeHours, missingHours: day.missingHours,
+      regularHours: earned && !weekend ? day.earned.workedHours : day.regularHours, overtimeHours: day.overtimeHours, missingHours: day.missingHours,
+      ...(earned ? { earnedGrossHours: weekend ? 0 : day.earned.grossHours,
+        earnedDeductibleMinutes: weekend ? 0 : day.earned.deductibleMinutes,
+        deductibleMinutes: weekend ? 0 : day.earned.deductibleMinutes, missingHours: weekend ? 0 : day.earned.deductibleMinutes / 60,
+        ...(!weekend ? { excessBreakMinutes: day.earned.excessBreakMinutes, excessLunchMinutes: day.earned.excessLunchMinutes,
+          nonBillableOffPhoneMinutes: day.earned.nonBillableOffPhoneMinutes,
+          ...(allEarnedDeductions ? { lateMinutes: day.earned.lateMinutes, lateHours: day.earned.lateMinutes / 60,
+            earlyTimeOutMinutes: day.earned.earlyTimeOutMinutes, absenceMinutes: day.earned.absenceMinutes } : {}) } : {}) } : {}),
       ...(attendanceAccuracyFixesEnabled() ? { restWarnings: day.calculated.restWarnings || [] } : {}),
       scheduledHours: weekend ? 0 : paidHours, recordCount: records.length };
   });
   const sum = (field: keyof PayrollDtrRow) => rows.reduce((total, row) => total + Number(row[field] || 0), 0);
-  const absent = rows.filter(row => row.status === "Absent"), late = rows.filter(row => row.status === "Late");
+  const absent = rows.filter(row => row.status === "Absent"), late = rows.filter(row => allEarnedDeductions ? row.lateMinutes > 0 : row.status === "Late");
   const summary: PayrollAttendanceSummary = { paidHoursPerDay: paidHours, attendanceDays: rows.filter(row => ["Present", "Late"].includes(row.status)).length,
     absentDays: absent.length, absentHours: absent.length * paidHours, lateDays: late.length, lateHours: sum("lateHours"),
     workingDays: countWorkingDays(start, end), workedHours: sum("regularHours"), overtimeHours: sum("overtimeHours"), missingHours: sum("missingHours"),
     scheduledHours: sum("scheduledHours"), lateMinutes: sum("lateMinutes"), excessBreakMinutes: sum("excessBreakMinutes"), excessLunchMinutes: sum("excessLunchMinutes"),
     absenceMinutes: sum("absenceMinutes"), earlyTimeOutMinutes: sum("earlyTimeOutMinutes"), deductibleMinutes: sum("deductibleMinutes"),
     nonBillableOffPhoneMinutes: sum("nonBillableOffPhoneMinutes"),
-    incompleteShiftDays: rows.filter(row => row.status === "Needs Review").length };
+    incompleteShiftDays: rows.filter(row => row.status === "Needs Review").length,
+    ...(earned ? { earnedGrossHours: sum("earnedGrossHours"), deductibleMinutes: sum("earnedDeductibleMinutes"),
+      attendanceDays: rows.filter(row => !row.isWeekend && (row.earnedGrossHours ?? 0) > 0).length } : {}) };
   return { rows, summary };
 }
 
@@ -1339,7 +1355,10 @@ async function accuratePayrollReadForPeriod(employeeCodes: string[], payPeriod: 
   if (!period) throw new PayrollValidationError("Choose a dated payroll cutoff.");
   const saved = await PayrollRecord.find({ isArchived: false, employeeId: { $in: employeeCodes } }).maxTimeMS(5000).lean();
   const groups = payrollReadGroups(saved).groups.filter(group => group.period.start === period.start && group.period.end === period.end);
-  return { records: groups.flatMap(group => group.record ? [{ ...group.record, requiresReview: group.requiresReview }] : []),
+  const { currentEarnedPayrollRecords } = await import("../services/payrollEarningsRead");
+  const settings = await getSystemSettings();
+  const records = await currentEarnedPayrollRecords(groups.flatMap(group => group.record ? [{ ...group.record, requiresReview: group.requiresReview }] : []), currentPeriod(settings.payrollBillingCycle, settings));
+  return { records,
     reviewCount: groups.filter(group => group.requiresReview).length, groups };
 }
 
@@ -1410,9 +1429,10 @@ export async function listPayrollStats(request: Request, response: Response) {
   const read = payrollAccuracyEnabled() ? await accuratePayrollReadForPeriod(activeEmployeeCodes, payPeriod) : null;
   const records = read?.records || await PayrollRecord.find({ isArchived: false, employeeId: { $in: activeEmployeeCodes }, payPeriod });
   const totalEmployees = activeEmployeeCodes.length;
-  const gross = records.reduce((sum, record) => sum + record.grossPay, 0);
-  const deductions = records.reduce((sum, record) => sum + record.deductions, 0);
-  const net = records.reduce((sum, record) => sum + record.netPay, 0);
+  const visible = records.filter(record => !("earningsUnavailable" in record && record.earningsUnavailable));
+  const gross = visible.reduce((sum, record) => sum + record.grossPay, 0);
+  const deductions = visible.reduce((sum, record) => sum + record.deductions, 0);
+  const net = visible.reduce((sum, record) => sum + record.netPay, 0);
 
   response.json({
     payPeriod,

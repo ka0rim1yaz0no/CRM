@@ -4,7 +4,8 @@ import { FiAlertTriangle, FiChevronDown, FiChevronLeft, FiChevronRight, FiRefres
 import { getEmployeePayments } from "../api/employeePayments";
 import { getAuthUser } from "../api/authStorage";
 import { getActiveBusinessId } from "../api/businessStorage";
-import { payrollDeductionRows } from "../../shared/payrollPresentation";
+import { payrollDeductionDisplayRows } from "../../shared/payrollPresentation";
+import { isEarnedPayrollVersion } from "../../shared/payrollEarnings";
 import type { EmployeePayment } from "../../shared/employeePayments";
 import { savedPayrollPeriod } from "../../shared/payrollPeriod";
 import { payrollPaymentStatus } from "../../shared/payrollPaymentStatus";
@@ -28,7 +29,8 @@ function calendarDate(value: string | null) {
 const quantity = (value: number | null, unit = "") => value === null ? "Not recorded" : `${Number(value.toFixed(2)).toLocaleString("en-US")}${unit}`;
 
 function PaymentDetails({ item, money }: { item: EmployeePayment; money: (value: number) => string }) {
-    const deductionRows = payrollDeductionRows(item);
+    if (item.earningsUnavailable) return <p className="employee-payments-error" role="status">Current earnings need payroll review. Saved amounts and payment status have not changed.</p>;
+    const deductionRows = payrollDeductionDisplayRows(item);
     const rates = savedPayrollDisplayRates(item);
     const values: Array<[string, string, string?]> = [
         ["Pay type", item.payType], ["Department", item.department],
@@ -42,13 +44,13 @@ function PaymentDetails({ item, money }: { item: EmployeePayment; money: (value:
     return <div className="employee-payment-details">
         <div className="employee-payment-breakdown">
             <section aria-label="Earnings"><h3>Earnings</h3><dl>
-                <div><dt>Basic pay (cutoff)</dt><dd>{item.basicPay === null ? "Not recorded" : money(item.basicPay)}</dd></div>
-                {item.basicPay !== null && item.grossPay > item.basicPay && <div><dt>Additional earnings</dt><dd>{money(Math.round((item.grossPay - item.basicPay) * 100) / 100)}</dd></div>}
+                <div><dt>{isEarnedPayrollVersion(item.calculationVersion) ? "Earned pay" : "Basic pay (cutoff)"}</dt><dd>{isEarnedPayrollVersion(item.calculationVersion) ? money(item.grossPay) : item.basicPay === null ? "Not recorded" : money(item.basicPay)}</dd></div>
+                {!isEarnedPayrollVersion(item.calculationVersion) && item.basicPay !== null && item.grossPay > item.basicPay && <div><dt>Additional earnings</dt><dd>{money(Math.round((item.grossPay - item.basicPay) * 100) / 100)}</dd></div>}
                 <div><dt>Overtime</dt><dd>{quantity(item.overtimeHours, "h")} / {item.overtimeApproved ? "Approved" : "Not approved"}</dd></div>
                 <div className="employee-payment-total"><dt>Gross pay</dt><dd>{money(item.grossPay)}</dd></div>
             </dl></section>
             <section aria-label="Deductions"><h3>Deductions</h3><dl>
-                {deductionRows.map(row => <div key={row.label}><dt>{row.label} <span>{row.minutes}m</span></dt><dd>{money(row.amount)}</dd></div>)}
+                {deductionRows.map(row => <div key={row.label}><dt>{row.label} <span>{row.minutes}m</span>{row.note && <small>{row.note}</small>}</dt><dd>{row.amount === null ? "--" : money(row.amount)}</dd></div>)}
                 <div className="employee-payment-total"><dt>Total deductions</dt><dd>{money(item.deductions)}</dd></div>
             </dl></section>
             <section aria-label="Attendance"><h3>Attendance</h3><dl>
@@ -59,7 +61,8 @@ function PaymentDetails({ item, money }: { item: EmployeePayment; money: (value:
             </dl></section>
         </div>
         <dl className="employee-payment-meta">{values.map(([label, value, title]) => <div key={label}><dt>{label}</dt><dd title={title}>{value}</dd></div>)}</dl>
-        <div className="employee-payment-net"><span>Net pay</span><strong>{money(item.netPay)}</strong></div>
+        <div className="employee-payment-net"><span>{item.earnedToDate ? "Net pay earned to date" : "Net pay"}</span><strong>{money(item.netPay)}</strong></div>
+        {item.earnedToDate && item.earningsAsOf && <p className="employee-payments-start">As of {new Date(item.earningsAsOf).toLocaleString("en-PH", { timeZone: "Asia/Manila" })} PH</p>}
     </div>;
 }
 
@@ -87,9 +90,9 @@ function PaymentsLedger({ employeeId, businessId }: { employeeId: string; busine
             {data.items.length > 0 && <div className="employee-payment-column-head" aria-hidden="true"><span>Cutoff</span><span>Gross pay</span><span>Deductions</span><span>Net pay</span><span>Status</span><span /></div>}
             {data.items.map(item => <details className="employee-payment" key={item.id}>
                 <summary><span className="employee-payment-cutoff">{savedPayrollPeriod(item.payPeriod)?.label || item.payPeriod}</span>
-                    <span className="employee-payment-amount"><small>Gross pay</small>{money(item.grossPay)}</span>
-                    <span className="employee-payment-amount"><small>Deductions</small>{money(item.deductions)}</span>
-                    <strong className="employee-payment-amount"><small>Net pay</small>{money(item.netPay)}</strong>
+                    <span className="employee-payment-amount"><small>Gross pay</small>{item.earningsUnavailable ? "Unavailable" : money(item.grossPay)}</span>
+                    <span className="employee-payment-amount"><small>Deductions</small>{item.earningsUnavailable ? "Unavailable" : money(item.deductions)}</span>
+                    <strong className="employee-payment-amount" title={item.earnedToDate ? "Earned to date" : undefined}><small>{item.earnedToDate ? "Earned net pay" : "Net pay"}</small>{item.earningsUnavailable ? "Unavailable" : money(item.netPay)}</strong>
                     <span className="employee-payment-status" data-paid={item.status === "Paid"}>{payrollPaymentStatus(item.status)}{item.requiresReview && <FiAlertTriangle role="img" aria-label="Conflicting saved payroll entries" title="Conflicting saved payroll entries" />}</span><FiChevronDown aria-hidden="true" />
                 </summary><PaymentDetails item={item} money={money} />
             </details>)}

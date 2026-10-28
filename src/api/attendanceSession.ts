@@ -11,6 +11,8 @@ export type SessionEvent = { id: string; source: "Login" | "Logout" | "Time In" 
     "Lunch Break Out" | "Lunch Break In" | "Off the Phone Out" | "Non-Billable Off the Phone Out" | "Off the Phone In"; at: string; commandId: string; sequence: number; sessionId?: string;
     attendanceStatus?: "On time" | "Late" | "Undertime" | ""; autoTimeOut?: boolean; shiftDayKey?: string };
 export type AttendanceSessionSnapshot = {
+    offPhonePolicy?: import("../../shared/attendanceOffPhone").OffPhoneLimitPolicy;
+    offPhoneBilling?: import("../../shared/attendanceOffPhone").OffPhoneBillingSnapshot | null;
     dashboardDays?: DashboardAttendanceDay[];
     currentShiftDay?: string;
     sessionId: string | null; revision: number; fingerprint: string; state: "ONLINE" | "OFFLINE" | "BREAK" | "LUNCH" | "OFF THE PHONE";

@@ -4,7 +4,7 @@ import { FiEdit2, FiLogOut, FiRotateCcw } from "react-icons/fi";
 import { getActiveBusinessId } from "../api/businessStorage";
 import { getAuthUser } from "../api/authStorage";
 import { attendanceIntegrityEnabled, getAttendanceSession, previewAttendanceCommand, submitAttendanceCommand, type AttendanceCommand, type SessionEvent, type AttendanceSessionSnapshot } from "../api/attendanceSession";
-import { attendanceInputValue } from "../lib/attendanceCommandDraft";
+import { attendanceInputValue, validateAttendanceEventTime } from "../lib/attendanceCommandDraft";
 import { refreshAttendanceWorkspace } from "../lib/employeeWorkspaceCache";
 import { attendanceCorrectionError, attendanceEventsForDay, attendanceUndoAvailability, attendanceUndoPlan } from "../lib/attendanceUndo";
 import { missingTimeOutChanges, missingTimeOutDraft, missingTimeOutSessions } from "../lib/attendanceMissingTimeOut";
@@ -68,6 +68,7 @@ export default function AttendanceCorrections({ employeeId, businessId = getActi
                 if (!availability.allowed) throw new Error(availability.reason);
             }
             const replacement = mode === "correct" && !remove ? (at === attendanceInputValue(target?.at) ? target!.at : new Date(`${at}+08:00`).toISOString()) : undefined;
+            if (replacement && target) validateAttendanceEventTime(query.data.sessions, target.id, source, replacement);
             const undo = mode === "undo" ? attendanceUndoPlan(query.data, target!, dayKey) : null;
             const checkoutChanges = mode === "add-time-out" ? missingTimeOutChanges(query.data, dayKey, timeOutSessionId, at, closeRest) : null;
             if (checkoutChanges?.some(change => change.remove) && !query.data.timeOutOverrideEnabled) throw new Error("Refresh CRM after the updated attendance server is available before replacing later actions.");
@@ -110,6 +111,7 @@ export default function AttendanceCorrections({ employeeId, businessId = getActi
                 </select></label>}
                 <label>PH Time Out<input aria-label="PH Time Out" type="datetime-local" step="1" value={at} required min={timeOutDraft?.min} max={timeOutDraft?.max}
                     onChange={event => { setAt(event.target.value); setPreview(null); }} /></label>
+                {timeOutDraft?.validationError && <p role="alert">{timeOutDraft.validationError}</p>}
                 {!!timeOutDraft?.replaced.length && <p role="status">{timeOutDraft.replaced.length} later action(s) in this session will be reversed. Original history will be retained.</p>}
                 {timeOutDraft?.returnSource && <label><input type="checkbox" checked={closeRest} onChange={event => { setCloseRest(event.target.checked); setPreview(null); }} />
                     Add {timeOutDraft.returnSource} at the same time</label>}

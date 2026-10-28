@@ -5,6 +5,7 @@ export type DashboardTarget = { metric: "calls" | "talkMinutes" | "qualified"; p
 export type DashboardSettings = { revision: number; targets: DashboardTarget[]; newLeadHours: number; followUpHours: number };
 export type HandoverNote = { _id: string; text: string; author: string; authorName: string; pinned: boolean; createdAt: string };
 export type DashboardWorkspaceData = { dashboard: AgentLeadDashboard; serverTime: string;
+  policy?: { shiftStart: string; shiftEnd: string };
   pace: { daily: number; monthly: number };
   trend: Array<{ day: string; count: number; comments: number; touched: number }>;
   range: { preset: string; from: string; to: string; previousFrom: string; previousTo: string; today: string; fromTime: string; toTime: string };

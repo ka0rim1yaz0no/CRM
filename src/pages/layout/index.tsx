@@ -9,6 +9,7 @@ import { getAuthUser } from "../../api/authStorage";
 import { connectAuthenticatedSocket, socket } from "../../lib/socket";
 import { refreshEmployeeWorkspace } from "../../lib/employeeWorkspaceCache";
 import { useAttendanceWorkspaceRefresh } from "../../hooks/useAttendanceWorkspaceRefresh";
+import EmployeeRestReminder from "../../components/EmployeeRestReminder";
 
 type Props = {
     children: ReactNode;
@@ -61,6 +62,7 @@ export default function MainLayout({ children }: Props) {
             <SideBar />
             <main className={["relative flex h-screen flex-col transition-[padding] duration-200", isSidebarCollapsed ? "pl-[5rem]" : "pl-[16rem]"].join(" ")}>
                 <Navbar />
+                {employeeId && <EmployeeRestReminder employeeId={employeeId} employeeCode={auth?.user.employeeCode || ""} />}
                 <div
                     className={[
                         "content-scroll min-h-0 flex-1 overflow-y-auto p-6",

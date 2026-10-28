@@ -21,10 +21,12 @@ export function missingTimeOutDraft(snapshot: AttendanceSessionSnapshot, dayKey:
     const value = Number.isFinite(proposed) ? attendanceInputValue(new Date(proposed).toISOString()) : "";
     const selected = selectedValue ?? value;
     let plan: ReturnType<typeof attendanceTimeOutPlan> | undefined;
-    try { plan = attendanceTimeOutPlan(snapshot.sessions, sessionId, new Date(`${selected}+08:00`).toISOString(), snapshot.serverTime); } catch { /* Review reports invalid draft times. */ }
+    let validationError = "";
+    try { plan = attendanceTimeOutPlan(snapshot.sessions, sessionId, new Date(`${selected}+08:00`).toISOString(), snapshot.serverTime); }
+    catch (error) { validationError = error instanceof Error ? error.message : "Check the Time Out date and time."; }
     return { session, returnSource: plan?.returnSource as SessionEvent["source"] | undefined, replaced: plan?.replaced || [], min: attendanceInputValue(session.startedAt),
         max: Number.isFinite(limit) ? attendanceInputValue(new Date(limit).toISOString()) : "",
-        value };
+        value, validationError };
 }
 
 export function missingTimeOutChanges(snapshot: AttendanceSessionSnapshot, dayKey: string | undefined, sessionId: string, value: string, closeRest: boolean): NonNullable<AttendanceCommand["changes"]> {

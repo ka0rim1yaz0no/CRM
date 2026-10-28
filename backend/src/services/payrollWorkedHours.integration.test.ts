@@ -86,6 +86,158 @@ const confirm = (plan: { token: string; workedMinutes: number }, extra = {}) => 
     token: plan.token, workedMinutes: plan.workedMinutes, confirm: true, reason: "Synthetic reviewed total-hours adjustment", ...extra });
 async function saved(business = businesses[0]) { return runWithBusiness(business, () => PayrollRecord.findOne({ employeeId: code }).lean()); }
 
+test("earned all-deductions policy matches all six refreshed Payroll and Payments views and preserves paid records", async context => {
+    context.mock.timers.enable({ apis: ["Date"], now: new Date("2026-10-11T01:00:00Z") });
+    const originalToken = token; token = createAdminDashboardSession("90000001")!;
+    const names = ["CRM_EARNED_PAYROLL_FROM", "CRM_EARNED_ALL_DEDUCTIONS_FROM", "CRM_OFF_PHONE_PAID_LIMIT_FROM", "CRM_ATTENDANCE_ACCURACY_FIXES"];
+    const previous = names.map(name => process.env[name]);
+    context.after(() => { context.mock.timers.reset(); token = originalToken; names.forEach((name, index) => {
+        if (previous[index] === undefined) delete process.env[name]; else process.env[name] = previous[index];
+    }); });
+    process.env.CRM_EARNED_PAYROLL_FROM = "2026-10-06"; process.env.CRM_EARNED_ALL_DEDUCTIONS_FROM = "2026-10-06";
+    process.env.CRM_OFF_PHONE_PAID_LIMIT_FROM = "2026-10-06T15:00:00Z"; process.env.CRM_ATTENDANCE_ACCURACY_FIXES = "true";
+    const start = Date.parse("2026-10-06T15:00:00Z");
+    const entries = [["Time In", 10], ["Break Out", 60], ["Break In", 76], ["Lunch Break Out", 180], ["Lunch Break In", 241],
+        ["Off the Phone Out", 300], ["Off the Phone In", 326], ["Time Out", 530],
+        ["Time In", 1440], ["Lunch Break Out", 1620], ["Lunch Break In", 1680], ["Time Out", 1980],
+        ["Time In", 2880], ["Lunch Break Out", 3060], ["Lunch Break In", 3120], ["Time Out", 3420]];
+    const events: SessionEvent[] = entries.map(([source, minutes], sequence) => ({ id: `all-${sequence}`, commandId: `all-${sequence}`,
+        source: source as SessionEvent["source"], sequence, at: new Date(start + Number(minutes) * 60000).toISOString(),
+        recordedAt: new Date(start + Number(minutes) * 60000).toISOString(),
+        ...(source === "Time In" ? { shift: assignAttendanceShift(new Date(start + Number(minutes) * 60000)) } : {}) }));
+    await AttendanceLedger.updateOne({ _id: "synthetic-hours" }, { $set: { events, revision: 2 } });
+    const originals: Array<Awaited<ReturnType<typeof saved>>> = [];
+    for (const business of businesses) await runWithBusiness(business, async () => {
+        const employee = (await Employee.findOne({ employeeCode: code }).lean())!;
+        await Attendance.deleteMany({ employee: employee._id });
+        await Attendance.insertMany(events.map(event => ({ employee: employee._id, source: event.source, timeIn: new Date(event.at), eventId: event.id,
+            sequence: event.sequence, ledgerIdentity: "synthetic-hours", ledgerRevision: 2, isEffective: true })));
+        await SystemSettings.updateOne({ key: "system" }, { payrollBillingCycle: "Semi-monthly" }); originals.push(await saved(business));
+    });
+    const candidate = await runWithBusiness(businesses[0], async () => calculatePayrollCandidate((await Employee.findOne({ employeeCode: code }).lean())!, period));
+    const value = candidate.value;
+    assert.equal(value.calculationVersion, "earned-hours-all-deductions-v1");
+    assert.equal(value.lateMinutes, 10); assert.equal(value.earlyTimeOutMinutes, 10); assert.equal(value.absenceMinutes, 480);
+    assert.equal(value.excessBreakMinutes, 1); assert.equal(value.excessLunchMinutes, 1); assert.equal(value.nonBillableOffPhoneMinutes, 6);
+    assert.equal(value.deductibleMinutes, 508); assert.ok(Math.abs(value.earnedGrossHours! - 1420 / 60) < 1e-10);
+    assert.equal(value.deductions, Math.round(508 * value.minuteRate * 100) / 100);
+    assert.equal(value.netPay, Math.round((value.grossPay - value.deductions) * 100) / 100); assert.ok(value.netPay > 0);
+    for (const [index, business] of businesses.entries()) {
+        const login = await request("/auth/login", { employeeCode: code }, business); assert.equal(login.status, 200);
+        for (let refresh = 0; refresh < 2; refresh++) {
+            const list = await request(`/payroll/records?payPeriod=${encodeURIComponent(period)}`, undefined, business);
+            assert.equal(list.status, 200); assert.equal(list.data[0].netPay, value.netPay); assert.equal(list.data[0].deductions, value.deductions);
+            const dtr = await request(`/payroll/dtr/${code}?payPeriod=${encodeURIComponent(period)}`, undefined, business);
+            assert.equal(dtr.status, 200); assert.equal(dtr.data.summary.deductibleMinutes, 508); assert.equal(dtr.data.summary.netPay, value.netPay);
+            const response = await fetch(`${base}/employees/${login.data.user._id}/payments`, { headers: { "X-Business-Id": business, "X-CRM-Attendance-Session": login.data.attendanceHubSession } });
+            assert.equal(response.status, 200); const item = (await response.json()).items[0];
+            assert.equal(item.netPay, value.netPay); assert.equal(item.deductions, value.deductions);
+            const lines = payrollDeductionRows(item); assert.equal(lines.length, 6);
+            assert.equal(lines.reduce((sum, row) => sum + Math.round(row.amount * 100), 0), Math.round(value.deductions * 100));
+            assert.ok(lines.every(row => row.amount > 0));
+        }
+        assert.deepEqual(await saved(business), originals[index]);
+    }
+    const plan = await request("/payroll/recompute/preview", { payPeriod: period, overtimeApprovals: {} });
+    assert.equal(plan.status, 200); assert.equal(plan.data.canApply, true, JSON.stringify(plan.data));
+    const applied = await request("/payroll/recompute/confirm", { token: plan.data.token, payPeriod: period, overtimeApprovals: {}, confirm: true, reason: "Synthetic approved all-deductions policy" });
+    assert.equal(applied.status, 200, JSON.stringify(applied.data));
+    const hours = await preview(900); assert.equal(hours.status, 200, JSON.stringify(hours.data));
+    assert.equal(hours.data.after.deductibleMinutes, 508); assert.equal(hours.data.after.status, value.status);
+    const changed = await confirm(hours.data); assert.equal(changed.status, 200, JSON.stringify(changed.data));
+    for (const business of businesses) await runWithBusiness(business, async () => {
+        const record = (await saved(business))!;
+        await PayrollRecord.updateOne({ _id: record._id }, { $set: { status: "Paid", paidOn: "Oct 9, 2026" } });
+        const frozen = await saved(business);
+        const list = await request(`/payroll/records?payPeriod=${encodeURIComponent(period)}`, undefined, business);
+        assert.equal(list.data[0].netPay, frozen!.netPay); assert.equal(list.data[0].earnedToDate, undefined);
+        assert.equal(list.data[0].status, "Paid"); assert.equal(list.data[0].paidOn, frozen!.paidOn); assert.deepEqual(await saved(business), frozen);
+    });
+});
+
+test("earned current pay and the whole-shift off-phone limit match Payroll, Payments and DTR in six businesses without rewriting saved or paid records", async context => {
+    context.mock.timers.enable({ apis: ["Date"], now: new Date("2026-10-16T08:00:00Z") });
+    const originalToken = token; token = createAdminDashboardSession("90000001")!;
+    const oldEarned = process.env.CRM_EARNED_PAYROLL_FROM, oldLimit = process.env.CRM_OFF_PHONE_PAID_LIMIT_FROM;
+    context.after(() => { context.mock.timers.reset(); token = originalToken;
+        if (oldEarned === undefined) delete process.env.CRM_EARNED_PAYROLL_FROM; else process.env.CRM_EARNED_PAYROLL_FROM = oldEarned;
+        if (oldLimit === undefined) delete process.env.CRM_OFF_PHONE_PAID_LIMIT_FROM; else process.env.CRM_OFF_PHONE_PAID_LIMIT_FROM = oldLimit; });
+    process.env.CRM_EARNED_PAYROLL_FROM = "2026-10-06";
+    process.env.CRM_OFF_PHONE_PAID_LIMIT_FROM = "2026-10-15T15:00:00Z";
+    const start = Date.parse("2026-10-15T15:00:00Z");
+    const events: SessionEvent[] = [["Time In", 0], ["Off the Phone Out", 60], ["Off the Phone In", 70], ["Time Out", 120],
+        ["Time In", 180], ["Off the Phone Out", 240], ["Off the Phone In", 250 + 1 / 60],
+        ["Lunch Break Out", 300], ["Lunch Break In", 360], ["Time Out", 540]].map(([source, minutes], sequence) => ({
+        id: `earned-${sequence}`, commandId: `earned-${sequence}`, source: source as SessionEvent["source"], sequence,
+        at: new Date(start + Number(minutes) * 60000).toISOString(), recordedAt: new Date(start + Number(minutes) * 60000).toISOString(),
+        ...(source === "Time In" ? { shift: assignAttendanceShift(new Date(start + Number(minutes) * 60000)) } : {}) }));
+    await AttendanceLedger.updateOne({ _id: "synthetic-hours" }, { $set: { events, revision: 2 } });
+    const originals: Array<Awaited<ReturnType<typeof saved>>> = [];
+    for (const business of businesses) await runWithBusiness(business, async () => {
+        const person = await Employee.findOne({ employeeCode: code }).lean(); assert.ok(person);
+        await Attendance.deleteMany({ employee: person._id });
+        await Attendance.insertMany(events.map(event => ({ employee: person._id, source: event.source, timeIn: new Date(event.at), eventId: event.id,
+            sequence: event.sequence, ledgerIdentity: "synthetic-hours", ledgerRevision: 2, isEffective: true })));
+        await SystemSettings.updateOne({ key: "system" }, { payrollBillingCycle: "Semi-monthly" });
+        originals.push(await saved(business));
+    });
+    const ledgerBefore = JSON.stringify(await AttendanceLedger.find().lean());
+    const candidate = await runWithBusiness(businesses[0], async () => calculatePayrollCandidate((await Employee.findOne({ employeeCode: code }).lean())!, period));
+    assert.equal(candidate.value.calculationVersion, "earned-hours-v1");
+    assert.equal(candidate.value.nonBillableOffPhoneMinutes, 1); assert.equal(candidate.value.deductibleMinutes, 1);
+    assert.equal(candidate.value.workedHours, 7 - 1 / 60); assert.equal(candidate.value.attendanceDays, 1);
+    assert.equal(candidate.value.grossPay, Math.round(7 * candidate.rates.hourlyRate * 100) / 100);
+    assert.equal(candidate.value.netPay, Math.round((candidate.value.grossPay - candidate.value.deductions) * 100) / 100);
+    for (const [index, business] of businesses.entries()) {
+        const login = await request("/auth/login", { employeeCode: code }, business); assert.equal(login.status, 200);
+        for (let refresh = 0; refresh < 2; refresh++) {
+            const list = await request(`/payroll/records?payPeriod=${encodeURIComponent(period)}`, undefined, business);
+            assert.equal(list.status, 200, JSON.stringify(list.data));
+            assert.equal(list.data[0].earnedToDate, true); assert.equal(list.data[0].netPay, candidate.value.netPay);
+            assert.equal(list.data[0].settlementRequired, true); assert.equal(list.data[0].status, originals[index]!.status);
+            const stats = await request(`/payroll/stats?payPeriod=${encodeURIComponent(period)}`, undefined, business);
+            assert.equal(stats.status, 200); assert.equal(stats.data.netPayroll, candidate.value.netPay);
+            const dtr = await request(`/payroll/dtr/${code}?payPeriod=${encodeURIComponent(period)}`, undefined, business);
+            assert.equal(dtr.status, 200); assert.equal(dtr.data.summary.netPay, candidate.value.netPay);
+            assert.equal(dtr.data.summary.workedHours, candidate.value.workedHours);
+            const response = await fetch(`${base}/employees/${login.data.user._id}/payments`, { headers: { "X-Business-Id": business, "X-CRM-Attendance-Session": login.data.attendanceHubSession } });
+            assert.equal(response.status, 200); const payments = await response.json();
+            assert.equal(payments.items[0].netPay, candidate.value.netPay); assert.equal(payments.items[0].deductions, candidate.value.deductions);
+            assert.equal(payments.items[0].earnedToDate, true); assert.equal(payments.items[0].nonBillableOffPhoneMinutes, 1);
+            const rows = payrollDeductionRows(payments.items[0]); assert.equal(rows.find(row => row.label === "Non-billable Off the Phone")!.minutes, 1);
+            assert.ok(!rows.some(row => ["Late", "Undertime", "Absence"].includes(row.label)));
+        }
+        assert.deepEqual(await saved(business), originals[index], "current earnings reads must not save or settle a payroll");
+    }
+    const blocked = await request(`/payroll/records/${id}/payment-status/preview`, { paid: true });
+    assert.equal(blocked.status, 200); assert.equal(blocked.data.canApply, false); assert.ok(blocked.data.blockers.some((message: string) => /Recompute/.test(message)));
+    const plan = await request("/payroll/recompute/preview", { payPeriod: period, overtimeApprovals: {} });
+    assert.equal(plan.status, 200); assert.equal(plan.data.canApply, true, JSON.stringify(plan.data));
+    const applied = await request("/payroll/recompute/confirm", { token: plan.data.token, payPeriod: period, overtimeApprovals: {}, confirm: true, reason: "Reviewed synthetic earned hours" });
+    assert.equal(applied.status, 200, JSON.stringify(applied.data));
+    const early = await request(`/payroll/records/${id}/payment-status/preview`, { paid: true });
+    assert.equal(early.status, 200); assert.equal(early.data.canApply, false);
+    assert.ok(early.data.blockers.some((message: string) => /still in progress/.test(message)), "a partial earned cutoff cannot be silently frozen as fully paid");
+    const legacyPaid = await fetch(`${base}/payroll/records/${id}/paid`, { method: "PATCH", headers: { "X-Business-Id": businesses[0], "X-CRM-Admin-Session": token } });
+    assert.equal(legacyPaid.status, 422, "legacy direct payment endpoints cannot bypass the earned-cutoff preview");
+    context.mock.timers.setTime(new Date("2026-10-21T01:00:00Z").getTime()); token = createAdminDashboardSession("90000001")!;
+    const payment = await request(`/payroll/records/${id}/payment-status/preview`, { paid: true });
+    assert.equal(payment.status, 200); assert.equal(payment.data.canApply, true, JSON.stringify(payment.data));
+    const paid = await request(`/payroll/records/${id}/payment-status/confirm`, { token: payment.data.token, paid: true, confirm: true, acknowledgeAttendance: true, reason: "Synthetic settled earned payroll" });
+    assert.equal(paid.status, 200, JSON.stringify(paid.data));
+    for (const business of businesses) {
+        const frozen = await saved(business); assert.ok(frozen); assert.equal(frozen.status, "Paid"); assert.equal(frozen.netPay, candidate.value.netPay);
+        const list = await request(`/payroll/records?payPeriod=${encodeURIComponent(period)}`, undefined, business);
+        assert.equal(list.data[0].netPay, frozen.netPay); assert.equal(list.data[0].earnedToDate, undefined);
+        const login = await request("/auth/login", { employeeCode: code }, business);
+        const response = await fetch(`${base}/employees/${login.data.user._id}/payments?view=history`, { headers: { "X-Business-Id": business, "X-CRM-Attendance-Session": login.data.attendanceHubSession } });
+        const payments = await response.json(); assert.equal(payments.items[0].netPay, frozen.netPay);
+        assert.equal(payments.items[0].status, "Paid"); assert.equal(payments.items[0].paidOn, frozen.paidOn);
+        assert.deepEqual(await saved(business), frozen);
+    }
+    assert.equal(JSON.stringify(await AttendanceLedger.find().lean()), ledgerBefore);
+});
+
 test("total-hours preview is read-only, uses saved rate, counts rest excess once and applies atomically to six businesses", async () => {
     const before = await saved(); assert.ok(before);
     for (const business of businesses) {

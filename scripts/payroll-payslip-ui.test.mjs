@@ -15,11 +15,14 @@ const names = new Set(["numberWordsUnderTwenty", "numberWordsTens", "monthNames"
 const declarations = ast.statements.filter(node => node.name && names.has(node.name.text) || ts.isVariableStatement(node) && node.declarationList.declarations.some(item => names.has(item.name.getText(ast))));
 const exports = {};
 const presentation = {};
+const earnings = {};
+runInNewContext(ts.transpileModule(readFileSync(new URL("../shared/payrollEarnings.ts", import.meta.url), "utf8"),
+    { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText, { exports: earnings });
 runInNewContext(ts.transpileModule(readFileSync(new URL("../shared/payrollPresentation.ts", import.meta.url), "utf8"),
     { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText, { exports: presentation });
 runInNewContext(ts.transpileModule('import { jsx, jsxs } from "react/jsx-runtime";\n' + declarations.map(node => node.getText(ast)).join("\n") +
-    "\nexports.document = PayslipDocument; exports.words = payslipAmountInWords; exports.rows = payslipDeductionRows; exports.ready = payslipOutputReady; exports.csv = payrollCsv; exports.search = payrollMatchesSearch;",
-    { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX } }).outputText, { require, exports, payrollDeductionRows: presentation.payrollDeductionRows });
+    "\nexports.document = PayslipDocument; exports.words = payslipAmountInWords; exports.rows = payrollDeductionRows; exports.displayRows = payslipDeductionRows; exports.ready = payslipOutputReady; exports.csv = payrollCsv; exports.search = payrollMatchesSearch;",
+    { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX } }).outputText, { require, exports, payrollDeductionRows: presentation.payrollDeductionRows, payrollDeductionDisplayRows: presentation.payrollDeductionDisplayRows, isEarnedPayrollVersion: earnings.isEarnedPayrollVersion });
 
 const record = { employeeName: "Synthetic Payroll", employeeId: "90000002", department: "Studio", payType: "Semi-monthly",
     payPeriod: "Oct 6, 2026 - Oct 20, 2026", paidOn: "Oct 25, 2026", grossPay: 15000, basicPay: 15000,
@@ -37,6 +40,33 @@ test("non-billable Off the Phone is included in the saved payslip breakdown exac
     assert.equal(rows.filter(row => row.label === "Non-billable Off the Phone").length, 1);
     assert.equal(rows.find(row => row.label === "Non-billable Off the Phone").minutes, 11);
     assert.equal(rows.reduce((sum, row) => sum + Math.round(row.amount * 100), 0), Math.round(value.deductions * 100));
+});
+
+test("deductions and payslips retain the non-billable line at zero without changing saved amounts", () => {
+    for (const minutes of [undefined, 0, 11]) {
+        const value = { ...record, nonBillableOffPhoneMinutes: minutes };
+        const before = JSON.stringify(value), rows = exports.rows(value);
+        const item = rows.find(row => row.label === "Non-billable Off the Phone");
+        assert.ok(item); assert.equal(item.minutes, minutes ?? 0);
+        assert.equal(rows.filter(row => row.label === item.label).length, 1);
+        if (!minutes) assert.equal(item.amount, 0);
+        assert.equal(rows.reduce((sum, row) => sum + Math.round(row.amount * 100), 0), Math.round(value.deductions * 100));
+        const html = renderToStaticMarkup(React.createElement(exports.document, { record: value, money }));
+        assert.ok(html.includes(`Non-billable Off the Phone (${minutes ?? 0} min)`));
+        assert.ok(html.includes("PHP 14951.09")); assert.ok(html.includes("PHP 48.91"));
+        assert.equal(JSON.stringify(value), before);
+    }
+});
+
+test("non-billable deductions remain separate from adjusted shortfall and reconcile for capped pay", () => {
+    for (const total of [0, 0.01, 29.89, 15000]) {
+        const rows = exports.rows({ ...record, deductions: total, scheduledHours: 8, workedMinutesOverride: 470,
+            excessBreakMinutes: 0, nonBillableOffPhoneMinutes: 11 });
+        assert.equal(rows.find(row => row.label === "Adjusted time shortfall").minutes, 0);
+        assert.equal(rows.find(row => row.label === "Non-billable Off the Phone").minutes, 11);
+        assert.equal(rows.filter(row => row.label === "Non-billable Off the Phone").length, 1);
+        assert.equal(rows.reduce((sum, row) => sum + Math.round(row.amount * 100), 0), Math.round(total * 100));
+    }
 });
 test("section searches and CSV exports preserve values without spreadsheet formula execution", () => {
     assert.equal(exports.search(["Synthetic Employee", "90000002", undefined], "  employee  "), true);
@@ -56,6 +86,54 @@ test("payslip renders saved monetary amounts and the exact saved hourly rate", (
     const zeroBase = renderToStaticMarkup(React.createElement(exports.document, { record: { ...record, basicPay: 0, grossPay: 10, netPay: 10, deductions: 0, overtimeHours: 1 }, money }));
     assert.match(zeroBase, /Basic Pay<\/td><td[^>]*>PHP 0\.00<\/td>/);
 });
+
+test("earned payslips show current earnings rather than the full cutoff basic pay and retain one non-billable charge", () => {
+    const value = { ...record, status: "Pending", calculationVersion: "earned-hours-v1", earnedToDate: true,
+        earningsAsOf: "2026-10-27T17:00:00Z", grossPay: 1000, deductions: 10, netPay: 990,
+        excessBreakMinutes: 0, excessLunchMinutes: 0, nonBillableOffPhoneMinutes: 6, lateMinutes: 600, absenceMinutes: 480, deductibleMinutes: 6, overtimeHours: 0 };
+    const before = JSON.stringify(value);
+    const html = renderToStaticMarkup(React.createElement(exports.document, { record: value, money }));
+    assert.ok(html.includes("Provisional Payslip")); assert.ok(html.includes("Earned Regular Pay"));
+    assert.ok(html.includes("PHP 1000.00")); assert.ok(html.includes("PHP 990.00")); assert.ok(!html.includes("PHP 15000.00"));
+    const rows = exports.rows(value); assert.equal(rows.reduce((sum, row) => sum + row.minutes, 0), 6);
+    assert.equal(rows.find(row => row.label === "Non-billable Off the Phone").amount, 10);
+    for (const label of ["Late", "Undertime", "Absence"]) assert.ok(html.includes(`${label} (`));
+    assert.equal((html.match(/Already excluded from earned pay/g) || []).length, 3);
+    assert.equal(JSON.stringify(value), before);
+});
+
+test("earned deduction display restores attendance shortfalls without charging them again or changing paid records", () => {
+    for (const status of ["Pending", "Paid", "Completed"]) for (const workedMinutesOverride of [null, 420]) {
+        const value = { ...record, status, calculationVersion: "earned-hours-v1", deductions: 10,
+            lateMinutes: 12, earlyTimeOutMinutes: 30, absenceMinutes: 480, nonBillableOffPhoneMinutes: 6,
+            excessBreakMinutes: 0, excessLunchMinutes: 0, workedMinutesOverride };
+        const before = JSON.stringify(value), rows = exports.displayRows(value);
+        for (const [label, minutes] of [["Late", 12], ["Undertime", 30], ["Absence", 480]]) {
+            const row = rows.find(item => item.label === label);
+            assert.equal(row.minutes, minutes); assert.equal(row.amount, null);
+            assert.equal(row.note, workedMinutesOverride === null ? "Already excluded from earned pay" : "Paid hours manually adjusted");
+        }
+        assert.equal(rows.reduce((total, row) => total + Math.round((row.amount ?? 0) * 100), 0), 1000);
+        assert.equal(rows.find(row => row.label === "Non-billable Off the Phone").amount, 10);
+        assert.equal(JSON.stringify(value), before);
+    }
+    assert.deepEqual(exports.displayRows(record), exports.rows(record));
+});
+
+test("approved earned all-deductions payslip subtracts all six categories and preserves its exact net", () => {
+    const value = { ...record, status: "Pending", calculationVersion: "earned-hours-all-deductions-v1", earnedToDate: true,
+        grossPay: 1000, deductions: 100, netPay: 900, lateMinutes: 10, earlyTimeOutMinutes: 10, absenceMinutes: 50,
+        excessBreakMinutes: 10, excessLunchMinutes: 10, nonBillableOffPhoneMinutes: 10, deductibleMinutes: 100, overtimeHours: 0 };
+    const before = JSON.stringify(value), rows = exports.displayRows(value);
+    assert.equal(rows.length, 6); assert.equal(rows.reduce((sum, row) => sum + row.amount, 0), 100);
+    for (const label of ["Late", "Undertime", "Absence", "Excess break", "Excess lunch", "Non-billable Off the Phone"]) {
+        assert.ok(rows.find(row => row.label === label).amount > 0, label);
+    }
+    const html = renderToStaticMarkup(React.createElement(exports.document, { record: value, money }));
+    assert.ok(html.includes("Earned Regular Pay")); assert.ok(html.includes("PHP 1000.00")); assert.ok(html.includes("PHP 900.00"));
+    assert.ok(!html.includes("Already excluded from earned pay")); assert.ok(!html.includes("PHP 15000.00"));
+    assert.equal(JSON.stringify(value), before);
+});
 test("payslip deduction rows reconcile in cents without negative rounding or invented zero totals", () => {
     assert.equal(typeof exports.rows, "function");
     for (const amount of [0, 0.01, 0.03, 48.91, 15000]) {
@@ -73,7 +151,8 @@ test("payslip output rejects loading, failed, mismatched, unsaved or inconsisten
     assert.equal(exports.ready(input), true);
     for (const patch of [{ fetching: true }, { error: true }, { accuracyEnabled: undefined }, { dtr: undefined }, { record: null },
         { dtr: { ...dtr, payPeriod: "Other cutoff" } }, { dtr: { ...dtr, employee: { employeeCode: "other" } } },
-        { dtr: { ...dtr, storedCutoff: false } }, { record: { ...record, netPay: 1 } }]) assert.equal(exports.ready({ ...input, ...patch }), false);
+        { dtr: { ...dtr, storedCutoff: false } }, { record: { ...record, netPay: 1 } },
+        { record: { ...record, earningsUnavailable: true } }, { dtr: { ...dtr, summary: { earningsUnavailable: true } } }]) assert.equal(exports.ready({ ...input, ...patch }), false);
     assert.equal(exports.ready({ ...input, accuracyEnabled: false, dtr: { ...dtr, storedCutoff: false } }), true);
     assert.match(source, /disabled=\{!isPayslipOutputReady \|\| sendPayslipMutation\.isPending \|\| payslipPdfMutation\.isPending\}/);
     assert.match(source, /if \(!isPayslipOutputReady \|\| payslipPdfMutation\.isPending\) return;/);

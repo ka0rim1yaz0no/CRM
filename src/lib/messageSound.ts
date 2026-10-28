@@ -3,13 +3,15 @@ type SoundDependencies = {
     storage: () => Pick<Storage, "getItem" | "setItem">;
     now?: () => number;
     exclusive?: (play: () => void) => Promise<void>;
+    claimsKey?: string;
+    claimLifetimeMs?: number;
 };
 
-const claimsKey = "crm:message-sound-claims";
 const pendingLifetime = 30_000;
 
 export function createMessageSoundPlayer(dependencies: SoundDependencies) {
     const now = dependencies.now || Date.now;
+    const claimsKey = dependencies.claimsKey || "crm:message-sound-claims";
     const played = new Set<string>();
     const pending = new Map<string, number>();
     function schedule(context: AudioContext) {
@@ -52,7 +54,7 @@ export function createMessageSoundPlayer(dependencies: SoundDependencies) {
                 played.add(id);
                 if (played.size > 200) played.delete(played.values().next().value!);
                 pending.delete(id);
-                try { dependencies.storage().setItem(claimsKey, JSON.stringify([...claims.slice(-199), [id, now() + 3_600_000]])); } catch { /* Best-effort cross-tab deduplication. */ }
+                try { dependencies.storage().setItem(claimsKey, JSON.stringify([...claims.slice(-199), [id, now() + (dependencies.claimLifetimeMs ?? 3_600_000)]])); } catch { /* Best-effort cross-tab deduplication. */ }
                 successful = true;
             };
             if (dependencies.exclusive) await dependencies.exclusive(claimAndPlay);
@@ -66,6 +68,7 @@ export function createMessageSoundPlayer(dependencies: SoundDependencies) {
             if (pending.size > 20) pending.delete(pending.keys().next().value!);
             return play(id);
         },
+        cancel(id: string) { pending.delete(id); },
         async unlock() {
             try {
                 const context = dependencies.context();
@@ -81,8 +84,13 @@ export function createMessageSoundPlayer(dependencies: SoundDependencies) {
 }
 
 let context: AudioContext | null = null;
+const soundContext = () => { if (!context || context.state === "closed") context = new AudioContext(); return context; };
 export const messageSound = createMessageSoundPlayer({
-    context: () => { if (!context || context.state === "closed") context = new AudioContext(); return context; },
+    context: soundContext,
     storage: () => localStorage,
     exclusive: (play) => navigator.locks ? navigator.locks.request("crm-message-sound", play) : Promise.resolve().then(play),
+});
+export const attendanceRestSound = createMessageSoundPlayer({
+    context: soundContext, storage: () => localStorage, claimsKey: "crm:attendance-rest-sound-claims", claimLifetimeMs: 7 * 86_400_000,
+    exclusive: (play) => navigator.locks ? navigator.locks.request("crm-attendance-rest-sound", play) : Promise.resolve().then(play),
 });

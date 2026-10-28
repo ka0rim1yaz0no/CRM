@@ -15,6 +15,8 @@ import { attendanceDerivedDaysDueForRefresh, deriveAttendanceDays } from "./atte
 import { attendanceDerivedAuditDelta, replayAttendanceDerived, sameAttendanceDerivedValues, type AttendanceDerivedAuditDelta } from "./attendanceDerivedAudit";
 import { attendancePayrollTransaction, lockPayrollAttendance } from "./payrollAttendanceFence";
 import { attendanceTimeOutPlan } from "../../../shared/attendanceTimeOut";
+import { offPhoneShiftBilling } from "../../../shared/attendanceOffPhone";
+import { offPhoneLimitPolicy } from "../config/payrollEarnings";
 
 export class AttendanceCommandError extends Error {
   constructor(public status: number, public code: string, message: string, public details?: unknown) { super(message); }
@@ -116,10 +118,18 @@ export function attendanceSnapshot(ledger: AttendanceLedgerDocument, now = new D
     return !projectAttendance([...ledger.events, ...additions], ledger.corrections, ledger.closures).blockingIssues.length;
   });
   const review = [...projection.issues.map((issue) => issue.message), ...projection.sessions.filter((item) => item.lifecycle === "system-closed").map(() => "Administrative missing-checkout closure requires review.")];
+  const shift = session?.shift || last?.shift;
+  const offPhonePolicy = offPhoneLimitPolicy();
+  const billed = shift ? offPhoneShiftBilling(projection.sessions.filter(item => item.shift?.dayKey === shift.dayKey).flatMap(item => [
+    ...item.events.map(event => ({ source: event.source, timeIn: new Date(event.at) })),
+    ...(item.lifecycle === "system-closed" && item.endedAt ? [{ source: "Time Out", timeIn: new Date(item.endedAt) }] : []),
+  ]), new Date(shift.start), new Date(shift.end), now, offPhonePolicy) : null;
+  const offPhoneBilling = billed ? { limited: billed.limited, endsAt: billed.endsAt, paidUsedMs: billed.paidUsedMs, remainingPaidMs: billed.remainingPaidMs,
+    active: session?.mode === "OFF THE PHONE" ? billed.active : null } : null;
   if (ledger.legacyAdoption?.businessStreamsDiffer) review.push("Historical business copies differed. Their original evidence was backed up and retained during reviewed adoption.");
   if (ledger.migrationRequired) review.push("Legacy history is readable, but adoption requires a reviewed migration and backup. No historical records were changed.");
   if (session?.shift?.ambiguous) review.push("Early clock-in assignment needs review. Automatic recovery is disabled for this ambiguous shift.");
-  return { timeOutOverrideEnabled: true, sessionId: session?.id || null, revision: ledger.revision, fingerprint: hash(ledger.events),
+  return { offPhonePolicy, offPhoneBilling, timeOutOverrideEnabled: true, sessionId: session?.id || null, revision: ledger.revision, fingerprint: hash(ledger.events),
     state: session?.mode || "OFFLINE", stateSince: session?.modeSince || last?.modeSince || null,
     lifecycle: session?.lifecycle || last?.lifecycle || "none", assignedShift: session?.shift || null, allowedActions,
     openIntervals: session && session.mode !== "ONLINE" ? [{ mode: session.mode, startedAt: session.modeSince }] : [],

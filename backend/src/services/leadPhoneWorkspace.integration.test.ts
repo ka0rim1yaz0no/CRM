@@ -7,7 +7,7 @@ import { MongoMemoryReplSet } from "mongodb-memory-server";
 
 const root = `phone_${crypto.randomUUID().replaceAll("-", "")}`;
 const businesses = Array.from({ length: 6 }, (_, i) => `phone-${i}`);
-Object.assign(process.env, { NODE_ENV: "test", CRM_SECURITY_LEGACY_AUTH: "true", CRM_LEAD_PHONE_DEDUP_V2: "true", CRM_CALL_TIMING_V2: "true",
+Object.assign(process.env, { NODE_ENV: "test", CRM_SECURITY_LEGACY_AUTH: "true", CRM_LEAD_PHONE_DEDUP_V2: "true", CRM_CALL_TIMING_V2: "true", CRM_DASHBOARD_V2: "true",
     CRM_ADMIN_ONE_CODE: "synthetic-phone-admin", CRM_ADMIN_SESSION_SECRET: crypto.randomBytes(48).toString("base64"),
     DEFAULT_BUSINESS_ID: businesses[0], DEFAULT_BUSINESS_DATABASE: `${root}_0`, CONTROL_DATABASE_NAME: `${root}_control`,
     BUSINESS_DATABASES: JSON.stringify(businesses.map((id, i) => ({ id, databaseName: `${root}_${i}` }))) });
@@ -66,6 +66,48 @@ test("six tenants choose one phone-first canonical before admin/employee paginat
         const counts = await (await f.request(`/my-leads/counts?employeeId=${f.owner._id}`, undefined, f.owner.employeeCode)).json();
         assert.equal(counts.ALL, 1);
         await runWithBusiness(business, async () => { assert.equal(await Lead.countDocuments(), 5); assert.equal(await Lead.countDocuments({ status: "Archived" }), 0); assert.equal(await Lead.countDocuments({ activePhoneKey: { $exists: true } }), 0); });
+    }
+});
+
+test("Insights matches canonical lead status totals, includes unassigned leads and refreshes after changes in all six businesses", async () => {
+    for (const business of businesses) {
+        const f = await fixture(business);
+        await f.old({ status: "Follow up", followUpAt: new Date(Date.now() - 60000) });
+        for (let i = 0; i < 6; i++) await f.old({ googlePlaceId: `synthetic-shadow-${i}`, updatedAt: new Date() });
+        const current = await f.old({ phone: "+12025550122" });
+        await f.old({ phone: "+12025550123", assignedAgent: null, assignedAgentName: "" });
+        await f.old({ phone: "+12025550124", status: "Qualified" });
+        await f.old({ phone: "+12025550125", status: "Ongoing Negotiation" });
+        await f.old({ phone: "+12025550126", status: "Completed" });
+        await f.old({ phone: "+12025550127", status: "Dead" });
+        await f.old({ phone: current.phone, status: "Archived", comments: [{ authorType: "employee", authorName: f.owner.name,
+            body: "Synthetic preserved history", createdAt: new Date() }] });
+        const before = await runWithBusiness(business, async () => JSON.stringify(await Lead.find().sort({ _id: 1 }).lean()));
+        for (let refresh = 0; refresh < 2; refresh++) {
+            const counts = await (await f.request("/leads/counts")).json();
+            const dashboard = await (await f.request("/leads/agent-dashboard")).json();
+            const workspaceResponse = await f.request("/dashboard-workspace/summary?preset=today");
+            assert.equal(workspaceResponse.status, 200);
+            const workspace = await workspaceResponse.json();
+            assert.deepEqual(dashboard.pipeline, { newLeads: 2, followUps: 1, qualified: 1 });
+            assert.deepEqual(workspace.dashboard.pipeline, dashboard.pipeline);
+            assert.equal(dashboard.pipeline.newLeads, counts.NEW);
+            assert.equal(dashboard.pipeline.followUps, counts["Follow up"]);
+            assert.equal(dashboard.pipeline.qualified, counts.Qualified);
+            assert.equal(dashboard.agents.reduce((sum: number, row: { newLeads: number }) => sum + row.newLeads, 0), 1);
+        }
+        assert.equal(await runWithBusiness(business, async () => JSON.stringify(await Lead.find().sort({ _id: 1 }).lean())), before,
+            "dashboard and refresh reads must not alter lead records or history");
+        const changed = await f.request(`/leads/${current._id}/status`, { status: "Dead" });
+        assert.equal(changed.status, 200);
+        for (let refresh = 0; refresh < 2; refresh++) {
+            const counts = await (await f.request("/leads/counts")).json();
+            const workspace = await (await f.request("/dashboard-workspace/summary?preset=today")).json();
+            assert.equal(workspace.dashboard.pipeline.newLeads, 1);
+            assert.equal(workspace.dashboard.pipeline.newLeads, counts.NEW);
+            assert.equal(workspace.dashboard.pipeline.followUps, counts["Follow up"]);
+            assert.equal(workspace.dashboard.pipeline.qualified, counts.Qualified);
+        }
     }
 });
 

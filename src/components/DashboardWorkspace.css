@@ -113,3 +113,6 @@
   :root[data-theme="light-command"] .dv2-page .dashboard-kpi-card .text-sm { font-size:12px !important; }
   :root[data-theme="light-command"] .dv2-page .dw-header h2 { font-size:20px !important; line-height:25px !important; }
 }
+.dw-hour-axis { display:grid; padding-inline:2.5%; margin-top:-24px; min-height:34px; font-size:10px; line-height:14px; }
+.dw-hour-axis span { white-space:nowrap; justify-self:center; }
+.dw-hour-axis[data-dense="true"] span { writing-mode:vertical-rl; }

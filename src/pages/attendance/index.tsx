@@ -457,7 +457,7 @@
 // }
 
 import { useEffect, useMemo, useState } from "react";
-import { isOffPhoneStart, nonBillableOffPhoneSource } from "../../../shared/attendanceOffPhone";
+import { isOffPhoneStart, nonBillableOffPhoneSource, offPhoneNonBillableAt } from "../../../shared/attendanceOffPhone";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FiClock, FiCoffee, FiLogIn, FiLogOut, FiPhoneOff, FiPower, FiRefreshCw, FiMenu } from "react-icons/fi";
 import { breakInEmployee, breakOutEmployee, getEmployeeAttendance, lunchBreakInEmployee, lunchBreakOutEmployee, reportEmployeeActivity, timeInEmployee, timeOutEmployee, type AttendanceRecord } from "../../api/attendance";
@@ -691,11 +691,15 @@ export default function AttendancePage() {
     const isActiveBreakOvertime = activeBreakLimitMs > 0 && activeBreakElapsedMs > activeBreakLimitMs;
     const offPhoneSessions = buildOffPhoneAttendanceSessions(slotRecords, serverNowMs);
     const activeOffPhoneSession = offPhoneSessions.find((session) => session.isOpen) || null;
-    const nonBillableOffPhoneActive = currentStatus === "OFF THE PHONE" && Boolean(activeOffPhoneSession?.nonBillable);
+    const nonBillableOffPhoneActive = currentStatus === "OFF THE PHONE" && (Boolean(activeOffPhoneSession?.nonBillable) || offPhoneNonBillableAt(confirmedSession?.offPhoneBilling, serverNowMs));
     const activeOffPhoneStartedAt = currentStatus === "OFF THE PHONE"
         ? getRecordTime(activeOffPhoneSession?.startRecord) || manualOffPhoneStartedAt || getEmployeeStatusTime(currentEmployee) || getRecordTime(latestRecord)
         : 0;
     const activeOffPhoneElapsedMs = activeOffPhoneStartedAt ? serverNowMs - activeOffPhoneStartedAt : 0;
+    const offPhoneTimerStartedAt = nonBillableOffPhoneActive && confirmedSession?.offPhoneBilling?.active?.nonBillableFrom
+        ? Date.parse(confirmedSession.offPhoneBilling.active.nonBillableFrom) : activeOffPhoneStartedAt;
+    const offPhoneTimerElapsedMs = Math.max(0, Math.min(serverNowMs,
+        confirmedSession?.assignedShift ? Date.parse(confirmedSession.assignedShift.end) : serverNowMs) - offPhoneTimerStartedAt);
     const slotRecordsChronological = [...slotRecords].sort(compareAttendanceRecords);
 
     const getBreakDurationMs = (record: AttendanceRecord) => {
@@ -1034,16 +1038,21 @@ export default function AttendancePage() {
                         )}
 
                         {currentStatus === "OFF THE PHONE" && activeOffPhoneStartedAt > 0 && (
-                            <div className="mt-4 rounded-lg border border-sky-300 bg-sky-50 p-4">
-                                <p className="text-xs font-semibold uppercase tracking-[0.16em] text-sky-700">
+                            <div className={`mt-4 rounded-lg border p-4 ${nonBillableOffPhoneActive ? "border-red-300 bg-red-50" : "border-sky-300 bg-sky-50"}`}>
+                                <p className={`text-xs font-semibold uppercase tracking-[0.16em] ${nonBillableOffPhoneActive ? "text-red-700" : "text-sky-700"}`}>
                                     {nonBillableOffPhoneActive ? "Non-Billable Off the Phone timer" : "Off the Phone timer"}
                                 </p>
                                 <p className="mt-2 font-mono text-3xl font-bold text-slate-950">
-                                    {formatBreakTimer(activeOffPhoneElapsedMs)}
+                                    {formatBreakTimer(offPhoneTimerElapsedMs)}
                                 </p>
                                 <p className="mt-1 text-xs text-slate-700">
-                                    Elapsed · Started {formatAttendanceDateTime(new Date(activeOffPhoneStartedAt), attendanceTimeZone)}
+                                    {nonBillableOffPhoneActive ? "Non-billable since " : "Elapsed · Started "}{formatAttendanceDateTime(new Date(offPhoneTimerStartedAt), attendanceTimeZone)}
                                 </p>
+                                {nonBillableOffPhoneActive && <p className="mt-1 text-xs text-slate-700">Total session {formatBreakTimer(activeOffPhoneElapsedMs)}</p>}
+                                {confirmedSession?.offPhoneBilling?.limited && <p className={`mt-2 text-sm font-semibold ${nonBillableOffPhoneActive ? "text-red-700" : "text-sky-700"}`}>
+                                    {confirmedSession.assignedShift && serverNowMs >= Date.parse(confirmedSession.assignedShift.end) ? "Shift ended" : nonBillableOffPhoneActive ? "Non-billable time is accruing" : `Paid allowance remaining ${formatBreakTimer(Math.max(0,
+                                        confirmedSession.offPhoneBilling.active?.nonBillableFrom ? Date.parse(confirmedSession.offPhoneBilling.active.nonBillableFrom) - serverNowMs : confirmedSession.offPhoneBilling.remainingPaidMs ?? 0))}`}
+                                </p>}
                             </div>
                         )}
 
@@ -1054,7 +1063,7 @@ export default function AttendancePage() {
                         <dl className="employee-attendance-allowances">
                             <div><dt>Break</dt><dd>{confirmedSession?.allowances?.breakMinutes ?? 15} min</dd></div>
                             <div><dt>Lunch</dt><dd>{confirmedSession?.allowances?.lunchMinutes ?? 60} min</dd></div>
-                            <div><dt>Off the phone</dt><dd>No time limit</dd></div>
+                            <div><dt>Off the phone</dt><dd>{confirmedSession?.offPhoneBilling?.limited ? "20 min paid / shift" : "No time limit"}</dd></div>
                         </dl>
 
                         <div className="mt-3 grid gap-3 sm:grid-cols-2">

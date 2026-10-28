@@ -55,5 +55,6 @@ test("the payroll roster has no separate non-billable column and leaves the dedu
     const roster = page.slice(page.indexOf('aria-label="Employee payroll records"'), page.indexOf('</table>', page.indexOf('aria-label="Employee payroll records"')));
     assert.doesNotMatch(roster, /Non-billable|nonBillable/);
     assert.match(roster, /colSpan=\{9\}/);
-    assert.match(page, /function payslipDeductionRows\(record: PayrollRecord\) \{ return payrollDeductionRows\(record\); \}/);
+    assert.match(page, /function payslipDeductionRows\(record: PayrollRecord\) \{ return payrollDeductionDisplayRows\(record\); \}/);
+    assert.match(page, /payrollDeductionDisplayRows\(employeeDtr\.summary\)/);
 });

@@ -6,7 +6,7 @@ export type PayrollStatus = "Paid" | "Pending" | "Failed" | "Completed" | "Revie
 export type PayrollItemCategory = "Payroll Runs" | "Payouts" | "Deductions" | "Tax Settings";
 export type PayrollPayType = "Monthly" | "Semi-monthly" | "Weekly" | "Hourly" | "Contract";
 
-export type PayrollRecord = {
+export type PayrollRecord = import("../../shared/payrollEarnings").PayrollEarningsView & {
     _id: string;
     employeeName: string;
     email: string;
@@ -112,7 +112,8 @@ export type PayrollDtr = {
     payPeriod: string;
     payDate: string;
     payType: PayrollPayType;
-    summary: {
+    summary: import("../../shared/payrollEarnings").PayrollEarningsView & {
+        calculationVersion?: string;
         attendanceDays: number;
         absentDays: number;
         absentHours: number;

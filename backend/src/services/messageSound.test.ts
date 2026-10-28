@@ -52,3 +52,19 @@ test("preview produces a fresh cue without resetting real-message deduplication"
   assert.equal(await player.preview(), true); assert.equal(await player.preview(), true);
   assert.equal(f.tones, 10);
 });
+
+test("returning from rest cancels a browser-blocked ping before the next gesture", async () => {
+  const f = fixture(); f.suspend();
+  const player = createMessageSoundPlayer({ ...f.dependencies, claimsKey: "rest-claims", claimLifetimeMs: 7 * 86_400_000 });
+  await player.incoming("rest"); player.cancel("rest"); f.allow(); await player.unlock();
+  assert.equal(f.tones, 0);
+});
+
+test("rest sound remains once-only across refreshes and businesses, independent of message claims", async () => {
+  const f = fixture(), options = { ...f.dependencies, claimsKey: "rest-claims", claimLifetimeMs: 7 * 86_400_000 };
+  await createMessageSoundPlayer(options).incoming("same-rest");
+  f.advance(); await createMessageSoundPlayer(options).incoming("same-rest");
+  assert.equal(f.tones, 5);
+  await createMessageSoundPlayer(options).incoming("next-rest"); assert.equal(f.tones, 10);
+  await createMessageSoundPlayer(f.dependencies).incoming("same-rest"); assert.equal(f.tones, 15);
+});

@@ -55,7 +55,7 @@ export function deriveAttendanceDays(ledger: AttendanceDerivedLedger, policy: At
     ));
     const breakSessions = perSession.flatMap((item) => item.breakSessions);
     const lunchSessions = perSession.flatMap((item) => item.lunchSessions);
-    const nonBillableOffPhoneSessions = perSession.flatMap(item => item.nonBillableOffPhoneSessions);
+    const nonBillableOffPhoneSessions = summary.nonBillableOffPhoneSessions;
     const nonBillableOffPhoneMinutes = nonBillableOffPhoneSessions.reduce((total, item) => total + item.minutes, 0);
     const excessBreakMinutes = breakSessions.reduce((total, item) => total + item.excessMinutes, 0);
     const excessLunchMinutes = lunchSessions.reduce((total, item) => total + item.excessMinutes, 0);

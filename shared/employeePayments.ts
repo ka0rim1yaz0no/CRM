@@ -1,6 +1,6 @@
 import type { SavedDeductionSource } from "./payrollPresentation";
 
-export type EmployeePayment = SavedDeductionSource & {
+export type EmployeePayment = SavedDeductionSource & import("./payrollEarnings").PayrollEarningsView & {
     id: string;
     payPeriod: string;
     cutoffStart: string;

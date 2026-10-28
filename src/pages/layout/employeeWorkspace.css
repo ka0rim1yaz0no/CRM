@@ -51,3 +51,9 @@
 @media (prefers-reduced-motion: reduce) {
   .employee-workspace :is(aside, main) { transition: none; }
 }
+.employee-rest-reminder { display:flex; align-items:center; flex-shrink:0; gap:12px; padding:10px 24px; border-block:1px solid #fda4af; background:#9f1239; color:#fff; font-size:13px; line-height:1.4; }
+.employee-rest-reminder > svg { flex-shrink:0; width:18px; height:18px; }
+.employee-rest-reminder > div { display:flex; flex:1; flex-wrap:wrap; gap:4px 12px; min-width:0; }
+.employee-rest-reminder time { font-variant-numeric:tabular-nums; }
+.employee-rest-reminder > a { color:#fff; text-decoration:underline; flex-shrink:0; }
+@media(max-width:760px) { .employee-rest-reminder { padding:10px 16px; flex-wrap:wrap; } }

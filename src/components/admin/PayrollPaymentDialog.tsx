@@ -2,7 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { FiRefreshCw, FiX } from "react-icons/fi";
-import { previewPayrollPaymentStatus, confirmPayrollPaymentStatus, type PayrollRecord } from "../../api/payroll";
+import type { PayrollRecord } from "../../api/payroll";
+import { preparePayrollPayment } from "../../api/payrollPayment";
 import { getActiveBusinessId } from "../../api/businessStorage";
 
 export default function PayrollPaymentDialog({ record, businessId, paid, currencyCode = "PHP", onClose }: {
@@ -13,9 +14,9 @@ export default function PayrollPaymentDialog({ record, businessId, paid, currenc
     const [reason, setReason] = useState(""), [acknowledged, setAcknowledged] = useState(false), [confirmed, setConfirmed] = useState(false);
     const [busy, setBusy] = useState(false), [error, setError] = useState(""), [stale, setStale] = useState(false);
     const query = useQuery({ queryKey: ["payroll-payment-preview", businessId, record._id, paid],
-        queryFn: ({ signal }) => previewPayrollPaymentStatus(record._id, paid, businessId, signal), staleTime: 0, gcTime: 0,
+        queryFn: ({ signal }) => preparePayrollPayment(record, paid, businessId, signal), staleTime: 0, gcTime: 0,
         retry: false, refetchOnWindowFocus: false });
-    const preview = query.data;
+    const context = query.data, preview = context?.preview;
     const money = (value: number) => new Intl.NumberFormat("en-PH", { style: "currency", currency: currencyCode }).format(value);
     const errorText = (failure: unknown) => {
         const item = failure as { response?: { data?: { message?: string } }; message?: string };
@@ -27,14 +28,14 @@ export default function PayrollPaymentDialog({ record, businessId, paid, currenc
         return () => { mounted.current = false; element?.close(); if (previous?.isConnected) previous.focus(); };
     }, []);
     const validScope = () => {
-        if (getActiveBusinessId() === businessId) return true;
+        try { if (getActiveBusinessId() === businessId) { context?.isCurrent(); return true; } } catch { /* Reopen after an account or signed-session change. */ }
         setError("Business changed. Close and reopen payment confirmation."); setStale(true); return false;
     };
     const save = async () => {
         if (!preview?.canApply || !confirmed || !reason.trim() || (preview.warnings.length > 0 && !acknowledged) || saving.current || stale || !validScope()) return;
         saving.current = true; setBusy(true); setError("");
         try {
-            await confirmPayrollPaymentStatus(preview, reason.trim(), acknowledged, businessId);
+            await context!.confirm(reason.trim(), acknowledged);
             await Promise.all(["payroll-records", "payroll-stats", "payroll-dtr", "payroll-payslip-dtr", "payroll-compute", "employee-payments"].map(key => queryClient.invalidateQueries({ queryKey: [key] })));
             if (mounted.current) onClose();
         } catch (failure) { if (mounted.current) { setError(errorText(failure)); setStale(true); setConfirmed(false); setAcknowledged(false); } }
@@ -56,6 +57,7 @@ export default function PayrollPaymentDialog({ record, businessId, paid, currenc
                 {preview && <>
                     <dl className="grid grid-cols-2 gap-3 text-sm"><div><dt className="text-slate-600">Payment status</dt><dd className="mt-1 font-semibold">{paid ? "Paid" : "Pending"}</dd></div>
                         <div><dt className="text-slate-600">Paid date</dt><dd className="mt-1 font-semibold">{preview.paidOn}</dd></div>
+                        <div className="col-span-2"><dt className="text-slate-600">Owning business</dt><dd className="mt-1 font-semibold">{context?.paymentBusinessName}</dd></div>
                         <div className="col-span-2 border-t border-slate-200 pt-3"><dt className="text-slate-600">Saved net pay</dt>
                             <dd className="mt-1 text-lg font-semibold tabular-nums">{money((preview.rows.find(row => row.businessId === businessId) || preview.rows[0])?.netPay ?? record.netPay)}</dd></div></dl>
                     <div className="overflow-x-auto"><table className="w-full min-w-[26rem] text-left text-sm"><thead className="border-b border-slate-200 text-xs text-slate-600"><tr>

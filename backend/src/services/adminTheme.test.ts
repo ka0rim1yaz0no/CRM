@@ -96,11 +96,12 @@ test("employee payroll columns keep room for values and actions on narrow screen
   const source = readFileSync(new URL("../../../src/pages/admin/payroll/index.tsx", import.meta.url), "utf8");
   assert.ok(source.includes('role="region" aria-label="Employee payroll records" tabIndex={0}'));
   const table = source.slice(source.indexOf('aria-label="Employee payroll records"')).split("</thead>")[0];
-  assert.ok(table.includes("min-w-[64rem] table-fixed"));
+  const minimumWidth = Number(table.match(/min-w-\[(\d+)rem\] table-fixed/)?.[1]);
+  assert.ok(minimumWidth >= 64);
   const widths = [...table.matchAll(/<th className="w-\[(\d+)%\]/g)].map((match) => Number(match[1]));
   assert.equal(widths.length, 9);
   assert.equal(widths.reduce((sum, width) => sum + width, 0), 100);
-  assert.ok(widths[8] * (64 * 15) / 100 - 24 >= 5 * 28 + 4 * 2);
+  assert.ok(widths[8] * (minimumWidth * 15) / 100 - 24 >= 5 * 28 + 4 * 2);
 });
 
 test("mobile admin navigation cannot reserve page width or expose hidden focus targets", () => {

@@ -3,6 +3,7 @@ import { attendanceSlotKey } from "./attendanceShift";
 import { hubShiftBounds } from "./attendanceHubMath";
 import { payrollAccuracyEnabled } from "../config/rolloutFlags";
 import { isOffPhoneStart, nonBillableOffPhoneSource } from "../../../shared/attendanceOffPhone";
+import { offPhoneLimitPolicy } from "../config/payrollEarnings";
 
 export type CheckPolicy = { shiftStart: string; shiftEnd: string; graceMinutes: number; breakMinutes: number; lunchMinutes: number; autoTimeOutTime?: string };
 export type AuditPunch = { id: string; code: string; source: string; at: string; sequence?: number; eventId?: string; slotKey?: string; storedSlotKey?: string; autoTimeOut?: boolean };
@@ -59,6 +60,13 @@ export function auditAttendance(events: AuditPunch[], date: string, policy: Chec
   let mode: "online" | "break" | "lunch" | "offPhone" | "offline" = "offline";
   let lastAt = start.getTime(); let workedMs = 0; let offPhoneMs = 0;
   let nonBillable = false, nonBillableMs = 0, nonBillableOffPhoneMinutes = 0;
+  const limit = offPhoneLimitPolicy();
+  let paidRemaining = limit && +start >= Date.parse(limit.effectiveFrom) ? limit.paidMinutes * 60_000 : Infinity;
+  const countOffPhone = (milliseconds: number) => {
+    const paid = nonBillable ? 0 : Math.min(paidRemaining, milliseconds);
+    nonBillableMs += milliseconds - paid;
+    if (!nonBillable) paidRemaining -= paid;
+  };
   const starts = { break: 0, lunch: 0 };
   let forgottenRests = 0;
   const sequence = events.filter(event => event.sequence !== undefined).sort((a, b) => a.sequence! - b.sequence!);
@@ -70,7 +78,7 @@ export function auditAttendance(events: AuditPunch[], date: string, policy: Chec
     const clipped = Math.max(start.getTime(), Math.min(at, end.getTime(), now.getTime()));
     if (mode === "online") workedMs += Math.max(0, clipped - lastAt);
     if (mode === "offPhone") offPhoneMs += Math.max(0, clipped - lastAt);
-    if (mode === "offPhone" && nonBillable) nonBillableMs += Math.max(0, clipped - lastAt);
+    if (mode === "offPhone") countOffPhone(Math.max(0, clipped - lastAt));
     lastAt = clipped;
     if (["Time In", "Login", "Time Out", "Logout", "Off the Phone In"].includes(event.source)) {
       nonBillableOffPhoneMinutes += Math.ceil(nonBillableMs / 60_000); nonBillableMs = 0; nonBillable = false;
@@ -121,7 +129,7 @@ export function auditAttendance(events: AuditPunch[], date: string, policy: Chec
   const tail = Math.max(start.getTime(), Math.min(now.getTime(), end.getTime()));
   if (mode === "online") workedMs += Math.max(0, tail - lastAt);
   if (mode === "offPhone") offPhoneMs += Math.max(0, tail - lastAt);
-  if (mode === "offPhone" && nonBillable) nonBillableMs += Math.max(0, tail - lastAt);
+  if (mode === "offPhone") countOffPhone(Math.max(0, tail - lastAt));
   nonBillableOffPhoneMinutes += Math.ceil(nonBillableMs / 60_000);
   for (const rest of ["break", "lunch"] as const) if (open[rest]) intervals[rest].push({ start: open[rest]!.at, end: null, milliseconds: Math.max(0, tail - Date.parse(open[rest]!.at)), excess: 0 });
   const late = firstIn ? Math.max(0, Math.floor((Date.parse(firstIn.at) - start.getTime()) / 60_000) - policy.graceMinutes) : 0;

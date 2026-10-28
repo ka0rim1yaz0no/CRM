@@ -371,6 +371,7 @@ export type AgentLeadMonthlyRow = {
 export type AgentLeadDashboard = {
     generatedAt: string;
     business: { id: string; name: string };
+    pipeline?: { newLeads: number; followUps: number; qualified: number };
     summary: AgentLeadDashboardSummary;
     agents: AgentLeadProgress[];
     selectedMonth: string;

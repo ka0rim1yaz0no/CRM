@@ -59,7 +59,7 @@ const additions = ['docs/guarded-online-activation.md', 'scripts/attendance-roll
   'backend/src/controllers/employeePaymentsController.ts', 'backend/src/scripts/initializeEmployeePayments.ts',
   'backend/src/services/employeePayments.integration.test.ts',
   'src/api/employeePayments.ts', 'src/components/EmployeePayments.tsx', 'src/components/employeePayments.css',
-  'scripts/employee-payments.test.mjs', 'scripts/employee-payments-browser.mjs', 'docs/employee-payments.md',
+  'scripts/employee-payments.test.mjs', 'scripts/employee-payments-browser.mjs', 'docs/employee-payments.md', 'scripts/dashboard-pipeline-ui.test.mjs',
   'src/lib/leadWorkspaceCache.ts', 'scripts/lead-live-workspace.test.mjs', 'scripts/lead-live-workspace-browser.mjs', 'scripts/attendance-undo-browser.mjs',
   'src/lib/attendanceWorkspaceLive.ts', 'src/hooks/useAttendanceWorkspaceRefresh.ts', 'scripts/attendance-workspace-live.test.mjs',
   'src/lib/payrollFormatting.ts', 'scripts/payroll-hours-format.test.mjs',

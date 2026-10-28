@@ -2,6 +2,8 @@ import { useQuery } from "@tanstack/react-query";
 import AdminLayout from "../adminLayout";
 import { getPayrollDtr, getPayrollRecords, type PayrollDtr, type PayrollRecord } from "../../../api/payroll";
 import { getActiveBusinessId } from "../../../api/businessStorage";
+import { payrollDeductionDisplayRows } from "../../../../shared/payrollPresentation";
+import { isEarnedPayrollVersion } from "../../../../shared/payrollEarnings";
 
 type PayrollComputeRow = {
     record: PayrollRecord;
@@ -36,7 +38,8 @@ function computePayroll(record: PayrollRecord) {
     const regularHoursPerDay = record.paidHoursPerDay;
     const hourlyRate = record.hourlyRate ?? Number(record.minuteRate || 0) * 60;
     const dailyRate = regularHoursPerDay != null ? hourlyRate * regularHoursPerDay : null;
-    const approvedOtPay = grossPay - basePay;
+    const approvedOtPay = isEarnedPayrollVersion(record.calculationVersion) ? approvedOtHours * hourlyRate : grossPay - basePay;
+    const regularPay = isEarnedPayrollVersion(record.calculationVersion) ? grossPay - approvedOtPay : basePay;
     const deductionHours = hourlyRate > 0 ? deductions / hourlyRate : 0;
     const netPay = record.netPay;
 
@@ -50,6 +53,7 @@ function computePayroll(record: PayrollRecord) {
         dailyRate,
         basePay,
         approvedOtPay,
+        regularPay,
         deductionHours,
         netPay,
         regularHoursPerDay,
@@ -57,6 +61,7 @@ function computePayroll(record: PayrollRecord) {
 }
 
 function renderRecord({ record, dtr }: PayrollComputeRow) {
+    if (record.earningsUnavailable) return `${record.employeeName}: current earned pay needs review; saved payroll and payment status are unchanged.`;
     const computed = computePayroll(record);
     const dtrSummary = dtr?.summary;
     const dtrRows = dtr?.rows || [];
@@ -77,11 +82,12 @@ function renderRecord({ record, dtr }: PayrollComputeRow) {
         `Stored hourly rate = ${money(computed.hourlyRate)}${computed.regularHoursPerDay != null ? `; paid day ${computed.regularHoursPerDay}h` : ""}`,
         "",
         "EARNINGS",
-        `Basic pay = ${money(computed.basePay)}`,
+        `${isEarnedPayrollVersion(record.calculationVersion) ? "Earned regular pay" : "Basic pay"} = ${money(computed.regularPay)}`,
         `Approved OT pay = ${hours(computed.approvedOtHours)} x ${money(computed.hourlyRate)} = ${money(computed.approvedOtPay)}`,
-        `Gross pay = ${money(computed.basePay)} + ${money(computed.approvedOtPay)} = ${money(computed.grossPay)}`,
+        `Gross pay = ${money(computed.regularPay)} + ${money(computed.approvedOtPay)} = ${money(computed.grossPay)}`,
         "",
         "DEDUCTIONS",
+        ...payrollDeductionDisplayRows(record).map(row => `${row.label}: ${row.minutes} min = ${row.amount === null ? row.note : money(row.amount)}`),
         `Attendance deduction hours = ${money(computed.deductions)} / ${money(computed.hourlyRate)} = ${hours(computed.deductionHours)}`,
         `Attendance deductions = ${hours(computed.deductionHours)} x ${money(computed.hourlyRate)} = ${money(computed.deductions)}`,
         "",

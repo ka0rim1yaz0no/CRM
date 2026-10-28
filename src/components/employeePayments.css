@@ -28,6 +28,7 @@
 .employee-payment-breakdown h3{font-size:14px;font-weight:650;margin:0 0 12px}
 .employee-payment dl{margin:0}.employee-payment-breakdown dl>div{display:flex;align-items:baseline;justify-content:space-between;gap:12px;padding:6px 0;font-size:13px;line-height:1.5}
 .employee-payment dt{color:var(--profile-muted,#b8c4d9);overflow-wrap:anywhere;min-width:0}.employee-payment dt span{font-size:12px;white-space:nowrap;margin-left:4px}
+.employee-payment dt small{display:block;font-size:11px;line-height:1.45;margin-top:2px}
 .employee-payment dd{margin:0;text-align:right;font-variant-numeric:tabular-nums;overflow-wrap:anywhere;min-width:0}
 .employee-payment-total{border-top:1px solid var(--profile-border,#74839c);margin-top:8px;font-weight:650}
 .employee-payment-meta{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:18px 24px;padding:20px 0;border-top:1px solid var(--profile-border,#74839c);margin-top:20px!important;font-size:12px;line-height:1.6}

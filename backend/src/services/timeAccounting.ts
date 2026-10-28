@@ -1,6 +1,7 @@
 import type { AttendanceSource } from "../models/Attendance";
 import { payrollAccuracyEnabled, attendanceAccuracyFixesEnabled } from "../config/rolloutFlags";
 import { isOffPhoneStart, nonBillableOffPhoneIntervals } from "../../../shared/attendanceOffPhone";
+import { offPhoneLimitPolicy } from "../config/payrollEarnings";
 
 export function deductionComponents(values: { lateMinutes?: number; earlyTimeOutMinutes?: number; excessBreakMinutes?: number; excessLunchMinutes?: number; absenceMinutes?: number; nonBillableOffPhoneMinutes?: number }, excluded = false) {
   const clean = (value?: number) => excluded ? 0 : Math.max(0, Number.isFinite(value) ? value! : 0);
@@ -44,7 +45,7 @@ export function calculateSlotAttendance(records: CalculationRecord[], policy: Sl
     });
   const breakSessions = intervals("Break Out", "Break In", policy.breakMinutes);
   const lunchSessions = intervals("Lunch Break Out", "Lunch Break In", policy.lunchMinutes);
-  const nonBillableOffPhoneSessions = nonBillableOffPhoneIntervals(ordered, policy.shiftStart, policy.shiftEnd, now);
+  const nonBillableOffPhoneSessions = nonBillableOffPhoneIntervals(ordered, policy.shiftStart, policy.shiftEnd, now, offPhoneLimitPolicy());
   const nonBillableOffPhoneMinutes = nonBillableOffPhoneSessions.reduce((total, interval) => total + interval.minutes, 0);
   const first = ordered.find((record) => record.source === "Time In" || record.source === "Login");
   const final = ordered.at(-1);

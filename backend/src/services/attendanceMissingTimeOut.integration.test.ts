@@ -5,6 +5,7 @@ import { before, after, test } from "node:test";
 import mongoose from "mongoose";
 import { MongoMemoryReplSet } from "mongodb-memory-server";
 import type { AttendanceSource } from "../models/Attendance";
+import { timeOutBeforeTimeInMessage } from "../../../shared/attendanceTimeOut";
 
 const prefix = `missing_checkout_${crypto.randomUUID().replaceAll("-", "")}`;
 const businesses = Array.from({ length: 6 }, (_, index) => `missing-${index}`);
@@ -333,6 +334,32 @@ test("earlier current checkout goes OFFLINE and rejects stale, cross-session and
             const undo = { operation: "undo", targetCommandId: command.commandId, expectedRevision: after.revision, commandId: crypto.randomUUID(), reason: "Synthetic undo current checkout" };
             const undone = await data.request(0, data.endpoint(0, "commands"), undo); assert.equal(undone.status, 200, JSON.stringify(await undone.clone().json()));
             assert.equal((await undone.json()).state, "ONLINE");
+        }
+    } finally { context.mock.timers.reset(); }
+});
+
+test("all six businesses explain checkout-before-check-in without changing attendance or paid payroll", async context => {
+    context.mock.timers.enable({ apis: ["Date"], now: new Date("2026-10-27T02:00:00Z") });
+    try {
+        const data = await seed("synthetic-checkout-order", [["Time In", "2026-10-26T14:59:37Z"]]);
+        const before = await (await data.request(0, data.endpoint(0, "session"))).json();
+        const payroll = [];
+        for (let index = 0; index < 6; index++) payroll.push(await runWithBusiness(businesses[index], async () => {
+            await PayrollRecord.create({ employeeId: data.code, employeeName: "Synthetic Missing Checkout", department: "Fixture", payType: "Semi-monthly",
+                payPeriod: "Oct 21, 2026 - Nov 5, 2026", grossPay: 15000, deductions: 50, netPay: 14950, status: "Paid", paidOn: "Oct 26, 2026" });
+            return PayrollRecord.findOne({ employeeId: data.code }).lean();
+        }));
+        for (let index = 0; index < 6; index++) {
+            for (const action of ["preview", "commands"]) {
+                const response = await data.request(index, data.endpoint(index, action), { operation: "add-time-out", commandId: crypto.randomUUID(),
+                    expectedRevision: before.revision, sessionId: before.sessionId, timeOutAt: "2026-10-26T03:38:00Z", closeRest: false, reason: "Synthetic invalid AM/PM test" });
+                assert.equal(response.status, 422);
+                const failure = await response.json(); assert.equal(failure.code, "INVALID_CHECKOUT"); assert.equal(failure.message, timeOutBeforeTimeInMessage);
+            }
+            const refreshed = await (await data.request(index, data.endpoint(index, "session"))).json();
+            assert.equal(refreshed.revision, before.revision); assert.deepEqual(refreshed.records, before.records);
+            assert.deepEqual(refreshed.audit, before.audit); assert.equal(refreshed.state, "ONLINE");
+            assert.deepEqual(await runWithBusiness(businesses[index], () => PayrollRecord.findOne({ employeeId: data.code }).lean()), payroll[index]);
         }
     } finally { context.mock.timers.reset(); }
 });

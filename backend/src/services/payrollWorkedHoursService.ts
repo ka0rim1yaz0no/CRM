@@ -16,6 +16,8 @@ import { PayrollValidationError, roundMoney } from "./payrollAccuracy";
 import { attendancePayrollDtr } from "../controllers/payrollController";
 import { savedPayrollPeriod } from "../../../shared/payrollPeriod";
 import { adjustedPayrollHours } from "../../../shared/payrollWorkedHours";
+import { earnedPayrollEnabled, earnedPayrollVersion } from "../config/payrollEarnings";
+import { isEarnedPayrollVersion } from "../../../shared/payrollEarnings";
 
 const fail = (statusCode: number, message: string) => Object.assign(new Error(message), { statusCode });
 const hash = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -28,7 +30,7 @@ function mirrorSignature(record: RecordValue) {
         record.paidHoursPerDay, record.workingDays, record.scheduledHours, record.workedMinutesOverride, record.incompleteShiftDays,
         record.excessBreakMinutes, record.excessLunchMinutes, record.nonBillableOffPhoneMinutes ?? 0, record.lateMinutes, record.earlyTimeOutMinutes, record.absenceMinutes,
         record.attendanceDays, record.absentDays, record.lateDays, record.absentHours, record.lateHours, record.overtimeHours, record.overtimeApproved,
-        record.payrollOwnerBusinessId, record.calculationSnapshot?.businessIds]);
+        record.payrollOwnerBusinessId, record.calculationSnapshot?.businessIds, record.calculationVersion]);
 }
 
 async function buildHoursPlan(id: string, workedMinutes: unknown, session?: ClientSession) {
@@ -37,6 +39,7 @@ async function buildHoursPlan(id: string, workedMinutes: unknown, session?: Clie
     const source = await loadRecord(id, session);
     if (!source || source.isArchived) throw fail(404, "Payroll record not found");
     if (["Paid", "Completed"].includes(source.status)) throw new PayrollValidationError("Paid or completed payroll is locked. No hours were changed.");
+    if (earnedPayrollEnabled(source.payPeriod) && source.calculationVersion !== earnedPayrollVersion(source.payPeriod)) throw new PayrollValidationError("Preview and confirm the earned-pay cutoff calculation before editing its paid hours.");
     if (source.payrollOwnerBusinessId && source.payrollOwnerBusinessId !== getCurrentBusinessId()) throw new PayrollValidationError("Edit total hours in the cutoff's owning business.");
     const period = savedPayrollPeriod(source.payPeriod);
     if (!period) throw new PayrollValidationError("Choose a dated cutoff before editing total hours.");
@@ -70,11 +73,12 @@ async function buildHoursPlan(id: string, workedMinutes: unknown, session?: Clie
             let adjusted;
             try { adjusted = adjustedPayrollHours(record, workedMinutes); }
             catch (error) { throw new PayrollValidationError((error as Error).message); }
-            const deductions = Math.min(record.grossPay, roundMoney(adjusted.deductibleMinutes * rate));
-            const value = { ...adjusted, deductions, netPay: roundMoney(record.grossPay - deductions),
+            const grossPay = isEarnedPayrollVersion(record.calculationVersion) ? roundMoney((adjusted.earnedGrossHours! + (record.overtimeApproved ? record.overtimeHours : 0)) * rate * 60) : record.grossPay;
+            const deductions = Math.min(grossPay, roundMoney(adjusted.deductibleMinutes * rate));
+            const value = { ...adjusted, grossPay, deductions, netPay: roundMoney(grossPay - deductions),
                 calculationSnapshot: { ...record.calculationSnapshot, workedHoursAdjustment: {
                     workedMinutes, scheduledMinutes: Math.round(record.scheduledHours * 60), minuteRate: rate,
-                    formula: "Scheduled minutes minus total worked minutes (including non-billable off-phone shortfall once), plus saved excess break and lunch; gross pay and payment status unchanged.",
+                    formula: isEarnedPayrollVersion(record.calculationVersion) ? "Reviewed paid hours at the saved hourly rate; saved attendance deductions follow the cutoff calculation version; payment status unchanged." : "Scheduled minutes minus total worked minutes (including non-billable off-phone shortfall once), plus saved excess break and lunch; gross pay and payment status unchanged.",
                 } } };
             return { businessId, id: String(record._id), beforeHash: hash(record), value,
                 attendanceHash: hash({ summary: attendance.summary, rows: attendance.rows, ledger: currentLedger }) };

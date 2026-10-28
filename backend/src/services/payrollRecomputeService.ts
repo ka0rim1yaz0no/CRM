@@ -18,6 +18,7 @@ import { payrollReadGroups } from "./payrollReadPolicy";
 import { savedPayrollPeriod } from "../../../shared/payrollPeriod";
 import { adjustedPayrollHours } from "../../../shared/payrollWorkedHours";
 import { payrollDeductionRows, type SavedDeductionSource } from "../../../shared/payrollPresentation";
+import { earnedPayrollEnabled, earnedAllDeductionsEnabled, earnedPayrollVersion } from "../config/payrollEarnings";
 
 const fail = (statusCode: number, message: string) => Object.assign(new Error(message), { statusCode });
 const fingerprint = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -27,10 +28,12 @@ export async function calculatePayrollCandidate(employee: { _id: Types.ObjectId;
   const { settings, policy } = await payrollCalculationContext(session);
   const rates = payrollRatesForCutoff(employee.salary, payPeriod, settings, policy);
   const dtr = await attendancePayrollDtr(employee._id, payPeriod, session);
+  const earned = earnedPayrollEnabled(payPeriod);
+  const calculationVersion = earned ? earnedPayrollVersion(payPeriod) : "duration-payroll-v1";
   const record = await PayrollRecord.findOne({ employeeId: employee.employeeCode, payPeriod, isArchived: false }, null, session ? { session } : undefined).lean();
   let hoursAdjustment = {};
   if (record?.workedMinutesOverride !== null && record?.workedMinutesOverride !== undefined) {
-    try { hoursAdjustment = adjustedPayrollHours(dtr.summary, record.workedMinutesOverride); }
+    try { hoursAdjustment = adjustedPayrollHours({ ...dtr.summary, calculationVersion }, record.workedMinutesOverride); }
     catch (error) { throw new PayrollValidationError((error as Error).message); }
   }
   const summary = { ...dtr.summary, ...hoursAdjustment };
@@ -38,7 +41,7 @@ export async function calculatePayrollCandidate(employee: { _id: Types.ObjectId;
   if (!Number.isFinite(approvedOvertimeHours) || approvedOvertimeHours < 0 || approvedOvertimeHours > dtr.summary.overtimeHours) {
     throw new PayrollValidationError("Approved overtime exceeds verified completed weekend work; review the cutoff");
   }
-  const grossPay = roundMoney(rates.cutoffBasePay + approvedOvertimeHours * rates.hourlyRate);
+  const grossPay = roundMoney((earned ? summary.earnedGrossHours! * rates.hourlyRate : rates.cutoffBasePay) + approvedOvertimeHours * rates.hourlyRate);
   const deductions = Math.min(grossPay, roundMoney(summary.deductibleMinutes * rates.minuteRate));
   const payDate = scheduledPayDateForPeriod(payPeriod, settings);
   const ledger = await AttendanceLedger.findOne({ employeeCode: employee.employeeCode, businessIds: getCurrentBusinessId() }, null, session ? { session } : undefined).select("revision events corrections closures businessIds migrationRequired").lean();
@@ -54,17 +57,18 @@ export async function calculatePayrollCandidate(employee: { _id: Types.ObjectId;
     paidHoursPerDay: rates.paidHoursPerDay, hourlyRate: rates.hourlyRate, minuteRate: rates.minuteRate,
     grossPay, deductions, netPay: roundMoney(Math.max(0, grossPay - deductions)),
     overtimeHours: approvedOvertimeHours, overtimeApproved: approvedOvertimeHours > 0, workedMinutesOverride: record?.workedMinutesOverride ?? null,
-    calculationVersion: "duration-payroll-v1", status: dtr.summary.incompleteShiftDays ? "Review" as const : "Pending" as const,
+    calculationVersion, status: dtr.summary.incompleteShiftDays ? "Review" as const : "Pending" as const,
     paidOn: record?.paidOn || payDate?.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }) || "-", payPeriod, isArchived: false,
     calculationSnapshot: { settings: { officialShiftStartTime: settings.officialShiftStartTime, officialShiftEndTime: settings.officialShiftEndTime },
       policy: { breakMinutes: policy.breakMinutes, lunchMinutes: policy.lunchMinutes, graceMinutes: policy.graceMinutes, revision: policy.revision },
-      ...rates, workedMinutesOverride: record?.workedMinutesOverride ?? null, attendanceRevision: ledger?.revision ?? null,
+      ...rates,
+      workedMinutesOverride: record?.workedMinutesOverride ?? null, attendanceRevision: ledger?.revision ?? null,
       attendanceFingerprint: fingerprint(ledger ? { events: ledger.events, corrections: ledger.corrections, closures: ledger.closures } : dtr.rows),
       evidence: evidence.filter(item => Date.parse(item.at) >= evidenceStart && Date.parse(item.at) < evidenceEnd),
       days: dtr.rows.map(item => ({ dayKey: item.dateKey, status: item.status, lateMinutes: item.lateMinutes, earlyTimeOutMinutes: item.earlyTimeOutMinutes,
         nonBillableOffPhoneMinutes: item.nonBillableOffPhoneMinutes ?? 0,
         excessBreakMinutes: item.excessBreakMinutes, excessLunchMinutes: item.excessLunchMinutes, absenceMinutes: item.absenceMinutes, deductibleMinutes: item.deductibleMinutes })),
-      rounding: "Each completed break/lunch excess rounds up; lateness uses minute boundaries after grace; early-out rounds up; money rounds once per total." } };
+      rounding: earnedAllDeductionsEnabled(payPeriod) ? "Earned-to-date gross less all verified attendance deductions: Late, Undertime, completed-shift Absence, excess Break/Lunch and non-billable Off the Phone. Shortfalls are additional charges under the approved policy. No future-shift absence; money rounds once per total; net floors at zero." : earned ? "Earned in-shift presence less the taken lunch allowance; excess rest and non-billable minutes round up and are deducted once. No future hours, late/early shortfall or absence is deducted again. Money rounds once per total." : "Each completed break/lunch excess rounds up; lateness uses minute boundaries after grace; early-out rounds up; money rounds once per total." } };
   return { record, value, dtr, rates };
 }
 
@@ -82,6 +86,11 @@ export async function getAccuratePayrollDtr(employee: Parameters<typeof calculat
   const saved = await PayrollRecord.findOne({ employeeId: employee.employeeCode, payPeriod, isArchived: false }).lean();
   // Viewing an existing cutoff must not depend on approval of a new calculation.
   if (saved) {
+    const { getSystemSettings } = await import("../controllers/systemSettingsController");
+    const { currentPeriod } = await import("../controllers/payrollController");
+    const { currentEarnedPayrollRecords } = await import("./payrollEarningsRead");
+    const settings = await getSystemSettings();
+    const shown = (await currentEarnedPayrollRecords([saved], currentPeriod(settings.payrollBillingCycle, settings)))[0];
     let current: Awaited<ReturnType<typeof attendancePayrollDtr>> | undefined;
     let currentAttendanceWarning: string | undefined;
     try { current = await attendancePayrollDtr(employee._id, payPeriod); }
@@ -93,8 +102,8 @@ export async function getAccuratePayrollDtr(employee: Parameters<typeof calculat
       payPeriod, payDate: saved.paidOn, payType: saved.payType, storedCutoff: true, currentAttendanceWarning,
       currentAttendanceReviewDays: current?.summary.incompleteShiftDays ?? null,
       potentialOvertimeHours: current?.summary.overtimeHours ?? 0,
-      summary: { ...saved, paidHoursPerDay: saved.paidHoursPerDay ?? null, hourlyRate: saved.hourlyRate ?? saved.minuteRate * 60,
-        workingDays: current?.summary.workingDays ?? null, monthlyWorkingDays: saved.workingDays, missingHours: saved.missingHours ?? saved.deductibleMinutes / 60 },
+      summary: { ...shown, paidHoursPerDay: shown.paidHoursPerDay ?? null, hourlyRate: shown.hourlyRate ?? shown.minuteRate * 60,
+        workingDays: current?.summary.workingDays ?? null, monthlyWorkingDays: shown.workingDays, missingHours: shown.missingHours ?? shown.deductibleMinutes / 60 },
       rows: current?.rows.filter(row => row.status !== "Scheduled") || [] };
   }
   const candidate = await calculatePayrollCandidate(employee, payPeriod);
@@ -229,6 +238,7 @@ export async function setAccuratePayrollPaid(request: Request, paid: boolean) {
   if (!actor) throw fail(403, "A verified administrator session is required");
   const source = await PayrollRecord.findById(request.params.id).lean();
   if (!source || source.isArchived) throw fail(404, "Payroll record not found");
+  if (earnedPayrollEnabled(source.payPeriod)) throw new PayrollValidationError("Use the payment-status preview and confirmation for earned payroll. No payment status was changed.");
   if (source.payrollOwnerBusinessId && source.payrollOwnerBusinessId !== getCurrentBusinessId()) throw new PayrollValidationError("Change payment status in the cutoff's owning business");
   if (paid && (source.incompleteShiftDays || source.status === "Review")) throw new PayrollValidationError("Resolve attendance review before marking payroll paid");
   const access = await getBusinessAccessForEmployeeCode(source.employeeId);

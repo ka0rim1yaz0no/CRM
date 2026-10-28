@@ -24,6 +24,7 @@ import { attendanceIntegrityEnabled, getAttendanceSession, previewAttendanceComm
 import { refreshAttendanceWorkspace } from "../../../lib/employeeWorkspaceCache";
 import { getActiveBusinessId } from "../../../api/businessStorage";
 import { getAuthUser } from "../../../api/authStorage";
+import { validateTimeOutOrder } from "../../../../shared/attendanceTimeOut";
 
 const emptyAttendanceShiftForm: AttendanceShiftForm = {
     timeIn: "",
@@ -197,6 +198,8 @@ function AttendanceForm() {
             }
 
             const validEntries = parsedEntries.filter(Boolean) as Array<{ field: keyof AttendanceShiftForm; source: AttendanceRecord["source"]; parsed: Date; slotKey: string }>;
+            const timeIn = validEntries.find(entry => entry.field === "timeIn"), timeOut = validEntries.find(entry => entry.field === "timeOut");
+            if (timeIn && timeOut) validateTimeOutOrder(timeIn.parsed.toISOString(), timeOut.parsed.toISOString());
             const rowsBySlot = new Map(attendanceRows.map((row) => [row.dateKey, row]));
             const formSlotKey = validEntries.find((entry) => entry.field === "timeIn")?.slotKey || validEntries[0]?.slotKey || "";
             const updates = validEntries.map(({ field, source, parsed, slotKey }) => {
@@ -514,7 +517,7 @@ function AttendanceForm() {
                             </div>}
 
                             {formError && (
-                                <p className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm font-semibold text-red-700">{formError}</p>
+                                <p role="alert" className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm font-semibold text-red-700">{formError}</p>
                             )}
                             {savedNotice && <p role="status" className="rounded-md border border-emerald-200 bg-emerald-50 p-3 text-sm !text-emerald-800">{savedNotice}</p>}
 
