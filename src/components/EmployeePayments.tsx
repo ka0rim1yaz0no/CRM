@@ -4,7 +4,7 @@ import { FiAlertTriangle, FiChevronDown, FiChevronLeft, FiChevronRight, FiRefres
 import { getEmployeePayments } from "../api/employeePayments";
 import { getAuthUser } from "../api/authStorage";
 import { getActiveBusinessId } from "../api/businessStorage";
-import { payrollDeductionDisplayRows } from "../../shared/payrollPresentation";
+import { payrollDeductionDisplayRows, payrollDeductionDisplayTotal } from "../../shared/payrollPresentation";
 import { isEarnedPayrollVersion } from "../../shared/payrollEarnings";
 import type { EmployeePayment } from "../../shared/employeePayments";
 import { savedPayrollPeriod } from "../../shared/payrollPeriod";
@@ -31,6 +31,7 @@ const quantity = (value: number | null, unit = "") => value === null ? "Not reco
 function PaymentDetails({ item, money }: { item: EmployeePayment; money: (value: number) => string }) {
     if (item.earningsUnavailable) return <p className="employee-payments-error" role="status">Current earnings need payroll review. Saved amounts and payment status have not changed.</p>;
     const deductionRows = payrollDeductionDisplayRows(item);
+    const displayedTotal = payrollDeductionDisplayTotal(item);
     const rates = savedPayrollDisplayRates(item);
     const values: Array<[string, string, string?]> = [
         ["Pay type", item.payType], ["Department", item.department],
@@ -50,8 +51,12 @@ function PaymentDetails({ item, money }: { item: EmployeePayment; money: (value:
                 <div className="employee-payment-total"><dt>Gross pay</dt><dd>{money(item.grossPay)}</dd></div>
             </dl></section>
             <section aria-label="Deductions"><h3>Deductions</h3><dl>
-                {deductionRows.map(row => <div key={row.label}><dt>{row.label} <span>{row.minutes}m</span>{row.note && <small>{row.note}</small>}</dt><dd>{row.amount === null ? "--" : money(row.amount)}</dd></div>)}
-                <div className="employee-payment-total"><dt>Total deductions</dt><dd>{money(item.deductions)}</dd></div>
+                {deductionRows.map(row => {
+                    const displayedAmount = row.amount ?? row.informationalAmount;
+                    return <div key={row.label}><dt>{row.label} <span>{row.minutes}m</span>{row.note && <small>{row.note}</small>}</dt>
+                        <dd>{displayedAmount === undefined ? "--" : money(displayedAmount)}</dd></div>;
+                })}
+                <div className="employee-payment-total"><dt>Total deductions</dt><dd>{displayedTotal === null ? "Unavailable" : money(displayedTotal)}</dd></div>
             </dl></section>
             <section aria-label="Attendance"><h3>Attendance</h3><dl>
                 {([["Monthly working days", quantity(item.workingDays)], ["Days attended", quantity(item.attendanceDays)], ["Days absent", quantity(item.absentDays)],
@@ -88,14 +93,14 @@ function PaymentsLedger({ employeeId, businessId }: { employeeId: string; busine
             {data.reviewCount > 0 && <p className="employee-payments-error" role="status">{data.reviewCount} cutoff record{data.reviewCount === 1 ? " needs" : "s need"} payroll review.</p>}
             {data.items.length === 0 && <p className="employee-payments-empty">{page === 1 ? "Payroll not yet released." : "No payments on this page."}</p>}
             {data.items.length > 0 && <div className="employee-payment-column-head" aria-hidden="true"><span>Cutoff</span><span>Gross pay</span><span>Deductions</span><span>Net pay</span><span>Status</span><span /></div>}
-            {data.items.map(item => <details className="employee-payment" key={item.id}>
+            {data.items.map(item => { const total = payrollDeductionDisplayTotal(item); return <details className="employee-payment" key={item.id}>
                 <summary><span className="employee-payment-cutoff">{savedPayrollPeriod(item.payPeriod)?.label || item.payPeriod}</span>
                     <span className="employee-payment-amount"><small>Gross pay</small>{item.earningsUnavailable ? "Unavailable" : money(item.grossPay)}</span>
-                    <span className="employee-payment-amount"><small>Deductions</small>{item.earningsUnavailable ? "Unavailable" : money(item.deductions)}</span>
+                    <span className="employee-payment-amount"><small>Deductions</small>{item.earningsUnavailable || total === null ? "Unavailable" : money(total)}</span>
                     <strong className="employee-payment-amount" title={item.earnedToDate ? "Earned to date" : undefined}><small>{item.earnedToDate ? "Earned net pay" : "Net pay"}</small>{item.earningsUnavailable ? "Unavailable" : money(item.netPay)}</strong>
                     <span className="employee-payment-status" data-paid={item.status === "Paid"}>{payrollPaymentStatus(item.status)}{item.requiresReview && <FiAlertTriangle role="img" aria-label="Conflicting saved payroll entries" title="Conflicting saved payroll entries" />}</span><FiChevronDown aria-hidden="true" />
                 </summary><PaymentDetails item={item} money={money} />
-            </details>)}
+            </details>; })}
             {(pages > 1 || page > 1) && <nav className="employee-payment-pagination" aria-label="Payment pages">
                 <button type="button" title="Previous payment page" aria-label="Previous payment page" disabled={page <= 1 || query.isFetching} onClick={() => setPage(value => value - 1)}><FiChevronLeft aria-hidden="true" /></button>
                 <span>Page {page} of {pages}</span><button type="button" title="Next payment page" aria-label="Next payment page" disabled={page >= pages || query.isFetching} onClick={() => setPage(value => value + 1)}><FiChevronRight aria-hidden="true" /></button>

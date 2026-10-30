@@ -458,8 +458,10 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { isOffPhoneStart, nonBillableOffPhoneSource, offPhoneNonBillableAt } from "../../../shared/attendanceOffPhone";
+import { coachingInSource, coachingOutSource } from "../../../shared/attendanceCoaching";
+import { coachingRemainingMs, offPhoneRemainingMs } from "../../lib/attendanceAllowances";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { FiClock, FiCoffee, FiLogIn, FiLogOut, FiPhoneOff, FiPower, FiRefreshCw, FiMenu } from "react-icons/fi";
+import { FiClock, FiCoffee, FiLogIn, FiLogOut, FiPhoneOff, FiPower, FiRefreshCw, FiMenu, FiUsers } from "react-icons/fi";
 import { breakInEmployee, breakOutEmployee, getEmployeeAttendance, lunchBreakInEmployee, lunchBreakOutEmployee, reportEmployeeActivity, timeInEmployee, timeOutEmployee, type AttendanceRecord } from "../../api/attendance";
 import { getAuthUser } from "../../api/authStorage";
 import { getEmployeeSummary, normalizeEmployeeAvailabilityStatus, type Employee, type EmployeeAvailabilityStatus } from "../../api/employees";
@@ -476,7 +478,7 @@ import {
 import { buildOffPhoneAttendanceSessions, formatAttendanceDuration } from "../../lib/attendanceRecords";
 import { formatDateInTimeZone, formatTimeInTimeZone } from "../../lib/dateTime";
 import MainLayout from "../layout";
-import { attendanceDurationModelEnabled, attendanceIntegrityEnabled, getAttendanceSession, sessionEventRecord, type AttendanceSessionSnapshot } from "../../api/attendanceSession";
+import { attendanceDurationModelEnabled, attendanceIntegrityEnabled, getAttendanceSession, performAttendanceAction, sessionEventRecord, type AttendanceSessionSnapshot } from "../../api/attendanceSession";
 import { attendanceBreakControl, attendanceDurationControls, attendanceRestActionLabel } from "../../lib/attendanceDurationUi";
 import { attendanceServerNow } from "../../lib/attendanceHubState";
 import { getActiveBusinessId } from "../../api/businessStorage";
@@ -588,7 +590,7 @@ export default function AttendancePage() {
     const businessId = getActiveBusinessId();
     const sessionQueryKey = ["attendance-session", businessId, employeeId];
     const sessionQuery = useQuery({ queryKey: sessionQueryKey, queryFn: () => getAttendanceSession(employeeId),
-        enabled: attendanceIntegrityEnabled && Boolean(employeeId), refetchInterval: 30_000, refetchOnWindowFocus: true });
+        enabled: attendanceIntegrityEnabled && Boolean(employeeId), refetchInterval: query => query.state.data?.coachingBilling?.active ? 1000 : 5000, refetchOnWindowFocus: true });
     const confirmedSession = sessionQuery.data;
     const serverNowMs = confirmedSession ? attendanceServerNow(confirmedSession.serverTime, confirmedSession.receivedAt, nowMs) : nowMs;
     useEffect(() => {
@@ -668,7 +670,7 @@ export default function AttendancePage() {
             ? "BREAK"
             : latestActionSource === "Lunch Break Out"
                 ? "LUNCH"
-                : isOffPhoneStart(latestActionSource)
+                : isOffPhoneStart(latestActionSource) || latestActionSource === coachingOutSource
                     ? "OFF THE PHONE"
                     : latestActionSource === "Logout" || latestActionSource === "Time Out"
                         ? "OFFLINE"
@@ -691,13 +693,16 @@ export default function AttendancePage() {
     const isActiveBreakOvertime = activeBreakLimitMs > 0 && activeBreakElapsedMs > activeBreakLimitMs;
     const offPhoneSessions = buildOffPhoneAttendanceSessions(slotRecords, serverNowMs);
     const activeOffPhoneSession = offPhoneSessions.find((session) => session.isOpen) || null;
-    const nonBillableOffPhoneActive = currentStatus === "OFF THE PHONE" && (Boolean(activeOffPhoneSession?.nonBillable) || offPhoneNonBillableAt(confirmedSession?.offPhoneBilling, serverNowMs));
+    const coachingActive = currentStatus === "OFF THE PHONE" && (activeOffPhoneSession?.startRecord.source === coachingOutSource || Boolean(confirmedSession?.coachingBilling?.active));
+    const activeAwayBilling = confirmedSession?.offPhoneBilling;
+    const coachingRemaining = coachingRemainingMs(confirmedSession?.coachingBilling, serverNowMs);
+    const nonBillableOffPhoneActive = currentStatus === "OFF THE PHONE" && !coachingActive && (Boolean(activeOffPhoneSession?.nonBillable) || offPhoneNonBillableAt(activeAwayBilling, serverNowMs));
     const activeOffPhoneStartedAt = currentStatus === "OFF THE PHONE"
         ? getRecordTime(activeOffPhoneSession?.startRecord) || manualOffPhoneStartedAt || getEmployeeStatusTime(currentEmployee) || getRecordTime(latestRecord)
         : 0;
     const activeOffPhoneElapsedMs = activeOffPhoneStartedAt ? serverNowMs - activeOffPhoneStartedAt : 0;
-    const offPhoneTimerStartedAt = nonBillableOffPhoneActive && confirmedSession?.offPhoneBilling?.active?.nonBillableFrom
-        ? Date.parse(confirmedSession.offPhoneBilling.active.nonBillableFrom) : activeOffPhoneStartedAt;
+    const offPhoneTimerStartedAt = nonBillableOffPhoneActive && activeAwayBilling?.active?.nonBillableFrom
+        ? Date.parse(activeAwayBilling.active.nonBillableFrom) : activeOffPhoneStartedAt;
     const offPhoneTimerElapsedMs = Math.max(0, Math.min(serverNowMs,
         confirmedSession?.assignedShift ? Date.parse(confirmedSession.assignedShift.end) : serverNowMs) - offPhoneTimerStartedAt);
     const slotRecordsChronological = [...slotRecords].sort(compareAttendanceRecords);
@@ -853,7 +858,19 @@ export default function AttendancePage() {
         onError: (error) => handleAttendanceError(error, "Unable to change status. Please try again."),
     });
 
-    const isSaving =
+    const coachingMutation = useMutation({
+        mutationFn: (ending: boolean) => performAttendanceAction(employeeId, ending ? coachingInSource : coachingOutSource),
+        onSuccess: (snapshot, ending) => {
+            queryClient.setQueryData<AttendanceSessionSnapshot>(sessionQueryKey, (current) => !current || current.revision <= snapshot.revision ? snapshot : current);
+            queryClient.setQueryData<AttendanceRecord[]>(attendanceQueryKey(employeeId), (current = []) =>
+                mergeAttendanceHistory(current, snapshot.records.map(event => sessionEventRecord(event, employeeId))));
+            updateEmployeeStatusCache(snapshot.state);
+            refreshAttendanceState();
+            setMessage(ending ? "Coaching ended." : "Coaching started.");
+        },
+        onError: (error) => handleAttendanceError(error, "Unable to save Coaching. Please try again."),
+    });
+    const isSaving = coachingMutation.isPending ||
         timeInMutation.isPending ||
         timeOutMutation.isPending ||
         breakOutMutation.isPending ||
@@ -865,6 +882,7 @@ export default function AttendancePage() {
     const sourceLabel = (source?: AttendanceRecord["source"]) => attendanceEventPresentation(source).label;
 
     const statusDisabled = (status: EmployeeAvailabilityStatus) => {
+        if (coachingActive) return true;
         if (attendanceIntegrityEnabled && (!confirmedSession || sessionQuery.isError || confirmedSession.reviewState !== "verified")) return true;
         if (!employeeId || isLoading || isEmployeeLoading || isSaving || status === currentStatus) return true;
         if (attendanceDurationModelEnabled) {
@@ -872,7 +890,7 @@ export default function AttendancePage() {
             if (!displayedShiftDay && (status === "BREAK" || status === "LUNCH" ||
                 (status === "ONLINE" && (currentStatus === "BREAK" || currentStatus === "LUNCH")))) return true;
             const source = status === "ONLINE" ? currentStatus === "BREAK" ? "Break In" : currentStatus === "LUNCH" ? "Lunch Break In"
-                : currentStatus === "OFF THE PHONE" ? "Off the Phone In" : "Time In"
+                : currentStatus === "OFF THE PHONE" ? coachingActive ? coachingInSource : "Off the Phone In" : "Time In"
                 : status === "BREAK" ? "Break Out" : status === "LUNCH" ? "Lunch Break Out"
                     : status === "OFFLINE" ? "Time Out" : "Off the Phone Out";
             if (!confirmedSession.allowedActions.includes(source)) return true;
@@ -886,6 +904,7 @@ export default function AttendancePage() {
     };
 
     const handleStatusChange = (status: EmployeeAvailabilityStatus) => {
+        if (coachingActive) return;
         setMessage("");
 
         if (status === "ONLINE") {
@@ -902,7 +921,8 @@ export default function AttendancePage() {
                 return;
             }
             if (currentStatus === "OFF THE PHONE") {
-                activityStatusMutation.mutate("ONLINE");
+                if (coachingActive) coachingMutation.mutate(true);
+                else activityStatusMutation.mutate("ONLINE");
             }
             return;
         }
@@ -955,7 +975,7 @@ export default function AttendancePage() {
         const isActive = status === currentStatus;
         const cardReturn = attendanceDurationModelEnabled && status === "ONLINE" && (currentStatus === "BREAK" || currentStatus === "LUNCH");
         const disabled = cardReturn || statusDisabled(status);
-        const label = status === "ONLINE" && !cardReturn ? attendanceOnlineActionLabel(currentStatus) : statusLabels[status];
+        const label = status === "ONLINE" && !cardReturn && !coachingActive ? attendanceOnlineActionLabel(currentStatus) : statusLabels[status];
         return <button key={status} type="button" disabled={disabled} onClick={() => handleStatusChange(status)}
             data-attendance-action={status}
             className={["inline-flex h-12 items-center justify-center gap-2 rounded-lg border px-4 text-sm font-semibold shadow-lg transition disabled:cursor-not-allowed disabled:border-slate-300 disabled:bg-slate-200 disabled:text-slate-500 disabled:shadow-none",
@@ -996,7 +1016,7 @@ export default function AttendancePage() {
                             </div>
                             <div>
                                 <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Current Status</p>
-                                <p className="text-xl font-semibold text-slate-950">{attendanceIntegrityEnabled && !confirmedSession ? "Checking attendance..." : nonBillableOffPhoneActive ? "Non-Billable Off the Phone" : statusLabels[currentStatus]}</p>
+                                <p className="text-xl font-semibold text-slate-950">{attendanceIntegrityEnabled && !confirmedSession ? "Checking attendance..." : nonBillableOffPhoneActive ? "Non-Billable Off the Phone" : coachingActive ? "Coaching" : statusLabels[currentStatus]}</p>
                                 {attendanceIntegrityEnabled && sessionQuery.isError && <div role="alert" className="text-sm text-amber-700">
                                     <p>{attendanceRequestError(sessionQuery.error, "Status could not be confirmed. Refresh before changing attendance.")}</p>
                                     {(sessionQuery.error as { response?: { status?: number } })?.response?.status === 401 &&
@@ -1040,7 +1060,7 @@ export default function AttendancePage() {
                         {currentStatus === "OFF THE PHONE" && activeOffPhoneStartedAt > 0 && (
                             <div className={`mt-4 rounded-lg border p-4 ${nonBillableOffPhoneActive ? "border-red-300 bg-red-50" : "border-sky-300 bg-sky-50"}`}>
                                 <p className={`text-xs font-semibold uppercase tracking-[0.16em] ${nonBillableOffPhoneActive ? "text-red-700" : "text-sky-700"}`}>
-                                    {nonBillableOffPhoneActive ? "Non-Billable Off the Phone timer" : "Off the Phone timer"}
+                                    {nonBillableOffPhoneActive ? "Non-Billable Off the Phone timer" : coachingActive ? "Coaching timer" : "Off the Phone timer"}
                                 </p>
                                 <p className="mt-2 font-mono text-3xl font-bold text-slate-950">
                                     {formatBreakTimer(offPhoneTimerElapsedMs)}
@@ -1049,9 +1069,8 @@ export default function AttendancePage() {
                                     {nonBillableOffPhoneActive ? "Non-billable since " : "Elapsed · Started "}{formatAttendanceDateTime(new Date(offPhoneTimerStartedAt), attendanceTimeZone)}
                                 </p>
                                 {nonBillableOffPhoneActive && <p className="mt-1 text-xs text-slate-700">Total session {formatBreakTimer(activeOffPhoneElapsedMs)}</p>}
-                                {confirmedSession?.offPhoneBilling?.limited && <p className={`mt-2 text-sm font-semibold ${nonBillableOffPhoneActive ? "text-red-700" : "text-sky-700"}`}>
-                                    {confirmedSession.assignedShift && serverNowMs >= Date.parse(confirmedSession.assignedShift.end) ? "Shift ended" : nonBillableOffPhoneActive ? "Non-billable time is accruing" : `Paid allowance remaining ${formatBreakTimer(Math.max(0,
-                                        confirmedSession.offPhoneBilling.active?.nonBillableFrom ? Date.parse(confirmedSession.offPhoneBilling.active.nonBillableFrom) - serverNowMs : confirmedSession.offPhoneBilling.remainingPaidMs ?? 0))}`}
+                                {(coachingActive || activeAwayBilling?.limited) && <p className={`mt-2 text-sm font-semibold ${nonBillableOffPhoneActive ? "text-red-700" : "text-sky-700"}`}>
+                                    {confirmedSession?.assignedShift && serverNowMs >= Date.parse(confirmedSession.assignedShift.end) ? "Shift ended" : coachingActive ? coachingRemaining === 0 ? "Returning Online" : `Billable Coaching remaining ${formatBreakTimer(coachingRemaining ?? 0)}` : nonBillableOffPhoneActive ? "Non-billable time is accruing" : `Paid allowance remaining ${formatBreakTimer(offPhoneRemainingMs(activeAwayBilling, serverNowMs) ?? 0)}`}
                                 </p>}
                             </div>
                         )}
@@ -1064,6 +1083,7 @@ export default function AttendancePage() {
                             <div><dt>Break</dt><dd>{confirmedSession?.allowances?.breakMinutes ?? 15} min</dd></div>
                             <div><dt>Lunch</dt><dd>{confirmedSession?.allowances?.lunchMinutes ?? 60} min</dd></div>
                             <div><dt>Off the phone</dt><dd>{confirmedSession?.offPhoneBilling?.limited ? "20 min paid / shift" : "No time limit"}</dd></div>
+                            {confirmedSession?.coachingEnabled && <div><dt>Coaching</dt><dd>20 min billable / shift</dd></div>}
                         </dl>
 
                         <div className="mt-3 grid gap-3 sm:grid-cols-2">
@@ -1080,6 +1100,13 @@ export default function AttendancePage() {
                                 onClick={() => activityStatusMutation.mutate(nonBillableOffPhoneActive ? "ONLINE" : "NON_BILLABLE")}
                                 className="inline-flex h-12 min-w-0 items-center justify-center gap-2 rounded-lg border border-red-600 bg-red-600 px-3 text-sm font-semibold text-white shadow-lg transition hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-50">
                                 <FiPhoneOff className="shrink-0" aria-hidden="true" /><span className="leading-tight">{nonBillableOffPhoneActive ? "End Non-Billable Off the Phone" : "Non-Billable Off the Phone"}</span>
+                            </button>}
+                            {attendanceIntegrityEnabled && confirmedSession?.coachingEnabled && <button type="button" data-attendance-action="COACHING"
+                                disabled={!employeeId || isLoading || isEmployeeLoading || isSaving || sessionQuery.isError || confirmedSession.reviewState !== "verified" || coachingRemaining === null || coachingRemaining <= 0 ||
+                                    !confirmedSession.allowedActions?.includes(coachingActive ? coachingInSource : coachingOutSource)}
+                                aria-pressed={coachingActive} onClick={() => coachingMutation.mutate(coachingActive)}
+                                className="inline-flex h-12 min-w-0 items-center justify-center gap-2 rounded-lg border border-emerald-600 bg-emerald-600 px-3 text-sm font-semibold text-white shadow-lg transition hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-50 sm:col-span-2">
+                                <FiUsers className="shrink-0" aria-hidden="true" /><span className="leading-tight">{coachingActive ? "Coaching Out" : "Coaching"}</span>
                             </button>}
                         </div>}
                     </section>
@@ -1222,8 +1249,8 @@ export default function AttendancePage() {
                             <button
                                 type="button"
                                 className="inline-flex h-10 items-center justify-center rounded-lg bg-rose-600 px-4 text-sm font-semibold text-white transition hover:bg-rose-700 disabled:opacity-60"
-                                onClick={() => timeOutMutation.mutate()}
-                                disabled={timeOutMutation.isPending}
+                                onClick={() => { if (!coachingActive) timeOutMutation.mutate(); }}
+                                disabled={isSaving || coachingActive}
                             >
                                 {timeOutMutation.isPending ? "Saving..." : "Confirm Offline"}
                             </button>

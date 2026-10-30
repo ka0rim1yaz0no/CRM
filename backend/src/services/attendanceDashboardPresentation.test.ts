@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { attendanceDashboardPresentation } from "./attendanceDashboardPresentation";
+import { attendanceDashboardPresentation, groupAttendanceByShiftDay } from "./attendanceDashboardPresentation";
 import { assignAttendanceShift } from "./attendanceShift";
 import { projectAttendance, type SessionEvent } from "./attendanceSessionState";
 import { calculateHubDay } from "./attendanceHubMath";
@@ -51,4 +51,48 @@ test("dashboard open breaks remain open with no fabricated checkout or undertime
   assert.equal(day.timeOut, null); assert.equal(day.milliseconds.underTime, 0);
   assert.equal(day.overBreakRows[0].endedAt, null); assert.equal(day.overBreakRows[0].isOpen, true);
   assert.equal(day.milliseconds.overBreak, 5 * 60_000);
+});
+
+test("shiftless legacy sessions retain every original event in the HR and Profile day group", () => {
+  const records: SessionEvent[] = [
+    ["Time In", "2026-10-12T15:00:00Z"], ["Break Out", "2026-10-12T17:00:00Z"],
+    ["Break In", "2026-10-12T17:15:00Z"], ["Off the Phone Out", "2026-10-12T18:00:00Z"],
+  ].map(([source, at], sequence) => ({ id: `legacy-${sequence}`, source: source as SessionEvent["source"],
+    at: new Date(at).toISOString(), sequence, commandId: "legacy", recordedAt: at, legacyReviewed: true }));
+  const projection = projectAttendance(records);
+  assert.equal(projection.sessions[0].shift, null);
+  const snapshot = { records: projection.effectiveEvents, sessions: projection.sessions }, before = JSON.stringify(snapshot);
+  const settings = { officialShiftStartTime: "23:00", officialShiftEndTime: "08:00", lateGraceMinutes: 0, attendanceTimeZone: "Asia/Manila" };
+  const groups = groupAttendanceByShiftDay(snapshot, settings);
+  const profile = attendanceDashboardPresentation(snapshot, policy, new Date("2026-10-13T01:00:00Z"));
+  assert.deepEqual(groups.get("2026-10-12")?.map(event => event.id), profile.dashboardDays[0].eventIds);
+  assert.equal(groups.get("2026-10-12")?.length, 4);
+  assert.equal(profile.dashboardDays[0].timeIn, records[0].at);
+  assert.equal(JSON.stringify(snapshot), before);
+});
+
+test("canonical overnight assignment wins over the checkout timestamp day", () => {
+  const shift = assignAttendanceShift(new Date("2026-10-13T15:00:00Z"));
+  const records: SessionEvent[] = [
+    { id: "assigned-in", source: "Time In", at: "2026-10-13T15:00:00.000Z", sequence: 1, commandId: "assigned", recordedAt: "2026-10-13T15:00:00.000Z", shift },
+    { id: "assigned-out", source: "Time Out", at: "2026-10-14T00:05:00.000Z", sequence: 2, commandId: "assigned", recordedAt: "2026-10-14T00:05:00.000Z", autoTimeOut: true },
+  ];
+  const projection = projectAttendance(records), before = JSON.stringify(projection);
+  const groups = groupAttendanceByShiftDay({ records: projection.effectiveEvents, sessions: projection.sessions },
+    { officialShiftStartTime: "23:00", officialShiftEndTime: "08:00", lateGraceMinutes: 0, attendanceTimeZone: "Asia/Manila" });
+  assert.deepEqual([...groups.keys()], ["2026-10-13"]);
+  assert.deepEqual(groups.get("2026-10-13")?.map(event => event.id), ["assigned-in", "assigned-out"]);
+  assert.equal(JSON.stringify(projection), before);
+});
+
+test("unpaired effective events remain visible but reversed events do not return", () => {
+  const records: SessionEvent[] = [
+    { id: "unpaired", source: "Break In", at: "2026-10-14T17:00:00.000Z", sequence: 1, commandId: "unpaired", recordedAt: "2026-10-14T17:00:00.000Z", legacyReviewed: true },
+    { id: "reversed", source: "Time In", at: "2026-10-15T15:00:00.000Z", sequence: 2, commandId: "reversed", recordedAt: "2026-10-15T15:00:00.000Z" },
+  ];
+  const projection = projectAttendance(records, [{ commandId: "undo", targets: ["reversed"], reason: "Synthetic", actor: "test", at: "2026-10-16T01:00:00.000Z" }]);
+  const groups = groupAttendanceByShiftDay({ records: projection.effectiveEvents, sessions: projection.sessions },
+    { officialShiftStartTime: "23:00", officialShiftEndTime: "08:00", lateGraceMinutes: 0, attendanceTimeZone: "Asia/Manila" });
+  assert.deepEqual([...groups.keys()], ["2026-10-14"]);
+  assert.deepEqual(groups.get("2026-10-14")?.map(event => event.id), ["unpaired"]);
 });

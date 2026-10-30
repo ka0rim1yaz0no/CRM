@@ -1,10 +1,10 @@
 import { attendanceAccuracyFixesEnabled } from "../config/rolloutFlags";
 
-export type AttendanceWorkerName = "auto-time-out" | "recovery" | "derived-refresh" | "policy-refresh" | "outbox";
+export type AttendanceWorkerName = "auto-time-out" | "recovery" | "derived-refresh" | "policy-refresh" | "outbox" | "coaching-return";
 export type WorkerCounters = { scanned: number; closed: number; failed: number; deliveryPending: number };
 type WorkerHealth = { name: AttendanceWorkerName; startedAt: string | null; lastRunAt: string | null; running: boolean;
   counters: WorkerCounters; lastErrorCode: string | null };
-const names: AttendanceWorkerName[] = ["auto-time-out", "recovery", "derived-refresh", "policy-refresh", "outbox"];
+const names: AttendanceWorkerName[] = ["auto-time-out", "recovery", "derived-refresh", "policy-refresh", "outbox", "coaching-return"];
 const empty = (): WorkerCounters => ({ scanned: 0, closed: 0, failed: 0, deliveryPending: 0 });
 const health = new Map<AttendanceWorkerName, WorkerHealth>(names.map(name => [name,
   { name, startedAt: null, lastRunAt: null, running: false, counters: empty(), lastErrorCode: null }]));

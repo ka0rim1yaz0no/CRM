@@ -10,6 +10,8 @@ import { payrollDeductionRows } from "../../../shared/payrollPresentation";
 import type { AttendanceLedgerDocument } from "../models/AttendanceLedger";
 import { accuratePayrollDay } from "./payrollAccuracy";
 import { currentEarnedPayrollRecords } from "./payrollEarningsRead";
+import { earnedPayrollVersion } from "../config/payrollEarnings";
+import { coachingShiftBilling } from "../../../shared/attendanceCoaching";
 
 const start = new Date("2026-10-26T15:00:00Z"), end = new Date("2026-10-27T00:00:00Z");
 const at = (minutes: number) => new Date(+start + minutes * 60_000);
@@ -18,6 +20,41 @@ const limit = { paidMinutes: 20, effectiveFrom: start.toISOString() };
 const policy = { shiftStart: start, shiftEnd: end, breakMinutes: 15, lunchMinutes: 60, graceMinutes: 0 };
 const previousLimit = process.env.CRM_OFF_PHONE_PAID_LIMIT_FROM;
 afterEach(() => { if (previousLimit === undefined) delete process.env.CRM_OFF_PHONE_PAID_LIMIT_FROM; else process.env.CRM_OFF_PHONE_PAID_LIMIT_FROM = previousLimit; });
+
+test("Coaching has a separate twenty-minute shift budget and can never become non-billable", () => {
+    const rows = [record("Time In", 0), record("Coaching Out", 10), record("Coaching In", 20),
+        record("Off the Phone Out", 30), record("Off the Phone In", 45), record("Time Out", 50),
+        record("Time In", 60), record("Coaching Out", 70)];
+    const original = structuredClone(rows);
+    const current = coachingShiftBilling(rows, start, end, at(75));
+    assert.equal(current.remainingPaidMs, 5 * 60_000);
+    assert.equal(current.active?.returnAt, at(80).toISOString());
+    assert.equal(offPhoneShiftBilling(rows, start, end, at(75), limit).remainingPaidMs, 5 * 60_000);
+    for (const now of [at(80), at(81), at(90), end, at(600)]) {
+        const view = coachingShiftBilling(rows, start, end, now);
+        assert.equal(view.totalMs, 20 * 60_000);
+        assert.equal(view.remainingPaidMs, 0);
+        assert.equal(view.active?.returnAt, at(80).toISOString());
+        assert.deepEqual(nonBillableOffPhoneIntervals(rows, start, end, now, limit), []);
+    }
+    assert.equal(coachingShiftBilling(rows, at(1440), at(1980), at(1450)).remainingPaidMs, 20 * 60_000);
+    assert.deepEqual(rows, original);
+});
+
+test("Coaching remains paid in earned payroll and an overdue server return does not create a deduction", () => {
+    process.env.CRM_OFF_PHONE_PAID_LIMIT_FROM = limit.effectiveFrom;
+    for (let business = 0; business < 6; business++) {
+        const rows = [record("Time In", 0), record("Coaching Out", 10), record("Coaching In", 35), record("Time Out", 60)];
+        const earned = earnedPayrollTime(rows, policy, end, 8);
+        assert.equal(earned.grossHours, 1);
+        assert.equal(earned.nonBillableOffPhoneMinutes, 0);
+        assert.equal(earned.workedHours, 1);
+        assert.equal(earned.deductibleMinutes, 0);
+    }
+    const nearEnd = coachingShiftBilling([record("Time In", 0), record("Coaching Out", 535)], start, end, at(545));
+    assert.equal(nearEnd.totalMs, 5 * 60_000);
+    assert.equal(nearEnd.active?.returnAt, end.toISOString());
+});
 
 test("the twenty-minute limit is shared across every normal off-phone episode in a shift", () => {
     const records = [record("Time In", 0), record("Off the Phone Out", 60), record("Off the Phone In", 70),
@@ -164,4 +201,60 @@ test("paid and completed saved payrolls stay frozen when the additional deductio
         if (previousEarned === undefined) delete process.env.CRM_EARNED_PAYROLL_FROM; else process.env.CRM_EARNED_PAYROLL_FROM = previousEarned;
         if (previousAll === undefined) delete process.env.CRM_EARNED_ALL_DEDUCTIONS_FROM; else process.env.CRM_EARNED_ALL_DEDUCTIONS_FROM = previousAll;
     }
+});
+
+test("excluding undertime and absence preserves attended hours and the Late, Break, Lunch and non-billable charges", () => {
+    process.env.CRM_OFF_PHONE_PAID_LIMIT_FROM = limit.effectiveFrom;
+    const rows = [record("Time In", 10), record("Break Out", 60), record("Break In", 76), record("Lunch Break Out", 180),
+        record("Lunch Break In", 241), record("Off the Phone Out", 300), record("Off the Phone In", 326), record("Time Out", 530)];
+    const old = earnedPayrollTime(rows, policy, end, 8, true), value = earnedPayrollTime(rows, policy, end, 8, true, true);
+    assert.equal(value.grossHours, old.grossHours); assert.equal(value.workedHours, old.workedHours);
+    assert.equal(value.lateMinutes, 10); assert.equal(value.earlyTimeOutMinutes, 10);
+    assert.equal(value.deductibleMinutes, 18);
+    assert.equal(value.deductibleMinutes, value.lateMinutes + value.excessBreakMinutes + value.excessLunchMinutes + value.nonBillableOffPhoneMinutes);
+    const absent = earnedPayrollTime([], policy, end, 8, true, true);
+    assert.equal(absent.absenceMinutes, 480); assert.equal(absent.deductibleMinutes, 0); assert.equal(absent.grossHours, 0);
+});
+
+test("the late-and-rest earned version never allocates cash to undertime or absence, including Edit Hours", () => {
+    const basis = { calculationVersion: "earned-hours-late-rest-v1", scheduledHours: 24, excessBreakMinutes: 1, excessLunchMinutes: 1,
+        nonBillableOffPhoneMinutes: 5, lateMinutes: 10, earlyTimeOutMinutes: 120, absenceMinutes: 480 };
+    const value = adjustedPayrollHours(basis, 420);
+    assert.equal(value.workedHours, 7); assert.equal(value.earnedGrossHours, 427 / 60); assert.equal(value.deductibleMinutes, 17);
+    const rows = payrollDeductionRows({ ...basis, deductions: 13.59 });
+    assert.equal(rows.length, 4); assert.ok(!rows.some(row => ["Undertime", "Absence"].includes(row.label)));
+    assert.equal(rows.reduce((sum, row) => sum + Math.round(row.amount * 100), 0), 1359);
+    assert.equal(rows.find(row => row.label === "Late")!.minutes, 10);
+    assert.throws(() => adjustedPayrollHours({ ...basis, lateMinutes: -1 }, 420), /shortfall/);
+});
+
+test("the exclusion policy is cutoff-scoped and leaves older earned versions unchanged until opted in", () => {
+    const names = ["CRM_EARNED_PAYROLL_FROM", "CRM_EARNED_ALL_DEDUCTIONS_FROM", "CRM_EARNED_EXCLUDE_UNDERTIME_ABSENCE_FROM"];
+    const prior = names.map(name => process.env[name]);
+    try {
+        process.env.CRM_EARNED_PAYROLL_FROM = "2026-10-06"; process.env.CRM_EARNED_ALL_DEDUCTIONS_FROM = "2026-10-06";
+        delete process.env.CRM_EARNED_EXCLUDE_UNDERTIME_ABSENCE_FROM;
+        assert.equal(earnedPayrollVersion("Oct 21, 2026 - Nov 5, 2026"), "earned-hours-all-deductions-v1");
+        process.env.CRM_EARNED_EXCLUDE_UNDERTIME_ABSENCE_FROM = "2026-10-21";
+        assert.equal(earnedPayrollVersion("Oct 6, 2026 - Oct 20, 2026"), "earned-hours-all-deductions-v1");
+        assert.equal(earnedPayrollVersion("Oct 21, 2026 - Nov 5, 2026"), "earned-hours-late-rest-v1");
+        assert.equal(earnedPayrollVersion("Nov 6, 2026 - Nov 20, 2026"), "earned-hours-late-rest-v1");
+        process.env.CRM_EARNED_EXCLUDE_UNDERTIME_ABSENCE_FROM = "invalid";
+        assert.throws(() => earnedPayrollVersion("Oct 21, 2026 - Nov 5, 2026"), /exclusion cutoff/);
+    } finally { names.forEach((name, index) => { if (prior[index] === undefined) delete process.env[name]; else process.env[name] = prior[index]; }); }
+});
+
+test("paid and completed all-deductions payrolls retain their original amounts and six cash categories after the new exclusion", async () => {
+    const names = ["CRM_EARNED_PAYROLL_FROM", "CRM_EARNED_ALL_DEDUCTIONS_FROM", "CRM_EARNED_EXCLUDE_UNDERTIME_ABSENCE_FROM"];
+    const prior = names.map(name => process.env[name]);
+    try {
+        for (const name of names) process.env[name] = "2026-10-21";
+        for (const status of ["Paid", "Completed"]) {
+            const record = { employeeId: "synthetic-frozen", payPeriod: "Oct 21, 2026 - Nov 5, 2026", status,
+                grossPay: 1000, deductions: 100, netPay: 900, paidOn: "Oct 28, 2026", calculationVersion: "earned-hours-all-deductions-v1",
+                lateMinutes: 1, earlyTimeOutMinutes: 1, absenceMinutes: 480, excessBreakMinutes: 1, excessLunchMinutes: 1, nonBillableOffPhoneMinutes: 1 };
+            const original = structuredClone(record), shown = (await currentEarnedPayrollRecords([record], record.payPeriod))[0];
+            assert.deepEqual(shown, original); assert.equal(payrollDeductionRows(shown).length, 6);
+        }
+    } finally { names.forEach((name, index) => { if (prior[index] === undefined) delete process.env[name]; else process.env[name] = prior[index]; }); }
 });

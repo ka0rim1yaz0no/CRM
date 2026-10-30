@@ -2,7 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import AdminLayout from "../adminLayout";
 import { getPayrollDtr, getPayrollRecords, type PayrollDtr, type PayrollRecord } from "../../../api/payroll";
 import { getActiveBusinessId } from "../../../api/businessStorage";
-import { payrollDeductionDisplayRows } from "../../../../shared/payrollPresentation";
+import { payrollDeductionDisplayRows, payrollDeductionDisplayTotal } from "../../../../shared/payrollPresentation";
 import { isEarnedPayrollVersion } from "../../../../shared/payrollEarnings";
 
 type PayrollComputeRow = {
@@ -87,7 +87,12 @@ function renderRecord({ record, dtr }: PayrollComputeRow) {
         `Gross pay = ${money(computed.regularPay)} + ${money(computed.approvedOtPay)} = ${money(computed.grossPay)}`,
         "",
         "DEDUCTIONS",
-        ...payrollDeductionDisplayRows(record).map(row => `${row.label}: ${row.minutes} min = ${row.amount === null ? row.note : money(row.amount)}`),
+        ...payrollDeductionDisplayRows(record).map(row => {
+            const amount = row.amount ?? row.informationalAmount;
+            return `${row.label}: ${row.minutes} min = ${amount === undefined ? "--" : money(amount)}${row.note ? `; ${row.note}` : ""}`;
+        }),
+        `Total displayed deductions = ${payrollDeductionDisplayTotal(record) === null ? "Unavailable" : money(payrollDeductionDisplayTotal(record)!)}`,
+        `Applied to net pay = ${money(computed.deductions)}`,
         `Attendance deduction hours = ${money(computed.deductions)} / ${money(computed.hourlyRate)} = ${hours(computed.deductionHours)}`,
         `Attendance deductions = ${hours(computed.deductionHours)} x ${money(computed.hourlyRate)} = ${money(computed.deductions)}`,
         "",

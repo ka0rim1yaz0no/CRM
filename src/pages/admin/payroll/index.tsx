@@ -1,5 +1,5 @@
 import type { FormEvent } from "react";
-import { payrollDeductionDisplayRows } from "../../../../shared/payrollPresentation";
+import { payrollDeductionDisplayRows, payrollDeductionDisplayTotal } from "../../../../shared/payrollPresentation";
 import { isEarnedPayrollVersion } from "../../../../shared/payrollEarnings";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
@@ -437,6 +437,7 @@ function PayslipDocument({
     const overtimePay = earnedBasis ? Math.round(overtimeHours * hourlyRate * 100) / 100 : Math.max(0, Math.round((record.grossPay - savedBasePay) * 100) / 100);
     const basePay = earnedBasis ? Math.round((record.grossPay - overtimePay) * 100) / 100 : savedBasePay;
     const deductionRows = payslipDeductionRows(record);
+    const displayedDeductionTotal = payrollDeductionDisplayTotal(record);
 
     return (
         <div className="payslip-print bg-white p-8 text-[11px] leading-tight text-slate-950">
@@ -521,16 +522,18 @@ function PayslipDocument({
                             </tr>
                         </thead>
                         <tbody>
-                            {deductionRows.map((item) => (
-                                <tr key={item.label}>
+                            {deductionRows.map((item) => {
+                                const displayedAmount = item.amount ?? item.informationalAmount;
+                                return <tr key={item.label}>
                                     <td className="border border-slate-200 px-3 py-2">{item.label}{item.label !== "Other saved deductions" && ` (${item.minutes} min)`}{item.note && <small className="mt-0.5 block text-[0.62rem] leading-snug text-slate-600">{item.note}</small>}</td>
-                                    <td className="border border-slate-200 px-3 py-2 text-right font-semibold">{item.amount === null ? "--" : money(item.amount)}</td>
-                                </tr>
-                            ))}
+                                    <td className="border border-slate-200 px-3 py-2 text-right font-semibold">{displayedAmount === undefined ? "--" : money(displayedAmount)}</td>
+                                </tr>;
+                            })}
                             <tr className="bg-slate-50">
-                                <td className="border border-slate-200 px-3 py-2 font-bold">Total Deductions ({record.deductibleMinutes ?? 0} min)</td>
-                                <td className="border border-slate-200 px-3 py-2 text-right font-bold">{money(record.deductions)}</td>
+                                <td className="border border-slate-200 px-3 py-2 font-bold">Total Deductions</td>
+                                <td className="border border-slate-200 px-3 py-2 text-right font-bold">{displayedDeductionTotal === null ? "Unavailable" : money(displayedDeductionTotal)}</td>
                             </tr>
+                            {displayedDeductionTotal !== record.deductions && <tr><td className="border border-slate-200 px-3 py-2">Applied to net pay ({record.deductibleMinutes ?? 0} min)</td><td className="border border-slate-200 px-3 py-2 text-right font-semibold">{money(record.deductions)}</td></tr>}
                         </tbody>
                     </table>
                 </div>
@@ -930,7 +933,7 @@ export default function PayrollPage() {
         { label: "Employees", value: String(rosterMode ? stats?.totalEmployees ?? payrollRows.length : stats?.recordedEmployees ?? stats?.totalEmployees ?? employees.length), icon: FiUsers },
         ...(rosterMode ? [{ label: "Generated", value: String(stats?.recordedEmployees ?? employees.length), icon: FiFileText }] : []),
         { label: "Gross", value: money(stats?.totalPayroll ?? 0), icon: FiBriefcase },
-        { label: "Deductions", value: money(stats?.totalDeductions ?? 0), icon: FiTarget },
+        { label: "Applied deductions", value: money(stats?.totalDeductions ?? 0), icon: FiTarget },
         { label: "Net", value: money(stats?.netPayroll ?? 0), icon: FiCreditCard },
         { label: "Paid", value: String(stats?.paidEmployees ?? 0), icon: FiCheckCircle },
     ];
@@ -1680,12 +1683,13 @@ export default function PayrollPage() {
                                                 ["Approved OT", formatHoursMinutes(dtrRecord.overtimeHours || 0)],
                                                 ["Hourly Rate", money(employeeDtr.summary.hourlyRate)],
                                                 ["Per Minute", money(employeeDtr.summary.minuteRate)],
-                                                ["Deductions", money(employeeDtr.summary.deductions)],
+                                                ["Total deductions", payrollDeductionDisplayTotal(employeeDtr.summary) === null ? "Unavailable" : money(payrollDeductionDisplayTotal(employeeDtr.summary)!)],
+                                                ["Applied to net pay", money(employeeDtr.summary.deductions)],
                                                 ["Net Pay", money(employeeDtr.summary.netPay)],
                                             ].map(([label, value]) => (
                                                 <div key={label} className="rounded-lg border border-slate-300 bg-slate-50 px-3 py-2.5">
                                                     <p className="text-[0.62rem] font-semibold uppercase tracking-[0.12em] !text-slate-500">{label}</p>
-                                                    <p className="mt-1 text-sm font-semibold !text-black">{employeeDtr.summary.earningsUnavailable && ["Net Pay", "Deductions", "Regular Hours"].includes(String(label)) ? "Unavailable" : value}</p>
+                                                    <p className="mt-1 text-sm font-semibold !text-black">{employeeDtr.summary.earningsUnavailable && ["Net Pay", "Total deductions", "Applied to net pay", "Regular Hours"].includes(String(label)) ? "Unavailable" : value}</p>
                                                 </div>
                                             ))}
                                         </div>
@@ -1693,10 +1697,15 @@ export default function PayrollPage() {
                                         {!employeeDtr.summary.earningsUnavailable && <section aria-label="Deduction breakdown" className="border-t border-slate-200 pt-4">
                                             <h3 className="text-sm font-semibold !text-black">Deduction breakdown</h3>
                                             <dl className="mt-2 grid gap-x-6 gap-y-2 sm:grid-cols-2">
-                                                {payrollDeductionDisplayRows(employeeDtr.summary).map(row => <div key={row.label} className="flex items-start justify-between gap-4 border-b border-slate-100 py-2 text-sm !text-black">
+                                                {payrollDeductionDisplayRows(employeeDtr.summary).map(row => {
+                                                    const displayedAmount = row.amount ?? row.informationalAmount;
+                                                    return <div key={row.label} className="flex items-start justify-between gap-4 border-b border-slate-100 py-2 text-sm !text-black">
                                                     <dt>{row.label} ({row.minutes} min){row.note && <small className="mt-0.5 block text-xs text-slate-600">{row.note}</small>}</dt>
-                                                    <dd className="shrink-0 font-semibold tabular-nums">{row.amount === null ? "--" : money(row.amount)}</dd>
-                                                </div>)}
+                                                    <dd className="shrink-0 text-right font-semibold tabular-nums">{displayedAmount === undefined ? "--" : money(displayedAmount)}</dd>
+                                                </div>;
+                                                })}
+                                                <div className="flex items-start justify-between gap-4 border-b border-slate-100 py-2 text-sm !text-black"><dt>Total deductions</dt><dd className="shrink-0 font-semibold tabular-nums">{payrollDeductionDisplayTotal(employeeDtr.summary) === null ? "Unavailable" : money(payrollDeductionDisplayTotal(employeeDtr.summary)!)}</dd></div>
+                                                <div className="flex items-start justify-between gap-4 border-b border-slate-100 py-2 text-sm !text-black"><dt>Applied to net pay</dt><dd className="shrink-0 font-semibold tabular-nums">{money(employeeDtr.summary.deductions)}</dd></div>
                                             </dl>
                                         </section>}
                                         <div className="overflow-hidden rounded-lg border border-slate-300">
@@ -1900,7 +1909,8 @@ export default function PayrollPage() {
                                 <div className="mt-4 grid gap-3 sm:grid-cols-3">
                                     {[
                                         ["Gross Pay", money(payslipPreviewRecord.grossPay)],
-                                        ["Deductions", money(payslipPreviewRecord.deductions)],
+                                        ["Total deductions", payrollDeductionDisplayTotal(payslipPreviewRecord) === null ? "Unavailable" : money(payrollDeductionDisplayTotal(payslipPreviewRecord)!)],
+                                        ["Applied to net pay", money(payslipPreviewRecord.deductions)],
                                         ["Net Pay", money(payslipPreviewRecord.netPay)],
                                     ].map(([label, value]) => (
                                         <div key={label} className="rounded-lg border border-white/10 bg-white/[0.055] px-4 py-3">

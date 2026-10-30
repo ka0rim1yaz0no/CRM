@@ -18,6 +18,7 @@ import { withAttendanceStatuses } from "../services/attendanceSnapshotPresentati
 import { attendanceDashboardPresentation } from "../services/attendanceDashboardPresentation";
 import { attendancePolicySyncPending, hasAttendancePolicyRefreshPending, runAttendancePolicyRefresh } from "../services/attendancePolicyRefreshWorker";
 import { deriveAttendanceDays } from "../services/attendanceDerived";
+import { readEmployeeAttendanceCalendar } from "./attendanceHubController";
 
 export function verifiedAttendanceActor(request: Request): AttendanceActor {
   const admin = verifyAdminDashboardSession(request.header("x-crm-admin-session"));
@@ -41,11 +42,21 @@ export async function getActiveAttendanceSession(request: Request, response: Res
     const policySyncPending = attendanceDurationModelEnabled() && attendancePolicySyncPending(ledger, policy.revision);
     const stored = attendanceSnapshot(ledger, new Date(), policy);
     const snapshot = withAttendanceStatuses({ ...stored, ...(policySyncPending ? { derived: deriveAttendanceDays(ledger, policy, new Date(stored.serverTime)), syncPending: true } : {}) }, policy.graceMinutes);
-    response.set("Cache-Control", "no-store").json({ ...snapshot, ...attendanceDashboardPresentation(snapshot, policy, new Date(snapshot.serverTime)), ...(actor.role === "admin" ? { policy } : {}),
+    response.set("Cache-Control", "no-store").json({ ...snapshot, ...attendanceDashboardPresentation(snapshot, policy, new Date(snapshot.serverTime)), ...(actor.role === "admin" ? { policy } : {}), profileCalendarEnabled: true,
       allowances: { breakMinutes: policy.breakMinutes, lunchMinutes: policy.lunchMinutes },
       autoTimeOutEnabled: attendanceIntegrityEnabled() && attendanceAutoTimeOutEnabled(), policySyncPending,
       recoveryEnabled: policy.recoveryEnabled || attendanceRecoveryEnvironmentEnabled(),
       resetDeadline: policy.recoveryEnabled || attendanceRecoveryEnvironmentEnabled() ? snapshot.assignedShift?.resetDeadline || null : null });
+  } catch (error) { attendanceError(response, error); }
+}
+export async function getEmployeeAttendanceCalendar(request: Request, response: Response) {
+  if (!attendanceActiveSessionEnabled()) { response.status(404).json({ message: "Attendance calendar is disabled." }); return; }
+  try {
+    const actor = verifiedAttendanceActor(request);
+    if (!Types.ObjectId.isValid(String(request.params.employeeId))) throw new AttendanceCommandError(400, "INVALID_EMPLOYEE", "Valid employee ID required.");
+    const identity = await resolveAttendanceIdentity(String(request.params.employeeId), actor);
+    const month = typeof request.query.month === "string" ? request.query.month : "";
+    response.set("Cache-Control", "no-store").json(await readEmployeeAttendanceCalendar(getCurrentBusinessId(), identity.code, month, new Date()));
   } catch (error) { attendanceError(response, error); }
 }
 export async function getAttendanceMigrationPreview(request: Request, response: Response) {

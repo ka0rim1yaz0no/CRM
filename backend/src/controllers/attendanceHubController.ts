@@ -17,6 +17,7 @@ import { AttendanceLedger } from "../models/AttendanceLedger";
 import { AttendanceCommandError, attendancePolicy } from "../services/attendanceLedgerService";
 import { attendanceNoteRevision, confirmAttendanceNote } from "../services/attendanceNoteCommand";
 import { projectAttendance } from "../services/attendanceSessionState";
+import { groupAttendanceByShiftDay } from "../services/attendanceDashboardPresentation";
 import { attendanceViewRange, manilaCalendarDate, type ShiftView } from "../../../shared/attendanceView";
 import { serverReadTime } from "../services/readSnapshot";
 import { attendanceWorkersSnapshot, attendanceWorkerFailure } from "../services/attendanceWorkerHealth";
@@ -192,8 +193,9 @@ async function loadHub(actor: Actor, filters: ReturnType<typeof assertQuery>, no
         if (key) rememberHistory(business.id, key);
       }
       if (projection) {
+        const byShiftDay = groupAttendanceByShiftDay({ records: projection.effectiveEvents, sessions: projection.sessions }, settings);
         for (const key of dayKeys(filters.from, filters.to)) {
-          const effective = projection.sessions.filter((item) => item.shift?.dayKey === key).flatMap((session) => session.events);
+          const effective = byShiftDay.get(key) || [];
           eventMap.set(`${employee._id}:${key}`, effective.map((event) => ({ id: event.id, eventId: event.id, source: event.source, at: new Date(event.at), sequence: event.sequence, autoTimeOut: event.autoTimeOut })));
         }
       }
@@ -392,6 +394,19 @@ export async function readDashboardAttendanceSummary(business: string, from: str
   const filters = assertQuery({ preset: "custom", from, to, business, employee }, now);
   const loaded = await loadHub({ role: "admin", code: adminCode }, filters, now);
   return totals(loaded.rows);
+}
+// Callers must first resolve the signed employee's identity in this business.
+export async function readEmployeeAttendanceCalendar(business: string, employeeCode: string, month: string, now: Date) {
+  if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(month) || Number(month.slice(0, 4)) < 1900) {
+    throw new AttendanceCommandError(422, "INVALID_CALENDAR_MONTH", "Choose a valid attendance month.");
+  }
+  const from = `${month}-01`;
+  const to = new Date(Date.UTC(Number(month.slice(0, 4)), Number(month.slice(5)), 0)).toISOString().slice(0, 10);
+  const filters = assertQuery({ preset: "custom", from, to, business }, now);
+  const loaded = await loadHub({ role: "employee", code: employeeCode }, filters, now, business);
+  return { month, serverTime: now.toISOString(), days: loaded.rows
+    .filter(row => row.employeeCode === employeeCode && (row.absent || row.excused))
+    .map(row => ({ dayKey: row.dayKey, shiftEnd: row.shiftEnd, absent: row.absent, excused: row.excused, attendanceRevision: row.attendanceRevision })) };
 }
 export const getHubDay = (request: Request, response: Response) => handleHubRead(request, response, "day");
 

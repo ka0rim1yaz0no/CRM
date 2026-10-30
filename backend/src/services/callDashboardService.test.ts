@@ -183,6 +183,27 @@ test("v2 starts a pending-dial online timer when the dial begins", () => {
   }
 });
 
+test("a persistent untracked audio stream is not presented as confirmed multi-hour call time", () => {
+  const previous = process.env.CRM_CALL_DASHBOARD_V2;
+  process.env.CRM_CALL_DASHBOARD_V2 = "true";
+  try {
+    const start = at("2026-10-28T17:00:00Z"), now = at("2026-10-28T19:30:00Z");
+    const base = { availabilityStatus: "ONLINE", attendance: [{ source: "Time In", timeIn: at("2026-10-28T15:00:00Z") }],
+      now, shift: { start: at("2026-10-28T15:00:00Z"), end: at("2026-10-29T00:00:00Z") },
+      devices: [{ bridgeVersion: "0.4.2", state: "active", audioSessionActive: true, nextivaProcessDetected: true,
+        lastSeenAt: now, lastStateChangedAt: start, lastIdleAt: at("2026-10-28T16:59:58Z") }],
+      schedule: { lastCallStartedAt: start } };
+    const before = JSON.stringify(base), unverified = callDashboardStatus(base);
+    assert.equal(unverified.status, "UNVERIFIED"); assert.equal(unverified.statusStartedAt, null);
+    assert.equal(JSON.stringify(base), before, "display uncertainty never ends or clears a call");
+    const tracked = callDashboardStatus({ ...base, schedule: { ...base.schedule, lastDialStartedAt: at("2026-10-28T16:59:59Z") } });
+    assert.equal(tracked.status, "ON CALL", "a genuinely tracked long call is not forcibly stopped");
+    assert.equal(tracked.statusStartedAt?.toISOString(), start.toISOString());
+  } finally {
+    if (previous === undefined) delete process.env.CRM_CALL_DASHBOARD_V2; else process.env.CRM_CALL_DASHBOARD_V2 = previous;
+  }
+});
+
 test("bridge availability timestamp changes only when readiness or connectivity changes", () => {
   const previous = { state: "idle", nextivaProcessDetected: true,
     lastSeenAt: at("2026-10-15T16:52:10Z"),

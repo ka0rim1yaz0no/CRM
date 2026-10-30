@@ -68,7 +68,7 @@ export default function CallDashboardPanel({ businessId, businessName }: { busin
     const { data, isLoading, isError } = useQuery({
         queryKey: ["admin-call-dashboard", businessId],
         queryFn: async () => {
-            const snapshot = { ...(await getCallDashboard()), receivedAt: performance.now() };
+            const snapshot = { ...(await getCallDashboard(businessId)), receivedAt: performance.now() };
             const previous = queryClient.getQueryData<typeof snapshot>(["admin-call-dashboard", businessId]);
             return previous && new Date(previous.generatedAt).getTime() > new Date(snapshot.generatedAt).getTime()
                 ? previous : snapshot;
@@ -198,7 +198,7 @@ export default function CallDashboardPanel({ businessId, businessName }: { busin
                                     </div>
                                 </td>
                                 <td className="px-4 py-2.5">
-                                    <span title={visible.detail} className={`inline-flex rounded-md border px-2 py-1 text-xs font-semibold ${statusClasses(visible.status)}`}>{visible.status === "OFF THE PHONE" && row.offPhoneNonBillable ? "NON-BILLABLE OFF PHONE" : visible.status}</span>
+                                    <span title={visible.detail} className={`inline-flex rounded-md border px-2 py-1 text-xs font-semibold ${statusClasses(visible.status)}`}>{visible.status === "OFF THE PHONE" && row.offPhoneNonBillable ? "NON-BILLABLE OFF PHONE" : visible.status === "OFF THE PHONE" && row.coachingActive ? "COACHING" : visible.status}</span>
                                 </td>
                                 <td className="px-4 py-2.5 text-right font-mono text-sm tabular-nums" title={statusTimeTitle}>{statusTime}</td>
                                 <td className="px-4 py-2.5 text-right font-mono text-sm tabular-nums">{offPhoneTime}</td>
@@ -224,7 +224,7 @@ export default function CallDashboardPanel({ businessId, businessName }: { busin
                                 </div>
                             </div>
                             <span title={visible.detail} className={`inline-flex max-w-[9rem] shrink-0 rounded-md border px-2 py-1 text-xs font-semibold ${statusClasses(visible.status)}`}>
-                                {visible.status === "OFF THE PHONE" && row.offPhoneNonBillable ? "NON-BILLABLE OFF PHONE" : visible.status}
+                                {visible.status === "OFF THE PHONE" && row.offPhoneNonBillable ? "NON-BILLABLE OFF PHONE" : visible.status === "OFF THE PHONE" && row.coachingActive ? "COACHING" : visible.status}
                             </span>
                         </div>
                         <dl className="mt-3 grid grid-cols-2 gap-3 rounded-md border border-slate-200 bg-slate-50 p-3">

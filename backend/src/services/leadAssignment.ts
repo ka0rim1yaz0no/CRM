@@ -46,7 +46,8 @@ export async function uniquelyOwnedLegacyNames(employeeId: string, names: string
     });
 }
 
-type Snapshot = { _id: Types.ObjectId; assignedAgent?: Types.ObjectId | null; assignedAgentName?: string; assignmentRevision?: number; status?: LeadDocument["status"] };
+type Snapshot = { _id: Types.ObjectId; assignedAgent?: Types.ObjectId | null; assignedAgentName?: string; assignmentRevision?: number; status?: LeadDocument["status"];
+    phone?: string; followUpAt?: LeadDocument["followUpAt"]; comments?: LeadDocument["comments"] };
 export function assignmentSnapshotFilter(lead: Snapshot) {
     return { _id: lead._id, assignedAgent: lead.assignedAgent || null, assignedAgentName: lead.assignedAgentName === undefined ? { $exists: false } : lead.assignedAgentName,
         status: lead.status,
@@ -73,8 +74,9 @@ export async function invalidateUnstartedLeadReservations(leadIds: string[]) {
 
 // Dispatch and reassignment contend on the same lead document. A transfer after
 // dispatch has committed must not terminate that already-authorized telephone call.
-export async function withLeadDispatchOwnership<T>(leadId: string, employeeId: string, operation: (session: ClientSession) => Promise<T>, phoneReservation?: { employeeCode: string; attemptId: string }) {
-    return mongoose.connection.transaction(async session => {
+class DispatchGuardRejected extends Error {}
+export async function withLeadDispatchOwnership<T>(leadId: string, employeeId: string, operation: (session: ClientSession) => Promise<T>, phoneReservation?: { employeeCode: string; attemptId: string }, attendanceGuard?: (session: ClientSession, lead: Snapshot) => Promise<boolean>) {
+    try { return await mongoose.connection.transaction(async session => {
         const lead = await Lead.findById(leadId).session(session).lean();
         if (!lead || lead.status === "Archived") return null;
         const owner = lead.assignedAgent ? String(lead.assignedAgent) === employeeId : await (async () => {
@@ -82,9 +84,12 @@ export async function withLeadDispatchOwnership<T>(leadId: string, employeeId: s
             return employee && (await uniquelyOwnedLegacyNames(employeeId, [employee.name, employee.employeeCode, ...(employee.aliases || [])])).includes(lead.assignedAgentName);
         })();
         if (!owner) return null;
-        if (leadPhoneDedupEnabled() && (!phoneReservation || !await consumePhoneSlot(lead.phone, phoneReservation.employeeCode, phoneReservation.attemptId, session))) return null;
+        if (attendanceGuard && !await attendanceGuard(session, lead)) throw new DispatchGuardRejected();
+        if (leadPhoneDedupEnabled() && (!phoneReservation || !await consumePhoneSlot(lead.phone, phoneReservation.employeeCode, phoneReservation.attemptId, session))) throw new DispatchGuardRejected();
         const locked = await Lead.updateOne(assignmentSnapshotFilter(lead), { $inc: { callingDispatchRevision: 1 } }, { session, timestamps: false });
-        if (!locked.modifiedCount) return null;
-        return operation(session);
-    });
+        if (!locked.modifiedCount) throw new DispatchGuardRejected();
+        const result = await operation(session);
+        if (result === null) throw new DispatchGuardRejected();
+        return result;
+    }); } catch (error) { if (error instanceof DispatchGuardRejected) return null; throw error; }
 }

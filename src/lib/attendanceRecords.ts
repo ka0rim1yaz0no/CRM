@@ -51,7 +51,7 @@ export function buildOffPhoneAttendanceSessions(
     chronologicalRecords.forEach((record) => {
         const recordTime = attendanceTimestamp(record);
 
-        if (isOffPhoneStart(record.source)) {
+        if (isOffPhoneStart(record.source) || record.source === "Coaching Out") {
             if (openRecord) {
                 closeOpenSession(record, recordTime, false);
             }
@@ -59,7 +59,7 @@ export function buildOffPhoneAttendanceSessions(
             return;
         }
 
-        if (record.source === "Off the Phone In" && openRecord) {
+        if ((record.source === "Off the Phone In" || record.source === "Coaching In") && openRecord) {
             closeOpenSession(record, recordTime, false);
             return;
         }

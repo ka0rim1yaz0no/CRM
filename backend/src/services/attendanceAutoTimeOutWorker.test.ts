@@ -127,6 +127,17 @@ test("07:59 Manila never closes a shift; opening the session snapshot is read-on
   assert.deepEqual(store, before);
 });
 
+test("catch-up checkout preserves the earlier billable Coaching boundary without non-billable conversion", async () => {
+  store.events.push(event("Coaching Out", "2026-10-15T23:30:00Z", 1));
+  const original = copy(store.events);
+  assert.equal(await runAttendanceAutoTimeOut(now("00:05:00"), noDelivery), 1);
+  assert.deepEqual(store.events.slice(0, original.length), original);
+  assert.deepEqual(store.events.slice(-2).map(item => [item.source, item.at]), [
+    ["Coaching In", "2026-10-15T23:50:00.000Z"], ["Time Out", cutoff],
+  ]);
+  assert.equal(store.derived?.[0].nonBillableOffPhoneMinutes, 0);
+});
+
 for (const [out, incoming] of [["Break Out", "Break In"], ["Lunch Break Out", "Lunch Break In"], ["Off the Phone Out", "Off the Phone In"]] as const) {
   test(`closes open ${out} before Time Out at the same cutoff, in sequence`, async () => {
     store.events.push(event(out, "2026-10-15T23:45:00Z", 1));

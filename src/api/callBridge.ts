@@ -2,6 +2,7 @@ import { getActiveBusinessId } from "./businessStorage";
 import { api } from "../lib/api";
 import { backendOrigin } from "../lib/backendUrl";
 import { CALLING_QUEUE_POLICY_VERSION } from "../../shared/leadCallingPolicy";
+import type { Lead } from "./leads";
 
 export type CallBridgeState = "offline" | "unknown" | "idle" | "calling" | "active";
 
@@ -26,7 +27,21 @@ export type CallBridgeStatus = {
     postCallWaitMs?: number;
     observedAttemptId?: string | null;
     observedLeadId?: string | null;
+    deadlineDispatchEnabled?: boolean;
+    deadlinePreparationMs?: number;
 };
+
+export async function prepareCallBridgeDeadline(employeeCode: string, options: {businessId: string; employeeSession: string;
+    attemptId: string; notBefore: string; signal: AbortSignal; timeoutMs: number}) {
+    const browserSession = readBrowserSession();
+    const response = await api.post<{startedAt: string; serverTime: string; dialIntentUntil: string; alreadyStarted: boolean;
+        reservationToken: string; leadId: string; normalizedPhone: string; lead: Lead | null}>("/call-bridge/dial-at-deadline",
+        {employeeCode, attemptId: options.attemptId, notBefore: options.notBefore, browserDeviceKey: getStoredBrowserDeviceKey(),
+            browserSessionId: browserSession?.employeeCode === employeeCode && browserSession.businessId === options.businessId ? browserSession.sessionId : ""},
+        {signal: options.signal, timeout: options.timeoutMs,
+            headers: {...autoCallClientHeaders, "X-Business-Id": options.businessId, "X-CRM-Attendance-Session": options.employeeSession}});
+    return response.data;
+}
 
 export type CallBridgePairing = {
     pairingCode: string;

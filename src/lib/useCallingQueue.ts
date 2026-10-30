@@ -16,7 +16,8 @@ export function useCallingQueue(input: CallingScope, enabled = true) {
     const scope = useMemo(() => ({ employeeId: input.employeeId, businessId: input.businessId }), [input.employeeId, input.businessId]);
     const client = useQueryClient();
     const query = useQuery({ queryKey: callingQueueKey(scope), queryFn: () => fetchCallingQueue(scope, getAuthUser()?.attendanceHubSession || undefined),
-        enabled: enabled && Boolean(scope.employeeId && scope.businessId), refetchInterval: 5000, refetchOnWindowFocus: true, refetchOnReconnect: true });
+        enabled: enabled && Boolean(scope.employeeId && scope.businessId), retry: false, networkMode: "always",
+        refetchInterval: 5000, refetchOnWindowFocus: true, refetchOnReconnect: true });
     useEffect(() => {
         if (!enabled || !scope.employeeId || !scope.businessId) return;
         const refresh = () => { void client.invalidateQueries({ queryKey: callingQueueKey(scope) }, { cancelRefetch: false }); };

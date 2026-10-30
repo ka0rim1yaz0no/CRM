@@ -28,6 +28,8 @@ const attendanceSources: AttendanceSource[] = [
   "Off the Phone Out",
   "Non-Billable Off the Phone Out",
   "Off the Phone In",
+  "Coaching Out",
+  "Coaching In",
 ];
 const timeInSources: AttendanceSource[] = ["Login", "Time In"];
 const timeOutSources: AttendanceSource[] = ["Logout", "Time Out"];

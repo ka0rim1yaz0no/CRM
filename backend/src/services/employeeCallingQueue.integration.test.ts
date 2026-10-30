@@ -23,6 +23,8 @@ const { Lead } = await import("../models/Lead");
 const { getCallBridgeDeviceModel, getCallBridgeScheduleModel } = await import("../models/CallBridge");
 const { setBusinessAccessForEmployeeCode } = await import("../models/BusinessUserAccess");
 const { createAttendanceHubSession } = await import("../config/attendanceHubSession");
+const { getAttendanceBusinessIdentity } = await import("../models/BusinessUserAccess");
+const { AttendanceLedger } = await import("../models/AttendanceLedger");
 const { CALLING_QUEUE_POLICY_VERSION } = await import("../../../shared/leadCallingPolicy");
 let mongo: MongoMemoryReplSet, server: http.Server, base = "";
 before(async () => {
@@ -44,6 +46,11 @@ beforeEach(async () => {
 async function fixture(business = businesses[0], code = `synthetic-${crypto.randomUUID()}`) {
     await setBusinessAccessForEmployeeCode(code, businesses);
     const employee = await runWithBusiness(business, () => Employee.create({ name: code, employeeCode: code, role: "Sales", status: "Active", availabilityStatus: "ONLINE" }));
+    const identity = await getAttendanceBusinessIdentity(code);
+    assert.ok(identity);
+    const at = new Date(+now - 100000).toISOString();
+    await AttendanceLedger.updateOne({ _id: `access:${identity.id}` }, { $setOnInsert: { employeeCode: code, canonicalBusinessId: business, businessIds: businesses,
+        revision: 1, events: [{ id: crypto.randomUUID(), source: "Time In", at, recordedAt: at, commandId: crypto.randomUUID(), sequence: 1 }] } }, { upsert: true });
     const bridgeToken = crypto.randomBytes(24).toString("hex");
     await getCallBridgeDeviceModel().findOneAndUpdate({ employeeCode: code, deviceId: code }, { $set: { employeeCode: code, employeeName: code,
         deviceName: "Synthetic device", deviceId: code, tokenHash: crypto.createHash("sha256").update(bridgeToken).digest("hex"), businessIds: businesses,
@@ -62,6 +69,24 @@ type TestQueue = { nextLeadId: string | null; version: string; nextDecision: { n
 type QueueEntry = { leadId: string; reason: string; callable: boolean };
 const reservation = (code: string, queue: TestQueue, id = queue.nextLeadId, attemptId = crypto.randomUUID()) => ({ employeeCode: code, leadId: id,
     attemptId, queueVersion: queue.version, normalizedPhone: queue.nextDecision?.normalizedPhone });
+
+test("release conflicts distinguish protected calls from obsolete ownership and never clear either reservation", async context => {
+    context.mock.timers.enable({ apis: ["Date"], now });
+    try {
+        const f = await fixture(); await f.add();
+        const q = (await f.queue()).callingQueue, body = reservation(f.code, q);
+        const accepted = await f.request("/call-bridge/reserve", body); assert.equal(accepted.status, 200);
+        const token = (await accepted.json()).reservationToken;
+        const before = JSON.stringify(await getCallBridgeScheduleModel().findOne({ employeeCode: f.code }).lean());
+        const wrong = await f.request("/call-bridge/release", { employeeCode: f.code, leadId: q.nextLeadId, reservationToken: crypto.randomUUID() });
+        assert.equal(wrong.status, 409); assert.equal((await wrong.json()).code, "CALL_RESERVATION_MISMATCH");
+        assert.equal(JSON.stringify(await getCallBridgeScheduleModel().findOne({ employeeCode: f.code }).lean()), before);
+        await getCallBridgeDeviceModel().updateOne({ employeeCode: f.code }, { $set: { state: "active", audioSessionActive: true } });
+        const blocked = await f.request("/call-bridge/release", { employeeCode: f.code, leadId: q.nextLeadId, reservationToken: token });
+        assert.equal(blocked.status, 409); assert.equal((await blocked.json()).code, "CALL_ACTIVE_RELEASE_BLOCKED");
+        assert.equal(JSON.stringify(await getCallBridgeScheduleModel().findOne({ employeeCode: f.code }).lean()), before);
+    } finally { context.mock.timers.reset(); }
+});
 
 test("six businesses share one deterministic due/NEW/follow-up queue and preserve visible waiting rows", async context => {
     context.mock.timers.enable({ apis: ["Date"], now });

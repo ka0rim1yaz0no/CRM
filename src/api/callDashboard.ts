@@ -9,7 +9,7 @@ export type CallDashboardRow = {
     businessName: string;
     role: string;
     team: string;
-    status: "ON CALL" | "ONLINE" | "READY" | "OFFLINE" | "CALL WAITING" | "OFF THE PHONE" | "BREAK" | "LUNCH";
+    status: "ON CALL" | "ONLINE" | "READY" | "OFFLINE" | "CALL WAITING" | "OFF THE PHONE" | "BREAK" | "LUNCH" | "UNVERIFIED";
     statusStartedAt: string | null;
     transitionUntil: string | null;
     detail: string;
@@ -17,6 +17,7 @@ export type CallDashboardRow = {
     offPhoneActiveStartedAt: string | null;
     offPhoneTotalMs: number;
     offPhoneNonBillable?: boolean;
+    coachingActive?: boolean;
     offPhoneNonBillableFrom?: string | null;
     timeBucketsMs?: { online: number; break: number; lunch: number; offPhone: number; offline: number };
     breakRemainingMs?: number | null;
@@ -38,10 +39,13 @@ export type CallDashboardSnapshot = {
     employees: CallDashboardRow[];
 };
 
-export async function getCallDashboard() {
+export async function getCallDashboard(businessId?: string) {
     const auth = getAuthUser();
     const response = await api.get<CallDashboardSnapshot>("/call-dashboard", {
-        headers: auth?.userType === "admin" && auth.sessionToken ? { "X-CRM-Admin-Session": auth.sessionToken } : {},
+        timeout: 10000,
+        headers: { ...(auth?.userType === "admin" && auth.sessionToken ? { "X-CRM-Admin-Session": auth.sessionToken } : {}),
+            ...(businessId ? { "X-Business-Id": businessId } : {}) },
     });
+    if (businessId && response.data.business.id !== businessId) throw new Error("Call Dashboard business changed. Refreshing the selected business.");
     return response.data;
 }

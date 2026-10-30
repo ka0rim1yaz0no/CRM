@@ -13,6 +13,7 @@ import { assertCredentialEncryptionConfiguration } from "./services/credentialEn
 import { assertAttendanceFlagConfiguration } from "./config/attendanceFlags";
 import { applyLeadWorkspaceSwitch } from "./config/leadWorkspaceRuntime";
 import { startPayrollGenerationWorker } from "./services/payrollGenerationWorker";
+import { startAttendanceCoachingWorker } from "./services/attendanceCoachingWorker";
 
 assertAttendanceFlagConfiguration();
 const port = Number(process.env.PORT || 4000);
@@ -28,6 +29,8 @@ const app = createApp();
 const httpServer = createServer(app);
 
 createSocketServer(httpServer);
+// Coaching's return deadline must not depend on the optional general worker group.
+startAttendanceCoachingWorker();
 let workersStarted = false;
 const startWorkers = () => {
   if (workersStarted) return;

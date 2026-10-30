@@ -48,8 +48,8 @@ export function evaluateCallingLead(lead: CallingPolicyLead, now: Date): Calling
     return { callable: true, reason, priority: reason === "SCHEDULED_DUE" ? 0 : reason === "NEW" ? 1 : 2, nextEligibleAt: null };
 }
 
-export function compareCallingLeads(a: CallingPolicyLead, b: CallingPolicyLead, now: Date) {
-    const first = evaluateCallingLead(a, now), second = evaluateCallingLead(b, now);
+export function compareCallingLeads(a: CallingPolicyLead, b: CallingPolicyLead, now: Date,
+    first = evaluateCallingLead(a, now), second = evaluateCallingLead(b, now)) {
     if (first.priority !== second.priority) return first.priority - second.priority;
     if (first.reason === "SCHEDULED_DUE" && second.reason === "SCHEDULED_DUE") {
         const due = time(a.followUpAt) - time(b.followUpAt);

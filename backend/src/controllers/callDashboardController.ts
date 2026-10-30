@@ -12,6 +12,7 @@ import { verifyAdminDashboardSession } from "../config/adminDashboardSession";
 import { CallBridgeObservation } from "../models/CallBridgeObservation";
 import { groupDashboardSnapshots, type DashboardSnapshot } from "../services/callDashboardAggregation";
 import { offPhoneNonBillableAt, offPhoneShiftBilling } from "../../../shared/attendanceOffPhone";
+import { coachingShiftBilling } from "../../../shared/attendanceCoaching";
 import { offPhoneLimitPolicy } from "../config/payrollEarnings";
 
 async function getCallDashboardForBusiness(request: Request, response: Response) {
@@ -85,13 +86,15 @@ async function getCallDashboardForBusiness(request: Request, response: Response)
     const heartbeatAgeMs = latestDevice ? Math.max(0, now.getTime() - latestDevice.lastSeenAt.getTime()) : null;
     const employeeCalls = observations.filter((observation) => observation.employeeCode === code);
     const billing = offPhoneShiftBilling(events, shift.start, shift.end, now, offPhoneLimitPolicy());
+    const coaching = coachingShiftBilling(events, shift.start, shift.end, now);
     return {
       employeeId: String(group.employee._id), employeeCode: code, name: group.employee.name || code,
       businessId: group.businesses[0]?.id || "", businessName: group.businesses[0]?.name || "",
       businesses: group.businesses, businessBreakdown, role: group.employee.role, team: group.employee.team,
       ...status, timeBucketsMs: accounted.milliseconds,
-      offPhoneNonBillable: status.status === "OFF THE PHONE" && offPhoneNonBillableAt(billing, +now),
-      offPhoneNonBillableFrom: status.status === "OFF THE PHONE" ? billing.active?.nonBillableFrom ?? null : null,
+      coachingActive: status.status === "OFF THE PHONE" && Boolean(coaching.active),
+      offPhoneNonBillable: status.status === "OFF THE PHONE" && !coaching.active && offPhoneNonBillableAt(billing, +now),
+      offPhoneNonBillableFrom: status.status === "OFF THE PHONE" && !coaching.active ? billing.active?.nonBillableFrom ?? null : null,
       offPhoneCompletedMs: offPhone.completedMs, offPhoneActiveStartedAt: offPhone.activeStartedAt,
       offPhoneTotalMs: accounted.milliseconds.offPhone,
       breakRemainingMs: accounted.remainingBreakMs, lunchRemainingMs: accounted.remainingLunchMs,
@@ -172,7 +175,7 @@ export async function getCallDashboard(request: Request, response: Response) {
           employee: { $in: employeeIds },
           isArchived: { $ne: true },
           timeIn: { $lte: now },
-          source: { $in: ["Time In", "Login", "Break In", "Lunch Break In", "Off the Phone In", "Time Out", "Logout", "Break Out", "Lunch Break Out", "Off the Phone Out", "Non-Billable Off the Phone Out"] },
+          source: { $in: ["Time In", "Login", "Break In", "Lunch Break In", "Off the Phone In", "Coaching Out", "Coaching In", "Time Out", "Logout", "Break Out", "Lunch Break Out", "Off the Phone Out", "Non-Billable Off the Phone Out"] },
         },
       },
       { $sort: { timeIn: -1 as const } },
@@ -220,6 +223,7 @@ export async function getCallDashboard(request: Request, response: Response) {
       ? { ...status, detail: autoCallDisabledReason }
       : status;
     const billing = offPhoneShiftBilling(employeeAttendance, shift.start, shift.end, now, offPhoneLimitPolicy());
+    const coaching = coachingShiftBilling(employeeAttendance, shift.start, shift.end, now);
 
     return {
       employeeId: String(employee._id),
@@ -230,8 +234,9 @@ export async function getCallDashboard(request: Request, response: Response) {
       role: employee.role,
       team: employee.team,
       ...dashboardStatus,
-      offPhoneNonBillable: dashboardStatus.status === "OFF THE PHONE" && offPhoneNonBillableAt(billing, +now),
-      offPhoneNonBillableFrom: dashboardStatus.status === "OFF THE PHONE" ? billing.active?.nonBillableFrom ?? null : null,
+      coachingActive: dashboardStatus.status === "OFF THE PHONE" && Boolean(coaching.active),
+      offPhoneNonBillable: dashboardStatus.status === "OFF THE PHONE" && !coaching.active && offPhoneNonBillableAt(billing, +now),
+      offPhoneNonBillableFrom: dashboardStatus.status === "OFF THE PHONE" && !coaching.active ? billing.active?.nonBillableFrom ?? null : null,
       offPhoneCompletedMs: offPhone.completedMs,
       offPhoneActiveStartedAt: offPhone.activeStartedAt,
       offPhoneTotalMs: offPhone.totalMs,

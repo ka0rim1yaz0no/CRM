@@ -12,10 +12,16 @@ import { AUTO_CALL_COMMENT_COOLDOWN_MS, CALLING_QUEUE_POLICY_VERSION, callingWin
 export type CallingEmployee = { _id: unknown; employeeCode: string; name?: string; aliases?: string[] };
 type Candidate = CallingPolicyLead & { _id: Types.ObjectId; phone?: string; updatedAt?: Date };
 export type CallingQueueEntry = CallingDecision & { leadId: string; normalizedPhone: string | null };
+const normalizedPhones = new Map<string, string | null>();
 
 export function normalizeCallingPhone(phone: unknown) {
-    const parsed = parsePhoneNumberFromString(String(phone || "").trim(), "US");
-    return parsed?.isValid() ? String(parsed.number) : null;
+    const text = String(phone || "").trim();
+    if (normalizedPhones.has(text)) return normalizedPhones.get(text)!;
+    const parsed = parsePhoneNumberFromString(text, "US");
+    const value = parsed?.isValid() ? String(parsed.number) : null;
+    if (normalizedPhones.size >= 65536) normalizedPhones.clear();
+    normalizedPhones.set(text, value);
+    return value;
 }
 
 const commentSummary = {
@@ -26,7 +32,7 @@ const summarize = (latest: Date | null, invalid: boolean) => invalid
     ? [{ authorType: "employee", createdAt: null }]
     : latest ? [{ authorType: "employee", createdAt: latest }] : [];
 
-export async function employeeCallingQueue(employee: CallingEmployee, businessId: string, now = new Date()) {
+export async function employeeCallingQueue(employee: CallingEmployee, businessId: string, now = new Date(), freshPhoneFacts = false) {
     const names = [...new Set([employee.name, employee.employeeCode, ...(employee.aliases || [])].filter((name): name is string => Boolean(name)))];
     const legacyNames = await uniquelyOwnedLegacyNames(String(employee._id), names);
     const escaped = legacyNames.map(name => new RegExp(`^${name.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i"));
@@ -54,13 +60,15 @@ export async function employeeCallingQueue(employee: CallingEmployee, businessId
         comments.push(...summarize(fact.latest, fact.invalid));
         commentsByDigits.set(digits, comments);
     }
-    const canonicalIds = leadPhoneDedupEnabled() ? (await leadPhoneCanonicalSnapshot(now)).ids : null;
+    const canonicalIds = leadPhoneDedupEnabled() ? (await leadPhoneCanonicalSnapshot(now, freshPhoneFacts)).ids : null;
     const candidates: Candidate[] = facts.filter(fact => !canonicalIds || canonicalIds.has(String(fact._id))).map(fact => ({ ...fact, comments: summarize(fact.latest, fact.invalid) }));
     const busyPhones = canonicalIds ? await busyPhonesForEmployee(candidates.flatMap(lead => normalizeCallingPhone(lead.phone) || []), employee.employeeCode, now) : new Set<string>();
     const decisions = new Map<string, CallingQueueEntry>();
+    const policyDecisions = new Map<string, CallingDecision>();
     for (const lead of candidates) {
         const normalizedPhone = normalizeCallingPhone(lead.phone);
         let decision = evaluateCallingLead(lead, now);
+        policyDecisions.set(String(lead._id), decision);
         if (!normalizedPhone) decision = { callable: false, reason: "INVALID_PHONE", priority: 9, nextEligibleAt: null };
         else if (busyPhones.has(normalizedPhone)) decision = { callable: false, reason: "PHONE_IN_USE", priority: 9, nextEligibleAt: null };
         if (decision.callable) {
@@ -75,7 +83,7 @@ export async function employeeCallingQueue(employee: CallingEmployee, businessId
     }
     candidates.sort((a, b) => {
         const first = decisions.get(String(a._id))!, second = decisions.get(String(b._id))!;
-        return Number(second.callable) - Number(first.callable) || compareCallingLeads(a, b, now);
+        return Number(second.callable) - Number(first.callable) || compareCallingLeads(a, b, now, policyDecisions.get(String(a._id)), policyDecisions.get(String(b._id)));
     });
     const seenPhones = new Set<string>();
     for (const lead of candidates) {
@@ -85,7 +93,7 @@ export async function employeeCallingQueue(employee: CallingEmployee, businessId
             decisions.set(decision.leadId, { ...decision, callable: false, reason: "DUPLICATE_PHONE", priority: 9 });
         } else seenPhones.add(decision.normalizedPhone);
     }
-    candidates.sort((a, b) => Number(decisions.get(String(b._id))!.callable) - Number(decisions.get(String(a._id))!.callable) || compareCallingLeads(a, b, now));
+    candidates.sort((a, b) => Number(decisions.get(String(b._id))!.callable) - Number(decisions.get(String(a._id))!.callable) || compareCallingLeads(a, b, now, policyDecisions.get(String(a._id)), policyDecisions.get(String(b._id))));
     const entries = candidates.map(lead => decisions.get(String(lead._id))!);
     const next = entries.find(entry => entry.callable) || null;
     const times = entries.flatMap(entry => entry.nextEligibleAt && +new Date(entry.nextEligibleAt) > +now ? [entry.nextEligibleAt] : []).sort();

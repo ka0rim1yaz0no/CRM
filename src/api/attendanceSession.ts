@@ -3,16 +3,20 @@ import { getAuthUser } from "./authStorage";
 import { getActiveBusinessId } from "./businessStorage";
 import type { AttendanceRecord } from "./attendance";
 import { attendanceSessionCacheKey, retainAttendanceSnapshot } from "../lib/attendanceSessionCache";
+import { beginCallingAttendanceUpdate, callingAttendanceGeneration, observeCallingAttendance } from "../lib/callingAttendance";
 
 export const attendanceIntegrityEnabled = import.meta.env.VITE_CRM_ATTENDANCE_INTEGRITY === "true" ||
     (import.meta.env.DEV && import.meta.env.VITE_CRM_ATTENDANCE_INTEGRITY !== "false");
 export const attendanceDurationModelEnabled = import.meta.env.VITE_CRM_ATTENDANCE_DURATION_MODEL === "true";
 export type SessionEvent = { id: string; source: "Login" | "Logout" | "Time In" | "Time Out" | "Break Out" | "Break In" |
-    "Lunch Break Out" | "Lunch Break In" | "Off the Phone Out" | "Non-Billable Off the Phone Out" | "Off the Phone In"; at: string; commandId: string; sequence: number; sessionId?: string;
+    "Lunch Break Out" | "Lunch Break In" | "Off the Phone Out" | "Non-Billable Off the Phone Out" | "Off the Phone In" | "Coaching Out" | "Coaching In"; at: string; commandId: string; sequence: number; sessionId?: string;
     attendanceStatus?: "On time" | "Late" | "Undertime" | ""; autoTimeOut?: boolean; shiftDayKey?: string };
 export type AttendanceSessionSnapshot = {
+    profileCalendarEnabled?: boolean;
     offPhonePolicy?: import("../../shared/attendanceOffPhone").OffPhoneLimitPolicy;
     offPhoneBilling?: import("../../shared/attendanceOffPhone").OffPhoneBillingSnapshot | null;
+    coachingEnabled?: boolean;
+    coachingBilling?: import("../../shared/attendanceCoaching").CoachingBillingSnapshot | null;
     dashboardDays?: DashboardAttendanceDay[];
     currentShiftDay?: string;
     sessionId: string | null; revision: number; fingerprint: string; state: "ONLINE" | "OFFLINE" | "BREAK" | "LUNCH" | "OFF THE PHONE";
@@ -33,6 +37,7 @@ export type AttendanceSessionSnapshot = {
     time?: { actual: Record<string, number>; scheduled: Record<string, number> } | null;
 };
 export type DashboardAttendanceDay = {
+    coachingMs?: number;
     dayKey: string; shiftStart: string; shiftEnd: string; eventIds: string[]; timeIn: string | null; timeOut: string | null;
     milliseconds: Record<string, number>; breakMinutes: number; lunchMinutes: number;
     overBreakRows: Array<{ id: string; label: string; startedAt: string; endedAt: string | null; durationMs: number;
@@ -56,17 +61,29 @@ function cacheKey(employeeId: string, businessId: string) {
     const auth = getAuthUser();
     return attendanceSessionCacheKey(`${auth?.userType}:${auth?.user.employeeCode}:${auth?.userType === "employee" ? auth.attendanceHubSession : auth?.sessionToken}`, businessId, employeeId);
 }
+function ownCallingScope(employeeId: string) {
+    const auth = getAuthUser();
+    return auth?.userType === "employee" && auth.user._id === employeeId ? { code: auth.user.employeeCode, session: auth.attendanceHubSession } : null;
+}
 export async function getAttendanceSession(employeeId: string, businessId?: string) {
     const business = businessId ?? getActiveBusinessId();
     const key = cacheKey(employeeId, business);
-    const response = await api.get<AttendanceSessionSnapshot>(`/employees/${employeeId}/attendance/session`, { headers: { ...attendanceSessionHeaders(), "X-Business-Id": business } });
-    return retainAttendanceSnapshot(snapshots, key, response.data);
+    const own = ownCallingScope(employeeId), generation = own ? callingAttendanceGeneration(own.code) : "";
+    const response = await api.get<AttendanceSessionSnapshot>(`/employees/${employeeId}/attendance/session`, { timeout: 10000, headers: { ...attendanceSessionHeaders(), "X-Business-Id": business } });
+    const result = retainAttendanceSnapshot(snapshots, key, response.data);
+    if (own && ownCallingScope(employeeId)?.session === own.session) observeCallingAttendance(own.code, result, generation);
+    return result;
 }
 export async function submitAttendanceCommand(employeeId: string, command: AttendanceCommand, businessId?: string) {
     const business = businessId ?? getActiveBusinessId();
     const key = cacheKey(employeeId, business);
-    const response = await api.post<AttendanceSessionSnapshot>(`/employees/${employeeId}/attendance/commands`, command, { headers: { ...attendanceSessionHeaders(), "X-Business-Id": business } });
-    return retainAttendanceSnapshot(snapshots, key, response.data);
+    const own = ownCallingScope(employeeId), finish = own ? beginCallingAttendanceUpdate(own.code) : undefined;
+    let result: AttendanceSessionSnapshot | undefined;
+    try {
+        const response = await api.post<AttendanceSessionSnapshot>(`/employees/${employeeId}/attendance/commands`, command, { timeout: 10000, headers: { ...attendanceSessionHeaders(), "X-Business-Id": business } });
+        result = retainAttendanceSnapshot(snapshots, key, response.data);
+        return result;
+    } finally { finish?.(ownCallingScope(employeeId)?.session === own?.session ? result : undefined); }
 }
 export async function previewAttendanceCommand(employeeId: string, command: AttendanceCommand, businessId?: string) {
     const response = await api.post<{ revision: number; before: AttendanceSessionSnapshot; after: AttendanceSessionSnapshot;
@@ -74,22 +91,26 @@ export async function previewAttendanceCommand(employeeId: string, command: Atte
     return response.data;
 }
 export async function performAttendanceAction(employeeId: string, source: SessionEvent["source"]) {
-    const business = getActiveBusinessId();
-    const sessionKey = cacheKey(employeeId, business);
-    const key = `${sessionKey}:${source}`;
-    let command = pendingActions.get(key);
-    if (!command) {
-        const snapshot = snapshots.get(sessionKey) || await getAttendanceSession(employeeId, business);
-        command = { commandId: crypto.randomUUID(), expectedRevision: snapshot.revision, fingerprint: snapshot.fingerprint, operation: "action", source };
-        pendingActions.set(key, command);
-    }
-    try { const result = await submitAttendanceCommand(employeeId, command, business); pendingActions.delete(key); return result; }
-    catch (error) {
-        const status = (error as { response?: { status?: number } }).response?.status;
-        const code = (error as { response?: { data?: { code?: string } } }).response?.data?.code;
-        if (status && code !== "ATTENDANCE_BUSY") pendingActions.delete(key);
-        throw error;
-    }
+    const own = ownCallingScope(employeeId), finish = own ? beginCallingAttendanceUpdate(own.code) : undefined;
+    let result: AttendanceSessionSnapshot | undefined;
+    try {
+        const business = getActiveBusinessId();
+        const sessionKey = cacheKey(employeeId, business);
+        const key = `${sessionKey}:${source}`;
+        let command = pendingActions.get(key);
+        if (!command) {
+            const snapshot = snapshots.get(sessionKey) || await getAttendanceSession(employeeId, business);
+            command = { commandId: crypto.randomUUID(), expectedRevision: snapshot.revision, fingerprint: snapshot.fingerprint, operation: "action", source };
+            pendingActions.set(key, command);
+        }
+        try { result = await submitAttendanceCommand(employeeId, command, business); pendingActions.delete(key); return result; }
+        catch (error) {
+            const status = (error as { response?: { status?: number } }).response?.status;
+            const code = (error as { response?: { data?: { code?: string } } }).response?.data?.code;
+            if (status && code !== "ATTENDANCE_BUSY") pendingActions.delete(key);
+            throw error;
+        }
+    } finally { finish?.(ownCallingScope(employeeId)?.session === own?.session ? result : undefined); }
 }
 export function sessionEventRecord(event: SessionEvent, employeeId: string): AttendanceRecord {
     return { _id: event.id, eventId: event.id, employee: employeeId, timeIn: event.at, source: event.source, createdAt: event.at,

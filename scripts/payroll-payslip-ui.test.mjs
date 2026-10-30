@@ -22,7 +22,7 @@ runInNewContext(ts.transpileModule(readFileSync(new URL("../shared/payrollPresen
     { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText, { exports: presentation });
 runInNewContext(ts.transpileModule('import { jsx, jsxs } from "react/jsx-runtime";\n' + declarations.map(node => node.getText(ast)).join("\n") +
     "\nexports.document = PayslipDocument; exports.words = payslipAmountInWords; exports.rows = payrollDeductionRows; exports.displayRows = payslipDeductionRows; exports.ready = payslipOutputReady; exports.csv = payrollCsv; exports.search = payrollMatchesSearch;",
-    { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX } }).outputText, { require, exports, payrollDeductionRows: presentation.payrollDeductionRows, payrollDeductionDisplayRows: presentation.payrollDeductionDisplayRows, isEarnedPayrollVersion: earnings.isEarnedPayrollVersion });
+    { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX } }).outputText, { require, exports, payrollDeductionRows: presentation.payrollDeductionRows, payrollDeductionDisplayRows: presentation.payrollDeductionDisplayRows, payrollDeductionDisplayTotal: presentation.payrollDeductionDisplayTotal, isEarnedPayrollVersion: earnings.isEarnedPayrollVersion });
 
 const record = { employeeName: "Synthetic Payroll", employeeId: "90000002", department: "Studio", payType: "Semi-monthly",
     payPeriod: "Oct 6, 2026 - Oct 20, 2026", paidOn: "Oct 25, 2026", grossPay: 15000, basicPay: 15000,
@@ -98,7 +98,7 @@ test("earned payslips show current earnings rather than the full cutoff basic pa
     const rows = exports.rows(value); assert.equal(rows.reduce((sum, row) => sum + row.minutes, 0), 6);
     assert.equal(rows.find(row => row.label === "Non-billable Off the Phone").amount, 10);
     for (const label of ["Late", "Undertime", "Absence"]) assert.ok(html.includes(`${label} (`));
-    assert.equal((html.match(/Already excluded from earned pay/g) || []).length, 3);
+    assert.ok(!html.includes("Already excluded from earned pay"));
     assert.equal(JSON.stringify(value), before);
 });
 
@@ -111,7 +111,7 @@ test("earned deduction display restores attendance shortfalls without charging t
         for (const [label, minutes] of [["Late", 12], ["Undertime", 30], ["Absence", 480]]) {
             const row = rows.find(item => item.label === label);
             assert.equal(row.minutes, minutes); assert.equal(row.amount, null);
-            assert.equal(row.note, workedMinutesOverride === null ? "Already excluded from earned pay" : "Paid hours manually adjusted");
+            assert.equal(row.note, workedMinutesOverride === null ? undefined : "Paid hours manually adjusted");
         }
         assert.equal(rows.reduce((total, row) => total + Math.round((row.amount ?? 0) * 100), 0), 1000);
         assert.equal(rows.find(row => row.label === "Non-billable Off the Phone").amount, 10);
@@ -133,6 +133,68 @@ test("approved earned all-deductions payslip subtracts all six categories and pr
     assert.ok(html.includes("Earned Regular Pay")); assert.ok(html.includes("PHP 1000.00")); assert.ok(html.includes("PHP 900.00"));
     assert.ok(!html.includes("Already excluded from earned pay")); assert.ok(!html.includes("PHP 15000.00"));
     assert.equal(JSON.stringify(value), before);
+});
+test("earned late-and-rest payslips show undertime and absence as information without charging them or restoring full basic pay", () => {
+    const value = { ...record, status: "Pending", calculationVersion: "earned-hours-late-rest-v1", earnedToDate: true,
+        grossPay: 1000, deductions: 40, netPay: 960, lateMinutes: 10, earlyTimeOutMinutes: 120, absenceMinutes: 480,
+        excessBreakMinutes: 10, excessLunchMinutes: 10, nonBillableOffPhoneMinutes: 10, deductibleMinutes: 40, overtimeHours: 0 };
+    const before = JSON.stringify(value), rows = exports.displayRows(value);
+    assert.equal(rows.length, 6); assert.equal(rows.reduce((sum, row) => sum + (row.amount ?? 0), 0), 40);
+    for (const label of ["Undertime", "Absence"]) {
+        assert.equal(rows.find(row => row.label === label).amount, null);
+        assert.equal(rows.find(row => row.label === label).note, undefined);
+    }
+    for (const label of ["Late", "Excess break", "Excess lunch", "Non-billable Off the Phone"]) assert.equal(rows.find(row => row.label === label).amount, 10);
+    const html = renderToStaticMarkup(React.createElement(exports.document, { record: value, money }));
+    for (const text of ["Earned Regular Pay", "PHP 1000.00", "PHP 40.00", "PHP 960.00", "Undertime (120 min)", "Absence (480 min)"]) assert.ok(html.includes(text));
+    assert.ok(!html.includes("Already excluded from earned pay")); assert.ok(!html.includes("no additional deduction"));
+    assert.ok(!html.includes("PHP 15000.00"));
+    assert.equal(JSON.stringify(value), before);
+});
+test("informational undertime and absence use the precise saved rate without becoming cash deductions", () => {
+    const value = { ...record, calculationVersion: "earned-hours-late-rest-v1", grossPay: 2248.29, deductions: 13.59, netPay: 2234.70,
+        minuteRate: 2.2644927536231885, hourlyRate: 135.8695652173913, lateMinutes: 5, earlyTimeOutMinutes: 502,
+        absenceMinutes: 960, excessBreakMinutes: 1, deductibleMinutes: 6, overtimeHours: 0 };
+    const before = JSON.stringify(value), rows = exports.displayRows(value);
+    assert.equal(rows.find(row => row.label === "Undertime").informationalAmount, 1136.78);
+    assert.equal(rows.find(row => row.label === "Absence").informationalAmount, 2173.91);
+    assert.equal(rows.reduce((sum, row) => sum + Math.round((row.amount ?? 0) * 100), 0), 1359);
+    const html = renderToStaticMarkup(React.createElement(exports.document, { record: value, money }));
+    for (const text of ["Undertime (502 min)", "Absence (960 min)", "PHP 1136.78", "PHP 2173.91", "PHP 13.59", "PHP 2234.70"]) assert.ok(html.includes(text), text);
+    assert.ok(!html.includes("Not deducted"));
+    assert.ok(!html.includes("Already excluded from earned pay")); assert.ok(!html.includes("no additional deduction"));
+    assert.ok(html.includes("PHP 3324.28")); assert.ok(html.includes("Applied to net pay"));
+    assert.equal(JSON.stringify(value), before);
+});
+test("displayed totals include reference undertime and absence once without changing saved cash deductions", () => {
+    for (const status of ["Pending", "Paid", "Completed"]) {
+        const value = { ...record, status, calculationVersion: "earned-hours-late-rest-v1", deductions: 13.59, netPay: 2234.70,
+            minuteRate: 2.2644927536231885, earlyTimeOutMinutes: 502, absenceMinutes: 960 };
+        const before = JSON.stringify(value);
+        assert.equal(presentation.payrollDeductionDisplayTotal(value), 3324.28);
+        assert.equal(value.deductions, 13.59); assert.equal(value.netPay, 2234.70);
+        assert.equal(JSON.stringify(value), before);
+    }
+    assert.equal(presentation.payrollDeductionDisplayTotal(record), 48.91);
+    assert.equal(presentation.payrollDeductionDisplayTotal({ ...record, calculationVersion: "earned-hours-late-rest-v1", minuteRate: null, hourlyRate: null, absenceMinutes: 480 }), null);
+    assert.equal(presentation.payrollDeductionDisplayTotal({ ...record, deductions: NaN }), null);
+});
+test("reference amounts fall back only to a valid saved hourly rate and leave paid cash categories intact", () => {
+    const value = { ...record, calculationVersion: "earned-hours-late-rest-v1", earlyTimeOutMinutes: 60, absenceMinutes: 480 };
+    for (const rate of [undefined, null, NaN, Infinity, -1]) {
+        const rows = exports.displayRows({ ...value, minuteRate: rate, hourlyRate: null });
+        for (const label of ["Undertime", "Absence"]) {
+            const row = rows.find(item => item.label === label);
+            assert.equal(row.amount, null); assert.equal(row.informationalAmount, undefined);
+        }
+    }
+    assert.equal(exports.displayRows({ ...value, minuteRate: null, hourlyRate: 150 }).find(row => row.label === "Absence").informationalAmount, 1200);
+    assert.equal(exports.displayRows({ ...value, minuteRate: 0 }).find(row => row.label === "Absence").informationalAmount, 0);
+    for (const version of [undefined, "earned-hours-all-deductions-v1"]) {
+        const paid = { ...value, status: "Paid", calculationVersion: version }, rows = exports.displayRows(paid);
+        assert.equal(rows.reduce((sum, row) => sum + Math.round(row.amount * 100), 0), 4891);
+        assert.ok(rows.every(row => row.informationalAmount === undefined));
+    }
 });
 test("payslip deduction rows reconcile in cents without negative rounding or invented zero totals", () => {
     assert.equal(typeof exports.rows, "function");

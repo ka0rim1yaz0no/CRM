@@ -2,11 +2,12 @@ import { Router } from "express";
 import { archiveEmployeeAttendance, breakInEmployee, breakOutEmployee, createEmployeeAttendance, lunchBreakInEmployee, lunchBreakOutEmployee, recordEmployeeActivity, timeInEmployee, timeOutEmployee, updateEmployeeAttendance, updateEmployeeWorkedMinutes } from "../controllers/attendanceController";
 import { withAttendanceActionLock } from "../middleware/attendanceActionLock";
 import { exportHubDays, getHubDay, getHubLive, getHubSummary, listHubDays, saveHubDayNote, getHubDeliveryHealth } from "../controllers/attendanceHubController";
-import { getActiveAttendanceSession, getAttendanceHistory, getScopedAttendanceList, getAttendancePolicy, getAttendanceMigrationPreview, previewAttendanceCorrection, requireCurrentAttendanceClient, saveAttendancePolicy, submitAttendanceCommand } from "../controllers/attendanceSessionController";
+import { getActiveAttendanceSession, getEmployeeAttendanceCalendar, getAttendanceHistory, getScopedAttendanceList, getAttendancePolicy, getAttendanceMigrationPreview, previewAttendanceCorrection, requireCurrentAttendanceClient, saveAttendancePolicy, submitAttendanceCommand } from "../controllers/attendanceSessionController";
 
 export const attendanceRouter = Router();
 
 attendanceRouter.get("/employees/:employeeId/attendance/session", getActiveAttendanceSession);
+attendanceRouter.get("/employees/:employeeId/attendance/calendar", getEmployeeAttendanceCalendar);
 attendanceRouter.get("/employees/:employeeId/attendance/migration-preview", getAttendanceMigrationPreview);
 attendanceRouter.post("/employees/:employeeId/attendance/commands", submitAttendanceCommand);
 attendanceRouter.post("/employees/:employeeId/attendance/preview", previewAttendanceCorrection);

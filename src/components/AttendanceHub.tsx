@@ -171,6 +171,7 @@ function DayDrawer({ selected, onClose, admin }: { selected: { dayKey: string; e
                     <div><dt>Breaks / over · {attendanceBreakAllowanceLabel(day.breakMinutes)}</dt><dd>{duration(day.milliseconds.break)} / {duration(day.milliseconds.overBreak)}</dd></div>
                     <div><dt>Lunch / over {day.lunchMinutes}m</dt><dd>{duration(day.milliseconds.lunch)} / {duration(day.milliseconds.overLunch)}</dd></div>
                     <div><dt>Off phone</dt><dd>{duration(day.milliseconds.offPhone)}</dd></div>
+                    {day.coachingMs !== undefined && <div><dt>Coaching</dt><dd>{duration(day.coachingMs)}</dd></div>}
                     <div><dt>Non-billable Off phone</dt><dd>{duration(day.milliseconds.nonBillableOffPhone ?? 0)} / {day.nonBillableOffPhoneMinutes ?? 0} min deduction</dd></div>
                     <div><dt>Under / overtime</dt><dd>{duration(day.milliseconds.underTime)} / {duration(day.milliseconds.overtime)}</dd></div>
                 </dl>
@@ -204,7 +205,7 @@ function DayRow({ day, visible, dense, open, employee }: { day: HubDay; visible:
         secondBreak: <><BreakRecord entry={day.breakSessions?.[1]} label="2nd break" available={Boolean(day.breakSessions)} />
             {day.breakSessions?.length > 2 && <small>{day.breakSessions.length - 2} additional break(s) in shift detail</small>}</>,
         lunch: `${duration(day.milliseconds.lunch)} / ${day.lunchMinutes}m per lunch / +${duration(day.milliseconds.overLunch)}`,
-        offPhone: <><span>{duration(day.milliseconds.offPhone)}</span>{Boolean(day.nonBillableOffPhoneMinutes) && <small className="text-red-700">Non-billable: {day.nonBillableOffPhoneMinutes}m</small>}</>, late: duration(day.milliseconds.late), underTime: duration(day.milliseconds.underTime),
+        offPhone: <><span>{duration(day.milliseconds.offPhone)}</span>{day.coachingMs !== undefined && <small>Coaching: {duration(day.coachingMs)}</small>}{Boolean(day.nonBillableOffPhoneMinutes) && <small className="text-red-700">Non-billable: {day.nonBillableOffPhoneMinutes}m</small>}</>, late: duration(day.milliseconds.late), underTime: duration(day.milliseconds.underTime),
         overtime: duration(day.milliseconds.overtime), issues: <div className="attendance-hub-badges">{day.issues.map((issue) => <span key={issue} className={issueClass(issue)}>{attendanceIssueLabel(issue)}</span>)}
             {day.mismatch && <span className="attendance-hub-badge warning">MISMATCH</span>}</div>,
         notes: <span className="attendance-hub-note-preview" title={day.note}>{day.note || "--"}</span>,
