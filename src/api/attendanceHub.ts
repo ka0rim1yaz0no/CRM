@@ -8,6 +8,7 @@ export type HubDay = {
     dayKey: string; shiftStart: string; shiftEnd: string; timeIn: string | null; timeOut: string | null;
     autoTimeOut?: boolean;
     nonBillableOffPhoneMinutes?: number;
+    coachingMs?: number;
     employeeCode: string; employeeId: string; employeeName: string; role: string; team: string; scopeKey: string;
     businessId: string; businessName: string; status: string; inProgress: boolean; excused: boolean; absent: boolean;
     mismatch: boolean; issues: string[]; review: string[]; note: string; leave: string | null;

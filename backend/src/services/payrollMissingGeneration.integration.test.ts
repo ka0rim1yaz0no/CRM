@@ -144,12 +144,33 @@ test("saved date aliases, archived drafts and archived paid history never reappe
     const plan = await preview(); assert.equal(plan.data.rows.length, 0); assert.match(plan.data.held[0].reason, /already has/);
 });
 
-test("opt-in future generation follows the configured rollover once and never rewrites current or paid payroll", async () => {
+for (const excludeUndertimeAbsence of [false, true]) test(`opt-in future generation ${excludeUndertimeAbsence ? "keeps undertime/absence informational and " : ""}follows the configured rollover once without rewriting current or paid payroll`, async context => {
+    const names = ["CRM_EARNED_PAYROLL_FROM", "CRM_EARNED_ALL_DEDUCTIONS_FROM", "CRM_EARNED_EXCLUDE_UNDERTIME_ABSENCE_FROM"];
+    const previous = names.map(name => process.env[name]);
+    context.after(() => names.forEach((name, index) => { if (previous[index] === undefined) delete process.env[name]; else process.env[name] = previous[index]; }));
+    if (excludeUndertimeAbsence) for (const name of names) process.env[name] = "2026-10-21";
     assert.equal(await generateFutureMissingPayroll(), null);
     const plan = await preview(); assert.equal((await confirm(plan.data, { enableFuture: true })).status, 200);
     const current = await records(); assert.equal(await generateFutureMissingPayroll(), null); assert.deepEqual(await records(), current);
     const policy = await PayrollGenerationPolicy.findById("missing-current-payroll").lean(); assert.ok(policy); assert.equal(policy.startsAfter, "2026-11-05");
     mock.timers.setTime(Date.parse("2026-11-11T08:00:00Z")); token = createAdminDashboardSession("90000001")!;
+    if (excludeUndertimeAbsence) {
+        const ledger = await AttendanceLedger.findById("generation-attendance").lean(); assert.ok(ledger);
+        const start = Date.parse("2026-11-06T15:00:00Z");
+        const additions = ([['Time In', 10], ['Time Out', 60]] as const).map(([source, minutes], index) => ({
+            id: `future-${index}`, commandId: `future-${index}`, source, sequence: ledger.events.length + index,
+            at: new Date(start + minutes * 60000).toISOString(), recordedAt: new Date(start + minutes * 60000).toISOString(),
+            ...(source === "Time In" ? { shift: assignAttendanceShift(new Date(start + minutes * 60000)) } : {}),
+        }));
+        const events = [...ledger.events, ...additions];
+        await AttendanceLedger.updateOne({ _id: ledger._id }, { $set: { events, revision: 2 } });
+        for (const business of businesses) await runWithBusiness(business, async () => {
+            const person = await Employee.findOne({ employeeCode: code }).lean(); assert.ok(person);
+            await Attendance.deleteMany({ employee: person._id });
+            await Attendance.insertMany(events.map(event => ({ employee: person._id, source: event.source, timeIn: new Date(event.at), eventId: event.id,
+                sequence: event.sequence, ledgerIdentity: ledger._id, ledgerRevision: 2, isEffective: true })));
+        });
+    }
     const generated = await generateFutureMissingPayroll(); assert.ok(generated); assert.equal(generated.created, 2); assert.equal(generated.mirrors, 12);
     assert.equal(generated.payPeriod, "Nov 6, 2026 - Nov 20, 2026");
     for (const [i, business] of businesses.entries()) await runWithBusiness(business, async () => {
@@ -157,6 +178,12 @@ test("opt-in future generation follows the configured rollover once and never re
         const person = await Employee.findOne({ employeeCode: code }).lean(); assert.ok(person);
         const next = await PayrollRecord.findOne({ employeeId: code, payPeriod: generated.payPeriod }).lean(); assert.ok(next);
         assert.equal(next.netPay, (await calculatePayrollCandidate(person, generated.payPeriod)).value.netPay);
+        if (excludeUndertimeAbsence) {
+            assert.equal(next.calculationVersion, "earned-hours-late-rest-v1");
+            assert.equal(next.lateMinutes, 10); assert.equal(next.earlyTimeOutMinutes, 480); assert.ok(next.absenceMinutes > 0);
+            assert.equal(next.deductibleMinutes, 10); assert.ok(next.netPay > 0);
+            assert.equal(next.deductions, Math.round(10 * next.minuteRate * 100) / 100);
+        }
     });
     const after = await records(); assert.equal(await generateFutureMissingPayroll(), null); assert.deepEqual(await records(), after);
     assert.equal(await runWithBusiness(businesses[1], () => generateFutureMissingPayroll()), null, "a business without opt-in never schedules generation");

@@ -32,6 +32,7 @@ import { getAuthUser } from "../api/authStorage";
 import { getActiveBusinessId } from "../api/businessStorage";
 import { attendanceIntegrityEnabled, getAttendanceSession, sessionEventRecord, type AttendanceSessionSnapshot } from "../api/attendanceSession";
 import { compareAttendanceRecords } from "../lib/attendancePresentation";
+import AttendanceAwayControls from "./AttendanceAwayControls";
 
 type WorkspaceDashboardProps = {
     userName: string;
@@ -2278,7 +2279,7 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
         queryKey: ["attendance-session", businessId, employeeId],
         queryFn: () => getAttendanceSession(employeeId, businessId),
         enabled: Boolean(employeeId) && attendanceIntegrityEnabled,
-        refetchInterval: 30_000,
+        refetchInterval: query => query.state.data?.coachingBilling?.active ? 1000 : 5000,
     });
 
     const announcementsQuery = useQuery({
@@ -2564,6 +2565,8 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
                     </Link>
                 </div>
             </div>
+
+            {!attendanceError && sessionQuery.data?.coachingEnabled && <AttendanceAwayControls employeeId={employeeId} snapshot={sessionQuery.data} />}
 
             {isLoading && <p className="rounded-lg border border-slate-200 bg-white p-3 text-sm font-semibold text-slate-600">Loading dashboard data...</p>}
             {hasError && <p role="alert" className="rounded-lg border border-rose-200 bg-rose-50 p-3 text-sm font-semibold text-rose-700">Some dashboard data could not be loaded.<button type="button" className="employee-dashboard-retry" onClick={() => { for (const query of [employeeQuery, logsQuery, tasksQuery, leadCountsQuery, queueQuery, noticesQuery, announcementsQuery, attendanceIntegrityEnabled ? sessionQuery : attendanceQuery]) void query.refetch(); }}><FiRefreshCw aria-hidden="true" />Retry</button></p>}

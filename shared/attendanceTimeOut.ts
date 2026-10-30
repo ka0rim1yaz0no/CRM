@@ -23,6 +23,6 @@ export function attendanceTimeOutPlan(sessions: TimeOutSession[], sessionId: str
     const replaced = ordered.filter(event => Date.parse(event.at) > cutoff);
     const last = ordered.filter(event => Date.parse(event.at) <= cutoff).at(-1);
     const incoming: Record<string, string> = { "Break Out": "Break In", "Lunch Break Out": "Lunch Break In",
-        "Off the Phone Out": "Off the Phone In", "Non-Billable Off the Phone Out": "Off the Phone In" };
+        "Off the Phone Out": "Off the Phone In", "Non-Billable Off the Phone Out": "Off the Phone In", "Coaching Out": "Coaching In" };
     return { at: new Date(cutoff).toISOString(), replaced, returnSource: last ? incoming[last.source] : undefined };
 }

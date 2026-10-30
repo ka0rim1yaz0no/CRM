@@ -17,17 +17,18 @@ import { attendancePayrollTransaction, lockPayrollAttendance } from "./payrollAt
 import { attendanceTimeOutPlan } from "../../../shared/attendanceTimeOut";
 import { offPhoneShiftBilling } from "../../../shared/attendanceOffPhone";
 import { offPhoneLimitPolicy } from "../config/payrollEarnings";
+import { attendanceAwayReturnSource, coachingShiftBilling } from "../../../shared/attendanceCoaching";
 
 export class AttendanceCommandError extends Error {
   constructor(public status: number, public code: string, message: string, public details?: unknown) { super(message); }
 }
 export type AttendanceIdentity = { key: string; code: string; businessIds: string[]; canonicalBusinessId: string; employeeId: string };
 export type AttendanceNoteReference = { businessId: string; dayKey: string; noteRevision: number; contentHash: string };
-export type AttendanceCommand = { commandId: string; expectedRevision: number; fingerprint?: string; operation: "action" | "correct" | "undo" | "add-time-out" | "recover" | "auto-time-out" | "recalculate" | "recalculate-policy" | "confirm-note";
+export type AttendanceCommand = { commandId: string; expectedRevision: number; fingerprint?: string; operation: "action" | "correct" | "undo" | "add-time-out" | "recover" | "auto-time-out" | "coaching-return" | "recalculate" | "recalculate-policy" | "confirm-note";
   source?: SessionEvent["source"]; changes?: Array<{ targetId?: string; source?: SessionEvent["source"]; at?: string; remove?: boolean }>;
   sessionId?: string; timeOutAt?: string; closeRest?: boolean; dayKey?: string; targetCommandId?: string; reason?: string; previewRevision?: number; policyRevision?: number; noteReference?: AttendanceNoteReference };
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-const supportedSources = new Set(["Login", "Logout", "Time In", "Time Out", "Break Out", "Break In", "Lunch Break Out", "Lunch Break In", "Off the Phone Out", "Non-Billable Off the Phone Out", "Off the Phone In"]);
+const supportedSources = new Set(["Login", "Logout", "Time In", "Time Out", "Break Out", "Break In", "Lunch Break Out", "Lunch Break In", "Off the Phone Out", "Non-Billable Off the Phone Out", "Off the Phone In", "Coaching Out", "Coaching In"]);
 const hash = (value: unknown) => crypto.createHash("sha256").update(JSON.stringify(value)).digest("hex");
 export function recoveryCommandId(sessionId: string) {
   const hex = hash(`attendance-recovery:${sessionId}`);
@@ -36,6 +37,22 @@ export function recoveryCommandId(sessionId: string) {
 export function autoTimeOutCommandId(sessionId: string) {
   const hex = hash(`attendance-auto-time-out:${sessionId}`);
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+}
+export function coachingReturnCommandId(eventId: string, returnAt: string) {
+  const hex = hash(`attendance-coaching-return:${eventId}:${returnAt}`);
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+}
+
+function shiftAttendanceRecords(projection: ReturnType<typeof projectAttendance>, dayKey: string) {
+  return projection.sessions.filter(item => item.shift?.dayKey === dayKey).flatMap(item => [
+    ...item.events.map(event => ({ source: event.source, timeIn: new Date(event.at) })),
+    ...(item.lifecycle === "system-closed" && item.endedAt ? [{ source: "Time Out", timeIn: new Date(item.endedAt) }] : []),
+  ]);
+}
+export function attendanceCoachingState(projection: ReturnType<typeof projectAttendance>, now: Date) {
+  const active = projection.active;
+  const shift = active?.shift || projection.sessions.at(-1)?.shift;
+  return shift ? coachingShiftBilling(shiftAttendanceRecords(projection, shift.dayKey), new Date(shift.start), new Date(shift.end), now) : null;
 }
 export function attendanceDerivedRefreshCommandId(dayKey: string, shiftEnd: string) {
   const hex = hash(`attendance-derived-refresh:${dayKey}:${shiftEnd}`);
@@ -107,29 +124,31 @@ export function attendanceSnapshot(ledger: AttendanceLedgerDocument, now = new D
   const session = projection.active;
   const eventDays = new Map(projection.sessions.flatMap(item => item.events.map(event => [event.id, item.shift?.dayKey] as const)));
   const last = projection.sessions.at(-1);
+  const coached = attendanceCoachingState(projection, now);
   const sequence = ledger.events.reduce((max, event) => Math.max(max, event.sequence), -1) + 1;
   const allowedActions = ledger.migrationRequired || projection.blockingIssues.length ||
     (cutoffContext && attendanceAutoTimeOutPending(session, now, cutoffContext)) ? [] : [...supportedSources].filter((source) => {
+    if (source === "Coaching Out" && (!session?.shift || now < new Date(session.shift.start) || now >= new Date(session.shift.end) || !coached?.remainingPaidMs)) return false;
     const additions: SessionEvent[] = [];
     const append = (candidate: SessionEvent["source"]) => additions.push({ id: `allowed:${sequence + additions.length}:${candidate}`,
       commandId: "allowed-action-preview", sequence: sequence + additions.length, source: candidate, at: now.toISOString(), recordedAt: now.toISOString() });
-    if (source === "Time Out" && session?.mode === "OFF THE PHONE") append("Off the Phone In");
+    if (source === "Time Out" && session?.mode === "OFF THE PHONE") append(attendanceAwayReturnSource(session.events));
     append(source as SessionEvent["source"]);
     return !projectAttendance([...ledger.events, ...additions], ledger.corrections, ledger.closures).blockingIssues.length;
   });
   const review = [...projection.issues.map((issue) => issue.message), ...projection.sessions.filter((item) => item.lifecycle === "system-closed").map(() => "Administrative missing-checkout closure requires review.")];
   const shift = session?.shift || last?.shift;
   const offPhonePolicy = offPhoneLimitPolicy();
-  const billed = shift ? offPhoneShiftBilling(projection.sessions.filter(item => item.shift?.dayKey === shift.dayKey).flatMap(item => [
-    ...item.events.map(event => ({ source: event.source, timeIn: new Date(event.at) })),
-    ...(item.lifecycle === "system-closed" && item.endedAt ? [{ source: "Time Out", timeIn: new Date(item.endedAt) }] : []),
-  ]), new Date(shift.start), new Date(shift.end), now, offPhonePolicy) : null;
+  const shiftRecords = shift ? shiftAttendanceRecords(projection, shift.dayKey) : [];
+  const billed = shift ? offPhoneShiftBilling(shiftRecords, new Date(shift.start), new Date(shift.end), now, offPhonePolicy) : null;
+  const coachingBilling = coached ? { limited: coached.limited, endsAt: coached.endsAt, paidUsedMs: coached.paidUsedMs,
+    remainingPaidMs: coached.remainingPaidMs, totalMs: coached.totalMs, active: session?.mode === "OFF THE PHONE" ? coached.active : null } : null;
   const offPhoneBilling = billed ? { limited: billed.limited, endsAt: billed.endsAt, paidUsedMs: billed.paidUsedMs, remainingPaidMs: billed.remainingPaidMs,
     active: session?.mode === "OFF THE PHONE" ? billed.active : null } : null;
   if (ledger.legacyAdoption?.businessStreamsDiffer) review.push("Historical business copies differed. Their original evidence was backed up and retained during reviewed adoption.");
   if (ledger.migrationRequired) review.push("Legacy history is readable, but adoption requires a reviewed migration and backup. No historical records were changed.");
   if (session?.shift?.ambiguous) review.push("Early clock-in assignment needs review. Automatic recovery is disabled for this ambiguous shift.");
-  return { offPhonePolicy, offPhoneBilling, timeOutOverrideEnabled: true, sessionId: session?.id || null, revision: ledger.revision, fingerprint: hash(ledger.events),
+  return { offPhonePolicy, offPhoneBilling, coachingEnabled: true, coachingBilling, timeOutOverrideEnabled: true, sessionId: session?.id || null, revision: ledger.revision, fingerprint: hash(ledger.events),
     state: session?.mode || "OFFLINE", stateSince: session?.modeSince || last?.modeSince || null,
     lifecycle: session?.lifecycle || last?.lifecycle || "none", assignedShift: session?.shift || null, allowedActions,
     openIntervals: session && session.mode !== "ONLINE" ? [{ mode: session.mode, startedAt: session.modeSince }] : [],
@@ -193,8 +212,14 @@ function applyAttendanceCommand(ledger: AttendanceLedgerDocument, input: Attenda
     if (!input.source) throw new AttendanceCommandError(422, "INVALID_ACTION", "Attendance action is required.");
     if (before.blockingIssues.length) throw new AttendanceCommandError(409, "TIMELINE_REVIEW_REQUIRED", "The current attendance session needs an administrator correction before another action.", before.blockingIssues);
     guardAttendanceActionCutoff(input, before.active, policy, now);
-    if (input.source === "Time Out" && before.active?.mode === "OFF THE PHONE") append("Off the Phone In", now.toISOString());
-    append(input.source, now.toISOString());
+    const coaching = attendanceCoachingState(before, now);
+    if (input.source === "Coaching Out" && (!before.active?.shift || now < new Date(before.active.shift.start) || now >= new Date(before.active.shift.end) || !coaching?.remainingPaidMs)) {
+      throw new AttendanceCommandError(409, "COACHING_ALLOWANCE_EXHAUSTED", "Coaching is available during the assigned shift until its 20-minute allowance is used.");
+    }
+    const returnAt = coaching?.active?.returnAt;
+    const awayReturnAt = returnAt && Date.parse(returnAt) <= +now ? returnAt : now.toISOString();
+    if (input.source === "Time Out" && before.active?.mode === "OFF THE PHONE") append(attendanceAwayReturnSource(before.active.events), awayReturnAt);
+    append(input.source, input.source === "Coaching In" ? awayReturnAt : now.toISOString());
   } else if (input.operation === "add-time-out") {
     if (actor.role !== "admin" || !input.reason?.trim()) throw new AttendanceCommandError(403, "ADMIN_REASON_REQUIRED", "An administrator and correction reason are required.");
     if (typeof input.sessionId !== "string" || typeof input.timeOutAt !== "string" || (input.closeRest !== undefined && typeof input.closeRest !== "boolean") || input.changes || input.source || input.targetCommandId) {
@@ -277,9 +302,23 @@ function applyAttendanceCommand(ledger: AttendanceLedgerDocument, input: Attenda
     }
     if (input.commandId !== autoTimeOutCommandId(active.id)) throw new AttendanceCommandError(422, "INVALID_AUTO_TIME_OUT_ID", "Automatic time-out requires its stable session command ID.");
     const at = cutoff.toISOString();
-    const returnSource = active.mode === "BREAK" ? "Break In" : active.mode === "LUNCH" ? "Lunch Break In" : active.mode === "OFF THE PHONE" ? "Off the Phone In" : null;
-    if (returnSource) append(returnSource, at).autoTimeOut = true;
+    const returnSource = active.mode === "BREAK" ? "Break In" : active.mode === "LUNCH" ? "Lunch Break In" : active.mode === "OFF THE PHONE" ? attendanceAwayReturnSource(active.events) : null;
+    const coachingReturnAt = attendanceCoachingState(before, now)?.active?.returnAt;
+    if (returnSource) append(returnSource, returnSource === "Coaching In" && coachingReturnAt && coachingReturnAt < at ? coachingReturnAt : at).autoTimeOut = true;
     append("Time Out", at).autoTimeOut = true;
+  } else if (input.operation === "coaching-return") {
+    if (actor.role !== "system") throw new AttendanceCommandError(403, "SYSTEM_ONLY", "Automatic Coaching return is a system operation.");
+    const active = before.active;
+    const coaching = attendanceCoachingState(before, now);
+    const event = active?.events.at(-1);
+    const returnAt = coaching?.active?.returnAt;
+    if (before.blockingIssues.length || !active || active.id !== input.sessionId || event?.source !== "Coaching Out" || !returnAt || +now < Date.parse(returnAt)) {
+      throw new AttendanceCommandError(409, "COACHING_RETURN_NOT_DUE", "This Coaching session is not due for automatic return.");
+    }
+    if (input.commandId !== coachingReturnCommandId(event.id, returnAt) || input.source || input.changes || input.targetCommandId) {
+      throw new AttendanceCommandError(422, "INVALID_COACHING_RETURN", "Automatic Coaching return requires its stable event and allowance boundary.");
+    }
+    append("Coaching In", returnAt);
   } else if (input.operation === "recalculate-policy") {
     if (actor.role !== "system") throw new AttendanceCommandError(403, "SYSTEM_ONLY", "Policy recalculation is a system operation.");
     if (!attendanceIntegrityEnabled() || !attendanceDurationModelEnabled() || input.policyRevision !== policy.revision || !ledger.derived?.length ||
@@ -343,9 +382,9 @@ export async function executeAttendanceCommand(identity: AttendanceIdentity, inp
     if (actor.role !== "admin") throw new AttendanceCommandError(403, "ADMIN_ONLY", "Only administrators can confirm attendance notes.");
     if (!options.session?.inTransaction() || !options.beforeCommit) throw new AttendanceCommandError(503, "NOTE_TRANSACTION_REQUIRED", "Attendance notes require an atomic server transaction.");
   }
-  if (["auto-time-out", "recalculate", "recalculate-policy"].includes(input.operation) && actor.role !== "system") throw new AttendanceCommandError(403, "SYSTEM_ONLY", "This attendance operation is system-only.");
+  if (["auto-time-out", "coaching-return", "recalculate", "recalculate-policy"].includes(input.operation) && actor.role !== "system") throw new AttendanceCommandError(403, "SYSTEM_ONLY", "This attendance operation is system-only.");
   if (!uuid.test(input.commandId) || !Number.isInteger(input.expectedRevision) || input.expectedRevision < 0) throw new AttendanceCommandError(426, "ATTENDANCE_REFRESH_REQUIRED", "Refresh CRM to use the current attendance controls.");
-  const request = { ...input, fingerprint: undefined, ...(["auto-time-out", "recalculate", "recalculate-policy"].includes(input.operation) ? { expectedRevision: undefined } : {}) };
+  const request = { ...input, fingerprint: undefined, ...(["auto-time-out", "coaching-return", "recalculate", "recalculate-policy"].includes(input.operation) ? { expectedRevision: undefined } : {}) };
   const requestHash = hash(["recalculate", "recalculate-policy", "confirm-note"].includes(input.operation) ? Object.fromEntries(Object.entries(request).sort(([a], [b]) => a.localeCompare(b))) : request);
   let ledger = await readAttendanceLedger(identity, options.session);
   if (ledger.migrationRequired) throw new AttendanceCommandError(409, "MIGRATION_REVIEW_REQUIRED", "Legacy attendance needs a reviewed adoption plan and database backup before enabling writes. No attendance was changed.");
@@ -421,6 +460,7 @@ export async function executeAttendanceCommand(identity: AttendanceIdentity, inp
       next.derivedBaseline = ledger.derivedBaseline ?? { revision: ledger.revision, days: beforeDerived };
     }
     const result = attendanceSnapshot(next, now, policy);
+    const coachingReturnAt = attendanceCoachingState(plan.after, now)?.active?.returnAt;
     const audit = { commandId: input.commandId, actor, reason: input.operation === "confirm-note" ? "Business-local attendance note confirmed" : input.reason || "Manual attendance button", operation: input.operation,
       at: now.toISOString(), beforeRevision: ledger.revision, afterRevision: revision, targetIds: plan.targets,
       beforeState: plan.before.active?.mode || "OFFLINE", afterState: plan.after.active?.mode || "OFFLINE",
@@ -429,7 +469,8 @@ export async function executeAttendanceCommand(identity: AttendanceIdentity, inp
     const committed = await commitAttendanceRevision(identity.key, token, ledger.fence, ledger.revision, {
       $set: { ...(["recalculate", "recalculate-policy", "confirm-note"].includes(input.operation) ? {} : { events: plan.events, corrections: plan.corrections, closures: plan.closures }),
         revision, jobs: next.jobs, businessIds: identity.businessIds,
-        ...(attendanceAccuracyFixesEnabled() ? { maintenance: attendanceMaintenanceState(plan.after, next.derived) } : {}),
+        ...(attendanceAccuracyFixesEnabled() || coachingReturnAt || ledger.maintenance?.coachingReturnAt ? { maintenance: {
+          ...attendanceMaintenanceState(plan.after, next.derived), ...(coachingReturnAt ? { coachingReturnAt: new Date(coachingReturnAt) } : {}) } } : {}),
         ...(derivedDelta ? { derived: next.derived, ...(!ledger.derivedBaseline ? { derivedBaseline: next.derivedBaseline } : {}) } : {}) },
       $push: { audit, commands: { id: input.commandId, actor: `${actor.role}:${actor.code}`, hash: requestHash, revision,
         result: { serverTime: result.serverTime, state: result.state, sessionId: result.sessionId } } },

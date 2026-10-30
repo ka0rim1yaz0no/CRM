@@ -1,4 +1,4 @@
-import { isTrustedBridgeActiveSignal } from "./callBridgeActiveSignal";
+import { hasTrackedActiveCall, isTrustedBridgeActiveSignal } from "./callBridgeActiveSignal";
 import { callDashboardV2Enabled } from "../config/rolloutFlags";
 import { bucketForAttendanceSource } from "./timeAccounting";
 import type { AttendanceSource } from "../models/Attendance";
@@ -104,10 +104,10 @@ export function offPhoneTimeInShift(events: CallDashboardAttendanceEvent[], shif
   for (const event of [...events].sort((a, b) => a.timeIn.getTime() - b.timeIn.getTime())) {
     const time = event.timeIn.getTime();
     if (time > end) break;
-    if (["Off the Phone Out", "Non-Billable Off the Phone Out"].includes(event.source)) {
+    if (["Off the Phone Out", "Non-Billable Off the Phone Out", "Coaching Out"].includes(event.source)) {
       if (openAt !== null) completedMs += Math.max(0, time - Math.max(openAt, start));
       openAt = time;
-    } else if (["Off the Phone In", "Time Out", "Logout"].includes(event.source) && openAt !== null) {
+    } else if (["Off the Phone In", "Coaching In", "Time Out", "Logout"].includes(event.source) && openAt !== null) {
       completedMs += Math.max(0, time - Math.max(openAt, start));
       openAt = null;
     }
@@ -149,7 +149,7 @@ export function callDashboardStatus(input: {
   // Duration totals stop at the shift boundary. A newer action still determines
   // current presence, including an early Time In before the next call shift.
   const latestTransition = [...sortedEvents].reverse().find(event => event.timeIn >= shift.start &&
-    ["Time In", "Login", "Break In", "Lunch Break In", "Off the Phone In", "Time Out", "Logout", "Break Out", "Lunch Break Out", "Off the Phone Out", "Non-Billable Off the Phone Out"].includes(event.source));
+    ["Time In", "Login", "Break In", "Lunch Break In", "Off the Phone In", "Coaching In", "Coaching Out", "Time Out", "Logout", "Break Out", "Lunch Break Out", "Off the Phone Out", "Non-Billable Off the Phone Out"].includes(event.source));
   const latestBucket = latestTransition ? bucketForAttendanceSource(latestTransition.source as AttendanceSource) : null;
   const laterPresence = latestBucket === "offPhone" ? "OFF THE PHONE" : latestBucket?.toUpperCase();
   const availabilityStatus = latestTransition && ["Time Out", "Logout"].includes(latestTransition.source) ? "OFFLINE"
@@ -217,7 +217,7 @@ export function callDashboardStatus(input: {
     ? authoritativeDevice
     : undefined;
   const lastOnlineAt = latestAttendanceTransition(sortedEvents, ["Time In", "Login", "Break In", "Lunch Break In", "Off the Phone In"]);
-  const lastOfflineAt = latestAttendanceTransition(sortedEvents, ["Time Out", "Logout", "Break Out", "Lunch Break Out", "Off the Phone Out", "Non-Billable Off the Phone Out"]);
+  const lastOfflineAt = latestAttendanceTransition(sortedEvents, ["Time Out", "Logout", "Break Out", "Lunch Break Out", "Off the Phone Out", "Non-Billable Off the Phone Out", "Coaching Out"]);
   const onlineAt = lastOnlineAt && (!lastOfflineAt || lastOnlineAt >= lastOfflineAt) ? lastOnlineAt : null;
   const offlineAt = lastOfflineAt && (!lastOnlineAt || lastOfflineAt >= lastOnlineAt) ? lastOfflineAt : null;
 
@@ -236,6 +236,11 @@ export function callDashboardStatus(input: {
 
   if (active) {
     const activeStartedAt = activeSignalStartedAt;
+    if (callDashboardV2Enabled() && activeStartedAt && !hasTrackedActiveCall(schedule || null) &&
+        now.getTime() - activeStartedAt.getTime() > maximumActiveCallSignalMs) {
+      return { status: "UNVERIFIED" as const, statusStartedAt: null, transitionUntil: null,
+        detail: "Unverified persistent Call Bridge audio signal. Current call duration is not confirmed." };
+    }
     if (!activeStartedAt || activeStartedAt < shift.start) {
       return {
         status: "ONLINE" as const,

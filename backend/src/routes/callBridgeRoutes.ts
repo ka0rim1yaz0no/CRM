@@ -1,4 +1,5 @@
 import { Router, type Request, type Response, type NextFunction } from "express";
+import { dispatchCallAtDeadline } from "../controllers/callDeadlineController";
 import {
   activateCallBridgeForEmployee,
   claimCallBridgePairing,
@@ -67,6 +68,7 @@ callBridgeRouter.get("/status", getCallBridgeStatus);
 callBridgeRouter.get("/attempts/latest", getLatestCallBridgeAttempt);
 callBridgeRouter.post("/reserve", logReserveConflict, reserveCallBridgeCall);
 callBridgeRouter.post("/dial-start", logDialStartFailure, markCallBridgeDialStarted);
+callBridgeRouter.post("/dial-at-deadline", logDialStartFailure, dispatchCallAtDeadline);
 callBridgeRouter.post("/release", releaseCallBridgeCall);
 callBridgeRouter.delete("/devices", revokeCallBridgeDevices);
 callBridgeRouter.get("/package", downloadCallBridgePackage);

@@ -33,6 +33,8 @@ export type AttendanceRecord = {
         | "Lunch Break In"
         | "Off the Phone Out"
         | "Non-Billable Off the Phone Out"
+        | "Coaching Out"
+        | "Coaching In"
         | "Off the Phone In";
     attendanceStatus?: "On time" | "Late" | "Undertime" | "";
     isArchived?: boolean;

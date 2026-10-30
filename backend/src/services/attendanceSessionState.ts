@@ -1,6 +1,7 @@
 import { accountTime, bucketForAttendanceSource } from "./timeAccounting";
 import type { AttendanceSource } from "../models/Attendance";
 import { attendanceBreakGapEnabled, attendanceDurationModelEnabled } from "../config/rolloutFlags";
+import { attendanceAwayReturnSource } from "../../../shared/attendanceCoaching";
 
 export type AttendanceMode = "ONLINE" | "BREAK" | "LUNCH" | "OFF THE PHONE" | "OFFLINE";
 export type AssignedShift = { dayKey: string; start: string; end: string; resetDeadline: string; ambiguous?: boolean };
@@ -14,10 +15,12 @@ export type AttendanceSession = { id: string; startedAt: string; endedAt: string
 
 const returns: Partial<Record<AttendanceSource, AttendanceMode>> = {
   "Break In": "BREAK", "Lunch Break In": "LUNCH", "Off the Phone In": "OFF THE PHONE",
+  "Coaching In": "OFF THE PHONE",
 };
 const outgoing: Partial<Record<AttendanceSource, AttendanceMode>> = {
   "Break Out": "BREAK", "Lunch Break Out": "LUNCH", "Off the Phone Out": "OFF THE PHONE",
   "Non-Billable Off the Phone Out": "OFF THE PHONE",
+  "Coaching Out": "OFF THE PHONE",
 };
 export function projectAttendance(events: SessionEvent[], corrections: SessionCorrection[] = [], closures: SystemClosure[] = [], accounting?: { allowUnreturnedCheckout: boolean }) {
   const reversed = new Set(corrections.flatMap((correction) => correction.targets));
@@ -82,6 +85,9 @@ export function projectAttendance(events: SessionEvent[], corrections: SessionCo
       active.mode = outMode;
     } else if (returnMode) {
       if (active.mode !== returnMode) { issues.push({ eventId: event.id, message: `No open ${returnMode} matches this return.` }); continue; }
+      if (returnMode === "OFF THE PHONE" && event.source !== attendanceAwayReturnSource(active.events)) {
+        issues.push({ eventId: event.id, message: "Return from the current Coaching or Off the Phone activity first." }); continue;
+      }
       active.mode = "ONLINE";
     }
     active.modeSince = event.at; active.events.push(event);

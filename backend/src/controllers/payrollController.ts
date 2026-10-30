@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { excessClickedSessionMinutes, calculateSlotAttendance, accountTime, bucketForAttendanceSource } from "../services/timeAccounting";
 import { attendanceDurationModelEnabled, payrollAccuracyEnabled, attendanceAccuracyFixesEnabled } from "../config/rolloutFlags";
 import { accuratePayrollRates, accuratePayrollDay, paidHoursPerDay, PayrollValidationError, type PayrollShiftSettings } from "../services/payrollAccuracy";
-import { earnedPayrollEnabled, earnedAllDeductionsEnabled } from "../config/payrollEarnings";
+import { earnedPayrollEnabled, earnedAllDeductionsEnabled, earnedUndertimeAbsenceExcluded } from "../config/payrollEarnings";
 import { legacyPayrollPolicy } from "../services/payrollLegacyPolicy";
 import { AttendanceLedger, AttendancePolicy } from "../models/AttendanceLedger";
 import { SystemSettings } from "../models/SystemSettings";
@@ -813,6 +813,7 @@ async function accurateAttendancePayrollDtr(employeeId: Types.ObjectId, payPerio
   const now = serverReadTime();
   const earned = earnedPayrollEnabled(payPeriod);
   const allEarnedDeductions = earnedAllDeductionsEnabled(payPeriod);
+  const excludeUndertimeAbsence = earnedUndertimeAbsenceExcluded(payPeriod);
   const employee = await Employee.findById(employeeId, null, session ? { session } : undefined).select("employeeCode").lean();
   if (!employee) throw new PayrollValidationError("Employee not found");
   const firstBound = new Date(hubShiftBounds(keys[0], settings).start.getTime() - 86_400_000);
@@ -852,7 +853,7 @@ async function accurateAttendancePayrollDtr(employeeId: Types.ObjectId, payPerio
     const bounds = hubShiftBounds(key, settings);
     const weekend = isWeekendDateKey(key);
     const day = accuratePayrollDay(records, { ...policy, shiftStart: bounds.start, shiftEnd: bounds.end,
-      closingBoundaries: closingBoundariesByDay.get(key) }, now, paidHours, weekend, mismatches.has(key), allEarnedDeductions);
+      closingBoundaries: closingBoundariesByDay.get(key) }, now, paidHours, weekend, mismatches.has(key), allEarnedDeductions, excludeUndertimeAbsence);
     const timeIn = firstRecord(records, ["Time In", "Login"]), timeOut = lastRecord(records, ["Time Out", "Logout"]);
     const status = earned && day.review && !day.integrityReview && now < bounds.end ? "In Progress" : day.status;
     return { dateKey: key, date: formatDtrDate(key), day: formatDtrDay(key), status: status as PayrollDtrRow["status"], isWeekend: weekend,

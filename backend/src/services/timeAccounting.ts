@@ -121,11 +121,11 @@ export function excessClickedSessionMilliseconds<T extends { source: string; tim
 
 export function bucketForAttendanceSource(source: AttendanceSource): TimeBucket | null {
   if (source === "Login" || source === "Time In" || source === "Break In" ||
-    source === "Lunch Break In" || source === "Off the Phone In") return "online";
+    source === "Lunch Break In" || source === "Off the Phone In" || source === "Coaching In") return "online";
   if (source === "Logout" || source === "Time Out") return "offline";
   if (source === "Break Out") return "break";
   if (source === "Lunch Break Out") return "lunch";
-  if (isOffPhoneStart(source)) return "offPhone";
+  if (isOffPhoneStart(source) || source === "Coaching Out") return "offPhone";
   return null;
 }
 

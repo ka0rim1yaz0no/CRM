@@ -1,7 +1,7 @@
 import { accountTime, bucketForAttendanceSource, calculateSlotAttendance, recordsWithClosingBoundaries, type SlotAttendancePolicy } from "./timeAccounting";
 import type { AttendanceSource } from "../models/Attendance";
 
-export function earnedPayrollTime(records: Array<{ source: string; timeIn: Date }>, policy: SlotAttendancePolicy, now: Date, paidHours: number, allDeductions = false) {
+export function earnedPayrollTime(records: Array<{ source: string; timeIn: Date }>, policy: SlotAttendancePolicy, now: Date, paidHours: number, allDeductions = false, excludeUndertimeAbsence = false) {
     const activity = accountTime(recordsWithClosingBoundaries(records, policy.closingBoundaries).flatMap(record => {
         const bucket = bucketForAttendanceSource(record.source as AttendanceSource);
         return bucket ? [{ at: record.timeIn, bucket }] : [];
@@ -19,7 +19,7 @@ export function earnedPayrollTime(records: Array<{ source: string; timeIn: Date 
     const lateMinutes = allDeductions ? attendance.lateMinutes : 0;
     const earlyTimeOutMinutes = allDeductions ? attendance.earlyTimeOutMinutes : 0;
     const absenceMinutes = allDeductions && !records.length && now >= policy.shiftEnd ? Math.round(paidHours * 60) : 0;
-    const deductibleMinutes = restMinutes + lateMinutes + earlyTimeOutMinutes + absenceMinutes;
+    const deductibleMinutes = restMinutes + lateMinutes + (excludeUndertimeAbsence ? 0 : earlyTimeOutMinutes + absenceMinutes);
     return { grossHours, workedHours: Math.max(0, grossHours - restMinutes / 60),
         excessBreakMinutes, excessLunchMinutes, nonBillableOffPhoneMinutes, lateMinutes, earlyTimeOutMinutes, absenceMinutes, deductibleMinutes };
 }

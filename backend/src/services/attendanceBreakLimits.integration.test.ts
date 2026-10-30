@@ -40,6 +40,7 @@ const shiftDay = "2026-10-19";
 const start = Date.parse(`${shiftDay}T15:00:00Z`);
 const at = (seconds: number) => new Date(start + seconds * 1000).toISOString();
 type Snapshot = { revision: number; fingerprint: string; state: string; reviewState: string; syncPending: boolean;
+  sessionId: string; allowedActions: string[]; coachingBilling?: import("../../../shared/attendanceCoaching").CoachingBillingSnapshot;
   offPhoneBilling?: import("../../../shared/attendanceOffPhone").OffPhoneBillingSnapshot;
   records: Array<{ id: string; source: AttendanceSource; at: string }>;
   derived: AttendanceDerivedDay[]; allowances: { breakMinutes: number; lunchMinutes: number };
@@ -139,6 +140,90 @@ async function rejectAction(person: Person, source: AttendanceSource, seconds: n
   if (message) assert.equal(rejected.message, message);
   assert.equal(await core(person), before, `${source} rejection must not write attendance, revision, audit, outbox, payroll, or availability`);
 }
+
+test("HTTP: Coaching returns ONLINE exactly at its separate shift boundary in all six businesses and freezes paid records", async () => {
+  const { runAttendanceCoachingReturns } = await import("./attendanceCoachingWorker");
+  const person = await fixture();
+  const payrollEvidence = async () => Promise.all(businesses.map(business => runWithBusiness(business, () => PayrollRecord.find({ employeeId: person.code }).sort({ _id: 1 }).lean())));
+  for (const business of businesses) await runWithBusiness(business, async () => {
+    await Employee.updateOne({ employeeCode: person.code }, { role: "Sales" });
+    for (const status of ["Paid", "Completed"]) await PayrollRecord.collection.insertOne({ employeeId: person.code, employeeName: "Synthetic employee",
+      status, grossPay: 100, deductions: 5, netPay: 95, paidOn: new Date(start - 86_400_000), payPeriod: "Synthetic protected history" });
+  });
+  const paidBefore = await payrollEvidence();
+  await action(person, "Time In", 0);
+  await action(person, "Coaching Out", 60);
+  await action(person, "Coaching In", 660);
+  await action(person, "Time Out", 700);
+  await action(person, "Time In", 800);
+  await action(person, "Coaching Out", 900);
+  mock.timers.setTime(start + 1200 * 1000);
+  for (const index of businesses.keys()) {
+    const view = await session(person, index);
+    assert.equal(view.coachingBilling?.remainingPaidMs, 300_000);
+    assert.equal(view.coachingBilling?.active?.returnAt, at(1500));
+    assert.equal(view.coachingBilling?.totalMs, 900_000);
+    assert.ok(!view.allowedActions.includes("Off the Phone In"));
+  }
+  mock.timers.setTime(start + 1_499_999);
+  assert.equal(await runAttendanceCoachingReturns(new Date()), 0);
+  const before = await AttendanceLedger.findOne({ employeeCode: person.code }).lean();
+  mock.timers.setTime(start + 1_500_000);
+  const returns = await Promise.all([runAttendanceCoachingReturns(new Date()), runAttendanceCoachingReturns(new Date())]);
+  assert.equal(returns.reduce((sum, count) => sum + count, 0), 1);
+  assert.equal(await runAttendanceCoachingReturns(new Date()), 0);
+  for (const index of businesses.keys()) {
+    const view = await session(person, index);
+    assert.equal(view.state, "ONLINE");
+    assert.equal(view.coachingBilling?.remainingPaidMs, 0);
+    assert.equal(view.coachingBilling?.totalMs, 1_200_000);
+    assert.equal(view.coachingBilling?.active, null);
+    assert.ok(!view.allowedActions.includes("Coaching Out"));
+    assert.equal(view.derived[0].nonBillableOffPhoneMinutes, 0);
+    const businessAttendance = await runWithBusiness(businesses[index], () => Attendance.find({ employee: person.ids[index] }).lean());
+    assert.equal(businessAttendance.filter(row => row.source === "Coaching In").length, 2);
+    assert.equal(businessAttendance.find(row => row.source === "Coaching In" && row.timeIn.toISOString() === at(1500))?.timeIn.toISOString(), at(1500));
+  }
+  const after = await AttendanceLedger.findOne({ employeeCode: person.code }).lean();
+  assert.deepEqual(after?.events.slice(0, before!.events.length), before?.events, "original punches remain intact");
+  assert.equal(after?.audit.at(-1)?.operation, "coaching-return");
+  assert.equal(after?.audit.at(-1)?.actor.role, "system");
+  assert.deepEqual(await payrollEvidence(), paidBefore);
+  const rejected = await action<{ code: string }>(person, "Coaching Out", 1600, 409, 5);
+  assert.equal(rejected.code, "COACHING_ALLOWANCE_EXHAUSTED");
+  await action(person, "Off the Phone Out", 1700);
+  await action(person, "Off the Phone In", 1760);
+  await action(person, "Time Out", 1800);
+  mock.timers.setTime(start + 86_400_000);
+  person.employeeToken = createAttendanceHubSession(person.code)!;
+  await action(person, "Time In", 86_400);
+  const next = await action(person, "Coaching Out", 86_460);
+  assert.equal(next.coachingBilling?.remainingPaidMs, 1_200_000);
+  assert.deepEqual(await payrollEvidence(), paidBefore);
+});
+
+test("HTTP: manual Coaching return, checkout and shift end cannot leave a duplicate or non-billable Coaching interval", async () => {
+  const { runAttendanceCoachingReturns } = await import("./attendanceCoachingWorker");
+  for (const source of ["Coaching In", "Time Out"] as const) {
+    mock.timers.setTime(start);
+    const person = await fixture();
+    await action(person, "Time In", 0); await action(person, "Coaching Out", 60);
+    await action(person, source, 1250);
+    mock.timers.setTime(start + 1300 * 1000);
+    assert.equal(await runAttendanceCoachingReturns(new Date()), 0);
+    const view = await session(person);
+    assert.equal(view.records.filter(row => row.source === "Coaching In").length, 1);
+  }
+  mock.timers.setTime(start);
+  const person = await fixture();
+  await action(person, "Time In", 0); await action(person, "Coaching Out", 9 * 3600 - 300);
+  mock.timers.setTime(start + (9 * 3600 + 10) * 1000);
+  assert.equal(await runAttendanceCoachingReturns(new Date()), 1);
+  const view = await session(person);
+  assert.equal(view.state, "ONLINE");
+  assert.equal(view.records.at(-1)?.at, at(9 * 3600));
+  assert.equal(view.derived[0].nonBillableOffPhoneMinutes, 0);
+});
 
 test("HTTP: one off-phone budget survives refresh, checkout, new Time In, automatic non-billable excess and Undo in all six businesses", async () => {
   const oldLimit = process.env.CRM_OFF_PHONE_PAID_LIMIT_FROM;

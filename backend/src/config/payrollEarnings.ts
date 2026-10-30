@@ -1,6 +1,6 @@
 import type { OffPhoneLimitPolicy } from "../../../shared/attendanceOffPhone";
 import { savedPayrollPeriod } from "../../../shared/payrollPeriod";
-import { earnedAllDeductionsVersion } from "../../../shared/payrollEarnings";
+import { earnedAllDeductionsVersion, earnedLateRestVersion } from "../../../shared/payrollEarnings";
 
 export function offPhoneLimitPolicy(): OffPhoneLimitPolicy | undefined {
     const effectiveFrom = process.env.CRM_OFF_PHONE_PAID_LIMIT_FROM;
@@ -26,5 +26,14 @@ export function earnedAllDeductionsEnabled(payPeriod: string) {
 }
 
 export function earnedPayrollVersion(payPeriod: string) {
+    if (earnedUndertimeAbsenceExcluded(payPeriod)) return earnedLateRestVersion;
     return earnedAllDeductionsEnabled(payPeriod) ? earnedAllDeductionsVersion : "earned-hours-v1";
+}
+
+export function earnedUndertimeAbsenceExcluded(payPeriod: string) {
+    const from = process.env.CRM_EARNED_EXCLUDE_UNDERTIME_ABSENCE_FROM;
+    if (!from || !earnedAllDeductionsEnabled(payPeriod)) return false;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !Number.isFinite(Date.parse(from))) throw new Error("Invalid earned undertime/absence exclusion cutoff");
+    const period = savedPayrollPeriod(payPeriod);
+    return Boolean(period && period.start >= from);
 }

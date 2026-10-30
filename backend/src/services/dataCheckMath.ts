@@ -60,9 +60,11 @@ export function auditAttendance(events: AuditPunch[], date: string, policy: Chec
   let mode: "online" | "break" | "lunch" | "offPhone" | "offline" = "offline";
   let lastAt = start.getTime(); let workedMs = 0; let offPhoneMs = 0;
   let nonBillable = false, nonBillableMs = 0, nonBillableOffPhoneMinutes = 0;
+  let coaching = false;
   const limit = offPhoneLimitPolicy();
   let paidRemaining = limit && +start >= Date.parse(limit.effectiveFrom) ? limit.paidMinutes * 60_000 : Infinity;
   const countOffPhone = (milliseconds: number) => {
+    if (coaching) return;
     const paid = nonBillable ? 0 : Math.min(paidRemaining, milliseconds);
     nonBillableMs += milliseconds - paid;
     if (!nonBillable) paidRemaining -= paid;
@@ -80,14 +82,15 @@ export function auditAttendance(events: AuditPunch[], date: string, policy: Chec
     if (mode === "offPhone") offPhoneMs += Math.max(0, clipped - lastAt);
     if (mode === "offPhone") countOffPhone(Math.max(0, clipped - lastAt));
     lastAt = clipped;
-    if (["Time In", "Login", "Time Out", "Logout", "Off the Phone In"].includes(event.source)) {
+    if (["Time In", "Login", "Time Out", "Logout", "Off the Phone In", "Coaching In"].includes(event.source)) {
       nonBillableOffPhoneMinutes += Math.ceil(nonBillableMs / 60_000); nonBillableMs = 0; nonBillable = false;
+      coaching = false;
     }
     const duplicate = event.eventId || `${event.source}:${event.at}`;
     if (seen.has(duplicate)) issues.push(event); seen.add(duplicate);
     const clockMinutes = (clock: string) => { const [hour, minute] = clock.split(":").map(Number); return hour * 60 + minute; };
     const cutoff = +end + ((clockMinutes(policy.autoTimeOutTime || "08:05") - clockMinutes(policy.shiftEnd) + 1440) % 1440) * 60_000;
-    const automaticCutoff = event.autoTimeOut && at <= cutoff && ["Time Out", "Break In", "Lunch Break In", "Off the Phone In"].includes(event.source);
+    const automaticCutoff = event.autoTimeOut && at <= cutoff && ["Time Out", "Break In", "Lunch Break In", "Off the Phone In", "Coaching In"].includes(event.source);
     if (!Number.isFinite(at) || at > +now || at < start.getTime() || (at > end.getTime() && !automaticCutoff) || (event.slotKey && event.slotKey !== date) || (event.storedSlotKey && event.storedSlotKey !== date)) issues.push(event);
     if (["Time In", "Login"].includes(event.source)) {
       for (const rest of ["break", "lunch"] as const) if (open[rest]) {
@@ -103,12 +106,13 @@ export function auditAttendance(events: AuditPunch[], date: string, policy: Chec
       }
       if (!online) issues.push(event);
       online = false; lastOut = event; mode = "offline";
-    } else if (isOffPhoneStart(event.source)) {
+    } else if (isOffPhoneStart(event.source) || event.source === "Coaching Out") {
       if (!online || mode !== "online") issues.push(event);
       nonBillableOffPhoneMinutes += Math.ceil(nonBillableMs / 60_000); nonBillableMs = 0;
       nonBillable = event.source === nonBillableOffPhoneSource; mode = "offPhone";
+      coaching = event.source === "Coaching Out";
     }
-    else if (event.source === "Off the Phone In") { if (mode !== "offPhone") issues.push(event); mode = "online"; }
+    else if (event.source === "Off the Phone In" || event.source === "Coaching In") { if (mode !== "offPhone") issues.push(event); mode = "online"; }
     else {
       const rest = event.source.startsWith("Lunch") ? "lunch" : event.source.startsWith("Break") ? "break" : null;
       if (!rest) continue;

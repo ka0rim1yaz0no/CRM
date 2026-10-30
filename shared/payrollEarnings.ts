@@ -7,6 +7,7 @@ export type PayrollEarningsView = {
 };
 
 export const earnedAllDeductionsVersion = "earned-hours-all-deductions-v1";
+export const earnedLateRestVersion = "earned-hours-late-rest-v1";
 export function isEarnedPayrollVersion(version?: string) {
-    return version === "earned-hours-v1" || version === earnedAllDeductionsVersion;
+    return version === "earned-hours-v1" || version === earnedAllDeductionsVersion || version === earnedLateRestVersion;
 }

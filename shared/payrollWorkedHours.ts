@@ -1,4 +1,4 @@
-import { earnedAllDeductionsVersion, isEarnedPayrollVersion } from "./payrollEarnings";
+import { earnedAllDeductionsVersion, earnedLateRestVersion, isEarnedPayrollVersion } from "./payrollEarnings";
 
 export function adjustedPayrollHours(source: { scheduledHours: number; excessBreakMinutes: number; excessLunchMinutes: number; nonBillableOffPhoneMinutes?: number; calculationVersion?: string; lateMinutes?: number; earlyTimeOutMinutes?: number; absenceMinutes?: number }, workedMinutes: number) {
     const scheduledMinutes = Math.round(source.scheduledHours * 60);
@@ -10,7 +10,8 @@ export function adjustedPayrollHours(source: { scheduledHours: number; excessBre
     }
     if (isEarnedPayrollVersion(source.calculationVersion)) {
         const restMinutes = source.excessBreakMinutes + source.excessLunchMinutes + (source.nonBillableOffPhoneMinutes ?? 0);
-        const shortfalls = source.calculationVersion === earnedAllDeductionsVersion ? [source.lateMinutes ?? 0, source.earlyTimeOutMinutes ?? 0, source.absenceMinutes ?? 0] : [];
+        const shortfalls = source.calculationVersion === earnedAllDeductionsVersion ? [source.lateMinutes ?? 0, source.earlyTimeOutMinutes ?? 0, source.absenceMinutes ?? 0]
+            : source.calculationVersion === earnedLateRestVersion ? [source.lateMinutes ?? 0] : [];
         if (!shortfalls.every(value => Number.isSafeInteger(value) && value >= 0)) throw new Error("Attendance shortfall deductions need payroll review.");
         const deductibleMinutes = restMinutes + shortfalls.reduce((sum, value) => sum + value, 0);
         if (workedMinutes + restMinutes > scheduledMinutes) throw new Error("Paid hours plus non-billable and rest deductions exceed the scheduled cutoff hours.");

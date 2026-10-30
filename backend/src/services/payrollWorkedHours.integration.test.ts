@@ -86,15 +86,17 @@ const confirm = (plan: { token: string; workedMinutes: number }, extra = {}) => 
     token: plan.token, workedMinutes: plan.workedMinutes, confirm: true, reason: "Synthetic reviewed total-hours adjustment", ...extra });
 async function saved(business = businesses[0]) { return runWithBusiness(business, () => PayrollRecord.findOne({ employeeId: code }).lean()); }
 
-test("earned all-deductions policy matches all six refreshed Payroll and Payments views and preserves paid records", async context => {
+for (const excludeUndertimeAbsence of [false, true]) test(`earned ${excludeUndertimeAbsence ? "late-and-rest" : "all-deductions"} policy matches all six refreshed Payroll and Payments views and preserves paid records`, async context => {
     context.mock.timers.enable({ apis: ["Date"], now: new Date("2026-10-11T01:00:00Z") });
     const originalToken = token; token = createAdminDashboardSession("90000001")!;
-    const names = ["CRM_EARNED_PAYROLL_FROM", "CRM_EARNED_ALL_DEDUCTIONS_FROM", "CRM_OFF_PHONE_PAID_LIMIT_FROM", "CRM_ATTENDANCE_ACCURACY_FIXES"];
+    const names = ["CRM_EARNED_PAYROLL_FROM", "CRM_EARNED_ALL_DEDUCTIONS_FROM", "CRM_OFF_PHONE_PAID_LIMIT_FROM", "CRM_ATTENDANCE_ACCURACY_FIXES", "CRM_EARNED_EXCLUDE_UNDERTIME_ABSENCE_FROM"];
     const previous = names.map(name => process.env[name]);
     context.after(() => { context.mock.timers.reset(); token = originalToken; names.forEach((name, index) => {
         if (previous[index] === undefined) delete process.env[name]; else process.env[name] = previous[index];
     }); });
     process.env.CRM_EARNED_PAYROLL_FROM = "2026-10-06"; process.env.CRM_EARNED_ALL_DEDUCTIONS_FROM = "2026-10-06";
+    if (excludeUndertimeAbsence) process.env.CRM_EARNED_EXCLUDE_UNDERTIME_ABSENCE_FROM = "2026-10-06";
+    else delete process.env.CRM_EARNED_EXCLUDE_UNDERTIME_ABSENCE_FROM;
     process.env.CRM_OFF_PHONE_PAID_LIMIT_FROM = "2026-10-06T15:00:00Z"; process.env.CRM_ATTENDANCE_ACCURACY_FIXES = "true";
     const start = Date.parse("2026-10-06T15:00:00Z");
     const entries = [["Time In", 10], ["Break Out", 60], ["Break In", 76], ["Lunch Break Out", 180], ["Lunch Break In", 241],
@@ -116,11 +118,12 @@ test("earned all-deductions policy matches all six refreshed Payroll and Payment
     });
     const candidate = await runWithBusiness(businesses[0], async () => calculatePayrollCandidate((await Employee.findOne({ employeeCode: code }).lean())!, period));
     const value = candidate.value;
-    assert.equal(value.calculationVersion, "earned-hours-all-deductions-v1");
+    const chargedMinutes = excludeUndertimeAbsence ? 18 : 508;
+    assert.equal(value.calculationVersion, excludeUndertimeAbsence ? "earned-hours-late-rest-v1" : "earned-hours-all-deductions-v1");
     assert.equal(value.lateMinutes, 10); assert.equal(value.earlyTimeOutMinutes, 10); assert.equal(value.absenceMinutes, 480);
     assert.equal(value.excessBreakMinutes, 1); assert.equal(value.excessLunchMinutes, 1); assert.equal(value.nonBillableOffPhoneMinutes, 6);
-    assert.equal(value.deductibleMinutes, 508); assert.ok(Math.abs(value.earnedGrossHours! - 1420 / 60) < 1e-10);
-    assert.equal(value.deductions, Math.round(508 * value.minuteRate * 100) / 100);
+    assert.equal(value.deductibleMinutes, chargedMinutes); assert.ok(Math.abs(value.earnedGrossHours! - 1420 / 60) < 1e-10);
+    assert.equal(value.deductions, Math.round(chargedMinutes * value.minuteRate * 100) / 100);
     assert.equal(value.netPay, Math.round((value.grossPay - value.deductions) * 100) / 100); assert.ok(value.netPay > 0);
     for (const [index, business] of businesses.entries()) {
         const login = await request("/auth/login", { employeeCode: code }, business); assert.equal(login.status, 200);
@@ -128,11 +131,12 @@ test("earned all-deductions policy matches all six refreshed Payroll and Payment
             const list = await request(`/payroll/records?payPeriod=${encodeURIComponent(period)}`, undefined, business);
             assert.equal(list.status, 200); assert.equal(list.data[0].netPay, value.netPay); assert.equal(list.data[0].deductions, value.deductions);
             const dtr = await request(`/payroll/dtr/${code}?payPeriod=${encodeURIComponent(period)}`, undefined, business);
-            assert.equal(dtr.status, 200); assert.equal(dtr.data.summary.deductibleMinutes, 508); assert.equal(dtr.data.summary.netPay, value.netPay);
+            assert.equal(dtr.status, 200); assert.equal(dtr.data.summary.deductibleMinutes, chargedMinutes); assert.equal(dtr.data.summary.netPay, value.netPay);
             const response = await fetch(`${base}/employees/${login.data.user._id}/payments`, { headers: { "X-Business-Id": business, "X-CRM-Attendance-Session": login.data.attendanceHubSession } });
             assert.equal(response.status, 200); const item = (await response.json()).items[0];
             assert.equal(item.netPay, value.netPay); assert.equal(item.deductions, value.deductions);
-            const lines = payrollDeductionRows(item); assert.equal(lines.length, 6);
+            const lines = payrollDeductionRows(item); assert.equal(lines.length, excludeUndertimeAbsence ? 4 : 6);
+            if (excludeUndertimeAbsence) assert.ok(!lines.some(row => ["Undertime", "Absence"].includes(row.label)));
             assert.equal(lines.reduce((sum, row) => sum + Math.round(row.amount * 100), 0), Math.round(value.deductions * 100));
             assert.ok(lines.every(row => row.amount > 0));
         }
@@ -143,7 +147,7 @@ test("earned all-deductions policy matches all six refreshed Payroll and Payment
     const applied = await request("/payroll/recompute/confirm", { token: plan.data.token, payPeriod: period, overtimeApprovals: {}, confirm: true, reason: "Synthetic approved all-deductions policy" });
     assert.equal(applied.status, 200, JSON.stringify(applied.data));
     const hours = await preview(900); assert.equal(hours.status, 200, JSON.stringify(hours.data));
-    assert.equal(hours.data.after.deductibleMinutes, 508); assert.equal(hours.data.after.status, value.status);
+    assert.equal(hours.data.after.deductibleMinutes, chargedMinutes); assert.equal(hours.data.after.status, value.status);
     const changed = await confirm(hours.data); assert.equal(changed.status, 200, JSON.stringify(changed.data));
     for (const business of businesses) await runWithBusiness(business, async () => {
         const record = (await saved(business))!;

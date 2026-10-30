@@ -2,7 +2,7 @@ import type { QueryClient } from "@tanstack/react-query";
 
 export function refreshAttendanceWorkspace(client: QueryClient) {
     // Tenant copies have different employee IDs. Invalidate views, never copy one tenant's payload into another.
-    return Promise.all(["attendance-session", "employee-attendance", "employee-dashboard-attendance",
+    return Promise.all(["attendance-session", "employee-attendance", "employee-dashboard-attendance", "employee-profile-attendance",
         "attendance-hub", "attendance-hub-day", "attendance-hub-live", "employees-attendance",
         "payroll", "payroll-records", "payroll-stats", "payroll-cutoffs", "payroll-roster-gaps", "payroll-current-previews", "payroll-dtr", "payroll-payslip-dtr", "payroll-compute", "employee-payments",
         "admin-dashboard-attendance-records", "admin-call-dashboard", "agent-lead-dashboard", "dashboard-quick-view", "employees"].map((key) =>
@@ -14,7 +14,7 @@ export function refreshEmployeeWorkspace(client: QueryClient, employeeId: string
         "employee-dashboard-tasks", "employee-dashboard-lead-counts", "employee-dashboard-lead-queue", "employee-notices"]) {
         void client.invalidateQueries({ queryKey: [key, employeeId] });
     }
-    for (const key of ["attendance-session", "employee-attendance"]) {
+    for (const key of ["attendance-session", "employee-attendance", "employee-profile-attendance"]) {
         void client.invalidateQueries({ predicate: (query) => query.queryKey[0] === key && query.queryKey[2] === employeeId });
     }
     for (const key of ["employee-dashboard-lead-logs", "employee-dashboard-announcements", "employee-agent-lead-dashboard"]) {

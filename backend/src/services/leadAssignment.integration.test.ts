@@ -297,6 +297,14 @@ test("old owner reservation and dispatch are rejected after a transfer while new
     try {
         for (const business of businesses) {
             const f = await fixture(business), lead = await f.add();
+            const { AttendanceLedger } = await import("../models/AttendanceLedger");
+            const { getAttendanceBusinessIdentity } = await import("../models/BusinessUserAccess");
+            const identity = await getAttendanceBusinessIdentity(f.owner.employeeCode);
+            assert.ok(identity);
+            await AttendanceLedger.create({ _id: `access:${identity.id}`, employeeCode: f.owner.employeeCode,
+                canonicalBusinessId: business, businessIds: businesses, revision: 1, fence: 0,
+                events: [{ id: "synthetic-online", source: "Time In", at: now.toISOString(), recordedAt: now.toISOString(), sequence: 1, commandId: "synthetic-online" }],
+                corrections: [], closures: [], audit: [], commands: [], jobs: [] });
             const { CALLING_QUEUE_POLICY_VERSION } = await import("../../../shared/leadCallingPolicy");
             await getCallBridgeDeviceModel().create({ employeeCode: f.owner.employeeCode, employeeName: f.owner.name, deviceName: "Synthetic device", deviceId: f.owner.employeeCode, tokenHash: crypto.randomBytes(24).toString("hex"), businessIds: businesses,
                 bridgeVersion: "0.4.2", state: "idle", nextivaProcessDetected: true, audioSessionActive: false, lastSeenAt: now, lastStateChangedAt: now, lastIdleAt: now });

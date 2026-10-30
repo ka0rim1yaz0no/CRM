@@ -1,4 +1,24 @@
-# Earned Pay With All Attendance Deductions
+# Earned Pay Deductions And Attendance Reference Values
+
+## Current Earned-Pay Rule
+
+`CRM_EARNED_EXCLUDE_UNDERTIME_ABSENCE_FROM` opts a configured cutoff into
+`earned-hours-late-rest-v1`. It requires both earned-pay and all-deductions flags.
+Earned gross is unchanged. Only Late, excess Break/Lunch and non-billable Off the
+Phone are cash deductions. Undertime and Absence remain in attendance statistics,
+but are not charged again because their unworked hours already reduce earned gross.
+Deduction breakdowns retain those two categories as information, with their exact
+minutes and reference currency values calculated from the saved full-precision
+minute rate. The displayed deduction total includes these reference values;
+the saved cash deduction field and actual net pay do not charge them again.
+The redundant explanatory labels and Applied to net pay row are not displayed
+in employee Payments. Missing historical rates remain unavailable rather than
+being guessed. Edit Hours uses the same calculation rule.
+Paid/Completed payrolls retain their saved calculation version, amounts and dates;
+older paid payslips keep their original deduction breakdown. Refreshing unpaid
+views is read-only and is not a bulk recompute or settlement.
+
+## Earlier Opt-In Rule
 
 This opt-in policy retains earned-to-date gross pay and additionally deducts Late,
 Undertime, completed scheduled-shift Absence, excess Break, excess Lunch and

@@ -36,7 +36,7 @@ export function accuratePayrollRates(salary: number, monthlyWorkingDays: number,
 }
 export function accuratePayrollDay(records: Array<{ source: string; timeIn: Date }>, policy: {
   breakMinutes: number; lunchMinutes: number; graceMinutes: number; shiftStart: Date; shiftEnd: Date; closingBoundaries?: Date[];
-}, now: Date, paidHours: number, weekend: boolean, mismatch = false, allEarnedDeductions = false) {
+}, now: Date, paidHours: number, weekend: boolean, mismatch = false, allEarnedDeductions = false, excludeUndertimeAbsence = false) {
   const calculated = calculateSlotAttendance(records, policy, now);
   const events = records.map((item, sequence) => ({ id: String(sequence), commandId: String(sequence), sequence,
     source: item.source as AttendanceSource, at: item.timeIn.toISOString(), recordedAt: item.timeIn.toISOString() } as SessionEvent));
@@ -59,7 +59,7 @@ export function accuratePayrollDay(records: Array<{ source: string; timeIn: Date
   const grossHours = (activity.milliseconds.online + activity.milliseconds.break + activity.milliseconds.lunch + activity.milliseconds.offPhone) / 3_600_000;
   const overtimeNonBillableMinutes = weekend && first ? nonBillableOffPhoneIntervals(records, first.timeIn, final?.timeIn || now, now, offPhoneLimitPolicy())
     .reduce((sum, interval) => sum + interval.minutes, 0) : 0;
-  const earned = earnedPayrollTime(records, policy, now, paidHours, allEarnedDeductions && !weekend && !integrityReview);
+  const earned = earnedPayrollTime(records, policy, now, paidHours, allEarnedDeductions && !weekend && !integrityReview, excludeUndertimeAbsence);
   return { earned, integrityReview, status, review, calculated, components, grossHours, lunchHours: activity.milliseconds.lunch / 3_600_000,
     regularHours: weekend || status === "Scheduled" || review ? 0 : Math.max(0, paidHours - components.deductibleMinutes / 60),
     overtimeHours: weekend && !review ? Math.max(0, grossHours - activity.milliseconds.lunch / 3_600_000 - overtimeNonBillableMinutes / 60) : 0,

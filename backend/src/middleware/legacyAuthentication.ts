@@ -123,7 +123,7 @@ export async function legacyAuthentication(request: Request, response: Response,
     const code = request.query.employeeCode || request.body?.employeeCode;
     if (code && code !== actor.code) return denied(response);
     if (["/call-bridge/status", "/call-bridge/attempts/latest", "/call-bridge/package"].includes(path) && request.method === "GET") return next();
-    if (["/call-bridge/pairings", "/call-bridge/activate", "/call-bridge/reserve", "/call-bridge/dial-start", "/call-bridge/release", "/call-bridge/devices"].includes(path)) return next();
+    if (["/call-bridge/pairings", "/call-bridge/activate", "/call-bridge/reserve", "/call-bridge/dial-start", "/call-bridge/dial-at-deadline", "/call-bridge/release", "/call-bridge/devices"].includes(path)) return next();
     return denied(response);
   }
   if (/^\/(leads|my-leads|log)(\/|$)/.test(path)) {

@@ -11,6 +11,7 @@ import { attendanceAutoTimeOutEnabled } from "../config/rolloutFlags";
 import { runAttendanceAutoTimeOut } from "./attendanceAutoTimeOutWorker";
 import { runAttendanceDerivedRefresh } from "./attendanceDerivedRefreshWorker";
 import { runAttendancePolicyRefresh } from "./attendancePolicyRefreshWorker";
+import { startAttendanceCoachingWorker } from "./attendanceCoachingWorker";
 import { attendanceWorkerCounter, attendanceWorkerFailure, trackAttendanceWorker } from "./attendanceWorkerHealth";
 
 export async function runAttendanceRecovery(now = new Date(), deliver = deliverAttendanceLedger) {
@@ -53,6 +54,7 @@ async function runRecovery(now: Date, deliver: typeof deliverAttendanceLedger) {
 let timer: NodeJS.Timeout | null = null;
 let running = false;
 export function startAttendanceIntegrityWorker() {
+  startAttendanceCoachingWorker();
   if (!timer) logAttendanceFlags();
   if (timer || !attendanceIntegrityEnabled()) return;
   const cycle = async () => {

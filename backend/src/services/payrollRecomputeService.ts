@@ -18,7 +18,7 @@ import { payrollReadGroups } from "./payrollReadPolicy";
 import { savedPayrollPeriod } from "../../../shared/payrollPeriod";
 import { adjustedPayrollHours } from "../../../shared/payrollWorkedHours";
 import { payrollDeductionRows, type SavedDeductionSource } from "../../../shared/payrollPresentation";
-import { earnedPayrollEnabled, earnedAllDeductionsEnabled, earnedPayrollVersion } from "../config/payrollEarnings";
+import { earnedPayrollEnabled, earnedAllDeductionsEnabled, earnedPayrollVersion, earnedUndertimeAbsenceExcluded } from "../config/payrollEarnings";
 
 const fail = (statusCode: number, message: string) => Object.assign(new Error(message), { statusCode });
 const fingerprint = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -68,7 +68,7 @@ export async function calculatePayrollCandidate(employee: { _id: Types.ObjectId;
       days: dtr.rows.map(item => ({ dayKey: item.dateKey, status: item.status, lateMinutes: item.lateMinutes, earlyTimeOutMinutes: item.earlyTimeOutMinutes,
         nonBillableOffPhoneMinutes: item.nonBillableOffPhoneMinutes ?? 0,
         excessBreakMinutes: item.excessBreakMinutes, excessLunchMinutes: item.excessLunchMinutes, absenceMinutes: item.absenceMinutes, deductibleMinutes: item.deductibleMinutes })),
-      rounding: earnedAllDeductionsEnabled(payPeriod) ? "Earned-to-date gross less all verified attendance deductions: Late, Undertime, completed-shift Absence, excess Break/Lunch and non-billable Off the Phone. Shortfalls are additional charges under the approved policy. No future-shift absence; money rounds once per total; net floors at zero." : earned ? "Earned in-shift presence less the taken lunch allowance; excess rest and non-billable minutes round up and are deducted once. No future hours, late/early shortfall or absence is deducted again. Money rounds once per total." : "Each completed break/lunch excess rounds up; lateness uses minute boundaries after grace; early-out rounds up; money rounds once per total." } };
+      rounding: earnedUndertimeAbsenceExcluded(payPeriod) ? "Earned-to-date gross less Late, excess Break/Lunch and non-billable Off the Phone. Undertime and Absence remain attendance information only; unworked hours are already excluded from earned gross. Money rounds once per total; net floors at zero." : earnedAllDeductionsEnabled(payPeriod) ? "Earned-to-date gross less all verified attendance deductions: Late, Undertime, completed-shift Absence, excess Break/Lunch and non-billable Off the Phone. Shortfalls are additional charges under the approved policy. No future-shift absence; money rounds once per total; net floors at zero." : earned ? "Earned in-shift presence less the taken lunch allowance; excess rest and non-billable minutes round up and are deducted once. No future hours, late/early shortfall or absence is deducted again. Money rounds once per total." : "Each completed break/lunch excess rounds up; lateness uses minute boundaries after grace; early-out rounds up; money rounds once per total." } };
   return { record, value, dtr, rates };
 }
 
