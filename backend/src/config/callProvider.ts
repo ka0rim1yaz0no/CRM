@@ -1,4 +1,5 @@
 import { CALLING_QUEUE_POLICY_VERSION } from "../../../shared/leadCallingPolicy";
+import { getCurrentBusinessId } from "./tenancy";
 
 // Historical RingCentral attempt records remain readable; live calls use Nextiva.
 export type CallProvider = "nextiva" | "ringcentral";
@@ -27,9 +28,17 @@ export function isAutoCallDisabledForEmployee(employeeCode: unknown) {
   const disabledEmployeeCodes = parseAutoCallDisabledEmployeeCodes(
     process.env.AUTO_CALL_DISABLED_EMPLOYEE_CODES || ""
   );
+  const businessId = getCurrentBusinessId();
 
   return Boolean(
     normalizedCode &&
-    (disabledEmployeeCodes.has("*") || disabledEmployeeCodes.has(normalizedCode))
+    (disabledEmployeeCodes.has("*") || disabledEmployeeCodes.has(normalizedCode) ||
+      disabledEmployeeCodes.has(`${businessId}:${normalizedCode}`) || isAutoCallDisabledForBusiness(businessId))
   );
+}
+
+export function isAutoCallDisabledForBusiness(businessId: unknown) {
+  const id = String(businessId || "").trim();
+  const disabled = parseAutoCallDisabledEmployeeCodes(process.env.AUTO_CALL_DISABLED_BUSINESS_IDS || "");
+  return Boolean(id && (disabled.has("*") || disabled.has(id)));
 }

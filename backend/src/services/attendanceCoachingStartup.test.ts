@@ -12,7 +12,7 @@ const code = ts.transpileModule(isolated, { compilerOptions: { module: ts.Module
 
 for (const gate of ["disabled", "workers-disabled", "enabled", "not-configured"] as const) {
     test(`Coaching starts independently while preserving the ${gate} general worker gate`, async () => {
-        let coaching = 0, otherWorkers = 0;
+        let coaching = 0, payroll = 0, otherWorkers = 0;
         const noop = () => undefined;
         await runInNewContext(`(async()=>{${code}\n})()`, {
             exports: {}, process: { env: gate === "not-configured" ? {} : { CRM_LEAD_WORKSPACE_SWITCH_FILE: "synthetic-private-gate" }, on: noop },
@@ -22,10 +22,11 @@ for (const gate of ["disabled", "workers-disabled", "enabled", "not-configured"]
             startAttendanceCoachingWorker: () => { coaching++; },
             startLeadAutoAssignmentScheduler: () => { otherWorkers++; }, startHempSurveyLeadQueueWorker: () => { otherWorkers++; },
             startAttendanceReconciliationWorker: () => { otherWorkers++; }, startAttendanceIntegrityWorker: () => { otherWorkers++; },
-            startPayrollGenerationWorker: () => { otherWorkers++; },
+            startPayrollGenerationWorker: () => { payroll++; },
             applyLeadWorkspaceSwitch: async (start: () => void) => { if (gate === "enabled") start(); },
         });
         assert.equal(coaching, 1, "Coaching must start even when the unrelated general worker group is disabled");
-        assert.equal(otherWorkers, gate === "enabled" || gate === "not-configured" ? 5 : 0, "Do not enable other workers to start Coaching");
+        assert.equal(payroll, 1, "The opt-in payroll scheduler starts independently of the general worker group");
+        assert.equal(otherWorkers, gate === "enabled" || gate === "not-configured" ? 4 : 0, "Do not enable other workers to start Coaching or payroll");
     });
 }

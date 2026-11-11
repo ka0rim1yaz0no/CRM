@@ -6,7 +6,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$BridgeVersion = "0.4.2"
+$BridgeVersion = "0.5.0"
 $InstallDirectory = Join-Path $env:LOCALAPPDATA "Assistly\CallBridge"
 $SourceScript = Join-Path $PSScriptRoot "AssistlyCallBridge.ps1"
 $InstalledScript = Join-Path $InstallDirectory "AssistlyCallBridge.ps1"
@@ -65,6 +65,16 @@ $body = @{
     bridgeVersion = $BridgeVersion
 } | ConvertTo-Json
 
+$confirmation = Read-Host "Pause Auto Call and let current calls finish normally. Type INSTALL when this PC is idle"
+if ($confirmation -cne "INSTALL") { throw "Installation cancelled. No pairing or running service was changed." }
+for ($sample = 0; $sample -lt 2; $sample++) {
+    $probe = & $PowerShellPath -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $SourceScript -ProbeOnly | ConvertFrom-Json
+    if ($LASTEXITCODE -ne 0 -or $probe.State -ne "idle" -or -not $probe.NextivaProcessDetected -or $probe.AudioSessionActive) {
+        throw "Nextiva is active or cannot be confirmed idle. Install later between calls."
+    }
+    if ($sample -eq 0) { Start-Sleep -Seconds 1 }
+}
+
 Write-Host "Pairing this computer with Assistly CRM..."
 $claim = Invoke-RestMethod `
     -Method Post `
@@ -79,7 +89,7 @@ if (-not $claim.token) {
 }
 
 Get-CimInstance Win32_Process |
-    Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -like "*AssistlyCallBridge.ps1*" } |
+    Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -like "*$InstalledScript*" } |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 
 New-Item -ItemType Directory -Path $InstallDirectory -Force | Out-Null

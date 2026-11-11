@@ -20,8 +20,9 @@ export async function runAttendanceRecovery(now = new Date(), deliver = deliverA
 async function runRecovery(now: Date, deliver: typeof deliverAttendanceLedger) {
   if (!attendanceIntegrityEnabled() || attendanceAutoTimeOutEnabled()) return 0;
   const accuracy = attendanceAccuracyFixesEnabled(); const budget = attendanceWorkerBudget();
+  const fields = "_id employeeCode businessIds canonicalBusinessId revision events corrections closures";
   const ledgers = accuracy ? await attendanceWorkerBatch("recovery", activeAttendanceWorkerFilter(),
-    "_id employeeCode businessIds canonicalBusinessId revision events corrections closures") : await AttendanceLedger.find({}).lean();
+    fields) : await AttendanceLedger.find({}).select(fields).lean();
   let closed = 0;
   for (const ledger of ledgers) {
     if (accuracy && !budget()) break;

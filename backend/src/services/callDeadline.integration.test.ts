@@ -22,6 +22,7 @@ const {getCallBridgeDeviceModel, getCallBridgeScheduleModel} = await import("../
 const {prepareDeadlineQueue} = await import("./callDeadlinePreparation");
 const {LeadPhoneSlot} = await import("./leadPhoneDispatch");
 const {CALLING_QUEUE_POLICY_VERSION} = await import("../../../shared/leadCallingPolicy");
+const {POST_CALL_WAIT_MS} = await import("./callTiming");
 let mongo: MongoMemoryReplSet, server: http.Server, base = "";
 let fixtureNumber = 0;
 const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
@@ -47,15 +48,62 @@ async function fixture(business = businesses[0]) {
     const deadline = new Date(+now + 10000);
     await getCallBridgeDeviceModel().create({employeeCode: code, deviceId: code, employeeName: "Synthetic", deviceName: "Synthetic", tokenHash: crypto.randomUUID(),
         state: "idle", nextivaProcessDetected: true, audioSessionActive: false, bridgeVersion: "0.4.2", businessIds: [business.id], lastSeenAt: now, lastStateChangedAt: now, lastIdleAt: now});
-    await getCallBridgeScheduleModel().create({employeeCode: code, lastCallEndedAt: new Date(+now - 20000), nextCallAllowedAt: deadline});
+    await getCallBridgeScheduleModel().create({employeeCode: code, lastCallEndedAt: new Date(+deadline - POST_CALL_WAIT_MS), nextCallAllowedAt: deadline});
     const add = (extra = {}) => runWithBusiness(business.id, () => Lead.create({businessName: "Synthetic", phone, status: "NEW", assignedAgent: employee._id, assignedAgentName: employee.name, ...extra}));
     const request = (attemptId = crypto.randomUUID(), signal?: AbortSignal, browser = {}) => fetch(base + "/call-bridge/dial-at-deadline", {method: "POST", signal,
         headers: {"Content-Type": "application/json", "X-Business-Id": business.id, "X-CRM-Attendance-Session": createAttendanceHubSession(code)!,
             "X-CRM-User-Code": code, "X-CRM-User-Type": "employee", "X-CRM-Auto-Call-Version": CALLING_QUEUE_POLICY_VERSION},
         body: JSON.stringify({employeeCode: code, attemptId, notBefore: deadline.toISOString(), ...browser})});
+    const verify = (leadId: string, reservationToken: string, browser = {}, headers = {}) => fetch(base + "/call-bridge/verify-deadline-launch", {method: "POST",
+        headers: {"Content-Type": "application/json", "X-Business-Id": business.id, "X-CRM-Attendance-Session": createAttendanceHubSession(code)!,
+            "X-CRM-User-Code": code, "X-CRM-User-Type": "employee", "X-CRM-Auto-Call-Version": CALLING_QUEUE_POLICY_VERSION, ...headers},
+        body: JSON.stringify({employeeCode: code, leadId, reservationToken, ...browser})});
     await mongoose.connection.getClient().db(business.databaseName).collection("payrollrecords").insertOne({employee: employee._id, status: "Paid", netPay: 99, paidOn: new Date("2026-10-21")});
-    return {business, code, employee, key, timeIn, deadline, add, request};
+    return {business, code, employee, key, timeIn, deadline, add, request, verify};
 }
+
+test("a slow original deadline grant is rechecked read-only in six businesses without resetting its timestamps", async context => {
+    context.mock.timers.enable({apis: ["Date"], now});
+    try {
+        for(const business of businesses){
+            context.mock.timers.setTime(+now);const f=await fixture(business),lead=await f.add(),attempt=crypto.randomUUID();
+            const pending=f.request(attempt);await pause(250);context.mock.timers.setTime(+f.deadline);
+            assert.equal((await pending).status,200);
+            const before=JSON.stringify(await getCallBridgeScheduleModel().findOne({employeeCode:f.code}).lean());
+            const payroll=JSON.stringify(await mongoose.connection.getClient().db(business.databaseName).collection('payrollrecords').findOne({employee:f.employee._id}));
+            const attendance=JSON.stringify((await AttendanceLedger.findById(f.key).lean())?.events);
+            context.mock.timers.setTime(+f.deadline+5000);
+            const response=await f.verify(String(lead._id),attempt),body=await response.json();
+            assert.equal(response.status,200,JSON.stringify(body));assert.equal(body.startedAt,f.deadline.toISOString());
+            assert.equal(JSON.stringify(await getCallBridgeScheduleModel().findOne({employeeCode:f.code}).lean()),before);
+            assert.equal(JSON.stringify(await mongoose.connection.getClient().db(business.databaseName).collection('payrollrecords').findOne({employee:f.employee._id})),payroll);
+            assert.equal(JSON.stringify((await AttendanceLedger.findById(f.key).lean())?.events),attendance);
+            const replay=await f.request(attempt);assert.equal((await replay.json()).alreadyStarted,true);
+        }
+    }finally{context.mock.timers.reset();}
+});
+
+test("deadline recovery refuses expired, changed, foreign-session and active-call grants", async context => {
+    context.mock.timers.enable({apis:["Date"],now});
+    try{
+        for(const scenario of ['expired','coaching','off-phone','break','lunch','checkout','active','unknown','role','phone','owner','browser','unsigned']){
+            context.mock.timers.setTime(+now);const f=await fixture(),lead=await f.add(),attempt=crypto.randomUUID();
+            const pending=f.request(attempt);await pause(250);context.mock.timers.setTime(+f.deadline);assert.equal((await pending).status,200);
+            const sources:Record<string,string>={coaching:'Coaching Out','off-phone':'Off the Phone Out',break:'Break Out',lunch:'Lunch Break Out',checkout:'Time Out'};
+            if(sources[scenario])await AttendanceLedger.updateOne({_id:f.key},{$push:{events:{id:'away',source:sources[scenario],at:new Date(+f.deadline+1).toISOString(),recordedAt:new Date(+f.deadline+1).toISOString(),sequence:2,commandId:'local-away'}}});
+            if(scenario==='active'||scenario==='unknown')await getCallBridgeDeviceModel().updateOne({employeeCode:f.code},{$set:{state:scenario,audioSessionActive:scenario==='active'}});
+            if(scenario==='role')await runWithBusiness(f.business.id,()=>Employee.updateOne({_id:f.employee._id},{$set:{role:'HR'}}));
+            if(scenario==='phone')await runWithBusiness(f.business.id,()=>Lead.updateOne({_id:lead._id},{$set:{phone:'+12025550999'}}));
+            if(scenario==='owner')await runWithBusiness(f.business.id,()=>Lead.updateOne({_id:lead._id},{$set:{assignedAgent:new mongoose.Types.ObjectId()}}));
+            if(scenario==='browser')await getCallBridgeDeviceModel().updateOne({employeeCode:f.code},{$set:{accountSwitchingEnabled:true,browserDeviceKeyHash:crypto.createHash('sha256').update('synthetic-device-key-at-least-24-chars').digest('hex'),browserSessionId:'another-synthetic-browser-session'}});
+            context.mock.timers.setTime(+f.deadline+(scenario==='expired'?30000:1000));
+            const before=JSON.stringify(await getCallBridgeScheduleModel().findOne({employeeCode:f.code}).lean());
+            const response=await f.verify(String(lead._id),attempt,{},scenario==='unsigned'?{'X-CRM-Attendance-Session':''}:{});
+            assert.ok([401,403,409].includes(response.status),scenario+': '+response.status);
+            assert.equal(JSON.stringify(await getCallBridgeScheduleModel().findOne({employeeCode:f.code}).lean()),before,scenario+' must not reset a grant');
+        }
+    }finally{context.mock.timers.reset();}
+});
 
 test("preparation selects the future due head without taking a lease and tracks legacy/raw lead writes", async context => {
     context.mock.timers.enable({apis: ["Date"], now});
@@ -72,6 +120,54 @@ test("preparation selects the future due head without taking a lease and tracks 
             assert.equal(plan.queue.nextLeadId, String(old._id), "change streams include writes that bypass application cache hooks");
         } finally {await plan.close();}
     } finally {context.mock.timers.reset();}
+});
+
+test("20 plans observe the same raw change independently and closing one cannot interrupt the others", async context => {
+    context.mock.timers.enable({ apis: ["Date"], now });
+    const plans: Array<Awaited<ReturnType<typeof prepareDeadlineQueue>>> = [];
+    try {
+        type Scope = Awaited<ReturnType<typeof fixture>>;
+        const scopes: Array<{ f: Scope; lead: Awaited<ReturnType<Scope["add"]>> }> = [];
+        for (let index = 0; index < 20; index++) { const f = await fixture(); const lead = await f.add(); scopes.push({ f, lead }); }
+        const evidence = async () => JSON.stringify({ schedules: await getCallBridgeScheduleModel().find({}).sort({ _id: 1 }).lean(),
+            attendance: await AttendanceLedger.find({}).sort({ _id: 1 }).lean() });
+        const before = await evidence();
+        plans.push(...await Promise.all(scopes.map(({ f }) => runWithBusiness(f.business.id, () => prepareDeadlineQueue(f.employee, f.business.id, +f.deadline)))));
+        const change = async (index: number) => {
+            await runWithBusiness(scopes[index].f.business.id, () => Lead.collection.updateOne({ _id: scopes[index].lead._id }, { $set: { status: "Dead" } }));
+            for (let retry = 0; retry < 40; retry++) { if (await plans[index].refresh()) return; await pause(25); }
+            assert.fail("Raw lead change was not observed");
+        };
+        await change(0);
+        assert.deepEqual(await Promise.all(plans.slice(1).map(plan => plan.refresh())), Array(19).fill(true));
+        assert.equal(plans[0].queue.nextLeadId, null);
+        plans.slice(1).forEach((plan, index) => assert.equal(plan.queue.nextLeadId, String(scopes[index + 1].lead._id)));
+        await plans[0].close(); await change(1); assert.equal(plans[1].queue.nextLeadId, null);
+        assert.equal(await evidence(), before, "preparation must not consume leases or mutate attendance");
+    } finally { await Promise.all(plans.map(plan => plan.close())); context.mock.timers.reset(); }
+});
+
+test("deadline preparation retains an unnoted call through queue changes and releases it on a saved note in six businesses", async context => {
+    context.mock.timers.enable({ apis: ["Date"], now });
+    try {
+        for (const business of businesses) {
+            const f = await fixture(business), lead = await f.add();
+            await runWithBusiness(business.id, () => Lead.updateOne({ _id: lead._id }, { $set: { callsByEmployee: [{ employee: f.employee._id, employeeName: f.employee.name, count: 1, lastCallAt: now }] } }));
+            const before = JSON.stringify(await getCallBridgeScheduleModel().findOne({ employeeCode: f.code }).lean());
+            const plan = await runWithBusiness(business.id, () => prepareDeadlineQueue(f.employee, business.id, +f.deadline));
+            try {
+                assert.equal(plan.queue.nextLeadId, String(lead._id));
+                await f.add({ phone: "+12025550198", createdAt: new Date(+now + 1) });
+                const callback = await f.add({ phone: "+12025550199", status: "Follow up", followUpAt: f.deadline });
+                await plan.refresh(true);
+                assert.equal(plan.queue.nextLeadId, String(lead._id), "preparing a future queue must use the same repeat selection as list/reserve");
+                await runWithBusiness(business.id, () => Lead.collection.updateOne({ _id: lead._id }, { $set: { comments: [{ authorType: "employee", authorName: "Synthetic", body: "Synthetic saved note", createdAt: now }] } }));
+                for (let read = 0; read < 40 && plan.queue.nextLeadId !== String(callback._id); read++) { await plan.refresh(); await pause(25); }
+                assert.equal(plan.queue.nextLeadId, String(callback._id), "a saved note observed through the change stream releases the target");
+                assert.equal(JSON.stringify(await getCallBridgeScheduleModel().findOne({ employeeCode: f.code }).lean()), before, "preparation is read-only and cannot take a lease");
+            } finally { await plan.close(); }
+        }
+    } finally { context.mock.timers.reset(); }
 });
 
 test("all six businesses prepare before the deadline, authorize no early dial and replay only one dispatch", async context => {
@@ -118,7 +214,7 @@ test("fractional-second stored bridge dates preserve the exact deadline in all s
                 context.mock.timers.setTime(+now); const f = await fixture(business); await f.add();
                 f.deadline.setMilliseconds(fraction);
                 await getCallBridgeScheduleModel().updateOne({employeeCode: f.code}, {$set: {
-                    lastCallEndedAt: new Date(+f.deadline - 30000), nextCallAllowedAt: f.deadline,
+                    lastCallEndedAt: new Date(+f.deadline - POST_CALL_WAIT_MS), nextCallAllowedAt: f.deadline,
                 }});
                 let completed = false;
                 const pending = f.request().then(response => {completed = true; return response;});
@@ -196,4 +292,70 @@ test("switchable bridges require current browser ownership at the deadline acros
             }
         }
     } finally {context.mock.timers.reset();}
+});
+
+
+test("business Auto Call restrictions fence deadline dispatch and rechecking without changing saved records", async context => {
+    const previous = process.env.AUTO_CALL_DISABLED_BUSINESS_IDS;
+    context.mock.timers.enable({apis: ["Date"], now});
+    try {
+        process.env.AUTO_CALL_DISABLED_BUSINESS_IDS = businesses.slice(0, 2).map(row => row.id).join(",");
+        for (const [index, business] of businesses.entries()) {
+            context.mock.timers.setTime(+now);
+            const f = await fixture(business), lead = await f.add(), attempt = crypto.randomUUID();
+            const evidence = async () => JSON.stringify({
+                attendance: (await AttendanceLedger.findById(f.key).lean())?.events,
+                payroll: await mongoose.connection.getClient().db(business.databaseName).collection("payrollrecords").findOne({employee: f.employee._id}),
+            });
+            const before = await evidence();
+            const schedule = JSON.stringify(await getCallBridgeScheduleModel().findOne({employeeCode: f.code}).lean());
+            if (index < 2) {
+                const response = await f.request(attempt);
+                assert.equal(response.status, 409);
+                assert.equal((await response.json()).code, "CALL_ATTENDANCE_CHANGED");
+                assert.equal(JSON.stringify(await getCallBridgeScheduleModel().findOne({employeeCode: f.code}).lean()), schedule);
+            } else {
+                context.mock.timers.setTime(+f.deadline);
+                const response = await f.request(attempt);
+                assert.equal(response.status, 200, JSON.stringify(await response.clone().json()));
+                process.env.AUTO_CALL_DISABLED_BUSINESS_IDS += "," + business.id;
+                const grant = JSON.stringify(await getCallBridgeScheduleModel().findOne({employeeCode: f.code}).lean());
+                const recheck = await f.verify(String(lead._id), attempt);
+                assert.equal(recheck.status, 409);
+                assert.equal((await recheck.json()).code, "CALL_ATTENDANCE_CHANGED");
+                assert.equal(JSON.stringify(await getCallBridgeScheduleModel().findOne({employeeCode: f.code}).lean()), grant);
+            }
+            assert.equal(await evidence(), before);
+        }
+    } finally {
+        if (previous === undefined) delete process.env.AUTO_CALL_DISABLED_BUSINESS_IDS;
+        else process.env.AUTO_CALL_DISABLED_BUSINESS_IDS = previous;
+        context.mock.timers.reset();
+    }
+});
+
+
+test("business-scoped employee restrictions reject only the selected employee deadline and preserve other callers", async context => {
+    const employeeCodes = process.env.AUTO_CALL_DISABLED_EMPLOYEE_CODES, businessIds = process.env.AUTO_CALL_DISABLED_BUSINESS_IDS;
+    context.mock.timers.enable({apis: ["Date"], now});
+    try {
+        process.env.AUTO_CALL_DISABLED_BUSINESS_IDS = "";
+        for (const business of businesses) {
+            context.mock.timers.setTime(+now);
+            const target = await fixture(business), other = await fixture(business);
+            await target.add(); await other.add();
+            process.env.AUTO_CALL_DISABLED_EMPLOYEE_CODES = `${business.id}:${target.code}`;
+            const schedule = JSON.stringify(await getCallBridgeScheduleModel().findOne({employeeCode: target.code}).lean());
+            const blocked = await target.request();
+            assert.equal(blocked.status, 409); assert.equal((await blocked.json()).code, "CALL_ATTENDANCE_CHANGED");
+            assert.equal(JSON.stringify(await getCallBridgeScheduleModel().findOne({employeeCode: target.code}).lean()), schedule);
+            context.mock.timers.setTime(+other.deadline);
+            const allowed = await other.request();
+            assert.equal(allowed.status, 200, JSON.stringify(await allowed.clone().json()));
+        }
+    } finally {
+        if (employeeCodes === undefined) delete process.env.AUTO_CALL_DISABLED_EMPLOYEE_CODES; else process.env.AUTO_CALL_DISABLED_EMPLOYEE_CODES = employeeCodes;
+        if (businessIds === undefined) delete process.env.AUTO_CALL_DISABLED_BUSINESS_IDS; else process.env.AUTO_CALL_DISABLED_BUSINESS_IDS = businessIds;
+        context.mock.timers.reset();
+    }
 });

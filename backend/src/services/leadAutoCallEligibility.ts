@@ -3,6 +3,7 @@ export { AUTO_CALL_COMMENT_COOLDOWN_MS } from "../../../shared/leadCallingPolicy
 type AutoCallEligibilityLead = {
   status?: string;
   followUpAt?: Date | string | null;
+  lastCallOutcomeAt?: Date | string | null;
   comments?: Array<{ authorName?: string; authorType?: string; createdAt?: Date | string | null }>;
   callsByEmployee?: Array<{ employeeName?: string; lastCallAt?: Date | string | null }>;
 };

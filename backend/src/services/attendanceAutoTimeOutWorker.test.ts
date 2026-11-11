@@ -25,6 +25,12 @@ const system = { role: "system" as const, code: "attendance-auto-time-out" };
 const cutoff = "2026-10-16T00:05:00.000Z";
 const now = (clock: string) => new Date(`2026-10-16T${clock}Z`);
 const copy = <T>(value: T): T => structuredClone(value);
+function candidateQuery(rows: () => unknown[]) {
+  let fields: string[] | undefined;
+  const query = { select(value: string) { fields = value.split(/\s+/); assert.ok(!fields.includes("commands") && !fields.includes("audit")); return query; },
+    async lean() { const selected = fields; return rows().map(row => selected ? Object.fromEntries(Object.entries(row as Record<string, unknown>).filter(([key]) => selected.includes(key))) as AttendanceLedgerDocument : row as AttendanceLedgerDocument); } };
+  return query;
+}
 function event(source: SessionEvent["source"], at: string, sequence: number): SessionEvent {
   return { id: `synthetic-${sequence}`, source, at: new Date(at).toISOString(), sequence, commandId: `synthetic-command-${sequence}`, recordedAt: new Date(at).toISOString(),
     ...(source === "Time In" ? { sessionId: "synthetic-session", shift: assignAttendanceShift(new Date(at)) } : {}) };
@@ -69,7 +75,7 @@ beforeEach(() => {
   mock.method(console, "warn", (...args: unknown[]) => { warnings.push(args); });
   mock.method(AttendancePolicy, "findById", () => ({ lean: async () => copy(policy) }) as never);
   mock.method(AttendanceLedger, "findById", () => ({ lean: async () => copy(store) }) as never);
-  mock.method(AttendanceLedger, "find", () => ({ lean: async () => [copy(store)] }) as never);
+  mock.method(AttendanceLedger, "find", () => candidateQuery(() => [copy(store)]) as never);
   mock.method(AttendanceLedger, "updateOne", async (_filter: Record<string, unknown>, update: Record<string, unknown>) => {
     if (update.$unset) { delete store.lockToken; delete store.lockUntil; }
     return { modifiedCount: 1 } as never;
@@ -127,13 +133,13 @@ test("07:59 Manila never closes a shift; opening the session snapshot is read-on
   assert.deepEqual(store, before);
 });
 
-test("catch-up checkout preserves the earlier billable Coaching boundary without non-billable conversion", async () => {
+test("catch-up checkout closes unlimited billable Coaching at the normal cutoff without non-billable conversion", async () => {
   store.events.push(event("Coaching Out", "2026-10-15T23:30:00Z", 1));
   const original = copy(store.events);
   assert.equal(await runAttendanceAutoTimeOut(now("00:05:00"), noDelivery), 1);
   assert.deepEqual(store.events.slice(0, original.length), original);
   assert.deepEqual(store.events.slice(-2).map(item => [item.source, item.at]), [
-    ["Coaching In", "2026-10-15T23:50:00.000Z"], ["Time Out", cutoff],
+    ["Coaching In", cutoff], ["Time Out", cutoff],
   ]);
   assert.equal(store.derived?.[0].nonBillableOffPhoneMinutes, 0);
 });
@@ -362,7 +368,7 @@ test("policy rejects cutoffs before 08:00 and malformed HH:MM, accepting the exa
 
 test("a permanent command failure does not prevent a later ledger closing, and reports counts only", async () => {
   const poison = { ...copy(store), _id: "synthetic-poison-ledger", employeeCode: "synthetic-private-employee" };
-  mock.method(AttendanceLedger, "find", () => ({ lean: async () => [poison, copy(store)] }) as never);
+  mock.method(AttendanceLedger, "find", () => candidateQuery(() => [poison, copy(store)]) as never);
   mock.method(AttendanceLedger, "findById", (id: string) => ({ lean: async () => {
     if (id === poison._id) throw Object.assign(new Error("Synthetic private identity must not be logged"), { code: "LEDGER_CAPACITY" });
     return copy(store);
@@ -374,7 +380,7 @@ test("a permanent command failure does not prevent a later ledger closing, and r
 
 test("policy lookup failure is isolated per ledger before command execution", async () => {
   const poison = { ...copy(store), _id: "synthetic-policy-failure" };
-  mock.method(AttendanceLedger, "find", () => ({ lean: async () => [poison, copy(store)] }) as never);
+  mock.method(AttendanceLedger, "find", () => candidateQuery(() => [poison, copy(store)]) as never);
   let reads = 0;
   mock.method(AttendancePolicy, "findById", () => ({ lean: async () => {
     if (++reads === 1) throw new Error("Synthetic policy unavailable");
@@ -387,7 +393,7 @@ test("policy lookup failure is isolated per ledger before command execution", as
 
 test("malformed timeline cannot abort later ledgers", async () => {
   const malformed = { ...copy(store), events: null };
-  mock.method(AttendanceLedger, "find", () => ({ lean: async () => [malformed, copy(store)] }) as never);
+  mock.method(AttendanceLedger, "find", () => candidateQuery(() => [malformed, copy(store)]) as never);
   assert.deepEqual(await runAttendanceAutoTimeOutCycle(now("00:05:00"), noDelivery),
     { scanned: 2, closed: 1, skipped: 0, failed: 1, deliveryPending: 0 });
 });

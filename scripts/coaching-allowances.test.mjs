@@ -6,7 +6,7 @@ import test from "node:test";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import ts from "typescript";
-import { allowanceClock, coachingRemainingMs, offPhoneRemainingMs } from "../src/lib/attendanceAllowances.ts";
+import { allowanceClock, attendanceAwayDisabledReason, coachingElapsedMs, coachingRemainingMs, offPhoneRemainingMs } from "../src/lib/attendanceAllowances.ts";
 
 const source = readFileSync(new URL("../src/components/AttendanceAwayControls.tsx", import.meta.url), "utf8");
 const require = createRequire(import.meta.url);
@@ -17,7 +17,7 @@ runInNewContext(ts.transpileModule(source, { compilerOptions: { target: ts.Scrip
         if (name === "@tanstack/react-query") return { useQueryClient: () => ({}), useMutation: () => ({ isPending: pendingMutation, isError: false }) };
         if (name === "../api/attendanceSession") return { performAttendanceAction: () => assert.fail("render cannot write attendance") };
         if (name === "../api/businessStorage") return { getActiveBusinessId: () => "synthetic" };
-        if (name === "../lib/attendanceAllowances") return { allowanceClock, coachingRemainingMs, offPhoneRemainingMs };
+        if (name === "../lib/attendanceAllowances") return { allowanceClock, attendanceAwayDisabledReason, coachingElapsedMs, coachingRemainingMs, offPhoneRemainingMs };
         if (name === "../lib/attendanceUndo") return { attendanceCorrectionError: () => "Synthetic error" };
         return require(name);
     } });
@@ -41,6 +41,50 @@ test("remaining clocks use server deadlines, survive refresh and cannot go below
     assert.equal(allowanceClock(299_001), "05:00");
     assert.equal(allowanceClock(0), "00:00");
     assert.equal(allowanceClock(null), "--:--");
+});
+
+test("unlimited Coaching shows elapsed time after refresh in six businesses and keeps Coaching Out available beyond twenty minutes", () => {
+    for (let business = 0; business < 6; business++) for (const minutes of [0, 20, 45, 90]) {
+        const view = snapshot(0, true), now = Date.parse(view.serverTime);
+        view.coachingBilling = { ...view.coachingBilling, limited: false, remainingPaidMs: null,
+            paidUsedMs: minutes * 60000, totalMs: minutes * 60000, active: { startedAt: new Date(now - minutes * 60000).toISOString(), returnAt: null } };
+        const html = renderToStaticMarkup(React.createElement(exported.default, { employeeId: "synthetic", snapshot: JSON.parse(JSON.stringify(view)) }));
+        const button = html.match(/<button[^>]+data-attendance-action="COACHING"[^>]*>/)[0];
+        assert.doesNotMatch(button, /disabled=""/); assert.match(html, />Coaching Out<\/button>/);
+        assert.match(html, /Coaching this shift/); assert.match(html, /Billable, no time limit/);
+        assert.doesNotMatch(html, /Coaching remaining|Coaching allowance remaining|Returning Online|20 min billable/);
+        assert.match(html, new RegExp('>' + String(minutes).padStart(2, '0') + ':00<\\/output>'));
+        assert.equal(coachingRemainingMs(view.coachingBilling, now), null);
+        assert.equal(coachingElapsedMs(view.coachingBilling, now + 1000, now), minutes * 60000 + 1000);
+        assert.match(html.match(/<button[^>]+data-attendance-action="OFF THE PHONE"[^>]*>/)[0], /disabled=""/);
+    }
+});
+
+test("unlimited Coaching elapsed time does not double-count after refresh, drift backwards or grow outside the shift", () => {
+    const view = snapshot(), now = Date.parse(view.serverTime), end = now + 60_000;
+    const billing = { ...view.coachingBilling, limited: false, remainingPaidMs: null, endsAt: new Date(end).toISOString(),
+        paidUsedMs: 3_600_000, totalMs: 3_600_000, active: { startedAt: new Date(now - 3_600_000).toISOString(), returnAt: null } };
+    assert.equal(coachingElapsedMs(billing, now + 5000, now), 3_605_000);
+    assert.equal(coachingElapsedMs({ ...billing, totalMs: 3_605_000 }, now + 5000, now + 5000), 3_605_000);
+    assert.equal(coachingElapsedMs(billing, now - 1000, now), 3_600_000);
+    assert.equal(coachingElapsedMs(billing, end + 60_000, now), 3_660_000);
+});
+
+test("unlimited Coaching can start again with zero elapsed time or after long completed sessions, but retains attendance and save guards", () => {
+    const render = view => renderToStaticMarkup(React.createElement(exported.default, { employeeId: "synthetic", snapshot: view }));
+    const button = html => html.match(/<button[^>]+data-attendance-action="COACHING"[^>]*>/)[0];
+    for (const elapsed of [0, 90 * 60_000]) {
+        const view = snapshot(0);
+        view.allowedActions = ["Coaching Out", "Off the Phone Out"];
+        view.coachingBilling = { ...view.coachingBilling, limited: false, remainingPaidMs: null, totalMs: elapsed, paidUsedMs: elapsed };
+        assert.doesNotMatch(button(render(view)), /disabled=""/);
+        assert.match(render(view), />Coaching<\/button>/);
+        assert.match(button(render({ ...view, reviewState: "needs-correction" })), /disabled=""/);
+        assert.match(button(render({ ...view, allowedActions: [] })), /disabled=""/);
+        pendingMutation = true;
+        try { assert.match(button(render(view)), /disabled=""/); }
+        finally { pendingMutation = false; }
+    }
 });
 
 test("all six business dashboards retain independent Off the Phone and billable Coaching controls after refresh", () => {

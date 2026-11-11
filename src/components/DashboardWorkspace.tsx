@@ -14,6 +14,7 @@ import AvailabilityBadge from "./AvailabilityBadge";
 import DeferredDashboardSection from "./DeferredDashboardSection";
 import WorkspaceMobileNavigation from "./WorkspaceMobileNavigation";
 import { recordedTalkTime } from "../lib/dashboardCallInsights";
+import { includesFormattedSearchValue } from "../../shared/workspaceSearch";
 const DashboardInsights = lazy(() => import("./DashboardInsights"));
 export function DashboardHeader({ controls, updatedAt, busy, error, refresh, onQuickView, employees, attention = [] }: {
   controls: DashboardControls; updatedAt?: string; busy: boolean; error: boolean; refresh: () => void; onQuickView: (name: string) => void; employees: Employee[]; attention?: DashboardWorkspaceData["attention"];
@@ -26,7 +27,11 @@ export function DashboardHeader({ controls, updatedAt, busy, error, refresh, onQ
   const [checkedAt, setCheckedAt] = useState(Date.now);
   useEffect(() => { const timer = window.setInterval(() => setCheckedAt(Date.now()), 15_000); return () => window.clearInterval(timer); }, []);
   useEffect(() => { const timer = window.setTimeout(() => setDebouncedSearch(search.trim()), 250); return () => window.clearTimeout(timer); }, [search]);
-  const leadSearch = useQuery({ queryKey: ["dashboard-palette-leads", controls.business, debouncedSearch], queryFn: () => getLeads({ search: debouncedSearch, page: 1, limit: 8 }), enabled: palette && debouncedSearch.length >= 2, staleTime: 60_000, retry: false });
+  const searchAuth = getAuthUser();
+  const leadSearch = useQuery({ queryKey: ["dashboard-palette-leads", controls.business, debouncedSearch],
+    queryFn: () => getLeads({ search: debouncedSearch, page: 1, limit: 8 }, { businessId: controls.business,
+      ...(searchAuth?.userType === "admin" ? { adminSession: searchAuth.sessionToken || "" } : { employeeSession: searchAuth?.attendanceHubSession || "" }) }),
+    enabled: Boolean(searchAuth) && palette && debouncedSearch.length >= 2, staleTime: 60_000, retry: false });
   const searchRef = useRef<HTMLInputElement>(null);
   const prefix = useRef(false);
   const opener = useRef<HTMLElement | null>(null);
@@ -64,7 +69,7 @@ export function DashboardHeader({ controls, updatedAt, busy, error, refresh, onQ
       {help ? <dl><dt>Ctrl / Cmd + K or /</dt><dd>Search</dd><dt>g then d / l / a</dt><dd>Dashboard / Leads / Attendance</dd><dt>?</dt><dd>This dialog</dd></dl> : <>
         <input ref={searchRef} autoFocus aria-label="Find a page or employee" placeholder="Page, employee name or code" value={search} onChange={(event) => setSearch(event.target.value)} />
         <nav>{["Dashboard", "Employees", "Leads", "Attendance", "Payroll", "Messages"].filter((item) => item.toLowerCase().includes(search.toLowerCase())).map((item) => <Link key={item} to={`/admin/${item.toLowerCase()}`} onClick={() => setPalette(false)}>{item}</Link>)}</nav>
-        {search.trim() && <><nav aria-label="Matching employees">{employees.filter((employee) => `${employee.name} ${employee.employeeCode}`.toLowerCase().includes(search.toLowerCase())).slice(0, 8).map((employee) => <button key={employee._id} type="button" onClick={() => { onQuickView(employee.employeeCode); setPalette(false); }}>{employee.name} | {employee.employeeCode}</button>)}</nav><nav aria-label="Matching leads">{leadSearch.isFetching && <span role="status">Searching leads...</span>}{leadSearch.isError && <span role="alert">Lead search is unavailable.</span>}{leadSearch.data?.map((lead) => <Link key={lead._id} to={`/admin/leads?scope=ALL&lead=${lead._id}`} onClick={() => setPalette(false)}>{lead.businessName || lead.leadName}</Link>)}</nav></>}
+        {search.trim() && <><nav aria-label="Matching employees">{employees.filter((employee) => [employee.name, employee.employeeCode].some(value => includesFormattedSearchValue(value, search))).slice(0, 8).map((employee) => <button key={employee._id} type="button" onClick={() => { onQuickView(employee.employeeCode); setPalette(false); }}>{employee.name} | {employee.employeeCode}</button>)}</nav><nav aria-label="Matching leads">{leadSearch.isFetching && <span role="status">Searching leads...</span>}{leadSearch.isError && <span role="alert">Lead search is unavailable.</span>}{leadSearch.data?.map((lead) => <Link key={lead._id} to={`/admin/leads?scope=ALL&lead=${lead._id}`} onClick={() => setPalette(false)}><span className="block truncate">{lead.businessName || lead.leadName}</span>{lead.phone && <span className="block truncate text-xs opacity-70">{lead.phone}</span>}</Link>)}</nav></>}
         <nav aria-label="Attention shortcuts">{attention.filter((item) => item.count > 0 && item.label.toLowerCase().includes(search.toLowerCase())).map((item) => <a key={item.key} href={item.href} onClick={() => setPalette(false)}>{item.count} {item.label}</a>)}</nav>
       </>}
     </dialog>

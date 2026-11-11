@@ -59,14 +59,14 @@ test("raw idle audio starts one confirmation window even if the old bridge still
     context.mock.timers.setTime(+now + 8000);
     const confirmed = await heartbeat("idle", false);
     assert.equal(confirmed.schedule?.lastCallEndedAt?.toISOString(), now.toISOString());
-    assert.equal(confirmed.schedule?.nextCallAllowedAt?.getTime(), +now + 30000, "confirmation must not add time to the 30-second deadline");
+    assert.equal(confirmed.schedule?.nextCallAllowedAt?.getTime(), +now + 15000, "confirmation must not add time to the 15-second deadline");
     const lease = { employeeCode: "synthetic-idle-signal", leaseUntil: new Date(+now + 75000), reservationTokenHash: "synthetic-token-hash",
       businessId: "synthetic-heartbeat", leadId: "synthetic-lead", timingV2: true };
-    assert.equal(await acquireCallBridgeLease({ ...lease, now: new Date(+now + 29999), attemptId: crypto.randomUUID() }), null);
+    assert.equal(await acquireCallBridgeLease({ ...lease, now: new Date(+now + 14999), attemptId: crypto.randomUUID() }), null);
     const competing = await Promise.all(["synthetic-heartbeat", "synthetic-other"].map(businessId => acquireCallBridgeLease({
-      ...lease, businessId, now: new Date(+now + 30000), attemptId: crypto.randomUUID(),
+      ...lease, businessId, now: new Date(+now + 15000), attemptId: crypto.randomUUID(),
     })));
-    assert.equal(competing.filter(Boolean).length, 1, "only one tab/business may dial at the shared 30-second deadline");
+    assert.equal(competing.filter(Boolean).length, 1, "only one tab/business may dial at the shared 15-second deadline");
   } finally { context.mock.timers.reset(); }
 });
 

@@ -1,3 +1,4 @@
+import { formattingInsensitiveNameRegex } from "../../../shared/workspaceSearch";
 import type { Request, Response } from "express";
 import { dashboardReadWindow } from "../services/dashboardReadWindow";
 import { Types } from "mongoose";
@@ -20,12 +21,16 @@ import { getRingCentralMonitorStatus } from "../services/ringCentralCallMonitor"
 import { isRingCentralOutcomeShadowEnabled } from "../services/ringCentralCallClassification";
 import { signedCrmIdentity, signedEmployeeInBusiness } from "../middleware/legacyAuthentication";
 import { employeeCallingQueue, hydrateCallingQueue } from "../services/employeeCallingQueue";
+import { setImmediate as yieldToEventLoop } from "node:timers/promises";
+import { callReadPriority } from "../services/callReadPriority";
+import { callingQueueTransport } from "../services/callingQueueTransport";
 import { compareCallingLeads, parseCallingSchedule, type CallingPolicyLead } from "../../../shared/leadCallingPolicy";
 import { isSalesEmployee as isSalesAssignableEmployee, isEligibleLeadRecipient } from "../../../shared/leadAssignmentPolicy";
 import { assignmentActor, assignmentSnapshotFilter, invalidateUnstartedLeadReservations, leadRecipients, uniquelyOwnedLegacyNames, writeLeadAssignment } from "../services/leadAssignment";
 import { normalizeLeadPhone, leadPhoneDigitVariants, logicalLeadKey } from "../../../shared/leadPhonePolicy";
 import { leadPhoneDedupEnabled } from "../config/rolloutFlags";
 import { leadPhoneCanonicalSnapshot, restrictToCanonicalPhones } from "../services/leadPhoneCanonical";
+import { orderCustomerMergeEnabled, storeOrderCustomerLead } from "../services/customerLeadMerge";
 
 const populateLead = [
   { path: "assignedAgent", select: "name employeeCode aliases role team status" },
@@ -1359,6 +1364,9 @@ const usStateAliases: Record<string, string> = {
 };
 
 const usStateCodes = new Set(Object.values(usStateAliases));
+const usStateNamePatterns = Object.entries(usStateAliases).map(([name, code]) =>
+  [new RegExp(`\\b${escapeRegex(name)}\\b`, "i"), code] as const
+);
 const usStateNamesByCode = new Map(
   Object.entries(usStateAliases).map(([name, code]) => [
     code,
@@ -1411,9 +1419,7 @@ function extractLeadStateFromAddress(address: unknown) {
 
   const normalizedAddress = normalizeLeadValue(addressText);
 
-  for (const [stateName, stateCode] of Object.entries(usStateAliases)) {
-    const stateNamePattern = new RegExp(`\\b${escapeRegex(stateName)}\\b`, "i");
-
+  for (const [stateNamePattern, stateCode] of usStateNamePatterns) {
     if (stateNamePattern.test(normalizedAddress)) {
       return stateCode;
     }
@@ -1450,13 +1456,15 @@ async function getLeadStateOptions(filter: Record<string, unknown>) {
     .limit(20000);
   const countsByState = new Map<string, number>();
 
-  leads.forEach((lead) => {
-    const state = extractLeadStateFromAddress(lead.businessAddress);
+  for (let index = 0; index < leads.length; index++) {
+    // State filters are display reads; let deadline/Bridge I/O progress between batches.
+    if (index && index % 128 === 0) await yieldToEventLoop();
+    const state = extractLeadStateFromAddress(leads[index].businessAddress);
 
     if (state) {
       countsByState.set(state, (countsByState.get(state) || 0) + 1);
     }
-  });
+  }
 
   return Array.from(countsByState.entries())
     .map(([code, count]) => ({
@@ -1465,6 +1473,50 @@ async function getLeadStateOptions(filter: Record<string, unknown>) {
       count,
     }))
     .sort((first, second) => first.name.localeCompare(second.name));
+}
+
+function extractLeadCityFromAddress(value: unknown) {
+  const parts = String(value || "").split(",").map(part => part.trim()).filter(Boolean);
+  const isCity = (city: string) => city.length >= 2 && city.length <= 100 && !/[\d\r\n]/.test(city) &&
+    !/^(?:unknown|n\/a|not provided|no address)$/i.test(city) &&
+    !/\b(?:street|st|road|rd|avenue|ave|blvd|boulevard|drive|dr|lane|ln|suite|ste|highway|hwy|county)\.?$/i.test(city);
+  for (let index = parts.length - 1; index >= 0; index--) {
+    const region = parts[index].replace(/\b\d{5}(?:-\d{4})?\b/g, "").trim();
+    if (normalizeLeadState(region)) {
+      const previous = parts[index - 1] || "";
+      const candidate = /\bcounty$/i.test(previous) ? parts[index - 2] || "" : previous;
+      return isCity(candidate) ? candidate : "";
+    }
+    const inline = region.match(/^(.+?)\s+([A-Z]{2})$/i);
+    if (inline && normalizeLeadState(inline[2]) && isCity(inline[1])) return inline[1].trim();
+  }
+  return "";
+}
+
+function createLeadCityAddressFilter(value: unknown) {
+  const city = String(value || "").trim();
+  if (!city || city === "ALL") return null;
+  if (city.length > 100 || /[\r\n]/.test(city)) return { _id: { $exists: false } };
+  const cityPattern = escapeRegex(city).replace(/\s+/g, "\\s+");
+  const regionPattern = [...usStateCodes, ...Object.keys(usStateAliases)].map(escapeRegex).join("|");
+  const postalSuffix = "(?:(?:\\s*,\\s*|\\s+)\\d{5}(?:-\\d{4})?)?";
+  const countrySuffix = `(?:\\s*,\\s*(?:USA|US|United States(?: of America)?)${postalSuffix})?`;
+  return { businessAddress: new RegExp(`(?:^|,\\s*)${cityPattern}(?:\\s*,\\s*(?:[^,\\d]{1,80}\\s+County,\\s*)?(?:${regionPattern})|\\s+(?:${regionPattern}))${postalSuffix}${countrySuffix}\\s*$`, "i") };
+}
+
+async function getLeadCityOptions(filter: Record<string, unknown>) {
+  await restrictToCanonicalPhones(filter);
+  const addresses = await Lead.distinct("businessAddress", filter);
+  const cities = new Map<string, string>();
+  for (let index = 0; index < addresses.length; index++) {
+    if (index && index % 128 === 0) await yieldToEventLoop();
+    const city = extractLeadCityFromAddress(addresses[index]);
+    const key = city.toLowerCase();
+    if (!city || cities.has(key)) continue;
+    const cityFilter = createLeadCityAddressFilter(city);
+    if (cityFilter?.businessAddress?.test(String(addresses[index]))) cities.set(key, city);
+  }
+  return [...cities.values()].sort((a, b) => a.localeCompare(b));
 }
 
 function parseGooglePlacesLocation(location: string) {
@@ -2404,6 +2456,7 @@ export async function listLeads(request: Request, response: Response) {
   if (search) {
     const searchRegex = wholeTermSearchRegex(search);
     const phoneRegexes = flexiblePhoneRegexes(search);
+    const nameRegex = response.locals?.crmActor?.type === "admin" ? formattingInsensitiveNameRegex(search) : null;
     andFilters.push({
       $or: [
         { leadName: searchRegex },
@@ -2418,6 +2471,7 @@ export async function listLeads(request: Request, response: Response) {
         { assignedAgentName: searchRegex },
         { notes: searchRegex },
         ...phoneRegexes.map((phoneRegex) => ({ phone: phoneRegex })),
+        ...(nameRegex ? [{ leadName: nameRegex }, { businessName: nameRegex }, { assignedAgentName: nameRegex }] : []),
       ],
     });
   }
@@ -2470,19 +2524,33 @@ export async function readLead(request: Request, response: Response) {
 }
 
 export async function listMyLeads(request: Request, response: Response) {
+  const workspaceView = String(request.query.workspaceView || "").toLowerCase() === "true";
   const callingRequested = String(request.query.callingQueue || "").toLowerCase() === "true";
+  const isWindowMode = request.query.windowEndPage !== undefined;
+  const windowStartPage = Number(request.query.windowStartPage || 1);
+  const windowEndPage = Number(request.query.windowEndPage || 1);
+  if (workspaceView && (callingRequested || String(request.query.autoCallEligible || "").toLowerCase() === "true") ||
+    (isWindowMode || request.query.windowStartPage !== undefined) && (!workspaceView || !isWindowMode ||
+      !Number.isSafeInteger(windowStartPage) || !Number.isSafeInteger(windowEndPage) || windowStartPage < 1 ||
+      windowEndPage < windowStartPage || windowEndPage - windowStartPage >= 20)) {
+    response.status(400).json({ message: "Invalid employee lead read window." }); return;
+  }
   const defaultCallingView = !request.query.search && !request.query.state && !request.query.stateFilter &&
     (!request.params.tab || request.params.tab === "my") && (!request.query.tab || request.query.tab === "my") &&
     (!request.query.queue || request.query.queue === "ALL");
   const actor = signedCrmIdentity(request.header("x-crm-admin-session"), request.header("x-crm-attendance-session"));
-  if (callingRequested || (actor?.type === "employee" && defaultCallingView)) {
+  if (callingRequested || (!workspaceView && actor?.type === "employee" && defaultCallingView)) {
     if (actor?.type !== "employee") { response.status(403).json({ message: "A signed employee session is required for the calling queue." }); return; }
     const businessId = request.business?.id || "";
-    const employee = await signedEmployeeInBusiness(actor.code, businessId);
+    let employee = await signedEmployeeInBusiness(actor.code, businessId);
     if (!employee) { response.status(403).json({ message: "This employee cannot access this business." }); return; }
+    if (await callReadPriority.waitForReadBudget()) {
+      employee = await signedEmployeeInBusiness(actor.code, businessId);
+      if (!employee) { response.status(403).json({ message: "This employee cannot access this business." }); return; }
+    }
     const page = Math.max(1, Math.floor(Number(request.query.page) || 1));
     const limit = Math.min(50, Math.max(1, Math.floor(Number(request.query.limit) || 50)));
-    const queue = await employeeCallingQueue(employee, businessId, new Date());
+    const queue = await employeeCallingQueue(employee, businessId, new Date(), false, { cacheComments: true });
     if (String(request.query.autoCallEligible || "").toLowerCase() === "true") queue.entries = queue.entries.filter(entry => entry.callable);
     const hydrated = await hydrateCallingQueue(queue, page, limit);
     const { leads, entries, ...snapshot } = hydrated;
@@ -2490,14 +2558,27 @@ export async function listMyLeads(request: Request, response: Response) {
     response.set("Cache-Control", "no-store");
     response.json({ leads, tab: "my", page, limit, total: entries.length, stateOptions,
       hasMore: page * limit < entries.length, nextPage: page * limit < entries.length ? page + 1 : null,
-      callingQueue: { ...snapshot, entries: entries.slice((page - 1) * limit, page * limit),
-        nextDecision: entries.find(entry => entry.leadId === queue.nextLeadId) || null } });
+      callingQueue: callingQueueTransport({ ...snapshot, entries: entries.slice((page - 1) * limit, page * limit),
+        nextDecision: entries.find(entry => entry.leadId === queue.nextLeadId) || null }, request.query.knownRefreshDependencies) });
     return;
   }
-  const employeeId = String(request.query.employeeId || "").trim();
-  const employeeNames = parseQueryList(request.query.employeeNames || request.query.employeeName);
-  const limit = Math.min(Math.max(Number(request.query.limit || 50) || 50, 1), 50);
-  const page = Math.max(Number(request.query.page || 1) || 1, 1);
+  let workspaceEmployee;
+  if (workspaceView) {
+    if (actor?.type !== "employee") { response.status(403).json({ message: "A signed employee session is required." }); return; }
+    const businessId = request.business?.id || "";
+    workspaceEmployee = await signedEmployeeInBusiness(actor.code, businessId);
+    if (!workspaceEmployee) { response.status(403).json({ message: "This employee cannot access this business." }); return; }
+    if (await callReadPriority.waitForReadBudget()) {
+      workspaceEmployee = await signedEmployeeInBusiness(actor.code, businessId);
+      if (!workspaceEmployee) { response.status(403).json({ message: "This employee cannot access this business." }); return; }
+    }
+    response.set("Cache-Control", "no-store");
+  }
+  const employeeId = workspaceEmployee ? String(workspaceEmployee._id) : String(request.query.employeeId || "").trim();
+  const employeeNames = workspaceEmployee ? [workspaceEmployee.name, workspaceEmployee.employeeCode, ...(workspaceEmployee.aliases || [])].filter(Boolean) :
+    parseQueryList(request.query.employeeNames || request.query.employeeName);
+  const limit = Math.floor(Math.min(Math.max(Number(request.query.limit || 50) || 50, 1), 50));
+  const page = Math.floor(Math.max(Number(request.query.page || 1) || 1, 1));
   const tab = normalizeEmployeeLeadTab(request.params.tab || request.query.tab);
   const queueFilter = String(request.query.queue || request.query.leadQueueFilter || "ALL").trim();
   const searchFilter = createLeadSearchFilter(String(request.query.search || ""));
@@ -2583,13 +2664,13 @@ export async function listMyLeads(request: Request, response: Response) {
   ].join(" ");
 
   const shouldClientPageQueue = tab === "my" && !searchAll && Object.keys(searchFilter).length === 0;
-  if (shouldClientPageQueue) {
+  if (shouldClientPageQueue || workspaceView) {
     // Queue ordering needs every candidate, but hydrating every matching lead
     // (including populated relations and history) on each auto-call check is
     // prohibitively expensive. Sort lightweight candidates and hydrate only the
     // requested page.
     const candidates = await Lead.find(filter)
-      .select("leadName businessName businessAddress email phone website status assignedAgent assignedAgentName followUpAt followUpPriority comments activity createdAt updatedAt")
+      .select("leadName businessName businessAddress email phone website status assignedAgent assignedAgentName followUpAt followUpPriority lastCallOutcomeAt comments activity createdAt updatedAt googlePlaceId providerPlaceId placeProvider")
       .slice("comments", -10)
       .slice("activity", 20)
       .sort({ createdAt: -1, _id: 1 })
@@ -2598,11 +2679,19 @@ export async function listMyLeads(request: Request, response: Response) {
       ? await excludeCommentedPhoneCandidates(candidates, new Date())
       : candidates;
     const sortedCandidates = dedupeLeads(sortLeadsForAgentWorkQueue(queueCandidates, employeeNames) as unknown as PopulatedLead[]);
+    if (workspaceView && tab === "my" && !searchAll) {
+      // Keep NEW leads first without overriding saved-work/callback priority among follow-ups.
+      sortedCandidates.sort((first, second) => Number(second.status === "NEW") - Number(first.status === "NEW") ||
+        (first.status === "NEW" ? (+new Date(second.createdAt || 0) || 0) - (+new Date(first.createdAt || 0) || 0) ||
+          String(first._id).localeCompare(String(second._id)) : 0));
+    }
     const effectiveTotal = sortedCandidates.length;
-    const pageCandidates = sortedCandidates.slice((page - 1) * limit, page * limit);
+    const responsePage = isWindowMode ? Math.min(windowEndPage, Math.max(1, Math.ceil(effectiveTotal / limit))) : page;
+    const firstPage = isWindowMode ? windowStartPage : page;
+    const pageCandidates = sortedCandidates.slice((firstPage - 1) * limit, responsePage * limit);
     const pageIds = pageCandidates.map((lead) => lead._id);
     const pageDocuments = pageIds.length > 0
-      ? await Lead.find({ _id: { $in: pageIds } })
+      ? await Lead.find(workspaceView ? { $and: [filter, { _id: { $in: pageIds } }] } : { _id: { $in: pageIds } })
         .select(leadFields)
         .slice("comments", -10)
         .slice("activity", 20)
@@ -2617,12 +2706,12 @@ export async function listMyLeads(request: Request, response: Response) {
     response.json({
       leads: pagedLeads,
       tab,
-      page,
+      page: responsePage,
       limit,
       total: effectiveTotal,
       stateOptions,
-      hasMore: page * limit < effectiveTotal,
-      nextPage: page * limit < effectiveTotal ? page + 1 : null,
+      hasMore: responsePage * limit < effectiveTotal,
+      nextPage: responsePage * limit < effectiveTotal ? responsePage + 1 : null,
     });
     return;
   }
@@ -2654,16 +2743,26 @@ export async function listMyLeads(request: Request, response: Response) {
 
 export async function listAdminLeads(request: Request, response: Response) {
   const isExportMode = String(request.query.export || request.query.exportFile || "").toLowerCase() === "true";
+  const isSelectionMode = String(request.query.selectionOnly || "").toLowerCase() === "true";
+  const isWindowMode = request.query.windowEndPage !== undefined;
+  const windowStartPage = Number(request.query.windowStartPage || 1);
+  const windowEndPage = Number(request.query.windowEndPage || 1);
+  if ((isSelectionMode && isExportMode) || (isWindowMode && (isExportMode || isSelectionMode ||
+    !Number.isSafeInteger(windowStartPage) || !Number.isSafeInteger(windowEndPage) || windowStartPage < 1 ||
+    windowEndPage < windowStartPage || windowEndPage - windowStartPage >= 500))) {
+    response.status(400).json({message: "Invalid lead read window."}); return;
+  }
   const maxLimit = isExportMode ? 10000 : 20;
   const defaultLimit = isExportMode ? 10000 : 20;
   const limit = Math.min(Math.max(Number(request.query.limit || defaultLimit) || defaultLimit, 1), maxLimit);
   const page = Math.max(Number(request.query.page || 1) || 1, 1);
   const filter = createAdminLeadTabFilter(request);
   await restrictToCanonicalPhones(filter);
-  const stateOptionFilter = createAdminLeadTabFilter(request, { includeStateFilter: false });
-  const [total, stateOptions] = await Promise.all([
+  const stateOptionFilter = createAdminLeadTabFilter(request, { includeStateFilter: false, includeCityFilter: false });
+  const [total, stateOptions, cityOptions] = isSelectionMode ? [0, [], []] as const : await Promise.all([
     Lead.countDocuments(filter),
     getLeadStateOptions(stateOptionFilter),
+    getLeadCityOptions(createAdminLeadTabFilter(request, { includeCityFilter: false })),
   ]);
   const tab = normalizeAdminLeadTab(request.params.tab || request.query.tab);
   const isQueueTab = tab === "leads" || tab === "unassigned";
@@ -2707,7 +2806,7 @@ export async function listAdminLeads(request: Request, response: Response) {
     // result set. Load lightweight candidates first, then populate only the
     // visible page so counts and page boundaries stay exact.
     const candidates = await Lead.find(filter)
-      .select("leadName businessName businessAddress email phone website status followUpAt comments activity createdAt updatedAt")
+      .select("leadName businessName businessAddress email phone website status followUpAt comments activity createdAt updatedAt assignmentRevision")
       .slice("comments", -10)
       .slice("activity", 30)
       .sort(isQueueTab ? { createdAt: -1, _id: 1 } : { updatedAt: -1, createdAt: -1 })
@@ -2717,7 +2816,15 @@ export async function listAdminLeads(request: Request, response: Response) {
       ? sortLeadsForAgentWorkQueue(dedupedCandidates)
       : dedupedCandidates;
     const effectiveTotal = sortedCandidates.length;
-    const pageCandidates = sortedCandidates.slice((page - 1) * limit, page * limit);
+    if (isSelectionMode) {
+      const revisions = new Map(candidates.map(lead => [String(lead._id), lead.assignmentRevision || 0]));
+      const leadIds = sortedCandidates.map(lead => String(lead._id));
+      response.json({leadIds, total: leadIds.length, assignmentRevisions: Object.fromEntries(leadIds.map(id => [id, revisions.get(id) || 0]))});
+      return;
+    }
+    const responsePage = isWindowMode ? Math.min(windowEndPage, Math.max(1, Math.ceil(effectiveTotal / limit))) : page;
+    const firstPage = isWindowMode ? windowStartPage : page;
+    const pageCandidates = sortedCandidates.slice((firstPage - 1) * limit, responsePage * limit);
     const pageIds = pageCandidates.map((lead) => lead._id);
     const pageDocuments = pageIds.length > 0
       ? await Lead.find({ _id: { $in: pageIds } })
@@ -2734,12 +2841,13 @@ export async function listAdminLeads(request: Request, response: Response) {
     response.json({
       leads: pagedLeads,
       tab,
-      page,
+      page: responsePage,
       limit,
       total: effectiveTotal,
       stateOptions,
-      hasMore: page * limit < effectiveTotal,
-      nextPage: page * limit < effectiveTotal ? page + 1 : null,
+      cityOptions,
+      hasMore: responsePage * limit < effectiveTotal,
+      nextPage: responsePage * limit < effectiveTotal ? responsePage + 1 : null,
     });
     return;
   }
@@ -2766,6 +2874,7 @@ export async function listAdminLeads(request: Request, response: Response) {
     limit,
     total: effectiveTotal,
     stateOptions,
+    cityOptions,
     hasMore: page * limit < effectiveTotal,
     nextPage: page * limit < effectiveTotal ? page + 1 : null,
   });
@@ -2874,7 +2983,7 @@ export async function readAgentLeadDashboard(request: Request, response: Respons
       .select("name employeeCode aliases role team status availabilityStatus")
       .lean() as unknown as Promise<AgentDashboardEmployee[]>,
     Lead.find(leadFilter)
-      .select("leadName businessName businessAddress email phone website googlePlaceId providerPlaceId placeProvider source category status assignedAgent assignedAgentName comments activity followUpAt updatedAt createdAt")
+      .select("leadName businessName businessAddress email phone website googlePlaceId providerPlaceId placeProvider source category status assignedAgent assignedAgentName comments.authorType comments.authorName comments.createdAt activity.label activity.detail activity.status activity.actorType activity.actorName activity.createdAt followUpAt updatedAt createdAt")
       .sort({ updatedAt: -1, createdAt: -1 })
       .lean() as unknown as Promise<AgentDashboardLead[]>,
     LeadCallStat.aggregate<{ employeeId: string; employeeName: string; calledAt: Date }>([
@@ -3019,8 +3128,10 @@ export async function readAgentLeadDashboard(request: Request, response: Respons
 
     }
 
-    if (createdAtTime > 0) {
-      recentActivity.push({
+    if (createdAtTime > 0 && isDashboardAgentRole(row.role) &&
+        (recentActivity.length < 12 || createdAtTime > dateTimeValue(recentActivity.at(-1)!.createdAt))) {
+      const index = recentActivity.findIndex(item => createdAtTime > dateTimeValue(item.createdAt));
+      recentActivity.splice(index < 0 ? recentActivity.length : index, 0, {
         id: `${row.employeeId}-${String(lead._id)}-${event.label}-${createdAtTime}`,
         employeeId: row.employeeId,
         employeeName: row.employeeName,
@@ -3032,6 +3143,7 @@ export async function readAgentLeadDashboard(request: Request, response: Respons
         status: String(lead.status || "NEW"),
         createdAt: event.createdAt || null,
       });
+      if (recentActivity.length > 12) recentActivity.pop();
     }
   };
 
@@ -3430,13 +3542,14 @@ function normalizeAdminLeadTab(value: unknown): AdminLeadTab {
 }
 
 function getAdminLeadTabStatuses(tab: AdminLeadTab, queueFilter: string): (typeof leadStatuses)[number][] {
-  if (tab === "leads" || tab === "unassigned") {
+  if (tab === "leads") {
+    const activeStatuses = leadStatuses.filter(status => status !== "Archived");
+    return activeStatuses.includes(queueFilter as (typeof activeStatuses)[number])
+      ? [queueFilter as (typeof activeStatuses)[number]] : activeStatuses;
+  }
+  if (tab === "unassigned") {
     if (queueFilter === "NEW" || queueFilter === "Follow up") {
       return [queueFilter];
-    }
-
-    if (tab === "leads") {
-      return ["NEW", "Follow up"];
     }
   }
 
@@ -3471,12 +3584,14 @@ function createAdminAssignmentFilters(request: Request) {
 
 
 
-function createAdminBaseFilter(request: Request, options: { includeStateFilter?: boolean } = {}) {
+function createAdminBaseFilter(request: Request, options: { includeStateFilter?: boolean; includeCityFilter?: boolean } = {}) {
   const includeStateFilter = options.includeStateFilter !== false;
 
-  const searchFilter = createLeadSearchFilter(String(request.query.search || ""));
+  const searchFilter = createLeadSearchFilter(String(request.query.search || ""), true);
   const assignmentFilters = createAdminAssignmentFilters(request);
   const andFilters: Record<string, unknown>[] = [];
+  const category = String(request.query.category || "").trim();
+  if (category && category !== "ALL") andFilters.push({category: flexibleExactRegex(category)});
 
   if (assignmentFilters.length === 1) {
     andFilters.push(assignmentFilters[0]);
@@ -3498,6 +3613,11 @@ function createAdminBaseFilter(request: Request, options: { includeStateFilter?:
     }
   }
 
+  if (options.includeCityFilter !== false) {
+    const cityFilter = createLeadCityAddressFilter(request.query.city);
+    if (cityFilter) andFilters.push(cityFilter);
+  }
+
   if (String(request.query.unassigned || "").toLowerCase() === "true") {
     andFilters.push(
       { $or: [{ assignedAgent: null }, { assignedAgent: { $exists: false } }] },
@@ -3508,7 +3628,7 @@ function createAdminBaseFilter(request: Request, options: { includeStateFilter?:
   return andFilters.length > 0 ? { $and: andFilters } : {};
 }
 
-function createAdminLeadTabFilter(request: Request, options: { includeStateFilter?: boolean } = {}) {
+function createAdminLeadTabFilter(request: Request, options: { includeStateFilter?: boolean; includeCityFilter?: boolean } = {}) {
   const tab = normalizeAdminLeadTab(request.params.tab || request.query.tab);
   const queueFilter = String(request.query.queue || request.query.leadQueueFilter || "ALL").trim();
   const rawStatusFilter = String(request.query.statusFilter || request.query.status || "").trim();
@@ -3598,7 +3718,7 @@ async function createEmployeeLeadAssignmentFilters(employeeId: string, employeeN
   return assignmentFilters;
 }
 
-function createLeadSearchFilter(search: string) {
+function createLeadSearchFilter(search: string, formattingNames = false) {
   const trimmedSearch = search.trim();
 
   if (!trimmedSearch) {
@@ -3607,6 +3727,7 @@ function createLeadSearchFilter(search: string) {
 
   const searchRegex = wholeTermSearchRegex(trimmedSearch);
   const phoneRegexes = flexiblePhoneRegexes(trimmedSearch);
+  const nameRegex = formattingNames ? formattingInsensitiveNameRegex(trimmedSearch) : null;
   const searchFields: Record<string, unknown>[] = [
     { leadName: searchRegex },
     { position: searchRegex },
@@ -3630,6 +3751,7 @@ function createLeadSearchFilter(search: string) {
   phoneRegexes.forEach((phoneRegex) => {
     searchFields.push({ phone: phoneRegex });
   });
+  if (nameRegex) searchFields.push(...["leadName", "businessName", "assignedAgentName", "comments.authorName"].map(field => ({ [field]: nameRegex })));
 
   return {
     $or: searchFields,
@@ -3637,7 +3759,7 @@ function createLeadSearchFilter(search: string) {
 }
 
 export async function countLeads(request: Request, response: Response) {
-  const searchFilter = createLeadSearchFilter(String(request.query.search || ""));
+  const searchFilter = createLeadSearchFilter(String(request.query.search || ""), response.locals?.crmActor?.type === "admin");
   const assignedAgent = String(request.query.assignedAgent || "").trim();
   const assignedAgentNames = parseQueryList(request.query.assignedAgentNames || request.query.assignedAgentName);
   const assignmentFilters: Record<string, unknown>[] = [];
@@ -3770,6 +3892,16 @@ export async function createLead(request: Request, response: Response) {
     ],
   };
 
+  if (await orderCustomerMergeEnabled()) {
+    const customer = await storeOrderCustomerLead(leadInput);
+    if (customer) {
+      const lead = await Lead.findById(customer.id).populate(populateLead);
+      emitLeadMutation(customer.merged ? "updated" : "created", lead);
+      response.status(customer.merged ? 200 : 201).json(lead);
+      return;
+    }
+  }
+
   const duplicateLead = await findDuplicateLead(leadInput);
 
   if (duplicateLead) {
@@ -3867,6 +3999,27 @@ export async function importLeads(request: Request, response: Response) {
   );
 
   const newLeads = leadsToImport;
+
+  if (await orderCustomerMergeEnabled()) {
+    let importedCount = 0, mergedCount = 0;
+    for (const lead of newLeads) {
+      const { assignedToName, ...fields } = lead;
+      const input = { ...fields, assignedAgent: employeesByAssignedTo.get(normalizeLeadValue(assignedToName)) || null,
+        assignedAgentName: assignedToName, createdByName: "CSV Import", createdByType: "system" as const,
+        comments: lead.notes ? [{ authorName: "CSV Import", authorType: "admin" as const, body: lead.notes, createdAt: lead.createdAt || new Date() }] : [],
+        activity: [leadActivity("Lead created", `${lead.source || "CSV Import"} lead added.`, { actorName: "CSV Import", actorType: "system" })] };
+      const customer = await storeOrderCustomerLead(input);
+      if (customer) {
+        if (customer.merged) mergedCount++; else importedCount++;
+        emitLeadMutation(customer.merged ? "updated" : "created", await Lead.findById(customer.id).populate(populateLead));
+      } else {
+        const created = await Lead.create(input); importedCount++;
+        emitLeadMutation("created", await Lead.findById(created._id).populate(populateLead));
+      }
+    }
+    response.status(201).json({ importedCount, mergedCount, skippedCount: rawLeads.length - newLeads.length, duplicateCount: 0, leads: [] });
+    return;
+  }
 
   if (newLeads.length > 0) {
     await Lead.bulkWrite(
@@ -4701,7 +4854,9 @@ export async function bulkAssignLeads(request: Request, response: Response) {
       (!Number.isSafeInteger(expected[String(lead._id)]) || expected[String(lead._id)] !== (lead.assignmentRevision || 0)))) {
     response.status(409).json({ code: "LEAD_ASSIGNMENT_CHANGED", message: "A selected lead's assignment changed. Refresh before trying again." }); return;
   }
-  const changedIds: string[] = [], changedGroups = new Set<string>();
+  const changedIds: string[] = [], changedGroups = new Set<string>(), unchangedGroups = new Set<string>(), conflictedGroups = new Set<string>();
+  const matchedIds = new Set(leads.map(lead => String(lead._id)));
+  let unchangedRecordCount = 0;
   let conflictCount = 0;
   const activityActor: LeadActivityActor = { actorName: actor.name, actorType: "admin" };
   for (const lead of leads) {
@@ -4709,10 +4864,14 @@ export async function bulkAssignLeads(request: Request, response: Response) {
     const changed = await writeLeadAssignment(lead, recipient, null,
       activityPush(recipient ? "Assigned" : "Unassigned", recipient ? `${actor.name} assigned this lead to ${recipient.name}.` : `${actor.name} unassigned this lead.`, activityActor));
     if (changed) { changedIds.push(String(lead._id)); changedGroups.add(getLeadDedupKey(lead)); }
-    else if (!same) conflictCount++;
+    else if (same) { unchangedRecordCount++; unchangedGroups.add(getLeadDedupKey(lead)); }
+    else { conflictCount++; conflictedGroups.add(getLeadDedupKey(lead)); }
   }
   if (changedIds.length) emitLeadChanged({ action: recipient ? "bulk-assigned" : "bulk-unassigned", leadIds: changedIds, assignedAgentId: recipient ? String(recipient._id) : null });
   response.status(conflictCount ? 409 : 200).json({ assignedCount: changedGroups.size, updatedRecordCount: changedIds.length, conflictCount,
+    unchangedCount: [...unchangedGroups].filter(key => !changedGroups.has(key) && !conflictedGroups.has(key)).length,
+    unchangedRecordCount, matchedCount: new Set(leads.map(getLeadDedupKey)).size, requestedCount: leadIds.length,
+    missingCount: leadIds.filter(id => !matchedIds.has(id)).length,
     ...(conflictCount ? { code: "LEAD_ASSIGNMENT_CHANGED", message: `${changedIds.length} records updated; ${conflictCount} changed concurrently. Refresh before retrying.` } : {}) });
 }
 

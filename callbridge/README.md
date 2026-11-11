@@ -1,6 +1,6 @@
 # Assistly Call Bridge
 
-Version 0.4.2 reports raw audio transitions promptly using 500 ms sampling. The server confirms a call end and anchors the 30-second minimum wait to the first idle observation; a second local debounce is no longer applied. Network, browser and Nextiva scheduling can still add latency, so an exact physical 30.000-second interval is not guaranteed. Two-way Windows audio remains a call-state proxy, not a provider-connected-call event.
+Version 0.5.0 retains 500 ms call-state sampling and adds one-use native dialing. See [Native Dialing](NATIVE-DIALING.md) for safe installation, Nextiva TEL association and confirmation requirements. The server retains the original 30-second post-call deadline; network, Windows and Nextiva scheduling can add handoff latency. Two-way Windows audio remains a call-state proxy, not a provider-connected-call event.
 
 Install this version only after the matching server heartbeat fix is activated, and run the updater only when Nextiva calls have finished. The updater restarts the bridge process and retains pairing. It must not be pushed to an employee during a call.
 
@@ -31,7 +31,7 @@ callbridge/dist/assistly-call-bridge.zip
 This command prints the detected Nextiva state without requiring pairing:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\AssistlyCallBridge.ps1 -Once
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\AssistlyCallBridge.ps1 -ProbeOnly
 ```
 
 Expected idle state when NextivaONE is running:

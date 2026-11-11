@@ -53,6 +53,14 @@ test('six businesses keep updates, detail caches and counts scoped; obsolete rea
     } finally {client.clear();}
 });
 
+test('a confirmed save applies its cache update without waiting for a stalled background refetch',async()=>{
+    const cached=[];let requested=false;
+    const client={cancelQueries:async()=>{},setQueriesData:()=>cached.push('page'),setQueryData:()=>cached.push('detail'),
+      invalidateQueries:()=>{requested=true;return new Promise(()=>{});}};
+    await synchronizeLeadWorkspace(client,'synthetic',{lead:lead('saved')});
+    assert.equal(requested,true);assert.ok(cached.includes('page')&&cached.includes('detail'));
+});
+
 test('reassignment/deletion remove rows without silently inserting leads into filtered pages', () => {
     assert.equal(applyLeadPageChange(page([lead('first')]),{lead:lead('first')},false).leads.length,0);
     assert.equal(applyLeadPageChange(page([lead('first')]),{leadIds:['first']}).leads.length,0);

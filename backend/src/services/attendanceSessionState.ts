@@ -100,6 +100,23 @@ export function projectAttendance(events: SessionEvent[], corrections: SessionCo
     blockingIssues: reviewedIssues.filter((issue) => !issue.historical), reversedIds: [...reversed] };
 }
 
+export function attendanceAppendHasBlockingIssues(events: SessionEvent[], corrections: SessionCorrection[], closures: SystemClosure[],
+  projection: ReturnType<typeof projectAttendance>, additions: SessionEvent[]) {
+  const last = projection.effectiveEvents.at(-1);
+  // An append after all existing evidence can only affect the active session
+  // and its shift's rest allowances. Unusual ordering keeps the full replay.
+  if (projection.blockingIssues.length || additions.some(event => !Number.isFinite(Date.parse(event.at)) || last && event.at <= last.at) ||
+      closures.some(closure => additions.some(event => closure.effectiveAt > event.at))) {
+    return projectAttendance([...events, ...additions], corrections, closures).blockingIssues.length > 0;
+  }
+  const active = projection.active;
+  const sessions = active ? attendanceDurationModelEnabled() && active.shift
+    ? projection.sessions.filter(session => session.shift?.dayKey === active.shift!.dayKey) : [active] : [];
+  const ids = new Set(sessions.map(session => session.id));
+  return projectAttendance([...sessions.flatMap(session => session.events), ...additions], [],
+    closures.filter(closure => ids.has(closure.sessionId))).blockingIssues.length > 0;
+}
+
 export function sessionTime(session: AttendanceSession, now: Date) {
   const events = session.events.flatMap((event) => {
     const bucket = bucketForAttendanceSource(event.source);

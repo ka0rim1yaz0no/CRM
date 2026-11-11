@@ -1,4 +1,4 @@
-import { earnedPayrollEnabled } from "../config/payrollEarnings";
+import { earnedPayrollEnabled, fixedHalfSalaryEnabled, minuteAccrualEnabled } from "../config/payrollEarnings";
 import { AttendanceLedger } from "../models/AttendanceLedger";
 import { Employee } from "../models/Employee";
 import { PayrollRecord } from "../models/Payroll";
@@ -10,9 +10,10 @@ import { payrollReadGroups } from "./payrollReadPolicy";
 import { PayrollValidationError } from "./payrollAccuracy";
 import { serverReadTime, withReadSnapshot } from "./readSnapshot";
 import type { ClientSession } from "mongoose";
+import { inheritedCurrentPayrollInputs } from "./payrollCanonicalInputs";
 
 type EarningsSource = { employeeId: string; payPeriod: string; status: string; grossPay: number; deductions: number; netPay: number;
-    requiresReview?: boolean; payrollOwnerBusinessId?: string };
+    requiresReview?: boolean; payrollOwnerBusinessId?: string; calculationSnapshot?: Record<string, unknown> };
 
 // A current earnings view is never an implicit recompute or permission to settle a saved amount.
 export async function currentEarnedPayrollRecords<T extends EarningsSource>(records: T[], currentPayPeriod: string, session?: ClientSession): Promise<Array<T & PayrollEarningsView>> {
@@ -26,7 +27,9 @@ export async function currentEarnedPayrollRecords<T extends EarningsSource>(reco
             if (["Paid", "Completed"].includes(record.status) || !period || !earnedPayrollEnabled(record.payPeriod)) { result.push(record); continue; }
             try {
                 if (record.requiresReview) throw new PayrollValidationError("Saved payroll conflicts need review.");
-                const ledger = await AttendanceLedger.findOne({ employeeCode: record.employeeId, businessIds: getCurrentBusinessId() }, null, session ? { session } : undefined).select("canonicalBusinessId migrationRequired businessIds").lean();
+                const scopedLedger = await AttendanceLedger.findOne({ employeeCode: record.employeeId, businessIds: getCurrentBusinessId() }, null, session ? { session } : undefined).select("canonicalBusinessId migrationRequired businessIds").lean();
+                const inherited = await inheritedCurrentPayrollInputs(record, session);
+                const ledger = inherited?.ledger || scopedLedger;
                 if (!ledger || ledger.migrationRequired) throw new PayrollValidationError("Canonical attendance is unavailable.");
                 const owner = record.payrollOwnerBusinessId || ledger.canonicalBusinessId;
                 if (!ledger.businessIds.includes(owner)) throw new PayrollValidationError("Payroll ownership is outside attendance membership.");
@@ -37,19 +40,20 @@ export async function currentEarnedPayrollRecords<T extends EarningsSource>(reco
                     const group = payrollReadGroups(saved).groups.find(item => item.period.start === period.start && item.period.end === period.end);
                     if (!group?.record || group.requiresReview) throw new PayrollValidationError("The owning payroll needs review.");
                     if (["Paid", "Completed"].includes(group.record.status)) throw new PayrollValidationError("The paid owning copy must be reconciled before current earnings can be shown.");
-                    const monthlySalary = group.record.calculationSnapshot?.monthlySalary;
+                    const monthlySalary = minuteAccrualEnabled(group.record.payPeriod) ? employee.salary : group.record.calculationSnapshot?.monthlySalary;
                     return calculatePayrollCandidate({ ...employee, salary: typeof monthlySalary === "number" && Number.isFinite(monthlySalary) ? monthlySalary : employee.salary }, group.record.payPeriod, undefined, session);
                 });
                 const value = candidate.value;
                 const savedAmounts = { grossPay: record.grossPay, deductions: record.deductions, netPay: record.netPay };
                 result.push({ ...record, ...value, payPeriod: record.payPeriod, status: record.status,
                     ...("paidOn" in record ? { paidOn: record.paidOn } : {}),
-                    earnedToDate: true, earningsAsOf: serverReadTime().toISOString(), savedAmounts,
+                    earnedToDate: fixedHalfSalaryEnabled(record.payPeriod) ? undefined : true,
+                    cutoffEstimate: fixedHalfSalaryEnabled(record.payPeriod) || undefined, earningsAsOf: serverReadTime().toISOString(), savedAmounts,
                     settlementRequired: value.grossPay !== record.grossPay || value.deductions !== record.deductions || value.netPay !== record.netPay ||
                         !("calculationVersion" in record) || record.calculationVersion !== value.calculationVersion });
             } catch (error) {
                 if (!(error instanceof PayrollValidationError)) throw error;
-                result.push({ ...record, earningsUnavailable: true });
+                result.push({ ...record, earningsUnavailable: true, earningsUnavailableReason: error.message, cutoffEstimate: fixedHalfSalaryEnabled(record.payPeriod) || undefined });
             }
         }
         return result;

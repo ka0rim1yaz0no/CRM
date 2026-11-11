@@ -1,5 +1,6 @@
 import type { Request, Response } from "express";
 import { payrollAccuracyEnabled } from "../config/rolloutFlags";
+import { currentCutoffLiveFrom } from "../config/payrollEarnings";
 import { applyPayrollCutoff, previewPayrollCutoff } from "../services/payrollRecomputeService";
 import { applyPayrollWorkedHours, previewPayrollWorkedHours } from "../services/payrollWorkedHoursService";
 import { confirmPayrollPaymentStatus, previewPayrollPaymentStatus } from "../services/payrollPaymentStatusService";
@@ -8,7 +9,7 @@ import { previewMissingPayroll, confirmMissingPayroll } from "../services/payrol
 
 export function payrollAccuracyConfig(_request: Request, response: Response) {
   response.setHeader("Cache-Control", "no-store");
-  response.json({ enabled: payrollAccuracyEnabled(), workedHoursEditingEnabled: payrollAccuracyEnabled(), paymentStatusPreviewEnabled: payrollAccuracyEnabled(), cutoffSelectionEnabled: payrollAccuracyEnabled(), employeeRosterEnabled: payrollAccuracyEnabled(), automaticPreviewsEnabled: payrollAccuracyEnabled(), missingGenerationEnabled: payrollAccuracyEnabled() });
+  response.json({ enabled: payrollAccuracyEnabled(), currentCutoffLiveFrom: currentCutoffLiveFrom(), workedHoursEditingEnabled: payrollAccuracyEnabled(), paymentStatusPreviewEnabled: payrollAccuracyEnabled(), cutoffSelectionEnabled: payrollAccuracyEnabled(), employeeRosterEnabled: payrollAccuracyEnabled(), automaticPreviewsEnabled: payrollAccuracyEnabled(), missingGenerationEnabled: payrollAccuracyEnabled() });
 }
 export async function previewMissingPayrollRecords(request: Request, response: Response) {
   response.setHeader("Cache-Control", "no-store");

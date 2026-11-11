@@ -4,7 +4,8 @@ import { FiAlertTriangle, FiChevronDown, FiChevronLeft, FiChevronRight, FiRefres
 import { getEmployeePayments } from "../api/employeePayments";
 import { getAuthUser } from "../api/authStorage";
 import { getActiveBusinessId } from "../api/businessStorage";
-import { payrollDeductionDisplayRows, payrollDeductionDisplayTotal } from "../../shared/payrollPresentation";
+import { payrollDeductionDisplayRows } from "../../shared/payrollPresentation";
+import { payrollDeductionDisplayTotal } from "../lib/payrollDeductionPresentation";
 import { isEarnedPayrollVersion } from "../../shared/payrollEarnings";
 import type { EmployeePayment } from "../../shared/employeePayments";
 import { savedPayrollPeriod } from "../../shared/payrollPeriod";
@@ -29,7 +30,7 @@ function calendarDate(value: string | null) {
 const quantity = (value: number | null, unit = "") => value === null ? "Not recorded" : `${Number(value.toFixed(2)).toLocaleString("en-US")}${unit}`;
 
 function PaymentDetails({ item, money }: { item: EmployeePayment; money: (value: number) => string }) {
-    if (item.earningsUnavailable) return <p className="employee-payments-error" role="status">Current earnings need payroll review. Saved amounts and payment status have not changed.</p>;
+    if (item.earningsUnavailable) return <p className="employee-payments-error" role="status">{item.earningsUnavailableReason || "Current earnings need payroll review."} Saved amounts and payment status have not changed.</p>;
     const deductionRows = payrollDeductionDisplayRows(item);
     const displayedTotal = payrollDeductionDisplayTotal(item);
     const rates = savedPayrollDisplayRates(item);
@@ -66,8 +67,8 @@ function PaymentDetails({ item, money }: { item: EmployeePayment; money: (value:
             </dl></section>
         </div>
         <dl className="employee-payment-meta">{values.map(([label, value, title]) => <div key={label}><dt>{label}</dt><dd title={title}>{value}</dd></div>)}</dl>
-        <div className="employee-payment-net"><span>{item.earnedToDate ? "Net pay earned to date" : "Net pay"}</span><strong>{money(item.netPay)}</strong></div>
-        {item.earnedToDate && item.earningsAsOf && <p className="employee-payments-start">As of {new Date(item.earningsAsOf).toLocaleString("en-PH", { timeZone: "Asia/Manila" })} PH</p>}
+        <div className="employee-payment-net"><span>{item.cutoffEstimate ? "Estimated cutoff net pay" : item.earnedToDate ? "Net pay earned to date" : "Net pay"}</span><strong>{money(item.netPay)}</strong></div>
+        {(item.earnedToDate || item.cutoffEstimate) && item.earningsAsOf && <p className="employee-payments-start">As of {new Date(item.earningsAsOf).toLocaleString("en-PH", { timeZone: "Asia/Manila" })} PH</p>}
     </div>;
 }
 
@@ -97,7 +98,7 @@ function PaymentsLedger({ employeeId, businessId }: { employeeId: string; busine
                 <summary><span className="employee-payment-cutoff">{savedPayrollPeriod(item.payPeriod)?.label || item.payPeriod}</span>
                     <span className="employee-payment-amount"><small>Gross pay</small>{item.earningsUnavailable ? "Unavailable" : money(item.grossPay)}</span>
                     <span className="employee-payment-amount"><small>Deductions</small>{item.earningsUnavailable || total === null ? "Unavailable" : money(total)}</span>
-                    <strong className="employee-payment-amount" title={item.earnedToDate ? "Earned to date" : undefined}><small>{item.earnedToDate ? "Earned net pay" : "Net pay"}</small>{item.earningsUnavailable ? "Unavailable" : money(item.netPay)}</strong>
+                    <strong className="employee-payment-amount" title={item.cutoffEstimate ? "Current cutoff estimate" : item.earnedToDate ? "Earned to date" : undefined}><small>{item.cutoffEstimate ? "Estimated net pay" : item.earnedToDate ? "Earned net pay" : "Net pay"}</small>{item.earningsUnavailable ? "Unavailable" : money(item.netPay)}</strong>
                     <span className="employee-payment-status" data-paid={item.status === "Paid"}>{payrollPaymentStatus(item.status)}{item.requiresReview && <FiAlertTriangle role="img" aria-label="Conflicting saved payroll entries" title="Conflicting saved payroll entries" />}</span><FiChevronDown aria-hidden="true" />
                 </summary><PaymentDetails item={item} money={money} />
             </details>; })}

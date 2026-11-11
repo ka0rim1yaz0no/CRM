@@ -1,10 +1,11 @@
 import type { FormEvent, UIEvent } from "react";
-import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { getActiveBusinessId } from "../../../api/businessStorage";
 import { getAuthUser } from "../../../api/authStorage";
 import { subscribeCredentialContext } from "../../../lib/credentialContext";
 import { reportRequestError } from "../../../lib/requestErrorToast";
-import { synchronizeLeadWorkspace, type LeadWorkspaceChange } from "../../../lib/leadWorkspaceCache";
+import { latestLead, synchronizeLeadWorkspace, type LeadWorkspaceChange } from "../../../lib/leadWorkspaceCache";
+import { readAdminLeadWindow } from "../../../lib/adminLeadWindow";
 import { connectAuthenticatedSocket, socket } from "../../../lib/socket";
 import { isEligibleLeadRecipient } from "../../../../shared/leadAssignmentPolicy";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -20,6 +21,7 @@ import {
     FiDownload,
     FiEdit2,
     FiExternalLink,
+    FiLoader,
     FiMail,
     FiMapPin,
     FiMoreVertical,
@@ -55,6 +57,7 @@ import {
     createLead,
     getAdminLeadCounts as getAdminLeadCountsInBusiness,
     getAdminLeads as getAdminLeadsInBusiness,
+    getAdminLeadSelection,
     getLead,
     getTomTomUsage,
     importLeads,
@@ -81,7 +84,7 @@ import { getPhoneCallUrl } from "../../../lib/phoneNumber";
 import { getSystemSettings } from "../../../api/systemSettings";
 
 type AdminLeadTab = LeadStatus | "Unassigned" | "ALL";
-type LeadQueueFilter = "ALL" | "NEW" | "Follow up";
+type LeadQueueFilter = AllStatusFilter;
 type AllStatusFilter = "ALL" | Exclude<LeadStatus, "Archived">;
 type LeadActionName = "archive" | "assignment" | "details" | "schedule" | "status";
 type PlacesManualSearchInput = {
@@ -739,7 +742,8 @@ function toLeadInput(lead: Lead, notes: string, overrides: Partial<LeadInput> = 
 }
 
 function mergeLeadPages(current: Lead[], next: Lead[]) {
-    const leadsById = new Map([...current, ...next].map((lead) => [lead._id, lead]));
+    const leadsById = new Map(current.map(lead => [lead._id, lead]));
+    for (const lead of next) leadsById.set(lead._id, latestLead(leadsById.get(lead._id), lead));
     return Array.from(leadsById.values());
 }
 
@@ -942,7 +946,7 @@ function AdminLeadsWorkspace({ businessId }: { businessId: string }) {
         const auth = getAuthUser();
         return getActiveBusinessId() === businessId && auth?.userType === "admin" && auth.sessionToken === assignmentContext.adminSession;
     };
-    const getAdminLeads = (params: Parameters<typeof getAdminLeadsInBusiness>[0]) => getAdminLeadsInBusiness(params, assignmentContext);
+    const getAdminLeads = (params: Parameters<typeof getAdminLeadsInBusiness>[0], signal?: AbortSignal) => getAdminLeadsInBusiness(params, {...assignmentContext, signal});
     const getAdminLeadCounts = (params: Parameters<typeof getAdminLeadCountsInBusiness>[0] = {}) => getAdminLeadCountsInBusiness(params, assignmentContext);
     const autoAssignLead = (id: string) => autoAssignLeadInBusiness(id, assignmentContext);
     const queryClient = useQueryClient();
@@ -951,6 +955,7 @@ function AdminLeadsWorkspace({ businessId }: { businessId: string }) {
     const [searchParams] = useSearchParams();
     const routeLeadId = searchParams.get("lead") || "";
     const [activeTab, setActiveTab] = useState<AdminLeadTab>("NEW");
+    const canUseActiveBulkActions = activeTab === "ALL" || activeTab === "Unassigned" || activeTab === "NEW" || activeTab === "Qualified";
     const [leadQueueFilter, setLeadQueueFilter] = useState<LeadQueueFilter>("ALL");
     const [allStatusFilter, setAllStatusFilter] = useState<AllStatusFilter>("ALL");
     const [activeCategoryTab, setActiveCategoryTab] = useState("ALL");
@@ -958,6 +963,7 @@ function AdminLeadsWorkspace({ businessId }: { businessId: string }) {
     const [debouncedLeadSearch, setDebouncedLeadSearch] = useState("");
     const [assignedAgentFilter, setAssignedAgentFilter] = useState("ALL");
     const [leadStateFilter, setLeadStateFilter] = useState("ALL");
+    const [leadCityFilter, setLeadCityFilter] = useState("ALL");
     const [dateFromFilter, setDateFromFilter] = useState("");
     const [dateToFilter, setDateToFilter] = useState("");
     const [, setLeadPage] = useState(1);
@@ -1012,6 +1018,7 @@ function AdminLeadsWorkspace({ businessId }: { businessId: string }) {
             dateFrom: effectiveDateFromFilter || undefined,
             dateTo: effectiveDateToFilter || undefined,
             state: leadStateFilter !== "ALL" ? leadStateFilter : undefined,
+            city: leadCityFilter !== "ALL" ? leadCityFilter : undefined,
         };
 
         if (assignedAgentFilter !== "ALL") {
@@ -1037,6 +1044,7 @@ function AdminLeadsWorkspace({ businessId }: { businessId: string }) {
         effectiveDateFromFilter,
         effectiveDateToFilter,
         leadStateFilter,
+        leadCityFilter,
         leadQueueFilter,
         selectedAgentName,
     ]);
@@ -1052,6 +1060,7 @@ function AdminLeadsWorkspace({ businessId }: { businessId: string }) {
                 debouncedLeadSearch,
                 assignedAgentFilter,
                 leadStateFilter,
+                leadCityFilter,
                 effectiveDateFromFilter,
                 effectiveDateToFilter,
                 selectedAgentName,
@@ -1063,6 +1072,7 @@ function AdminLeadsWorkspace({ businessId }: { businessId: string }) {
             allStatusFilter,
             assignedAgentFilter,
             leadStateFilter,
+            leadCityFilter,
             effectiveDateFromFilter,
             effectiveDateToFilter,
             debouncedLeadSearch,
@@ -1073,7 +1083,9 @@ function AdminLeadsWorkspace({ businessId }: { businessId: string }) {
 
     const { data: leadPageData, isLoading, isError } = useQuery({
         queryKey: leadQueryKey,
-        queryFn: () => getAdminLeads(leadQueryParams),
+        queryFn: ({signal}) => readAdminLeadWindow(getAdminLeads, leadQueryParams,
+            leadQueryIdentityRef.current === leadQueryIdentity
+                ? Math.max(leadPageRef.current, queryClient.getQueryData<AdminLeadsPage>(leadQueryKey)?.page || 1) : 1, signal),
         refetchInterval: 30000,
         refetchOnReconnect: "always",
     });
@@ -1097,6 +1109,7 @@ function AdminLeadsWorkspace({ businessId }: { businessId: string }) {
 
     const leads = leadPageData?.leads || EMPTY_QUERY_ROWS;
     const leadStateOptions = leadPageData?.stateOptions || EMPTY_QUERY_ROWS;
+    const leadCityOptions = leadPageData?.cityOptions || EMPTY_QUERY_ROWS;
 
     const assignedAgentOptions = useMemo(() => {
         const optionMap = new Map<string, string>();
@@ -1214,6 +1227,16 @@ function AdminLeadsWorkspace({ businessId }: { businessId: string }) {
     const [deleteTarget, setDeleteTarget] = useState<Lead | null>(null);
     const [importMessage, setImportMessage] = useState("");
     const [selectedBulkLeadIds, setSelectedBulkLeadIds] = useState<string[]>([]);
+    const [selectedBulkLeadRevisions, setSelectedBulkLeadRevisions] = useState<Record<string, number>>({});
+    const [allFilteredSelection, setAllFilteredSelection] = useState<{scope: string; total: number} | null>(null);
+    const [isSelectingAllLeads, setIsSelectingAllLeads] = useState(false);
+    const selectionRequestRef = useRef<AbortController | null>(null);
+    const bulkSelectionScope = JSON.stringify([leadQueryIdentity, activeCategoryTab, leadSearch.trim()]);
+    const selectionScopeRef = useRef(bulkSelectionScope);
+    useLayoutEffect(() => {
+        selectionScopeRef.current = bulkSelectionScope;
+        return () => { selectionRequestRef.current?.abort(); selectionRequestRef.current = null; };
+    }, [bulkSelectionScope]);
     const [bulkAction, setBulkAction] = useState<null | "archive" | "delete-active-selected" | "restore" | "delete-selected">(null);
     const [isBulkMenuOpen, setIsBulkMenuOpen] = useState(false);
     const [isBulkAssignMenuOpen, setIsBulkAssignMenuOpen] = useState(false);
@@ -1228,17 +1251,11 @@ function AdminLeadsWorkspace({ businessId }: { businessId: string }) {
     }, isBulkMenuOpen);
 
     const invalidateLeads = async () => {
-        leadPageRef.current = 1;
-        leadFetchInFlightRef.current = false;
-        setLeadPage(1);
-        setHasMoreLeads(true);
-        await queryClient.invalidateQueries({ queryKey: ["admin-leads"] });
-        await queryClient.invalidateQueries({ queryKey: ["admin-lead-counts"] });
-        await queryClient.invalidateQueries({ queryKey: ["leads"] });
-        await queryClient.invalidateQueries({ queryKey: ["lead-counts"] });
+        await queryClient.invalidateQueries({ queryKey: ["admin-leads", businessId] });
+        await queryClient.invalidateQueries({ queryKey: ["admin-lead-counts", businessId] });
+        await queryClient.invalidateQueries({ queryKey: ["leads", businessId] });
+        await queryClient.invalidateQueries({ queryKey: ["lead-counts", businessId] });
         await queryClient.invalidateQueries({ queryKey: ["calling-queue", businessId] });
-        await queryClient.refetchQueries({ queryKey: ["admin-leads"] });
-        await queryClient.refetchQueries({ queryKey: ["admin-lead-counts"] });
     };
 
     useEffect(() => {
@@ -1335,7 +1352,7 @@ function AdminLeadsWorkspace({ businessId }: { businessId: string }) {
                 );
             }
             setImportMessage(
-                `Imported ${result.importedCount} lead${result.importedCount === 1 ? "" : "s"}${result.duplicateCount ? `, skipped ${result.duplicateCount} duplicate${result.duplicateCount === 1 ? "" : "s"}` : ""
+                `Imported ${result.importedCount} lead${result.importedCount === 1 ? "" : "s"}${result.mergedCount ? `, merged ${result.mergedCount} matching customer record${result.mergedCount === 1 ? "" : "s"}` : ""}${result.duplicateCount ? `, skipped ${result.duplicateCount} duplicate${result.duplicateCount === 1 ? "" : "s"}` : ""
                 }`
             );
             invalidateLeads();
@@ -1364,14 +1381,14 @@ function AdminLeadsWorkspace({ businessId }: { businessId: string }) {
         onSuccess: invalidateLeads,
     });
     const bulkArchiveLeadsMutation = useMutation({
-        mutationFn: bulkArchiveLeads,
+        mutationFn: (ids: string[]) => bulkArchiveLeads(ids, assignmentContext),
         onSuccess: () => {
             setSelectedBulkLeadIds([]);
             invalidateLeads();
         },
     });
     const bulkRestoreLeadsMutation = useMutation({
-        mutationFn: bulkRestoreLeads,
+        mutationFn: (ids: string[]) => bulkRestoreLeads(ids, assignmentContext),
         onSuccess: () => {
             setSelectedBulkLeadIds([]);
             invalidateLeads();
@@ -1381,21 +1398,31 @@ function AdminLeadsWorkspace({ businessId }: { businessId: string }) {
         mutationFn: (input: Parameters<typeof bulkAssignLeads>[0]) => bulkAssignLeads(input, assignmentContext),
         onSuccess: (result, variables) => {
             if (!assignmentScopeIsCurrent()) { void invalidateLeads(); return; }
-            setSelectedBulkLeadIds([]);
             setIsBulkAssignMenuOpen(false);
             void invalidateLeads();
 
             const leadLabel = result.assignedCount === 1 ? "lead" : "leads";
+            const unchanged = Math.max(0, result.unchangedCount || 0), missing = Math.max(0, result.missingCount || 0);
+            const unchangedLabel = unchanged === 1 ? "lead is" : "leads are";
+            const unassigned = variables.assignedAgent === "UNASSIGNED";
             if (result.assignedCount === 0) {
-                showToast({ tone: "info", message: "No lead assignments changed. Refresh the list and try again." });
+                if (missing > 0) {
+                    setSelectedBulkLeadIds([]);
+                    showToast({ tone: "info", message: `No assignment changes were made. ${missing.toLocaleString()} selected leads are no longer available. Selection refreshed.` });
+                } else if (unchanged > 0) {
+                    showToast({ tone: "info", message: unassigned ? `${unchanged.toLocaleString()} selected ${unchangedLabel} already unassigned.`
+                        : `${unchanged.toLocaleString()} selected ${unchangedLabel} already assigned to ${variables.assignedAgentName}.` });
+                } else showToast({ tone: "info", message: "No assignment changes were needed." });
                 return;
             }
 
+            setSelectedBulkLeadIds([]);
+            const summary = unassigned ? `Unassigned ${result.assignedCount.toLocaleString()} ${leadLabel}.`
+                : `Assigned ${result.assignedCount.toLocaleString()} ${leadLabel} to ${variables.assignedAgentName}.`;
             showToast({
-                tone: "success",
-                message: variables.assignedAgent === "UNASSIGNED"
-                    ? `Unassigned ${result.assignedCount.toLocaleString()} ${leadLabel}.`
-                    : `Assigned ${result.assignedCount.toLocaleString()} ${leadLabel} to ${variables.assignedAgentName}. Assigned leads leave Unassigned but remain in NEW until their status changes.`,
+                tone: missing ? "info" : "success",
+                message: summary + (unchanged ? ` ${unchanged.toLocaleString()} already ${unassigned ? "unassigned" : "assigned"}.` : "") +
+                    (missing ? ` ${missing.toLocaleString()} no longer available.` : ""),
             });
         },
         onError: (error) => {
@@ -1404,14 +1431,14 @@ function AdminLeadsWorkspace({ businessId }: { businessId: string }) {
         },
     });
     const bulkPermanentDeleteMutation = useMutation({
-        mutationFn: bulkPermanentlyDeleteArchivedLeads,
+        mutationFn: (ids: string[]) => bulkPermanentlyDeleteArchivedLeads(ids, assignmentContext),
         onSuccess: () => {
             setSelectedBulkLeadIds([]);
             invalidateLeads();
         },
     });
     const bulkPermanentDeleteActiveMutation = useMutation({
-        mutationFn: bulkPermanentlyDeleteActiveLeads,
+        mutationFn: (ids: string[]) => bulkPermanentlyDeleteActiveLeads(ids, assignmentContext),
         onSuccess: () => {
             setSelectedBulkLeadIds([]);
             invalidateLeads();
@@ -1681,7 +1708,7 @@ function AdminLeadsWorkspace({ businessId }: { businessId: string }) {
         const categoryNames = new Map<string, string>();
         const categorySource =
             activeTab === "NEW"
-                ? leads.filter((lead) => (leadQueueFilter === "ALL" ? lead.status === "NEW" || lead.status === "Follow up" : lead.status === leadQueueFilter))
+                ? leads.filter((lead) => (leadQueueFilter === "ALL" ? lead.status !== "Archived" : lead.status === leadQueueFilter))
                 : activeTab === "Unassigned"
                     ? leads.filter((lead) => (leadQueueFilter === "ALL" ? lead.status !== "Archived" && lead.status !== "Dead" : lead.status === leadQueueFilter))
                     : leads;
@@ -1704,6 +1731,7 @@ function AdminLeadsWorkspace({ businessId }: { businessId: string }) {
         const params: Parameters<typeof getAdminLeadCounts>[0] = {
             search: debouncedLeadSearch || undefined,
             state: leadStateFilter !== "ALL" ? leadStateFilter : undefined,
+            city: leadCityFilter !== "ALL" ? leadCityFilter : undefined,
         };
 
         if (assignedAgentFilter !== "ALL") {
@@ -1722,7 +1750,7 @@ function AdminLeadsWorkspace({ businessId }: { businessId: string }) {
         }
 
         return params;
-    }, [assignedAgentFilter, debouncedLeadSearch, leadStateFilter, selectedAgentName]);
+    }, [assignedAgentFilter, debouncedLeadSearch, leadStateFilter, leadCityFilter, selectedAgentName]);
 
     const { data: leadCounts = {} } = useQuery({
         queryKey: ["admin-lead-counts", businessId, leadCountParams],
@@ -1749,7 +1777,7 @@ function AdminLeadsWorkspace({ businessId }: { businessId: string }) {
                     ? lead.status !== "Archived" && (allStatusFilter === "ALL" || lead.status === allStatusFilter)
                     : activeTab === "NEW"
                         ? leadQueueFilter === "ALL"
-                            ? lead.status === "NEW" || lead.status === "Follow up"
+                            ? lead.status !== "Archived"
                             : lead.status === leadQueueFilter
                         : activeTab === "Unassigned"
                             ? isUnassigned && (leadQueueFilter === "ALL" ? lead.status !== "Archived" && lead.status !== "Dead" : lead.status === leadQueueFilter)
@@ -1793,7 +1821,7 @@ function AdminLeadsWorkspace({ businessId }: { businessId: string }) {
     }, [activeCategoryTab, activeTab, allStatusFilter, assignedAgentFilter, effectiveDateFromFilter, effectiveDateToFilter, isAiSorted, leadQueueFilter, leads, selectedAgentName]);
 
     const selectableLeadIds = useMemo(() => {
-        if (activeTab === "ALL" || activeTab === "Unassigned" || activeTab === "NEW") {
+        if (canUseActiveBulkActions) {
             return filteredLeads
                 .filter((lead) => lead.status !== "Archived")
                 .map((lead) => lead._id);
@@ -1806,20 +1834,20 @@ function AdminLeadsWorkspace({ businessId }: { businessId: string }) {
         }
 
         return [];
-    }, [activeTab, filteredLeads]);
+    }, [activeTab, canUseActiveBulkActions, filteredLeads]);
     const getTabLabel = (tab: AdminLeadTab) => (tab === "NEW" ? "Leads" : tab);
     const getLeadQueueFilterLabel = (filter: LeadQueueFilter) => {
         if (filter === "ALL") {
             return "All";
         }
 
-        return filter === "NEW" ? "New" : "Follow up";
+        return filter === "NEW" ? "New" : filter === "Dead" ? "Archive/Dead" : filter;
     };
     const activeTabTotalCount =
         leadPageData?.total ??
         (activeTab === "NEW"
             ? leadQueueFilter === "ALL"
-                ? (leadCounts.NEW || 0) + (leadCounts["Follow up"] || 0)
+                ? leadCounts.ALL || 0
                 : leadCounts[leadQueueFilter] || 0
             : activeTab === "Unassigned"
                 ? leadQueueFilter === "ALL"
@@ -1832,15 +1860,17 @@ function AdminLeadsWorkspace({ businessId }: { businessId: string }) {
         }
 
         if (tab === "NEW") {
-            return (leadCounts.NEW || 0) + (leadCounts["Follow up"] || 0);
+            return leadCounts.ALL || 0;
         }
 
         return leadCounts[tab] || 0;
     };
     const selectableLeadCount = selectableLeadIds.length;
     const selectedBulkCount = selectedBulkLeadIds.length;
+    const selectedBulkLeadIdSet = useMemo(() => new Set(selectedBulkLeadIds), [selectedBulkLeadIds]);
     const selectedBulkLabel = String(selectedBulkCount);
-    const areAllVisibleLeadsSelected = selectableLeadIds.length > 0 && selectableLeadIds.every((leadId) => selectedBulkLeadIds.includes(leadId));
+    const areAllFilteredLeadsSelected = allFilteredSelection?.scope === bulkSelectionScope && allFilteredSelection.total > 0 &&
+        allFilteredSelection.total === selectedBulkCount && selectableLeadIds.every(leadId => selectedBulkLeadIdSet.has(leadId));
 
     const selectedRouteLead = routeLead?._id === selectedLeadId ? routeLead : null;
     const selectedLead = leads.find((lead) => lead._id === selectedLeadId) || selectedRouteLead || filteredLeads[0] || null;
@@ -1876,35 +1906,72 @@ function AdminLeadsWorkspace({ businessId }: { businessId: string }) {
     };
 
     const [previousBulkLeadSelection, setPreviousBulkLeadSelection] = useState<readonly unknown[] | null>(null);
-    const bulkLeadSelectionInputs = [activeTab, activeCategoryTab, assignedAgentFilter, leadSearch];
+    const bulkLeadSelectionInputs = [leadQueryIdentity, activeTab, activeCategoryTab, assignedAgentFilter, leadSearch, leadQueueFilter, allStatusFilter,
+        leadStateFilter, leadCityFilter, effectiveDateFromFilter, effectiveDateToFilter];
     if (previousBulkLeadSelection === null || bulkLeadSelectionInputs.some((input, index) => !Object.is(input, previousBulkLeadSelection[index]))) {
         setPreviousBulkLeadSelection(bulkLeadSelectionInputs);
         (() => {
             setSelectedBulkLeadIds([]);
+            setSelectedBulkLeadRevisions({});
+            setAllFilteredSelection(null);
+            setIsSelectingAllLeads(false);
             setIsBulkMenuOpen(false);
         })();
     }
 
     useEffect(() => {
         if (!isLoading && leadPageData) {
-            leadPageRef.current = Math.max(leadPageData.page || 1, 1);
+            leadPageRef.current = leadFetchInFlightRef.current
+                ? Math.max(leadPageRef.current, leadPageData.page || 1) : Math.max(leadPageData.page || 1, 1);
             setLeadPage(leadPageRef.current);
             setHasMoreLeads(leadPageData.hasMore);
         }
     }, [isLoading, leadPageData]);
 
     const toggleBulkLead = (leadId: string) => {
+        selectionRequestRef.current?.abort(); selectionRequestRef.current = null;
+        setIsSelectingAllLeads(false); setAllFilteredSelection(null);
+        setSelectedBulkLeadRevisions(current => {
+            const next = {...current};
+            if (selectedBulkLeadIds.includes(leadId)) delete next[leadId];
+            else next[leadId] = leads.find(lead => lead._id === leadId)?.assignmentRevision || 0;
+            return next;
+        });
         setSelectedBulkLeadIds((current) => (current.includes(leadId) ? current.filter((id) => id !== leadId) : [...current, leadId]));
     };
 
-    const toggleAllVisibleLeads = () => {
-        setSelectedBulkLeadIds((current) => {
-            if (areAllVisibleLeadsSelected) {
-                return current.filter((leadId) => !selectableLeadIds.includes(leadId));
-            }
+    const clearBulkLeadSelection = () => {
+        selectionRequestRef.current?.abort(); selectionRequestRef.current = null;
+        setIsSelectingAllLeads(false);
+        setSelectedBulkLeadIds([]); setSelectedBulkLeadRevisions({}); setAllFilteredSelection(null);
+    };
 
-            return Array.from(new Set([...current, ...selectableLeadIds]));
-        });
+    const toggleAllFilteredLeads = async () => {
+        if (isSelectingAllLeads) return;
+        if (areAllFilteredLeadsSelected) {
+            clearBulkLeadSelection(); return;
+        }
+        const controller = new AbortController(), scope = bulkSelectionScope;
+        selectionRequestRef.current?.abort(); selectionRequestRef.current = controller; setIsSelectingAllLeads(true);
+        try {
+            const selection = await getAdminLeadSelection({...leadQueryParams, category: activeCategoryTab !== "ALL" ? activeCategoryTab : undefined},
+                {...assignmentContext, signal: controller.signal});
+            if (controller.signal.aborted || selectionRequestRef.current !== controller || selectionScopeRef.current !== scope || !assignmentScopeIsCurrent()) return;
+            if (!Array.isArray(selection.leadIds) || !selection.assignmentRevisions || typeof selection.assignmentRevisions !== "object")
+                throw new Error("Could not verify the selected leads. Please try again.");
+            const ids = Array.from(new Set(selection.leadIds));
+            if (ids.length !== selection.total || ids.some(id => !Number.isSafeInteger(selection.assignmentRevisions[id]) || selection.assignmentRevisions[id] < 0)) {
+                throw new Error("Could not verify the selected leads. Please try again.");
+            }
+            setSelectedBulkLeadIds(ids); setSelectedBulkLeadRevisions(selection.assignmentRevisions);
+            setAllFilteredSelection({scope, total: ids.length});
+            showToast({tone: "success", message: `Selected ${ids.length.toLocaleString()} leads.`});
+        } catch (error) {
+            if (!controller.signal.aborted && selectionScopeRef.current === scope && assignmentScopeIsCurrent())
+                showToast({tone: "error", message: getRequestErrorMessage(error, "Could not select matching leads. Please try again.")});
+        } finally {
+            if (selectionRequestRef.current === controller) {selectionRequestRef.current = null; setIsSelectingAllLeads(false);}
+        }
     };
 
     const closeBulkPrompt = () => setBulkAction(null);
@@ -2043,16 +2110,19 @@ function AdminLeadsWorkspace({ businessId }: { businessId: string }) {
         const requestIdentity = leadQueryIdentityRef.current;
         const nextPage = leadPageRef.current + 1;
         leadFetchInFlightRef.current = true;
+        leadPageRef.current = nextPage;
         setIsFetchingMoreLeads(true);
 
         try {
+            await queryClient.cancelQueries({queryKey: leadQueryKey, exact: true});
+            if (requestIdentity !== leadQueryIdentityRef.current || !assignmentScopeIsCurrent()) return;
             const nextLeadPage = await getAdminLeads({
                 ...leadQueryParams,
                 page: nextPage,
                 limit: LEAD_PAGE_SIZE,
             });
 
-            if (requestIdentity !== leadQueryIdentityRef.current) {
+            if (requestIdentity !== leadQueryIdentityRef.current || !assignmentScopeIsCurrent()) {
                 return;
             }
 
@@ -2062,15 +2132,19 @@ function AdminLeadsWorkspace({ businessId }: { businessId: string }) {
                 }
 
                 return {
-                    ...nextLeadPage,
+                    ...(current.page >= nextPage ? current : nextLeadPage),
                     leads: mergeLeadPages(current.leads, nextLeadPage.leads),
                 };
             });
-            leadPageRef.current = nextPage;
-            setLeadPage(nextPage);
-            setHasMoreLeads(nextLeadPage.hasMore);
+            const loaded = queryClient.getQueryData<AdminLeadsPage>(leadQueryKey);
+            leadPageRef.current = loaded?.page || nextPage;
+            setLeadPage(leadPageRef.current);
+            setHasMoreLeads(loaded?.hasMore ?? nextLeadPage.hasMore);
         } catch (error) {
-            showToast({ tone: "error", message: getRequestErrorMessage(error, "Could not load more leads. Please try again.") });
+            if (requestIdentity === leadQueryIdentityRef.current && assignmentScopeIsCurrent()) {
+                leadPageRef.current = queryClient.getQueryData<AdminLeadsPage>(leadQueryKey)?.page || nextPage - 1;
+                showToast({ tone: "error", message: getRequestErrorMessage(error, "Could not load more leads. Please try again.") });
+            }
         } finally {
             if (requestIdentity === leadQueryIdentityRef.current) {
                 leadFetchInFlightRef.current = false;
@@ -2436,7 +2510,7 @@ function AdminLeadsWorkspace({ businessId }: { businessId: string }) {
     const handleBulkAssignment = (input: Parameters<typeof bulkAssignLeads>[0]) => {
         if (bulkAssignLeadsMutation.isPending) return;
         const assignment = { ...input, leadIds: [...input.leadIds], expectedAssignmentRevisions: Object.fromEntries(
-            leads.filter(lead => input.leadIds.includes(lead._id)).map(lead => [lead._id, lead.assignmentRevision || 0])) };
+            input.leadIds.map(id => [id, selectedBulkLeadRevisions[id] ?? leads.find(lead => lead._id === id)?.assignmentRevision ?? 0])) };
         void runLeadActionAfterComment(selectedLead?._id || "", "assignment", () => bulkAssignLeadsMutation.mutateAsync(assignment));
     };
 
@@ -2521,20 +2595,14 @@ function AdminLeadsWorkspace({ businessId }: { businessId: string }) {
             effectiveDateFromFilter,
             effectiveDateToFilter,
             leadStateFilter,
+            leadCityFilter,
         ],
         queryFn: () => getAdminLeads(queueCountQueryParams),
         enabled: usesLeadQueueFilter(activeTab),
     });
 
 
-    const newLeadCount = leadCounts.NEW || 0;
-    const followUpLeadCount = leadCounts["Follow up"] || 0;
-
-    const queueFilterCounts: Record<LeadQueueFilter, number> = {
-        ALL: newLeadCount + followUpLeadCount,
-        NEW: newLeadCount,
-        "Follow up": followUpLeadCount,
-    };
+    const queueFilterCounts = Object.fromEntries(allStatusFilters.map(status => [status, leadCounts[status] || 0])) as Record<LeadQueueFilter, number>;
 
     return (
         <AdminLayout>
@@ -2665,7 +2733,7 @@ function AdminLeadsWorkspace({ businessId }: { businessId: string }) {
 
                 <div className="grid h-[calc(100vh-15rem)] min-h-[24rem] gap-4 pt-4 xl:h-[calc(100vh-14rem)] xl:grid-cols-[minmax(15rem,19rem)_1fr] 2xl:h-[calc(100vh-12rem)] 2xl:gap-5 2xl:pt-5">
                     <section className="admin-leads-list-panel relative z-30 flex min-h-0 flex-col overflow-visible rounded-lg border border-white/10 bg-[#f100ff30]">
-                        <div className="flex h-14 items-center justify-between border-b border-white/10 px-5">
+                        <div className="flex h-14 shrink-0 items-center justify-between border-b border-white/10 px-5">
                             <div>
                                 <h2 className="text-base font-semibold text-white">Leads</h2>
                                 {isAiSorted && (
@@ -2684,10 +2752,10 @@ function AdminLeadsWorkspace({ businessId }: { businessId: string }) {
                                     <FiZap className="size-3.5" aria-hidden="true" />
                                     {scoreLeadsMutation.isPending ? "Saving" : isScoreSaved ? "Saved" : "AI sort"}
                                 </button>
-                                <span className="rounded-md bg-white/[0.06] px-2 py-1 text-xs font-medium text-white/55">
+                                <span className="rounded-md bg-white/[0.06] px-2 py-1 text-xs font-medium text-white/55" title={`${filteredLeads.length.toLocaleString()} leads loaded`}>
                                     {filteredLeads.length}
                                 </span>
-                                {(activeTab === "ALL" || activeTab === "Unassigned" || activeTab === "Archived" || activeTab === "NEW") && (
+                                {(canUseActiveBulkActions || activeTab === "Archived") && (
                                     <div ref={bulkMenuRef} className="relative">
                                         <button
                                             className="flex size-8 items-center justify-center rounded-lg border border-white/10 bg-white/[0.04] text-white/55 transition hover:bg-white/[0.08] hover:text-white"
@@ -2697,6 +2765,8 @@ function AdminLeadsWorkspace({ businessId }: { businessId: string }) {
                                                 setIsBulkAssignMenuOpen(false);
                                             }}
                                             aria-label="Lead bulk actions"
+                                            aria-expanded={isBulkMenuOpen}
+                                            aria-haspopup="menu"
                                         >
                                             <FiMoreVertical className="size-4" aria-hidden="true" />
                                         </button>
@@ -2706,23 +2776,24 @@ function AdminLeadsWorkspace({ businessId }: { businessId: string }) {
                                                     className="flex h-9 w-full items-center justify-between rounded-md px-3 text-left text-xs font-semibold text-white/70 transition hover:bg-white/[0.06] hover:text-white disabled:cursor-not-allowed disabled:opacity-40"
                                                     type="button"
                                                     onClick={() => {
-                                                        toggleAllVisibleLeads();
+                                                        void toggleAllFilteredLeads();
                                                     }}
-                                                    disabled={selectableLeadCount === 0}
+                                                    disabled={isSelectingAllLeads || isLoading || leadSearch.trim() !== debouncedLeadSearch ||
+                                                        (activeTabTotalCount === 0 && selectableLeadCount === 0 && selectedBulkCount === 0)}
                                                 >
                                                     <span className="flex items-center gap-2">
-                                                        {areAllVisibleLeadsSelected ? <FiCheckSquare className="size-3.5 text-[#9b5cff]" aria-hidden="true" /> : <FiSquare className="size-3.5" aria-hidden="true" />}
-                                                        {areAllVisibleLeadsSelected ? "Clear selection" : "Select all"}
+                                                        {isSelectingAllLeads ? <FiLoader className="size-3.5 animate-spin" aria-hidden="true" /> : areAllFilteredLeadsSelected ? <FiCheckSquare className="size-3.5 text-[#9b5cff]" aria-hidden="true" /> : <FiSquare className="size-3.5" aria-hidden="true" />}
+                                                        {isSelectingAllLeads ? "Selecting" : areAllFilteredLeadsSelected ? "Clear selection" : "Select all"}
                                                     </span>
                                                     <span className="text-white/35">{selectedBulkLabel}</span>
                                                 </button>
-                                                {(activeTab === "ALL" || activeTab === "Unassigned" || activeTab === "NEW") && (
+                                                {canUseActiveBulkActions && (
                                                     <>
                                                         <div className="relative">
                                                             <button
                                                                 className="flex h-9 w-full items-center justify-between rounded-md px-3 text-left text-xs font-semibold !text-black transition hover:bg-[#2e86de]/15 hover:!text-black disabled:cursor-not-allowed disabled:!text-black disabled:opacity-100"
                                                                 type="button"
-                                                                disabled={selectedBulkCount === 0 || bulkAssignLeadsMutation.isPending}
+                                                                disabled={selectedBulkCount === 0 || isSelectingAllLeads || bulkAssignLeadsMutation.isPending}
                                                                 onClick={() => setIsBulkAssignMenuOpen((isOpen) => !isOpen)}
                                                             >
                                                                 <span className="flex items-center gap-2">
@@ -2782,7 +2853,7 @@ function AdminLeadsWorkspace({ businessId }: { businessId: string }) {
                                                         <button
                                                             className="flex h-9 w-full items-center gap-2 rounded-md px-3 text-left text-xs font-semibold text-white/70 transition hover:bg-red-500/10 hover:text-red-100 disabled:cursor-not-allowed disabled:opacity-40"
                                                             type="button"
-                                                            disabled={selectedBulkCount === 0 || bulkArchiveLeadsMutation.isPending}
+                                                            disabled={selectedBulkCount === 0 || isSelectingAllLeads || bulkArchiveLeadsMutation.isPending}
                                                             onClick={() => {
                                                                 setBulkAction("archive");
                                                                 setIsBulkMenuOpen(false);
@@ -2795,7 +2866,7 @@ function AdminLeadsWorkspace({ businessId }: { businessId: string }) {
                                                         <button
                                                             className="flex h-9 w-full items-center gap-2 rounded-md px-3 text-left text-xs font-semibold text-white/70 transition hover:bg-red-500/10 hover:text-red-100 disabled:cursor-not-allowed disabled:opacity-40"
                                                             type="button"
-                                                            disabled={selectedBulkCount === 0 || bulkPermanentDeleteActiveMutation.isPending}
+                                                            disabled={selectedBulkCount === 0 || isSelectingAllLeads || bulkPermanentDeleteActiveMutation.isPending}
                                                             onClick={() => {
                                                                 setBulkAction("delete-active-selected");
                                                                 setIsBulkMenuOpen(false);
@@ -2812,7 +2883,7 @@ function AdminLeadsWorkspace({ businessId }: { businessId: string }) {
                                                         <button
                                                             className="flex h-9 w-full items-center gap-2 rounded-md px-3 text-left text-xs font-semibold text-white/70 transition hover:bg-emerald-400/10 hover:text-emerald-100 disabled:cursor-not-allowed disabled:opacity-40"
                                                             type="button"
-                                                            disabled={selectedBulkCount === 0 || bulkRestoreLeadsMutation.isPending}
+                                                            disabled={selectedBulkCount === 0 || isSelectingAllLeads || bulkRestoreLeadsMutation.isPending}
                                                             onClick={() => {
                                                                 setBulkAction("restore");
                                                                 setIsBulkMenuOpen(false);
@@ -2824,7 +2895,7 @@ function AdminLeadsWorkspace({ businessId }: { businessId: string }) {
                                                         <button
                                                             className="flex h-9 w-full items-center gap-2 rounded-md px-3 text-left text-xs font-semibold text-white/70 transition hover:bg-red-500/10 hover:text-red-100 disabled:cursor-not-allowed disabled:opacity-40"
                                                             type="button"
-                                                            disabled={selectedBulkCount === 0 || bulkPermanentDeleteMutation.isPending}
+                                                            disabled={selectedBulkCount === 0 || isSelectingAllLeads || bulkPermanentDeleteMutation.isPending}
                                                             onClick={() => {
                                                                 setBulkAction("delete-selected");
                                                                 setIsBulkMenuOpen(false);
@@ -2842,6 +2913,20 @@ function AdminLeadsWorkspace({ businessId }: { businessId: string }) {
                             </div>
                         </div>
 
+                        {(isSelectingAllLeads || selectedBulkCount > 0) && (
+                            <div data-testid="admin-lead-selection-state" className="flex min-h-10 shrink-0 items-center justify-between gap-2 border-b border-white/10 bg-sky-400/10 px-4 py-1 text-xs font-semibold text-white/80">
+                                <span role="status" aria-live="polite" aria-atomic="true" className="flex min-w-0 items-center gap-2">
+                                    {isSelectingAllLeads ? <FiLoader className="size-3.5 shrink-0 animate-spin" aria-hidden="true" /> : <FiCheckSquare className="size-3.5 shrink-0" aria-hidden="true" />}
+                                    {isSelectingAllLeads ? "Selecting leads..." : `${selectedBulkCount.toLocaleString()} selected`}
+                                </span>
+                                <button type="button" onClick={clearBulkLeadSelection}
+                                    className="flex size-8 shrink-0 items-center justify-center rounded border border-white/15 transition hover:bg-white/10"
+                                    aria-label={isSelectingAllLeads ? "Cancel lead selection" : "Clear lead selection"}
+                                    title={isSelectingAllLeads ? "Cancel lead selection" : "Clear lead selection"}>
+                                    <FiX className="size-4" aria-hidden="true" />
+                                </button>
+                            </div>
+                        )}
                         <div className="grid gap-2.5 border-b border-white/10 bg-black/[0.04] px-4 py-3">
                             <label className="flex h-9 min-w-0 items-center gap-2 rounded-lg border border-white/12 bg-white/[0.08] px-3 text-white/45 shadow-sm shadow-black/5 focus-within:border-[#842cff]/70 focus-within:bg-white/[0.11] focus-within:ring-2 focus-within:ring-[#842cff]/20">
                                 <FiSearch className="size-3.5 shrink-0" aria-hidden="true" />
@@ -2858,6 +2943,7 @@ function AdminLeadsWorkspace({ businessId }: { businessId: string }) {
                                     value={leadStateFilter}
                                     onChange={(event) => {
                                         setLeadStateFilter(event.target.value);
+                                        setLeadCityFilter("ALL");
                                         setActiveCategoryTab("ALL");
                                     }}
                                     disabled={isLoading || leadStateOptions.length === 0}
@@ -2869,6 +2955,17 @@ function AdminLeadsWorkspace({ businessId }: { businessId: string }) {
                                             {option.name}
                                         </option>
                                     ))}
+                                </select>
+                                <select
+                                    className="h-9 min-w-0 rounded-lg border border-white/12 bg-[#16101f] px-3 text-xs font-semibold text-white outline-none transition hover:bg-[#1b1227] focus:border-[#842cff]/70 focus:ring-2 focus:ring-[#842cff]/20"
+                                    value={leadCityFilter}
+                                    onChange={event => { setLeadCityFilter(event.target.value); setActiveCategoryTab("ALL"); }}
+                                    disabled={isLoading}
+                                    aria-label="Filter leads by city"
+                                >
+                                    <option value="ALL">All City</option>
+                                    {leadCityFilter !== "ALL" && !leadCityOptions.includes(leadCityFilter) && <option value={leadCityFilter}>{leadCityFilter}</option>}
+                                    {leadCityOptions.map(city => <option key={city} value={city}>{city}</option>)}
                                 </select>
                                 <select
                                     className="h-9 min-w-0 rounded-lg border border-white/12 bg-[#16101f] px-3 text-xs font-semibold text-white outline-none transition hover:bg-[#1b1227] focus:border-[#842cff]/70 focus:ring-2 focus:ring-[#842cff]/20"
@@ -2901,7 +2998,7 @@ function AdminLeadsWorkspace({ businessId }: { businessId: string }) {
                                         }}
                                         aria-label="Filter leads by status"
                                     >
-                                        {(["ALL", "NEW", "Follow up"] as LeadQueueFilter[]).map((filter) => {
+                                        {(activeTab === "NEW" ? allStatusFilters : ["ALL", "NEW", "Follow up"] as LeadQueueFilter[]).map((filter) => {
                                             const count = queueFilterCounts[filter];
 
                                             return (
@@ -2926,7 +3023,7 @@ function AdminLeadsWorkspace({ businessId }: { businessId: string }) {
                                     >
                                         {allStatusFilters.map((status) => (
                                             <option key={status} value={status}>
-                                                {status === "ALL" ? "All statuses" : `${status} (${leadCounts[status] || 0})`}
+                                                {status === "ALL" ? "All statuses" : `${getLeadQueueFilterLabel(status)} (${leadCounts[status] || 0})`}
                                             </option>
                                         ))}
                                     </select>
@@ -2970,12 +3067,10 @@ function AdminLeadsWorkspace({ businessId }: { businessId: string }) {
                             )}
                             {filteredLeads.map((lead) => {
                                 const isBulkSelectable =
-                                    ((activeTab === "ALL" ||
-                                        activeTab === "Unassigned" ||
-                                        activeTab === "NEW") &&
+                                    (canUseActiveBulkActions &&
                                         lead.status !== "Archived") ||
                                     (activeTab === "Archived" && lead.status === "Archived");
-                                const isBulkSelected = selectedBulkLeadIds.includes(lead._id);
+                                const isBulkSelected = selectedBulkLeadIdSet.has(lead._id);
                                 const isCallPriority = isCallPriorityLead(lead);
                                 const isScheduledToday = isScheduledForToday(lead);
                                 const wasCommentedToday = hasManualCommentToday(lead);

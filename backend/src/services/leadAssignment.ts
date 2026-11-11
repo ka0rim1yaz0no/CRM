@@ -8,7 +8,7 @@ import { getCurrentBusinessId } from "../config/tenancy";
 import { signedCrmIdentity, signedEmployeeInBusiness } from "../middleware/legacyAuthentication";
 import { isEligibleLeadRecipient } from "../../../shared/leadAssignmentPolicy";
 import { leadPhoneDedupEnabled } from "../config/rolloutFlags";
-import { consumePhoneSlot } from "./leadPhoneDispatch";
+import { consumePhoneSlot, ownsConsumedPhoneSlot } from "./leadPhoneDispatch";
 
 export async function leadRecipients() {
     const employees = await Employee.find({ status: { $in: ["Active", "Training"] }, $or: [{ role: /sales/i }, { team: /sales/i }] })
@@ -46,8 +46,12 @@ export async function uniquelyOwnedLegacyNames(employeeId: string, names: string
     });
 }
 
-type Snapshot = { _id: Types.ObjectId; assignedAgent?: Types.ObjectId | null; assignedAgentName?: string; assignmentRevision?: number; status?: LeadDocument["status"];
-    phone?: string; followUpAt?: LeadDocument["followUpAt"]; comments?: LeadDocument["comments"] };
+export function matchesUniqueLegacyName(names: string[], value: unknown) {
+    return names.some(name => name.toLowerCase() === String(value || "").toLowerCase());
+}
+
+export type Snapshot = { _id: Types.ObjectId; assignedAgent?: Types.ObjectId | null; assignedAgentName?: string; assignmentRevision?: number; status?: LeadDocument["status"];
+    phone?: string; followUpAt?: LeadDocument["followUpAt"]; lastCallOutcomeAt?: LeadDocument["lastCallOutcomeAt"]; comments?: LeadDocument["comments"] };
 export function assignmentSnapshotFilter(lead: Snapshot) {
     return { _id: lead._id, assignedAgent: lead.assignedAgent || null, assignedAgentName: lead.assignedAgentName === undefined ? { $exists: false } : lead.assignedAgentName,
         status: lead.status,
@@ -75,17 +79,17 @@ export async function invalidateUnstartedLeadReservations(leadIds: string[]) {
 // Dispatch and reassignment contend on the same lead document. A transfer after
 // dispatch has committed must not terminate that already-authorized telephone call.
 class DispatchGuardRejected extends Error {}
-export async function withLeadDispatchOwnership<T>(leadId: string, employeeId: string, operation: (session: ClientSession) => Promise<T>, phoneReservation?: { employeeCode: string; attemptId: string }, attendanceGuard?: (session: ClientSession, lead: Snapshot) => Promise<boolean>) {
+export async function withLeadDispatchOwnership<T>(leadId: string, employeeId: string, operation: (session: ClientSession) => Promise<T>, phoneReservation?: { employeeCode: string; attemptId: string; revalidateConsumed?: boolean }, attendanceGuard?: (session: ClientSession, lead: Snapshot) => Promise<boolean>) {
     try { return await mongoose.connection.transaction(async session => {
-        const lead = await Lead.findById(leadId).session(session).lean();
+        const lead = await Lead.findById(leadId).select("assignedAgent assignedAgentName assignmentRevision status phone followUpAt lastCallOutcomeAt comments").session(session).lean();
         if (!lead || lead.status === "Archived") return null;
         const owner = lead.assignedAgent ? String(lead.assignedAgent) === employeeId : await (async () => {
             const employee = await Employee.findById(employeeId).select("name employeeCode aliases").session(session).lean();
-            return employee && (await uniquelyOwnedLegacyNames(employeeId, [employee.name, employee.employeeCode, ...(employee.aliases || [])])).includes(lead.assignedAgentName);
+            return employee && matchesUniqueLegacyName(await uniquelyOwnedLegacyNames(employeeId, [employee.name, employee.employeeCode, ...(employee.aliases || [])]), lead.assignedAgentName);
         })();
         if (!owner) return null;
         if (attendanceGuard && !await attendanceGuard(session, lead)) throw new DispatchGuardRejected();
-        if (leadPhoneDedupEnabled() && (!phoneReservation || !await consumePhoneSlot(lead.phone, phoneReservation.employeeCode, phoneReservation.attemptId, session))) throw new DispatchGuardRejected();
+        if (leadPhoneDedupEnabled() && (!phoneReservation || !await (phoneReservation.revalidateConsumed ? ownsConsumedPhoneSlot : consumePhoneSlot)(lead.phone, phoneReservation.employeeCode, phoneReservation.attemptId, session))) throw new DispatchGuardRejected();
         const locked = await Lead.updateOne(assignmentSnapshotFilter(lead), { $inc: { callingDispatchRevision: 1 } }, { session, timestamps: false });
         if (!locked.modifiedCount) throw new DispatchGuardRejected();
         const result = await operation(session);

@@ -1,23 +1,17 @@
 import mongoose from "mongoose";
 import { getBusinessById, runWithBusiness } from "../config/tenancy";
 import { employeeCallingQueue, hydrateCallingQueue, type CallingEmployee } from "./employeeCallingQueue";
+import { deadlineChangeFeeds } from "./callDeadlineChanges";
+import { callReadPriority } from "./callReadPriority";
+
+const changes = deadlineChangeFeeds(database => mongoose.connection.getClient().db(database).collection("leads").watch([], { maxAwaitTimeMS: 1 }));
 
 export async function prepareDeadlineQueue(employee: CallingEmployee, business: string, deadline: number) {
     const configured = getBusinessById(business); if (!configured) throw Error("CALL_PREPARATION_BUSINESS_UNAVAILABLE");
-    const stream = mongoose.connection.getClient().db(configured.databaseName).collection("leads").watch([], {maxAwaitTimeMS: 1});
-    let failed = false; stream.on("error", () => { failed = true; });
-    const changed = async () => {
-        let dirty = false;
-        for (let count = 0; count < 1000; count++) {
-            if (failed) throw Error("CALL_PREPARATION_UNVERIFIED");
-            const event = await stream.tryNext(); if (!event) return dirty;
-            const fields = event.operationType === "update" ? Object.keys(event.updateDescription.updatedFields || {}) : [];
-            if (event.operationType !== "update" || event.updateDescription.removedFields?.length || fields.some(field => field !== "callingDispatchRevision")) dirty = true;
-        }
-        throw Error("CALL_PREPARATION_BUSY");
-    };
+    const priority = callReadPriority.reserve(deadline);
+    const feed = changes.acquire(configured.databaseName);
     try {
-        await changed();
+        let revision = await feed.poll();
         const load = () => runWithBusiness(business, async () => {
             const queue = await employeeCallingQueue(employee, business, new Date(Math.max(deadline, Date.now())), true);
             return {queue, page: await hydrateCallingQueue(queue, 1, 1)};
@@ -27,11 +21,12 @@ export async function prepareDeadlineQueue(employee: CallingEmployee, business: 
             get queue() { return current.queue; },
             get lead() { return current.page.nextLead; },
             async refresh(force = false) {
+                const observed = await feed.poll();
                 const due = current.queue.nextEligibilityChangeAt && Date.parse(current.queue.nextEligibilityChangeAt) <= Date.now();
-                if (force || await changed() || due) { current = await load(); return true; }
+                if (force || observed !== revision || due) { current = await load(); revision = observed; return true; }
                 return false;
             },
-            close: () => stream.close().catch(() => undefined),
+            close: async () => { priority.close(); await feed.close(); },
         };
-    } catch (error) { await stream.close().catch(() => undefined); throw error; }
+    } catch (error) { priority.close(); await feed.close(); throw error; }
 }

@@ -6,7 +6,7 @@ import mongoose from "mongoose";
 import { MongoMemoryReplSet } from "mongodb-memory-server";
 
 const root = `assignment_${crypto.randomUUID().replaceAll("-", "")}`;
-const businesses = Array.from({ length: 6 }, (_, i) => `assignment-${i}`);
+const businesses = Array.from({ length: 7 }, (_, i) => `assignment-${i}`);
 const now = new Date("2026-10-22T17:00:00Z");
 process.env.NODE_ENV = "test";
 process.env.CRM_SECURITY_LEGACY_AUTH = "true";
@@ -32,7 +32,7 @@ const { employeeCallingQueue } = await import("./employeeCallingQueue");
 const { withLeadDispatchOwnership } = await import("./leadAssignment");
 let mongo: MongoMemoryReplSet, server: http.Server, base = "", adminSession = "", trackerSession = "";
 before(async () => {
-    mongo = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
+    mongo = await MongoMemoryReplSet.create({ replSet: { count: 1 }, instanceOpts: [{args: ["--wiredTigerCacheSizeGB", "0.25"]}] });
     const uri = mongo.getUri(root);
     assert.equal(new URL(uri).hostname, "127.0.0.1");
     await mongoose.connect(uri);
@@ -148,14 +148,77 @@ test("manual admin and bulk assignments work with automatic assignment off, pres
         assert.equal(String((await f.read(String(two._id)))!.assignedAgent), String(f.training._id));
         const body = { leadIds: [String(one._id)], assignedAgent: String(f.active._id), assignedAgentName: "Forged stale name" };
         const result = await request(business, "/leads/bulk/assign", body);
-        assert.equal(result.status, 200); assert.deepEqual(await result.json(), { assignedCount: 1, updatedRecordCount: 2, conflictCount: 0 });
+        assert.equal(result.status, 200); assert.deepEqual(await result.json(), { assignedCount: 1, updatedRecordCount: 2, conflictCount: 0,
+            unchangedCount: 0, unchangedRecordCount: 0, matchedCount: 1, requestedCount: 1, missingCount: 0 });
         for (const lead of [one, two]) { const saved = (await f.read(String(lead._id)))!; assert.equal(saved.assignedAgentName, f.active.name); assert.equal(saved.activity.length, 2); }
         const replay = await request(business, "/leads/bulk/assign", body);
-        assert.equal((await replay.json()).updatedRecordCount, 0);
+        assert.deepEqual(await replay.json(), {assignedCount: 0, updatedRecordCount: 0, conflictCount: 0,
+            unchangedCount: 1, unchangedRecordCount: 2, matchedCount: 1, requestedCount: 1, missingCount: 0});
         assert.equal((await f.read(String(one._id)))!.activity.length, 2);
         const cleared = await request(business, "/leads/bulk/assign", { ...body, assignedAgent: "UNASSIGNED" });
         assert.equal((await cleared.json()).updatedRecordCount, 2);
         assert.equal((await f.read(String(two._id)))!.assignedAgentName, "");
+    }
+});
+
+test("93 already-assigned filtered leads report an exact no-op in all seven businesses without rewriting history or calling controls", async () => {
+    for (const business of businesses) {
+        const f = await fixture(business);
+        await runWithBusiness(business, () => Lead.insertMany(Array.from({length: 93}, (_, index) => ({
+            businessName: `Synthetic selected ${index}`, phone: `+1202555${String(100 + index).padStart(4, "0")}`,
+            assignedAgent: f.owner._id, assignedAgentName: f.owner.name, status: "NEW", notes: "Synthetic retained note",
+        }))));
+        const schedule = await getCallBridgeScheduleModel().create({employeeCode: f.owner.employeeCode, autoCallPaused: true,
+            autoCallControlVersion: 7, manualCallHoldId: crypto.randomUUID()});
+        const beforeSchedule = JSON.stringify(await getCallBridgeScheduleModel().findById(schedule._id).lean());
+        const read = () => runWithBusiness(business, async () => JSON.stringify(await Lead.find({}).sort({_id: 1}).lean()));
+        const before = await read();
+        const selected = await (await request(business, "/admin-leads?search=Synthetic&selectionOnly=true")).json();
+        assert.equal(selected.total, 93); assert.equal(selected.leadIds.length, 93);
+        const response = await request(business, "/leads/bulk/assign", {leadIds: selected.leadIds,
+            assignedAgent: String(f.owner._id), expectedAssignmentRevisions: selected.assignmentRevisions});
+        assert.equal(response.status, 200);
+        assert.deepEqual(await response.json(), {assignedCount: 0, updatedRecordCount: 0, conflictCount: 0,
+            unchangedCount: 93, unchangedRecordCount: 93, matchedCount: 93, requestedCount: 93, missingCount: 0});
+        assert.equal(await read(), before);
+        assert.equal(JSON.stringify(await getCallBridgeScheduleModel().findById(schedule._id).lean()), beforeSchedule);
+    }
+});
+
+test("mixed bulk selections distinguish changed, already-correct and unavailable leads without weakening revision checks", async () => {
+    for (const business of businesses) {
+        const f = await fixture(business), correct = await f.add({phone: "+12025550121"});
+        const changed = await f.add({phone: "+12025550122", assignedAgent: f.active._id, assignedAgentName: f.active.name,
+            notes: "Synthetic original", comments: [{body: "Synthetic retained comment", authorType: "admin", authorName: "Admin"}]});
+        const missing = String(new mongoose.Types.ObjectId()), before = await f.read(String(correct._id));
+        const result = await request(business, "/leads/bulk/assign", {leadIds: [String(correct._id), String(changed._id), missing],
+            assignedAgent: String(f.owner._id), expectedAssignmentRevisions: {[String(correct._id)]: 0, [String(changed._id)]: 0, [missing]: 0}});
+        assert.equal(result.status, 200);
+        assert.deepEqual(await result.json(), {assignedCount: 1, updatedRecordCount: 1, conflictCount: 0,
+            unchangedCount: 1, unchangedRecordCount: 1, matchedCount: 2, requestedCount: 3, missingCount: 1});
+        assert.deepEqual(await f.read(String(correct._id)), before);
+        const saved = await f.read(String(changed._id)); assert.equal(String(saved!.assignedAgent), String(f.owner._id));
+        assert.equal(saved!.notes, changed.notes); assert.deepEqual(saved!.comments, changed.toObject().comments);
+        const stale = await request(business, "/leads/bulk/assign", {leadIds: [String(changed._id)], assignedAgent: String(f.active._id),
+            expectedAssignmentRevisions: {[String(changed._id)]: 0}});
+        assert.equal(stale.status, 409); assert.equal((await stale.json()).code, "LEAD_ASSIGNMENT_CHANGED");
+        assert.deepEqual(await f.read(String(changed._id)), saved);
+    }
+});
+
+test("already-unassigned and missing-only selections never receive fake assignment changes", async () => {
+    for (const business of businesses) {
+        const f = await fixture(business), lead = await f.add({assignedAgent: null, assignedAgentName: ""});
+        const before = await f.read(String(lead._id));
+        const result = await request(business, "/leads/bulk/assign", {leadIds: [String(lead._id)], assignedAgent: "UNASSIGNED"});
+        assert.equal(result.status, 200);
+        assert.deepEqual(await result.json(), {assignedCount: 0, updatedRecordCount: 0, conflictCount: 0,
+            unchangedCount: 1, unchangedRecordCount: 1, matchedCount: 1, requestedCount: 1, missingCount: 0});
+        assert.deepEqual(await f.read(String(lead._id)), before);
+        const missing = await request(business, "/leads/bulk/assign", {leadIds: [String(new mongoose.Types.ObjectId())], assignedAgent: String(f.owner._id)});
+        assert.equal(missing.status, 200);
+        assert.deepEqual(await missing.json(), {assignedCount: 0, updatedRecordCount: 0, conflictCount: 0,
+            unchangedCount: 0, unchangedRecordCount: 0, matchedCount: 0, requestedCount: 1, missingCount: 1});
     }
 });
 

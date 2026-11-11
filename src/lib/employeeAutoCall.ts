@@ -1,6 +1,6 @@
 import { evaluateCallingLead } from "../../shared/leadCallingPolicy.ts";
 import { isSalesEmployee } from "../../shared/leadAssignmentPolicy.ts";
-export const AUTO_CALL_MIN_INTERVAL_MS = 30 * 1000;
+export { POST_CALL_WAIT_MS as AUTO_CALL_MIN_INTERVAL_MS } from "../../shared/callTimingPolicy.ts";
 export const AUTO_CALL_CHECK_INTERVAL_MS = 5 * 1000;
 export const AUTO_CALL_API_TIMEOUT_MS = 10 * 1000;
 export const AUTO_CALL_CONFIRM_TIMEOUT_MS = 30 * 1000;
@@ -29,6 +29,7 @@ type EmployeeCommentMarkerInput = {
 type AutoCallEligibilityLead = {
     status?: string;
     followUpAt?: string | Date | null;
+    lastCallOutcomeAt?: string | Date | null;
     comments?: EmployeeCommentMarkerInput[];
     callsByEmployee?: Array<{
         employeeName?: string;

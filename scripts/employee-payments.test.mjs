@@ -77,6 +77,11 @@ test("Profile Payments retains deduction totals and net pay without a separate a
             { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText, { exports: exported });
         Object.assign(modules, exported);
     }
+    const display = {};
+    runInNewContext(ts.transpileModule(readFileSync(new URL('../src/lib/payrollDeductionPresentation.ts', import.meta.url), 'utf8'),
+        { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText,
+        { exports: display, require: () => modules });
+    Object.assign(modules, display);
     const exported = {};
     runInNewContext(ts.transpileModule(declarations.map(node => node.getText(ast)).join("\n") + "\nexports.details = PaymentDetails;",
         { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX } }).outputText,
@@ -88,7 +93,9 @@ test("Profile Payments retains deduction totals and net pay without a separate a
         attendanceDays: 2, absentDays: 1, workedHours: 16, scheduledHours: 24, deductibleMinutes: 4, incompleteShiftDays: 0, overtimeHours: 0 };
     const before = JSON.stringify(value), money = number => `PHP ${number.toFixed(2)}`;
     const html = renderToStaticMarkup(React.createElement(exported.details, { item: value, money }));
-    for (const text of ["Undertime", "60m", "PHP 150.00", "Absence", "480m", "PHP 1200.00", "Total deductions", "PHP 1360.00", "PHP 2390.00"]) assert.ok(html.includes(text), text);
+    for (const text of ["Undertime", "60m", "PHP 150.00", "Absence", "480m", "PHP 1200.00", "Total deductions", "PHP 10.00", "PHP 2390.00"]) assert.ok(html.includes(text), text);
+    assert.match(html, /<dt>Total deductions<\/dt><dd>PHP 10\.00<\/dd>/);
+    assert.ok(!html.includes("PHP 1360.00"));
     assert.ok(!html.includes("Applied to net pay"));
     assert.ok(!html.includes("Not deducted"));
     assert.ok(!html.includes("Already excluded from earned pay")); assert.ok(!html.includes("no additional deduction"));

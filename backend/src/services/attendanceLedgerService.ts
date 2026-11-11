@@ -9,7 +9,7 @@ import { SystemSettings } from "../models/SystemSettings";
 import { attendanceAutoTimeOutEnabled, attendanceDurationModelEnabled, attendanceIntegrityEnabled, attendanceRecoveryEnvironmentEnabled, payrollAccuracyEnabled, attendanceAccuracyFixesEnabled } from "../config/rolloutFlags";
 import { attendanceMaintenanceState } from "./attendanceWorkerCandidates";
 import { assignAttendanceShift } from "./attendanceShift";
-import { projectAttendance, sessionTime, type SessionEvent } from "./attendanceSessionState";
+import { attendanceAppendHasBlockingIssues, projectAttendance, sessionTime, type SessionEvent } from "./attendanceSessionState";
 import { attendanceAutoTimeOutCutoff } from "./attendanceAutoTimeOut";
 import { attendanceDerivedDaysDueForRefresh, deriveAttendanceDays } from "./attendanceDerived";
 import { attendanceDerivedAuditDelta, replayAttendanceDerived, sameAttendanceDerivedValues, type AttendanceDerivedAuditDelta } from "./attendanceDerivedAudit";
@@ -82,8 +82,9 @@ export async function attendancePolicy(businessId = getCurrentBusinessId(), sess
     shiftStart: settings?.officialShiftStartTime || "23:00", shiftEnd: settings?.officialShiftEndTime || "08:00",
     recoveryEnabled: false, recoveryTime: "22:59", autoTimeOutTime: "08:05", audit: [] };
 }
-export async function readAttendanceLedger(identity: AttendanceIdentity, session?: ClientSession) {
-  const ledger = await AttendanceLedger.findById(identity.key, null, session ? { session } : undefined).lean();
+export async function readAttendanceLedger(identity: AttendanceIdentity, session?: ClientSession, read: "complete" | "presentation" | "status" = "complete") {
+  const projection = read === "complete" ? null : { commands: 0, derivedBaseline: 0, ...(read === "status" ? { audit: 0 } : {}) };
+  const ledger = await AttendanceLedger.findById(identity.key, projection, session ? { session } : undefined).lean();
   if (ledger) return ledger;
   const policy = await attendancePolicy(identity.canonicalBusinessId, session);
   const events = await runWithBusiness(identity.canonicalBusinessId, async () => {
@@ -119,22 +120,26 @@ function guardAttendanceActionCutoff(input: AttendanceCommand, session: ReturnTy
     throw new AttendanceCommandError(409, "AUTO_TIME_OUT_PENDING", "Automatic time-out is pending. Refresh attendance after the worker closes this shift.");
   }
 }
-export function attendanceSnapshot(ledger: AttendanceLedgerDocument, now = new Date(), cutoffContext?: AttendanceCutoffContext) {
-  const projection = projectAttendance(ledger.events, ledger.corrections, ledger.closures);
+export function attendanceSnapshot(ledger: AttendanceLedgerDocument, now = new Date(), cutoffContext?: AttendanceCutoffContext,
+  read: { includeHistory?: boolean; statusOnly?: boolean; projection?: ReturnType<typeof projectAttendance> } = {}) {
+  const projection = read.projection || projectAttendance(ledger.events, ledger.corrections, ledger.closures);
+  const includeHistory = read.includeHistory !== false && !read.statusOnly;
   const session = projection.active;
-  const eventDays = new Map(projection.sessions.flatMap(item => item.events.map(event => [event.id, item.shift?.dayKey] as const)));
+  const eventDays = new Map(includeHistory ? projection.sessions.flatMap(item => item.events.map(event => [event.id, item.shift?.dayKey] as const)) : []);
   const last = projection.sessions.at(-1);
+  const visibleSessions = read.statusOnly ? session ? [session] : last ? [last] : [] : projection.sessions;
+  const activeTime = session ? sessionTime(session, now) : null;
   const coached = attendanceCoachingState(projection, now);
   const sequence = ledger.events.reduce((max, event) => Math.max(max, event.sequence), -1) + 1;
   const allowedActions = ledger.migrationRequired || projection.blockingIssues.length ||
     (cutoffContext && attendanceAutoTimeOutPending(session, now, cutoffContext)) ? [] : [...supportedSources].filter((source) => {
-    if (source === "Coaching Out" && (!session?.shift || now < new Date(session.shift.start) || now >= new Date(session.shift.end) || !coached?.remainingPaidMs)) return false;
+    if (source === "Coaching Out" && (!session?.shift || now < new Date(session.shift.start) || now >= new Date(session.shift.end))) return false;
     const additions: SessionEvent[] = [];
     const append = (candidate: SessionEvent["source"]) => additions.push({ id: `allowed:${sequence + additions.length}:${candidate}`,
       commandId: "allowed-action-preview", sequence: sequence + additions.length, source: candidate, at: now.toISOString(), recordedAt: now.toISOString() });
     if (source === "Time Out" && session?.mode === "OFF THE PHONE") append(attendanceAwayReturnSource(session.events));
     append(source as SessionEvent["source"]);
-    return !projectAttendance([...ledger.events, ...additions], ledger.corrections, ledger.closures).blockingIssues.length;
+    return !attendanceAppendHasBlockingIssues(ledger.events, ledger.corrections, ledger.closures, projection, additions);
   });
   const review = [...projection.issues.map((issue) => issue.message), ...projection.sessions.filter((item) => item.lifecycle === "system-closed").map(() => "Administrative missing-checkout closure requires review.")];
   const shift = session?.shift || last?.shift;
@@ -154,10 +159,10 @@ export function attendanceSnapshot(ledger: AttendanceLedgerDocument, now = new D
     openIntervals: session && session.mode !== "ONLINE" ? [{ mode: session.mode, startedAt: session.modeSince }] : [],
     reviewState: ledger.migrationRequired ? "migration-review" : projection.blockingIssues.length ? "needs-correction" : "verified", review,
     historyReviewRequired: projection.issues.some((issue) => issue.historical) || Boolean(ledger.legacyAdoption?.businessStreamsDiffer), serverTime: now.toISOString(),
-    sessions: projection.sessions.map((item) => ({ ...item, time: sessionTime(item, now) })),
-    records: projection.effectiveEvents.map(event => ({ ...event, ...(eventDays.get(event.id) ? { shiftDayKey: eventDays.get(event.id) } : {}) })), audit: ledger.audit,
-    time: session ? sessionTime(session, now) : null, syncPending: ledger.jobs.some((job) => !job.done),
-    systemClosure: last?.closure || null, ...(attendanceDurationModelEnabled() ? { derived: ledger.derived } : {}) };
+    sessions: visibleSessions.map((item) => ({ ...item, ...(!includeHistory ? { events: [] } : {}), time: item === session ? activeTime! : sessionTime(item, now) })),
+    records: includeHistory ? projection.effectiveEvents.map(event => ({ ...event, ...(eventDays.get(event.id) ? { shiftDayKey: eventDays.get(event.id) } : {}) })) : [], audit: includeHistory ? ledger.audit : [],
+    time: activeTime, syncPending: ledger.jobs.some((job) => !job.done),
+    systemClosure: last?.closure || null, ...(includeHistory && attendanceDurationModelEnabled() ? { derived: ledger.derived } : {}) };
 }
 
 function replaySnapshot(ledger: AttendanceLedgerDocument, revision: number, serverTime: string) {
@@ -213,8 +218,8 @@ function applyAttendanceCommand(ledger: AttendanceLedgerDocument, input: Attenda
     if (before.blockingIssues.length) throw new AttendanceCommandError(409, "TIMELINE_REVIEW_REQUIRED", "The current attendance session needs an administrator correction before another action.", before.blockingIssues);
     guardAttendanceActionCutoff(input, before.active, policy, now);
     const coaching = attendanceCoachingState(before, now);
-    if (input.source === "Coaching Out" && (!before.active?.shift || now < new Date(before.active.shift.start) || now >= new Date(before.active.shift.end) || !coaching?.remainingPaidMs)) {
-      throw new AttendanceCommandError(409, "COACHING_ALLOWANCE_EXHAUSTED", "Coaching is available during the assigned shift until its 20-minute allowance is used.");
+    if (input.source === "Coaching Out" && (!before.active?.shift || now < new Date(before.active.shift.start) || now >= new Date(before.active.shift.end))) {
+      throw new AttendanceCommandError(409, "COACHING_OUTSIDE_SHIFT", "Coaching is available during the assigned shift.");
     }
     const returnAt = coaching?.active?.returnAt;
     const awayReturnAt = returnAt && Date.parse(returnAt) <= +now ? returnAt : now.toISOString();

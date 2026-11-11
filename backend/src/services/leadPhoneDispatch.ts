@@ -1,36 +1,36 @@
 import { Schema, type ClientSession } from "mongoose";
 import { getCurrentBusinessId, tenantModel } from "../config/tenancy";
 import { getCallBridgeScheduleModel } from "../models/CallBridge";
-import { canReserveCall } from "./callTiming";
+import { canReserveCall, canReserveManualCall } from "./callTiming";
 import { normalizeLeadPhone } from "../../../shared/leadPhonePolicy";
 import { Lead } from "../models/Lead";
 
 type Slot = { _id: string; employeeCode: string; attemptId: string; reservedAt: Date; consumedAt: Date | null };
-type Schedule = { lastReservedAt?: Date | null; callLeaseUntil?: Date | null; nextCallAllowedAt?: Date | null;
+type Schedule = { lastReservedAt?: Date | null; callLeaseUntil?: Date | null; nextCallAllowedAt?: Date | null; lastDialStartedAt?: Date | null;
     dialIntentUntil?: Date | null; lastCallStartedAt?: Date | null; lastCallEndedAt?: Date | null };
 const schema = new Schema<Slot>({ _id: { type: String, required: true }, employeeCode: { type: String, required: true },
     attemptId: { type: String, required: true }, reservedAt: { type: Date, required: true }, consumedAt: { type: Date, default: null } }, { versionKey: false });
 export const LeadPhoneSlot = tenantModel<Slot>("LeadPhoneSlot", schema);
 
-export async function phoneSlotBusy(slot: Slot, now: Date, session?: ClientSession) {
+export async function phoneSlotBusy(slot: Slot, now: Date, session?: ClientSession, manual = false) {
     const schedule = await getCallBridgeScheduleModel().findOne({ employeeCode: slot.employeeCode }).session(session || null).lean();
-    return isPhoneSlotBusy(slot, schedule, now);
+    return isPhoneSlotBusy(slot, schedule, now, manual);
 }
 
-function isPhoneSlotBusy(slot: Slot, schedule: Schedule | null | undefined, now: Date) {
+function isPhoneSlotBusy(slot: Slot, schedule: Schedule | null | undefined, now: Date, manual = false) {
     // A later reservation proves the employee passed the previous call's existing
     // timing guard. Do not make an unrelated later call block this old phone.
     if (schedule?.lastReservedAt && schedule.lastReservedAt > slot.reservedAt) return false;
     if (!schedule) return Boolean(slot.consumedAt) || +slot.reservedAt + 30000 > +now;
-    return !canReserveCall(now, schedule);
+    return !(manual ? canReserveManualCall(now, schedule) : canReserveCall(now, schedule));
 }
 
-export async function reservePhoneSlot(phone: string, employeeCode: string, attemptId: string, now: Date, session: ClientSession) {
+export async function reservePhoneSlot(phone: string, employeeCode: string, attemptId: string, now: Date, session: ClientSession, manual = false) {
     const key = normalizeLeadPhone(phone);
     if (!key) return false;
     const previous = await LeadPhoneSlot.findById(key).session(session).lean();
     if (previous?.employeeCode === employeeCode && previous.attemptId === attemptId) return true;
-    if (previous && await phoneSlotBusy(previous, now, session)) return false;
+    if (previous && await phoneSlotBusy(previous, now, session, manual && previous.employeeCode === employeeCode)) return false;
     if ((await busyLegacyPhones([key], employeeCode, now, session)).has(key)) return false;
     await LeadPhoneSlot.findOneAndUpdate({ _id: key }, { $set: { employeeCode, attemptId, reservedAt: now, consumedAt: null } }, { session, upsert: true });
     return true;
@@ -49,6 +49,11 @@ export async function consumePhoneSlot(phone: string, employeeCode: string, atte
     }
     const result = await LeadPhoneSlot.updateOne({ _id: key, employeeCode, attemptId, consumedAt: null }, { $set: { consumedAt: new Date() } }, { session });
     return result.modifiedCount === 1;
+}
+
+export async function ownsConsumedPhoneSlot(phone: string, employeeCode: string, attemptId: string, session: ClientSession) {
+    const key = normalizeLeadPhone(phone);
+    return Boolean(key && await LeadPhoneSlot.exists({ _id: key, employeeCode, attemptId, consumedAt: { $ne: null } }).session(session));
 }
 
 export async function busyPhonesForEmployee(phones: string[], employeeCode: string, now: Date) {

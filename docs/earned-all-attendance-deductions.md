@@ -1,4 +1,4 @@
-# Earned Pay Deductions And Attendance Reference Values
+# Earned Pay With All Attendance Deductions
 
 ## Current Earned-Pay Rule
 
@@ -7,13 +7,11 @@
 Earned gross is unchanged. Only Late, excess Break/Lunch and non-billable Off the
 Phone are cash deductions. Undertime and Absence remain in attendance statistics,
 but are not charged again because their unworked hours already reduce earned gross.
-Deduction breakdowns retain those two categories as information, with their exact
-minutes and reference currency values calculated from the saved full-precision
-minute rate. The displayed deduction total includes these reference values;
-the saved cash deduction field and actual net pay do not charge them again.
-The redundant explanatory labels and Applied to net pay row are not displayed
-in employee Payments. Missing historical rates remain unavailable rather than
-being guessed. Edit Hours uses the same calculation rule.
+Deduction breakdowns retain those two categories as information, with their minutes
+and a no-additional-deduction note rather than a cash charge. Their reference peso
+values use the saved full-precision minute rate and are explicitly marked Not
+deducted; these values are never added to the charged deduction total. Missing
+historical rates remain unavailable rather than being guessed. Edit Hours uses the same rule.
 Paid/Completed payrolls retain their saved calculation version, amounts and dates;
 older paid payslips keep their original deduction breakdown. Refreshing unpaid
 views is read-only and is not a bulk recompute or settlement.

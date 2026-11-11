@@ -16,6 +16,12 @@ const identity = { key: "fake-derived", code: "fake-code", employeeId: "", canon
 const end = new Date("2026-10-16T00:00:00Z");
 const checkout = new Date("2026-10-15T23:00:00Z");
 const clone = <T>(value: T): T => structuredClone(value);
+function candidateQuery(rows: () => unknown[]) {
+  let fields: string[] | undefined;
+  const query = { select(value: string) { fields = value.split(/\s+/); assert.ok(!fields.includes("commands") && !fields.includes("audit")); return query; },
+    async lean() { const selected = fields; return rows().map(row => selected ? Object.fromEntries(Object.entries(row as Record<string, unknown>).filter(([key]) => selected.includes(key))) as AttendanceLedgerDocument : row as AttendanceLedgerDocument); } };
+  return query;
+}
 let payrollAccuracyFlag: string | undefined;
 let store: AttendanceLedgerDocument;
 let failCas = false;
@@ -44,7 +50,7 @@ beforeEach(() => {
   fixture(); failCas = false; onLease = undefined; commits.length = 0;
   mock.method(AttendancePolicy, "findById", () => ({ lean: async () => clone(policy) }));
   mock.method(AttendanceLedger, "findById", () => ({ lean: async () => clone(store) }));
-  mock.method(AttendanceLedger, "find", () => ({ lean: async () => [clone(store)] }));
+  mock.method(AttendanceLedger, "find", () => candidateQuery(() => [clone(store)]));
   mock.method(AttendanceLedger, "updateOne", async (_query: unknown, update: Record<string, unknown>) => {
     if (update.$unset) { delete store.lockToken; delete store.lockUntil; }
     return { matchedCount: 1, modifiedCount: 1 };
@@ -148,7 +154,7 @@ test("a manual reopen after the scan is rechecked under the lease", async () => 
 
 test("one malformed ledger cannot prevent a later eligible ledger finalizing", async () => {
   const malformed = clone(store); malformed.derived![0].sessionIds = undefined as never;
-  mock.method(AttendanceLedger, "find", () => ({ lean: async () => [malformed, clone(store)] }));
+  mock.method(AttendanceLedger, "find", () => candidateQuery(() => [malformed, clone(store)]));
   assert.equal(await runAttendanceDerivedRefresh(end, async () => {}), 1);
 });
 

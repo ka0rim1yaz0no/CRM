@@ -21,23 +21,25 @@ const policy = { shiftStart: start, shiftEnd: end, breakMinutes: 15, lunchMinute
 const previousLimit = process.env.CRM_OFF_PHONE_PAID_LIMIT_FROM;
 afterEach(() => { if (previousLimit === undefined) delete process.env.CRM_OFF_PHONE_PAID_LIMIT_FROM; else process.env.CRM_OFF_PHONE_PAID_LIMIT_FROM = previousLimit; });
 
-test("Coaching has a separate twenty-minute shift budget and can never become non-billable", () => {
+test("Coaching has no duration allowance, remains billable beyond twenty minutes and does not consume Off the Phone", () => {
     const rows = [record("Time In", 0), record("Coaching Out", 10), record("Coaching In", 20),
         record("Off the Phone Out", 30), record("Off the Phone In", 45), record("Time Out", 50),
         record("Time In", 60), record("Coaching Out", 70)];
     const original = structuredClone(rows);
     const current = coachingShiftBilling(rows, start, end, at(75));
-    assert.equal(current.remainingPaidMs, 5 * 60_000);
-    assert.equal(current.active?.returnAt, at(80).toISOString());
+    assert.equal(current.limited, false);
+    assert.equal(current.remainingPaidMs, null);
+    assert.equal(current.active?.returnAt, null);
+    assert.equal(current.totalMs, 15 * 60_000);
     assert.equal(offPhoneShiftBilling(rows, start, end, at(75), limit).remainingPaidMs, 5 * 60_000);
     for (const now of [at(80), at(81), at(90), end, at(600)]) {
         const view = coachingShiftBilling(rows, start, end, now);
-        assert.equal(view.totalMs, 20 * 60_000);
-        assert.equal(view.remainingPaidMs, 0);
-        assert.equal(view.active?.returnAt, at(80).toISOString());
+        assert.equal(view.totalMs, 10 * 60_000 + Math.max(0, Math.min(+now, +end) - +at(70)));
+        assert.equal(view.remainingPaidMs, null);
+        assert.equal(view.active?.returnAt, null);
         assert.deepEqual(nonBillableOffPhoneIntervals(rows, start, end, now, limit), []);
     }
-    assert.equal(coachingShiftBilling(rows, at(1440), at(1980), at(1450)).remainingPaidMs, 20 * 60_000);
+    assert.equal(coachingShiftBilling(rows, at(1440), at(1980), at(1450)).totalMs, 0);
     assert.deepEqual(rows, original);
 });
 
@@ -53,7 +55,7 @@ test("Coaching remains paid in earned payroll and an overdue server return does 
     }
     const nearEnd = coachingShiftBilling([record("Time In", 0), record("Coaching Out", 535)], start, end, at(545));
     assert.equal(nearEnd.totalMs, 5 * 60_000);
-    assert.equal(nearEnd.active?.returnAt, end.toISOString());
+    assert.equal(nearEnd.active?.returnAt, null);
 });
 
 test("the twenty-minute limit is shared across every normal off-phone episode in a shift", () => {

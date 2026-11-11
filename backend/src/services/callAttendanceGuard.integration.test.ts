@@ -38,6 +38,7 @@ test("canonical rest and checkout states block stale ONLINE business projections
         await AttendanceLedger.updateOne({_id: key}, {$set: {events: [timeIn, {id: "pause", source, at: "2026-10-28T16:00:00.000Z", recordedAt: "2026-10-28T16:00:00.000Z", commandId: "pause", sequence: 2}]}});
         for (const [index, business] of businesses.entries()) {
             assert.equal(await runWithBusiness(business.id, () => attendanceAllowsCall(people[index])), false, source);
+            assert.equal(await runWithBusiness(business.id, () => attendanceAllowsCall(people[index], undefined, "manual")), source === "Coaching Out", source);
             assert.equal((await runWithBusiness(business.id, () => Employee.findById(people[index]._id).lean()))?.availabilityStatus, "ONLINE", "guard does not rewrite a projection to hide lag");
         }
     }

@@ -1,6 +1,7 @@
 type Confirmation = { revision: number; serverTime: string; state: string };
+type AttendanceSnapshot = Confirmation & { stateSince?: string | null; coachingBilling?: { active: { startedAt: string } | null } | null };
 type Hold = { id: string; until: number };
-type Gate = { generation: string; pending: Hold[]; confirmed?: Confirmation; verified: boolean };
+type Gate = { generation: string; pending: Hold[]; confirmed?: Confirmation & { coaching?: boolean }; verified: boolean };
 const memory = new Map<string, Gate>();
 const unpersisted = new Set<string>();
 const prefix = "crm:calling-attendance:v1:";
@@ -17,7 +18,7 @@ function read(code: string): Gate {
     return value ? { ...value, pending: [...value.pending], confirmed: value.confirmed ? { ...value.confirmed } : undefined }
         : { generation: "", pending: [], verified: true };
 }
-const signature = (value: Gate) => JSON.stringify([value.generation, value.pending, value.verified, value.confirmed?.revision, value.confirmed?.state]);
+const signature = (value: Gate) => JSON.stringify([value.generation, value.pending, value.verified, value.confirmed?.revision, value.confirmed?.state, value.confirmed?.coaching]);
 function write(code: string, value: Gate) {
     const changed = signature(read(code)) !== signature(value);
     memory.set(code, value);
@@ -27,15 +28,17 @@ function write(code: string, value: Gate) {
         window.dispatchEvent(new Event(callingAttendanceChanged));
     }
 }
-function confirm(value: Gate, snapshot: Confirmation) {
+function confirm(value: Gate, snapshot: AttendanceSnapshot) {
     if (!value.confirmed || snapshot.revision > value.confirmed.revision ||
         snapshot.revision === value.confirmed.revision && snapshot.serverTime >= value.confirmed.serverTime) {
-        value.confirmed = { revision: snapshot.revision, serverTime: snapshot.serverTime, state: snapshot.state };
+        const coaching = snapshot.state === "OFF THE PHONE" && Boolean(snapshot.stateSince) &&
+            snapshot.coachingBilling?.active?.startedAt === snapshot.stateSince;
+        value.confirmed = { revision: snapshot.revision, serverTime: snapshot.serverTime, state: snapshot.state, coaching };
         value.verified = true;
     }
 }
 export const callingAttendanceGeneration = (code: string) => read(code).generation;
-export function observeCallingAttendance(code: string, snapshot: Confirmation, generation: string) {
+export function observeCallingAttendance(code: string, snapshot: AttendanceSnapshot, generation: string) {
     const value = read(code);
     if (value.generation !== generation) return;
     value.pending = value.pending.filter(hold => hold.until > Date.now());
@@ -46,7 +49,7 @@ export function beginCallingAttendanceUpdate(code: string) {
     value.generation = id;
     value.pending = [...value.pending.filter(hold => hold.until > Date.now()), { id, until: Date.now() + 60000 }];
     write(code, value);
-    return (snapshot?: Confirmation) => {
+    return (snapshot?: AttendanceSnapshot) => {
         const current = read(code);
         current.generation = crypto.randomUUID();
         current.pending = current.pending.filter(hold => hold.id !== id && hold.until > Date.now());
@@ -57,9 +60,13 @@ export function beginCallingAttendanceUpdate(code: string) {
 export function callingAttendancePending(code: string) {
     return read(code).pending.some(hold => hold.until > Date.now());
 }
-export function callingAttendanceBlock(code: string) {
+export function callingAttendanceBlock(code: string, intent: "automatic" | "manual" = "automatic") {
     const value = read(code);
     if (value.pending.some(hold => hold.until > Date.now())) return "Saving attendance";
     if (!value.verified || value.pending.length) return "Checking attendance";
-    return value.confirmed && value.confirmed.state !== "ONLINE" ? "Employee not ONLINE" : "";
+    if (!value.confirmed || value.confirmed.state === "ONLINE") return "";
+    if (value.confirmed.state === "OFF THE PHONE" && value.confirmed.coaching === true) {
+        return intent === "manual" ? "" : "Auto Call paused during Coaching";
+    }
+    return intent === "manual" ? "Manual calling requires Online or Coaching attendance" : "Employee not ONLINE";
 }

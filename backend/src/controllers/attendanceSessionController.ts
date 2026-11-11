@@ -19,6 +19,9 @@ import { attendanceDashboardPresentation } from "../services/attendanceDashboard
 import { attendancePolicySyncPending, hasAttendancePolicyRefreshPending, runAttendancePolicyRefresh } from "../services/attendancePolicyRefreshWorker";
 import { deriveAttendanceDays } from "../services/attendanceDerived";
 import { readEmployeeAttendanceCalendar } from "./attendanceHubController";
+import { attendanceChangedDays } from "../services/attendanceReadPresentation";
+import { hubDayKey } from "../services/attendanceHubMath";
+import { attendanceReadPolicyFingerprint } from "../services/attendanceReadPolicy";
 
 export function verifiedAttendanceActor(request: Request): AttendanceActor {
   const admin = verifyAdminDashboardSession(request.header("x-crm-admin-session"));
@@ -37,12 +40,28 @@ export async function getActiveAttendanceSession(request: Request, response: Res
     const actor = verifiedAttendanceActor(request);
     if (!Types.ObjectId.isValid(String(request.params.employeeId))) throw new AttendanceCommandError(400, "INVALID_EMPLOYEE", "Valid employee ID required.");
     const identity = await resolveAttendanceIdentity(String(request.params.employeeId), actor);
-    const ledger = await readAttendanceLedger(identity);
+    const statusOnly = request.query.view === "status";
+    const ledger = await readAttendanceLedger(identity, undefined, statusOnly ? "status" : "presentation");
     const policy = await attendancePolicy(identity.canonicalBusinessId);
     const policySyncPending = attendanceDurationModelEnabled() && attendancePolicySyncPending(ledger, policy.revision);
-    const stored = attendanceSnapshot(ledger, new Date(), policy);
-    const snapshot = withAttendanceStatuses({ ...stored, ...(policySyncPending ? { derived: deriveAttendanceDays(ledger, policy, new Date(stored.serverTime)), syncPending: true } : {}) }, policy.graceMinutes);
-    response.set("Cache-Control", "no-store").json({ ...snapshot, ...attendanceDashboardPresentation(snapshot, policy, new Date(snapshot.serverTime)), ...(actor.role === "admin" ? { policy } : {}), profileCalendarEnabled: true,
+    const now = new Date();
+    const policyFingerprint = attendanceReadPolicyFingerprint(policy);
+    const knownPolicy = typeof request.query.knownPolicyFingerprint === "string"
+      ? request.query.knownPolicyFingerprint === policyFingerprint : policy.revision > 0;
+    const since = typeof request.query.knownServerTime === "string" ? new Date(request.query.knownServerTime) : null;
+    const reuseHistory = !policySyncPending && knownPolicy && ledger.revision >= 0 &&
+      String(request.query.knownRevision) === String(ledger.revision) && String(request.query.knownPolicyRevision) === String(policy.revision) &&
+      Boolean(since && Number.isFinite(since.getTime()) && since <= now);
+    const projection = projectAttendance(ledger.events, ledger.corrections, ledger.closures);
+    let stored = attendanceSnapshot(ledger, now, policy, { projection, statusOnly, includeHistory: !statusOnly && !reuseHistory });
+    const delta = reuseHistory && request.query.knownFingerprint === stored.fingerprint;
+    if (!statusOnly && reuseHistory && !delta) stored = attendanceSnapshot(ledger, now, policy, { projection });
+    const snapshot = withAttendanceStatuses({ ...stored, ...(policySyncPending ? {
+      ...(!statusOnly ? { derived: deriveAttendanceDays(ledger, policy, new Date(stored.serverTime)) } : {}), syncPending: true } : {}) }, policy.graceMinutes);
+    const presentation = statusOnly ? { currentShiftDay: hubDayKey(now, { officialShiftStartTime: policy.shiftStart, officialShiftEndTime: policy.shiftEnd, lateGraceMinutes: policy.graceMinutes, attendanceTimeZone: "Asia/Manila" }) }
+      : delta ? attendanceChangedDays(projection, policy, since!, now) : attendanceDashboardPresentation(snapshot, policy, now);
+    response.set("Cache-Control", "no-store").json({ ...snapshot, ...presentation, historyIncluded: !statusOnly && !delta,
+      statusOnly, policyRevision: policy.revision, policyFingerprint, ...(actor.role === "admin" ? { policy } : {}), profileCalendarEnabled: true,
       allowances: { breakMinutes: policy.breakMinutes, lunchMinutes: policy.lunchMinutes },
       autoTimeOutEnabled: attendanceIntegrityEnabled() && attendanceAutoTimeOutEnabled(), policySyncPending,
       recoveryEnabled: policy.recoveryEnabled || attendanceRecoveryEnvironmentEnabled(),

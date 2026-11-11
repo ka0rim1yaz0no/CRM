@@ -11,7 +11,8 @@ export function latestLead(current: Lead | null | undefined, incoming: Lead) {
 }
 
 function matchesTab(lead: Lead, tab: string) {
-    if (tab === "my" || tab === "leads" || tab === "unassigned") return lead.status === "NEW" || lead.status === "Follow up";
+    if (tab === "leads") return lead.status !== "Archived";
+    if (tab === "my" || tab === "unassigned") return lead.status === "NEW" || lead.status === "Follow up";
     const status = { qualified: "Qualified", negotiation: "Ongoing Negotiation", completed: "Completed", dead: "Dead", archived: "Archived" }[tab];
     return !status || lead.status === status;
 }
@@ -49,5 +50,5 @@ export async function synchronizeLeadWorkspace(client: QueryClient, businessId: 
     for (const id of change.leadIds || []) {
         for (const kind of ["lead", "admin-route-lead"]) client.removeQueries({ queryKey: [kind, businessId, id], exact: true });
     }
-    await client.invalidateQueries({ predicate }, { cancelRefetch: false });
+    void client.invalidateQueries({ predicate }, { cancelRefetch: false }).catch(() => undefined);
 }

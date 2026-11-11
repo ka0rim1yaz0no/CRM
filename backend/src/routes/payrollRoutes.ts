@@ -7,6 +7,7 @@ import {
   createPayrollItem,
   createPayrollRecord,
   getPayrollDtr,
+  getEmployeeBasicPay,
   listPayrollItems,
   listPayrollCutoffs,
   listPayrollRosterGaps,
@@ -45,6 +46,7 @@ payrollRouter.post("/records/:id/worked-minutes/preview", previewWorkedHours);
 payrollRouter.post("/records/:id/worked-minutes/confirm", confirmWorkedHours);
 payrollRouter.post("/records/:id/payment-status/preview", previewPaymentStatus);
 payrollRouter.post("/records/:id/payment-status/confirm", confirmPaymentStatus);
+payrollRouter.get("/employees/:employeeId/basic-pay", getEmployeeBasicPay);
 payrollRouter.patch("/employees/:employeeId/basic-pay", updateEmployeeBasicPay);
 payrollRouter.patch("/records/:id/paid", markPayrollRecordPaid);
 payrollRouter.patch("/records/:id/unpaid", markPayrollRecordUnpaid);

@@ -1,9 +1,10 @@
 import { useMemo, useState } from "react";
 import { createPortal } from "react-dom";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate } from "react-router";
 import {
     FiAlertCircle,
+    FiArrowUpRight,
     FiBell,
     FiBriefcase,
     FiCalendar,
@@ -13,6 +14,7 @@ import {
     FiChevronRight,
     FiClock,
     FiFileText,
+    FiFilter,
     FiMessageCircle,
     FiPhoneCall,
     FiRefreshCw,
@@ -33,6 +35,8 @@ import { getActiveBusinessId } from "../api/businessStorage";
 import { attendanceIntegrityEnabled, getAttendanceSession, sessionEventRecord, type AttendanceSessionSnapshot } from "../api/attendanceSession";
 import { compareAttendanceRecords } from "../lib/attendancePresentation";
 import AttendanceAwayControls from "./AttendanceAwayControls";
+import "./DashboardWorkspace.css";
+import "./employeeDashboard.css";
 
 type WorkspaceDashboardProps = {
     userName: string;
@@ -44,6 +48,8 @@ type DashboardStat = {
     label: string;
     value: number | string;
     detail: string;
+    href: string;
+    actionLabel: string;
     tone: "violet" | "emerald" | "amber" | "rose" | "sky";
     icon: typeof FiTarget;
 };
@@ -75,6 +81,11 @@ const taskStatuses: TaskStatus[] = ["Todo", "In Progress", "Done", "Blocked"];
 const leadStatuses: LeadStatus[] = ["NEW", "Follow up", "Qualified", "Ongoing Negotiation", "Completed", "Dead"];
 const agentRowsPerPage = 5;
 const monthlyRowsPerPage = 5;
+const employeeDashboardViews = ["overview", "calls", "performance", "attendance"] as const;
+type EmployeeDashboardView = typeof employeeDashboardViews[number];
+const employeeDashboardViewLabels: Record<EmployeeDashboardView, string> = {
+    overview: "Overview", calls: "Calls", performance: "Performance", attendance: "Attendance",
+};
 
 const statToneClass: Record<DashboardStat["tone"], string> = {
     violet: "border-violet-200 bg-violet-50 text-violet-700",
@@ -222,16 +233,20 @@ function StatCard({ stat }: { stat: DashboardStat }) {
     const Icon = stat.icon;
 
     return (
-        <article className="employee-stat rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
+        <article className="employee-stat dashboard-kpi-card rounded-lg border border-slate-200 bg-white p-4">
             <div className="flex items-start justify-between gap-4">
+                <div>
+                    <p className="text-sm font-semibold text-slate-600">{stat.label}</p>
+                    <p className="text-2xl font-semibold text-slate-950">{stat.value}</p>
+                </div>
                 <span className={`flex size-11 items-center justify-center rounded-lg border ${statToneClass[stat.tone]}`}>
                     <Icon className="size-5" aria-hidden="true" />
                 </span>
-                <span className="rounded-full bg-slate-100 px-2.5 py-1 text-xs font-semibold text-slate-600">PH Time</span>
             </div>
-            <p className="mt-4 text-sm font-semibold text-slate-600">{stat.label}</p>
-            <p className="mt-2 text-3xl font-semibold text-slate-950">{stat.value}</p>
-            <p className="mt-2 text-xs font-semibold text-slate-500">{stat.detail}</p>
+            <p className="text-xs text-slate-500">{stat.detail}</p>
+            <Link className="employee-stat-link" to={stat.href}>
+                {stat.actionLabel}<FiArrowUpRight aria-hidden="true" />
+            </Link>
         </article>
     );
 }
@@ -686,13 +701,13 @@ function AnnouncementsPanel({ announcements }: { announcements: KnowledgeBaseEnt
     const visibleAnnouncements = announcements.filter((announcement) => announcement.status === "Active").slice(0, 3);
 
     return (
-        <section className={`${dashboardOverviewPanelClass} xl:col-span-2`}>
+        <section className="employee-announcements-panel">
             <div className="flex items-center justify-between gap-3">
                 <div>
                     <p className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">Announcements</p>
                     <h2 className="mt-1 text-base font-semibold text-slate-950">Latest updates from admin</h2>
                 </div>
-                <Link className="rounded-lg border border-slate-200 px-3 py-2 text-sm font-semibold text-slate-700 transition hover:bg-slate-50" to="/announcements">
+                <Link className="text-sm font-semibold text-slate-700" to="/announcements">
                     View all
                 </Link>
             </div>
@@ -701,12 +716,9 @@ function AnnouncementsPanel({ announcements }: { announcements: KnowledgeBaseEnt
                 {visibleAnnouncements.map((announcement) => (
                     <Link
                         key={announcement._id}
-                        className="group min-h-32 rounded-lg border border-slate-200 bg-slate-50 px-3 py-3 transition hover:border-violet-300 hover:bg-white hover:shadow-sm focus:outline-none focus:ring-2 focus:ring-violet-200"
+                        className="employee-announcement-item"
                         to={`/announcements/${announcement._id}`}
                     >
-                        <div className="flex items-start justify-between gap-3">
-                            <FiFileText className="mt-0.5 size-4 shrink-0 text-violet-600 transition group-hover:text-violet-700" aria-hidden="true" />
-                        </div>
                         <h3 className="mt-3 line-clamp-2 text-sm font-semibold leading-5 text-slate-950">{announcement.title}</h3>
                         <p className="mt-2 line-clamp-3 whitespace-pre-line text-xs leading-5 text-slate-600">
                             {getPlainTextFromRichText(announcement.description, "No details provided.")}
@@ -1186,7 +1198,7 @@ function AttendancePanel({ employee, attendance, confirmedStatus, session }: { e
                     <p className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">Attendance</p>
                     <h2 className="mt-1 text-base font-semibold text-slate-950">Attendance by shift</h2>
                     <p className="mt-1 text-xs text-slate-500">
-                        One row equals one full shift: 11:00 PM shift date to 8:00 AM next day. Showing {formatNumber(filteredShiftRows.length)} of {formatNumber(allShiftRows.length)} shift row{allShiftRows.length === 1 ? "" : "s"}.
+                        Showing {formatNumber(filteredShiftRows.length)} of {formatNumber(allShiftRows.length)} shift{allShiftRows.length === 1 ? "" : "s"}.
                     </p>
                 </div>
                 <span className={`rounded-full border px-3 py-1 text-xs font-bold ${statusBadgeClass(status)}`}>{status}</span>
@@ -1207,7 +1219,6 @@ function AttendancePanel({ employee, attendance, confirmedStatus, session }: { e
                     <div>
                         <p className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">Shift Filter</p>
                         <p className="mt-1 text-sm font-semibold text-slate-800">{filterSummary}</p>
-                        <p className="mt-1 text-xs text-slate-500">Date means the shift start date. Example: 06/16/2026 means 11:00 PM 06/16/2026 to 8:00 AM 06/17/2026.</p>
                     </div>
 
                     <div className="grid w-full gap-3 sm:grid-cols-2 lg:w-auto lg:grid-cols-[10rem_10rem_10rem_auto]">
@@ -1282,9 +1293,9 @@ function AttendancePanel({ employee, attendance, confirmedStatus, session }: { e
                 <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 bg-slate-50 px-4 py-3">
                     <div>
                         <p className="text-xs font-semibold uppercase tracking-[0.12em] text-slate-500">Shift Attendance Table</p>
-                        <p className="mt-1 text-xs text-slate-500">Click View to open every punch, issue, and break detail inside that shift. {filterSummary}</p>
+                        <p className="mt-1 text-xs text-slate-500">{filterSummary}</p>
                     </div>
-                    <span className="rounded-full bg-white px-2.5 py-1 text-[0.65rem] font-bold text-slate-500">Shift 11PM-8AM · Break {session?.allowances?.breakMinutes ?? 15}m · Lunch {session?.allowances?.lunchMinutes ?? 60}m</span>
+                    <span className="rounded-full bg-white px-2.5 py-1 text-[0.65rem] font-bold text-slate-500">PH time · Break {session?.allowances?.breakMinutes ?? 15}m · Lunch {session?.allowances?.lunchMinutes ?? 60}m</span>
                 </div>
 
                 <div className="content-scroll max-h-[34rem] overflow-auto">
@@ -1317,7 +1328,7 @@ function AttendancePanel({ employee, attendance, confirmedStatus, session }: { e
                                     <td className="px-3 py-3 font-semibold text-slate-900"><button type="button" className="underline underline-offset-4" aria-label={`View attendance for ${formatDateOrDash(row.shiftDateValue)}`} onClick={(event) => { event.stopPropagation(); setSelectedShiftId(row.id); }}>{formatDateOrDash(row.shiftDateValue)}</button></td>
                                     <td className="px-3 py-3">
                                         <p className="font-semibold text-slate-950">{getShiftLabel(row)}</p>
-                                        <p className="mt-0.5 text-xs text-slate-500">11:00 PM to 8:00 AM next day</p>
+                                        <p className="mt-0.5 text-xs text-slate-500">{row.allowanceLabel || "PH time"}</p>
                                     </td>
                                     <td className="px-3 py-3">{row.firstTimeIn ? formatPhTime(row.firstTimeIn.timeIn) : "-"}</td>
                                     <td className="px-3 py-3">{row.lastTimeOut ? formatPhTime(row.lastTimeOut.timeIn) : "No time out"}</td>
@@ -1409,7 +1420,7 @@ function AttendanceShiftDetailsModal({ row, onClose }: { row: AttendanceShiftRow
                     <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
                         <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
                             <p className="text-[0.65rem] font-bold uppercase tracking-[0.12em] text-slate-500">Shift Window</p>
-                            <p className="mt-1 text-sm font-semibold text-slate-950">11PM to 8AM</p>
+                            <p className="mt-1 text-sm font-semibold text-slate-950">{formatPhTime(row.shiftStart)} - {formatPhTime(row.shiftEnd)} PH</p>
                         </div>
                         <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
                             <p className="text-[0.65rem] font-bold uppercase tracking-[0.12em] text-slate-500">Records</p>
@@ -1700,7 +1711,7 @@ function MyTasksTable({ tasks }: { tasks: CrmTask[] }) {
         .slice(0, 6);
 
     return (
-        <section className="overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm xl:col-span-2">
+        <section className="employee-work-panel employee-task-panel" aria-label="My tasks">
             <div className="flex items-center justify-between gap-3 px-5 py-4">
                 <div>
                     <p className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">My Tasks</p>
@@ -1710,41 +1721,14 @@ function MyTasksTable({ tasks }: { tasks: CrmTask[] }) {
                     View all
                 </Link>
             </div>
-            <div className="overflow-x-auto">
-                <table className="w-full min-w-[44rem] text-left text-sm">
-                    <thead className="border-y border-slate-200 bg-slate-50 text-xs font-semibold uppercase tracking-[0.12em] text-slate-500">
-                        <tr>
-                            <th className="px-5 py-3">Task</th>
-                            <th className="px-5 py-3">Lead</th>
-                            <th className="px-5 py-3">Due</th>
-                            <th className="px-5 py-3">Priority</th>
-                            <th className="px-5 py-3">Status</th>
-                        </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-200">
-                        {visibleTasks.map((task) => (
-                            <tr key={task._id} className="text-slate-700">
-                                <td className="px-5 py-3 font-semibold text-slate-950">{task.title}</td>
-                                <td className="px-5 py-3">{task.relatedLead?.businessName || task.relatedLead?.leadName || "-"}</td>
-                                <td className="px-5 py-3">{formatDateOrDash(task.dueAt)}</td>
-                                <td className="px-5 py-3">
-                                    <span className={`rounded-full border px-2 py-1 text-xs font-semibold ${priorityClass[task.priority] || priorityClass.Medium}`}>{task.priority}</span>
-                                </td>
-                                <td className="px-5 py-3">
-                                    <span className="rounded-full border border-slate-200 bg-slate-50 px-2 py-1 text-xs font-semibold text-slate-700">{task.status}</span>
-                                </td>
-                            </tr>
-                        ))}
-                        {visibleTasks.length === 0 && (
-                            <tr>
-                                <td className="px-5 py-8 text-center text-sm text-slate-500" colSpan={5}>
-                                    No assigned tasks yet.
-                                </td>
-                            </tr>
-                        )}
-                    </tbody>
-                </table>
-            </div>
+            <ul className="employee-task-list">
+                {visibleTasks.map((task) => <li key={task._id}>
+                    <div className="employee-task-title"><h3><Link to={`/tasks/${encodeURIComponent(task._id)}`}>{task.title}</Link></h3><p>{task.relatedLead?.businessName || task.relatedLead?.leadName || "No linked lead"}</p></div>
+                    <span className={`employee-task-priority ${priorityClass[task.priority] || priorityClass.Medium}`}>{task.priority}</span>
+                    <div className="employee-task-meta"><span><FiClock aria-hidden="true" />{formatDateOrDash(task.dueAt)}</span><span>{task.status}</span></div>
+                </li>)}
+            </ul>
+            {visibleTasks.length === 0 && <p className="employee-panel-empty">No assigned tasks yet.</p>}
         </section>
     );
 }
@@ -2229,6 +2213,10 @@ void filterLeadCallStatsByDateTimeRange;
 export default function WorkspaceDashboard({ userName, employee }: WorkspaceDashboardProps) {
     const employeeId = employee?._id || "";
     const businessId = getActiveBusinessId();
+    const queryClient = useQueryClient();
+    const dashboardScope = `${businessId}:${employeeId}`;
+    const [dashboardSelection, setDashboardSelection] = useState<{ scope: string; view: EmployeeDashboardView }>({ scope: dashboardScope, view: "overview" });
+    const dashboardView = dashboardSelection.scope === dashboardScope ? dashboardSelection.view : "overview";
 
     const employeeQuery = useQuery({
         queryKey: ["employee", employeeId, businessId],
@@ -2279,7 +2267,7 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
         queryKey: ["attendance-session", businessId, employeeId],
         queryFn: () => getAttendanceSession(employeeId, businessId),
         enabled: Boolean(employeeId) && attendanceIntegrityEnabled,
-        refetchInterval: query => query.state.data?.coachingBilling?.active ? 1000 : 5000,
+        refetchInterval: query => query.state.data?.coachingBilling?.active && query.state.data.coachingBilling.limited !== false ? 1000 : 5000,
     });
 
     const announcementsQuery = useQuery({
@@ -2309,31 +2297,39 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
     const stats: DashboardStat[] = [
         {
             label: "Assigned Leads",
-            value: leadCountsQuery.isError && !counts ? "Unavailable" : leadCount(counts, "ALL"),
-            detail: `${leadCount(counts, "Follow up")} follow-ups in queue`,
+            value: counts ? leadCount(counts, "ALL") : "--",
+            detail: counts ? `${leadCount(counts, "Follow up")} follow-ups in queue` : leadCountsQuery.isError ? "Could not load leads" : "Loading leads...",
+            href: "/leads",
+            actionLabel: "View leads",
             tone: "violet",
             icon: FiTarget,
         },
         {
             label: "Contacted Today",
-            value: leadCountsQuery.isError && !counts ? "Unavailable" : leadCount(counts, "ContactedToday"),
+            value: counts ? leadCount(counts, "ContactedToday") : "--",
             detail: "Leads already touched today",
+            href: "/leads",
+            actionLabel: "View leads",
             tone: "emerald",
             icon: FiPhoneCall,
         },
         {
             label: "Open Tasks",
-            value: tasksQuery.isError && !tasksQuery.data ? "Unavailable" : openTasks,
-            detail: `${tasks.filter((task) => task.status === "In Progress").length} in progress`,
+            value: tasksQuery.data ? openTasks : "--",
+            detail: tasksQuery.data ? `${tasks.filter((task) => task.status === "In Progress").length} in progress` : tasksQuery.isError ? "Could not load tasks" : "Loading tasks...",
+            href: "/tasks",
+            actionLabel: "View tasks",
             tone: "sky",
             icon: FiBriefcase,
         },
         {
-            label: "Due / Unread",
-            value: (tasksQuery.isError && !tasksQuery.data) || (noticesQuery.isError && !noticesQuery.data) ? "Unavailable" : `${dueTasks}/${unreadNotices}`,
-            detail: "Due tasks / unread notices",
-            tone: dueTasks || unreadNotices ? "amber" : "emerald",
-            icon: dueTasks || unreadNotices ? FiAlertCircle : FiCheckCircle,
+            label: "Due Tasks",
+            value: tasksQuery.data ? dueTasks : "--",
+            detail: "Due now or overdue",
+            href: "/tasks",
+            actionLabel: "View tasks",
+            tone: dueTasks ? "amber" : "emerald",
+            icon: dueTasks ? FiAlertCircle : FiCheckCircle,
         },
     ];
 
@@ -2538,6 +2534,18 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
         setCallFilterTimeTo(today.slice(11, 16));
     };
 
+    const dashboardQueries = [employeeQuery, logsQuery, tasksQuery, leadCountsQuery, queueQuery, noticesQuery, announcementsQuery,
+        ...(!invalidCallRange ? [leadCallStatsQuery] : []),
+        attendanceIntegrityEnabled ? sessionQuery : attendanceQuery];
+    const dashboardRefreshing = dashboardQueries.some(query => query.isFetching);
+    const refreshDashboard = () => {
+        for (const query of dashboardQueries) void query.refetch();
+        void queryClient.invalidateQueries({ queryKey: ["employee-agent-lead-dashboard", businessId, employeeId] });
+    };
+    const coachingActive = confirmedStatus === "OFF THE PHONE" && Boolean(sessionQuery.data?.coachingBilling?.active);
+    const statusLabel = coachingActive ? "Coaching" : confirmedStatus || normalizeEmployeeAvailabilityStatus(currentEmployee?.availabilityStatus);
+    const callSummaryReady = Boolean(leadCallStatsQuery.data) && !leadCallStatsQuery.isError && !invalidCallRange;
+
     if (!employeeId) {
         return (
             <section className="rounded-lg border border-amber-200 bg-amber-50 p-5 text-amber-800">
@@ -2549,27 +2557,33 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
 
 
     return (
-        <section className="employee-dashboard space-y-5 text-slate-950">
-            <div className="flex flex-wrap items-start justify-between gap-4">
+        <section className="employee-dashboard employee-dashboard-v2 dv2-page text-slate-950" data-employee-view={dashboardView}>
+            <header className="dw-header employee-dashboard-header">
                 <div>
-                    <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-500">Employee Workspace</p>
-                    <h1 className="mt-1 text-2xl font-semibold text-slate-950">Welcome back, {currentEmployee?.name || userName}</h1>
+                    <p className="dw-eyebrow">Employee workspace</p>
+                    <h1>Welcome back, {currentEmployee?.name || userName}</h1>
+                    <div className="employee-dashboard-meta">
+                        <span>{[currentEmployee?.role, currentEmployee?.team].filter(Boolean).join(" | ")}</span>
+                        {sessionQuery.data?.assignedShift && <span><FiClock aria-hidden="true" />Shift {formatPhTime(sessionQuery.data.assignedShift.start)} - {formatPhTime(sessionQuery.data.assignedShift.end)} PH</span>}
+                    </div>
                 </div>
-                <div className="flex flex-wrap gap-2">
-                    <span className={`inline-flex h-10 items-center rounded-lg border px-3 text-sm font-bold ${statusBadgeClass(confirmedStatus || currentEmployee?.availabilityStatus)}`}>
-                        {confirmedStatus || normalizeEmployeeAvailabilityStatus(currentEmployee?.availabilityStatus)}
+                <div className="employee-dashboard-actions">
+                    <span role="status" data-coaching={coachingActive} className={`employee-dashboard-status ${statusBadgeClass(confirmedStatus || currentEmployee?.availabilityStatus)}`}>
+                        <FiClock aria-hidden="true" />{statusLabel}
                     </span>
+                    <Link to="/profile?tab=notices" className="employee-notices-shortcut"><FiBell aria-hidden="true" />Notices <span>{noticesQuery.data ? unreadNotices : "--"}</span></Link>
+                    <button type="button" title="Refresh dashboard" aria-label="Refresh dashboard" disabled={dashboardRefreshing} onClick={refreshDashboard}><FiRefreshCw aria-hidden="true" /></button>
                     <Link className="inline-flex h-10 items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 text-sm font-semibold text-slate-700 shadow-sm transition hover:bg-slate-50" to="/attendance">
                         <FiCalendar className="size-4" aria-hidden="true" />
                         Attendance
                     </Link>
                 </div>
-            </div>
+            </header>
 
             {!attendanceError && sessionQuery.data?.coachingEnabled && <AttendanceAwayControls employeeId={employeeId} snapshot={sessionQuery.data} />}
 
             {isLoading && <p className="rounded-lg border border-slate-200 bg-white p-3 text-sm font-semibold text-slate-600">Loading dashboard data...</p>}
-            {hasError && <p role="alert" className="rounded-lg border border-rose-200 bg-rose-50 p-3 text-sm font-semibold text-rose-700">Some dashboard data could not be loaded.<button type="button" className="employee-dashboard-retry" onClick={() => { for (const query of [employeeQuery, logsQuery, tasksQuery, leadCountsQuery, queueQuery, noticesQuery, announcementsQuery, attendanceIntegrityEnabled ? sessionQuery : attendanceQuery]) void query.refetch(); }}><FiRefreshCw aria-hidden="true" />Retry</button></p>}
+            {hasError && <p role="alert" className="rounded-lg border border-rose-200 bg-rose-50 p-3 text-sm font-semibold text-rose-700">Some dashboard data could not be loaded.<button type="button" className="employee-dashboard-retry" onClick={refreshDashboard}><FiRefreshCw aria-hidden="true" />Retry</button></p>}
 
             <div className="employee-dashboard-stats grid gap-4 md:grid-cols-2 xl:grid-cols-4">
                 {stats.map((stat) => (
@@ -2577,41 +2591,48 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
                 ))}
             </div>
 
-            <div className="grid gap-4 xl:grid-cols-[1.2fr_0.8fr]">
-                <AnnouncementsPanel announcements={announcements} />
-                <div className="xl:col-span-2">
-                    <EmployeeAgentProductivity />
-                </div>
+            <div className="dw-view-bar"><div role="tablist" aria-label="Employee dashboard views">
+                {employeeDashboardViews.map(view => <button key={view} type="button" role="tab" id={`employee-dashboard-tab-${view}`}
+                    aria-selected={dashboardView === view} aria-controls={`employee-dashboard-view-${view}`} tabIndex={dashboardView === view ? 0 : -1}
+                    onClick={() => setDashboardSelection({ scope: dashboardScope, view })}
+                    onKeyDown={event => {
+                        const index = employeeDashboardViews.indexOf(view);
+                        const next = event.key === "ArrowRight" ? (index + 1) % employeeDashboardViews.length : event.key === "ArrowLeft" ? (index + employeeDashboardViews.length - 1) % employeeDashboardViews.length
+                            : event.key === "Home" ? 0 : event.key === "End" ? employeeDashboardViews.length - 1 : -1;
+                        if (next >= 0) { event.preventDefault(); setDashboardSelection({ scope: dashboardScope, view: employeeDashboardViews[next] }); document.getElementById(`employee-dashboard-tab-${employeeDashboardViews[next]}`)?.focus(); }
+                    }}>{employeeDashboardViewLabels[view]}</button>)}
+            </div></div>
+
+            <div role="tabpanel" id="employee-dashboard-view-performance" aria-labelledby="employee-dashboard-tab-performance" hidden={dashboardView !== "performance"} className="employee-performance-grid">
+                <EmployeeAgentProductivity />
+                <TaskOverview tasks={tasks} />
+                <LeadProgress counts={counts} />
+                <RecentActivity logs={recentLogs} />
+            </div>
+
+            <div role="tabpanel" id="employee-dashboard-view-calls" aria-labelledby="employee-dashboard-tab-calls" hidden={dashboardView !== "calls"}>
 
                 {/* Call logger */}
                 <div className="employee-call-counts flex min-w-0 w-full flex-col xl:col-span-2 rounded-lg border border-slate-200 bg-white p-4 text-slate-950 shadow-sm">
-                    <div className="flex flex-wrap items-center justify-between gap-3 py-4 pb-6">
+                    <div className="employee-call-header">
                         <div>
                             <p className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">
                                 Log Call Counts
                             </p>
 
-                            <h3 className="mt-1 text-base font-semibold text-slate-900">
-                                {leadCallStatsQuery.isLoading || leadCallStatsQuery.isFetching
-                                    ? "Loading call data"
-                                    : `${formatNumber(totalLoggedLeadCalls)} connected calls`}
-                            </h3>
-
-                            <p className="mt-1 text-xs font-semibold text-rose-600">
-                                {formatNumber(totalNotConnectedCalls)} not connected
-                            </p>
-
-                            <p className="mt-1 text-xs font-semibold text-blue-600">
-                                {formatNumber(totalVoicemails)} voicemails
-                            </p>
-
-                            <p className="mt-1 text-xs font-semibold text-slate-500">
-                                {formatNumber(totalCallAttempts)} total attempt
-                                {totalCallAttempts === 1 ? "" : "s"}
-                            </p>
+                            <h3 className="mt-1 text-base font-semibold text-slate-900">Call counts</h3>
+                            <p className="employee-call-range-label">{callFilterDateFrom || callFilterDateTo
+                                ? `${callFrom ? formatPhDateTime(callFrom) : "Start"} - ${callTo ? formatPhDateTime(callTo) : "Now"}` : "All recorded calls"} / PH time</p>
                         </div>
 
-                        <div className="flex flex-wrap items-center gap-3">
+                        <div className="employee-call-toolbar">
+                            <div className="employee-call-presets" role="group" aria-label="Call count periods">
+                                <button type="button" onClick={applyTodayCallFilter}>Today</button>
+                                <button type="button" onClick={applyThisMonthCallFilter}>This month</button>
+                            </div>
+                            <Link className="employee-primary-link" to="/leads"><FiTarget aria-hidden="true" />Manage leads</Link>
+                            <details className="employee-call-filters"><summary><FiFilter aria-hidden="true" />Custom range</summary>
+                            <div className="employee-call-range">
                             <label className="flex flex-col gap-1">
                                 <span className="text-[0.65rem] font-semibold uppercase tracking-[0.12em] text-slate-500">
                                     From
@@ -2620,6 +2641,7 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
                                 <div className="flex gap-2">
                                     <input
                                         type="date"
+                                        aria-label="Call counts from date"
                                         className="h-9 rounded-lg border border-slate-300 bg-white px-3 text-sm font-semibold text-slate-800 outline-none transition focus:border-[#842cff] focus:ring-2 focus:ring-[#842cff]/20"
                                         value={callFilterDateFrom}
                                         onChange={(event) => setCallFilterDateFrom(event.target.value)}
@@ -2627,6 +2649,7 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
 
                                     <input
                                         type="time"
+                                        aria-label="Call counts from time"
                                         className="h-9 w-32 rounded-lg border border-slate-300 bg-white px-3 text-sm font-semibold text-slate-800 outline-none transition focus:border-[#842cff] focus:ring-2 focus:ring-[#842cff]/20"
                                         value={callFilterTimeFrom}
                                         onChange={(event) => setCallFilterTimeFrom(event.target.value)}
@@ -2642,6 +2665,7 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
                                 <div className="flex gap-2">
                                     <input
                                         type="date"
+                                        aria-label="Call counts to date"
                                         className="h-9 rounded-lg border border-slate-300 bg-white px-3 text-sm font-semibold text-slate-800 outline-none transition focus:border-[#842cff] focus:ring-2 focus:ring-[#842cff]/20"
                                         value={callFilterDateTo}
                                         onChange={(event) => setCallFilterDateTo(event.target.value)}
@@ -2649,28 +2673,13 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
 
                                     <input
                                         type="time"
+                                        aria-label="Call counts to time"
                                         className="h-9 w-32 rounded-lg border border-slate-300 bg-white px-3 text-sm font-semibold text-slate-800 outline-none transition focus:border-[#842cff] focus:ring-2 focus:ring-[#842cff]/20"
                                         value={callFilterTimeTo}
                                         onChange={(event) => setCallFilterTimeTo(event.target.value)}
                                     />
                                 </div>
                             </label>
-
-                            <button
-                                type="button"
-                                className="mt-5 h-9 rounded-lg border border-slate-300 bg-white px-3 text-sm font-semibold text-slate-700 transition hover:border-[#842cff]/40 hover:text-[#6426d9]"
-                                onClick={applyTodayCallFilter}
-                            >
-                                Today
-                            </button>
-
-                            <button
-                                type="button"
-                                className="mt-5 h-9 rounded-lg border border-slate-300 bg-white px-3 text-sm font-semibold text-slate-700 transition hover:border-[#842cff]/40 hover:text-[#6426d9]"
-                                onClick={applyThisMonthCallFilter}
-                            >
-                                This Month
-                            </button>
 
                             <button
                                 type="button"
@@ -2686,20 +2695,16 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
                                 Clear
                             </button>
 
-                            <span className="mt-5 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm font-semibold text-emerald-700">
-                                {formatNumber(totalCallLeadCount)} lead
-                                {totalCallLeadCount === 1 ? "" : "s"}
-                            </span>
-
-                            <Link
-                                className="mt-5 inline-flex h-9 items-center gap-2 rounded-lg bg-[#842cff] px-3 text-sm font-semibold text-white transition hover:brightness-110"
-                                to="/leads"
-                            >
-                                <FiTarget className="size-4" aria-hidden="true" />
-                                Manage Leads
-                            </Link>
+                            </div></details>
                         </div>
                     </div>
+
+                    <dl className="dw-call-totals employee-call-totals">
+                        {([["Connected", totalLoggedLeadCalls, "connected"], ["Not connected", totalNotConnectedCalls, "missed"], ["Voicemails", totalVoicemails, "voicemail"], ["Leads", totalCallLeadCount, "leads"]] as const).map(([label, value, tone]) =>
+                            <div key={label} data-tone={tone}><dt>{label}</dt><dd>{callSummaryReady ? formatNumber(value) : "--"}</dd></div>)}
+                    </dl>
+                    <p className="employee-call-attempts">{callSummaryReady ? `${formatNumber(totalCallAttempts)} total attempt${totalCallAttempts === 1 ? "" : "s"}` : leadCallStatsQuery.isFetching ? "Loading call data..." : "Call data unavailable"}
+                        {callSummaryReady && leadCallStatsQuery.isFetching && <span role="status">Refreshing</span>}</p>
 
                     {invalidCallRange ? <p role="alert" className="py-4 text-sm text-rose-600">Choose a valid date range with From before To.</p> : leadCallStatsQuery.isError ? <p role="alert" className="py-4 text-sm text-rose-600">Call counts could not load.<button type="button" className="employee-dashboard-retry" onClick={() => void leadCallStatsQuery.refetch()}><FiRefreshCw aria-hidden="true" />Retry</button></p> : !authEmployeeId ? (
                         <div className="mt-4">
@@ -2708,7 +2713,7 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
                                 message="The logged-in user ID could not be found, so call data cannot be filtered."
                             />
                         </div>
-                    ) : leadCallStatsQuery.isLoading || leadCallStatsQuery.isFetching ? (
+                    ) : leadCallStatsQuery.isLoading && !leadCallStatsQuery.data ? (
                         <div className="mt-4">
                             <EmptyPanel
                                 title="Loading call counts"
@@ -2723,7 +2728,16 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
                             />
                         </div>
                     ) : (
-                        <div className="overflow-x-auto rounded-lg border border-slate-300 bg-white">
+                        <>
+                        <div className="employee-call-mobile">
+                            {employeeCallRows.map(row => <article key={row.employeeId}>
+                                <h4>{row.employeeName || "Employee"}</h4>
+                                <dl>{([["Connected", row.totalCalls], ["Not connected", row.totalNotConnectedCalls], ["Voicemails", row.totalVoicemails], ["Leads", row.leads.length]] as const).map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{formatNumber(value)}</dd></div>)}</dl>
+                                <p>Last call: {row.lastCallAt ? formatPhDateTime(row.lastCallAt) : "No recorded call"}</p>
+                                <button type="button" onClick={() => setSelectedCallEmployeeRow(row)}><FiFileText aria-hidden="true" />View logged calls</button>
+                            </article>)}
+                        </div>
+                        <div className="employee-call-table overflow-x-auto rounded-lg border border-slate-300 bg-white">
                             <table className="w-full min-w-[54rem] table-fixed border-separate border-spacing-0">
                                 <colgroup>
                                     <col className="w-[25%]" />
@@ -2780,6 +2794,7 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
                                             <td className="px-3 py-3 text-center font-semibold text-slate-950">
                                                 <button
                                                     type="button"
+                                                    aria-label={`Connected call details for ${row.employeeName || "employee"}`}
                                                     className="inline-flex h-8 items-center justify-center rounded-md border border-emerald-200 bg-emerald-50 px-3 text-xs font-semibold text-emerald-700 transition hover:border-emerald-400 hover:bg-emerald-100 focus:outline-none focus:ring-2 focus:ring-emerald-300"
                                                     onClick={() => setSelectedCallEmployeeRow(row)}
                                                 >
@@ -2790,6 +2805,7 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
                                             <td className="px-3 py-3 text-center font-semibold text-rose-600">
                                                 <button
                                                     type="button"
+                                                    aria-label={`Not connected call details for ${row.employeeName || "employee"}`}
                                                     className="inline-flex h-8 items-center justify-center rounded-md border border-rose-200 bg-rose-50 px-3 text-xs font-semibold text-rose-700 transition hover:border-rose-400 hover:bg-rose-100 focus:outline-none focus:ring-2 focus:ring-rose-300"
                                                     onClick={() => setSelectedCallEmployeeRow(row)}
                                                 >
@@ -2800,6 +2816,7 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
                                             <td className="px-3 py-3 text-center font-semibold text-blue-600">
                                                 <button
                                                     type="button"
+                                                    aria-label={`Voicemail details for ${row.employeeName || "employee"}`}
                                                     className="inline-flex h-8 items-center justify-center rounded-md border border-blue-200 bg-blue-50 px-3 text-xs font-semibold text-blue-700 transition hover:border-blue-400 hover:bg-blue-100 focus:outline-none focus:ring-2 focus:ring-blue-300"
                                                     onClick={() => setSelectedCallEmployeeRow(row)}
                                                 >
@@ -2819,15 +2836,15 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
                                 </tbody>
                             </table>
                         </div>
+                        </>
                     )}
                 </div>
                 {/* Call logger */}
-                <TaskOverview tasks={tasks} />
-                <LeadProgress counts={counts} />
             </div>
 
-            <div className="grid gap-4 xl:grid-cols-[0.9fr_1.1fr]">
-                <section className="rounded-lg border border-slate-200 bg-white p-5 shadow-sm">
+            <div role="tabpanel" id="employee-dashboard-view-overview" aria-labelledby="employee-dashboard-tab-overview" hidden={dashboardView !== "overview"}>
+            <div className="employee-work-grid">
+                <section className="employee-work-panel employee-lead-queue" aria-label="Next leads to work">
                     <div className="flex items-center justify-between gap-3">
                         <div>
                             <p className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">Lead Queue</p>
@@ -2839,10 +2856,10 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
                     </div>
                     <div className="mt-5 space-y-3">
                         {queueLeads.slice(0, 5).map((lead) => (
-                            <article key={lead._id} className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+                            <article key={lead._id} className="employee-queue-row">
                                 <div className="flex items-start justify-between gap-3">
                                     <div className="min-w-0">
-                                        <p className="truncate text-sm font-semibold text-slate-950">{lead.businessName || lead.leadName || "Untitled lead"}</p>
+                                        <p className="truncate text-sm font-semibold text-slate-950"><Link to={`/leads?lead=${encodeURIComponent(lead._id)}`}>{lead.businessName || lead.leadName || "Untitled lead"}</Link></p>
                                         <p className="mt-1 truncate text-xs text-slate-500">{lead.source || "No source"}{lead.category ? ` • ${lead.category}` : ""}</p>
                                     </div>
                                     <span className="shrink-0 rounded-full border border-violet-200 bg-violet-50 px-2 py-1 text-[0.65rem] font-bold uppercase tracking-[0.08em] text-violet-700">{lead.status}</span>
@@ -2855,15 +2872,15 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
                                 )}
                             </article>
                         ))}
-                        {queueLeads.length === 0 && <p className="rounded-lg border border-dashed border-slate-300 bg-slate-50 p-4 text-sm text-slate-500">No leads in your queue right now.</p>}
+                        {queueLeads.length === 0 && <p className="employee-panel-empty">No leads in your queue right now.</p>}
                     </div>
                 </section>
+                <MyTasksTable tasks={tasks} />
             </div>
 
-            <div className="grid gap-4 xl:grid-cols-[0.85fr_1.15fr]">
-                <RecentActivity logs={recentLogs} />
-
-                <section className="rounded-lg border border-slate-200 bg-white p-5 shadow-sm">
+            <div className="employee-updates-grid">
+                <AnnouncementsPanel announcements={announcements} />
+                <section className="employee-work-panel employee-notices-panel" aria-label="Latest notices">
                     <div className="flex items-center justify-between gap-3">
                         <div>
                             <p className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-500">Notices</p>
@@ -2871,7 +2888,7 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
                         </div>
                         <span className="inline-flex items-center gap-2 rounded-full bg-slate-100 px-2.5 py-1 text-xs font-semibold text-slate-600">
                             <FiBell className="size-3" aria-hidden="true" />
-                            {unreadNotices} unread
+                            {noticesQuery.data ? unreadNotices : "--"} unread
                         </span>
                     </div>
                     <div className="mt-5 space-y-3">
@@ -2887,12 +2904,15 @@ export default function WorkspaceDashboard({ userName, employee }: WorkspaceDash
                                 <p className="mt-2 text-xs text-slate-500">{formatPhDateTime(notice.createdAt)}</p>
                             </Link>
                         ))}
-                        {notices.length === 0 && <p className="rounded-lg border border-dashed border-slate-300 bg-slate-50 p-4 text-sm text-slate-500">No admin notices yet.</p>}
+                        {notices.length === 0 && <p className="employee-panel-empty">No admin notices yet.</p>}
                     </div>
                 </section>
             </div>
-            <MyTasksTable tasks={tasks} />
-            {!attendanceLoading && !attendanceError && <AttendancePanel employee={currentEmployee} attendance={attendance} confirmedStatus={confirmedStatus} session={sessionQuery.data} />}
+            </div>
+            <div role="tabpanel" id="employee-dashboard-view-attendance" aria-labelledby="employee-dashboard-tab-attendance" hidden={dashboardView !== "attendance"}>
+                {attendanceLoading ? <p role="status" className="employee-panel-empty">Loading attendance...</p> : attendanceError ? <p role="alert" className="employee-panel-empty">Attendance could not be confirmed.<button type="button" className="employee-dashboard-retry" onClick={() => void (attendanceIntegrityEnabled ? sessionQuery : attendanceQuery).refetch()}><FiRefreshCw aria-hidden="true" />Retry</button></p>
+                    : <AttendancePanel employee={currentEmployee} attendance={attendance} confirmedStatus={confirmedStatus} session={sessionQuery.data} />}
+            </div>
 
             {selectedCallEmployeeRow && (
                 <EmployeeLeadCallsModal

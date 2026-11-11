@@ -2,7 +2,8 @@ import { useQuery } from "@tanstack/react-query";
 import AdminLayout from "../adminLayout";
 import { getPayrollDtr, getPayrollRecords, type PayrollDtr, type PayrollRecord } from "../../../api/payroll";
 import { getActiveBusinessId } from "../../../api/businessStorage";
-import { payrollDeductionDisplayRows, payrollDeductionDisplayTotal } from "../../../../shared/payrollPresentation";
+import { payrollDeductionDisplayRows } from "../../../../shared/payrollPresentation";
+import { payrollDeductionDisplayTotal } from "../../../lib/payrollDeductionPresentation";
 import { isEarnedPayrollVersion } from "../../../../shared/payrollEarnings";
 
 type PayrollComputeRow = {

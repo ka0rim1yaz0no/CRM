@@ -1,7 +1,8 @@
-import { hasTrackedActiveCall, isTrustedBridgeActiveSignal } from "./callBridgeActiveSignal";
+import { hasReliableTwoWayAudioDetection, hasTrackedActiveCall, isTrustedBridgeActiveSignal } from "./callBridgeActiveSignal";
 import { callDashboardV2Enabled } from "../config/rolloutFlags";
 import { bucketForAttendanceSource } from "./timeAccounting";
 import type { AttendanceSource } from "../models/Attendance";
+import { POST_CALL_WAIT_MS } from "./callTiming";
 
 export type CallDashboardAttendanceEvent = {
   source: string;
@@ -134,6 +135,23 @@ function latestDate(...dates: Array<Date | null | undefined>) {
   return valid.length ? new Date(Math.max(...valid.map((date) => date.getTime()))) : null;
 }
 
+export function callWaitingStartedAt(attendance: CallDashboardAttendanceEvent[], schedule: CallDashboardSchedule | null | undefined,
+  shift: { start: Date; end: Date }, now: Date) {
+  if (now < shift.start || now >= shift.end) return null;
+  const events = attendance.filter(event => event.timeIn <= now).sort((a, b) => a.timeIn.getTime() - b.timeIn.getTime());
+  const onlineAt = latestAttendanceTransition(events, ["Time In", "Login", "Break In", "Lunch Break In", "Off the Phone In", "Coaching In"]);
+  const endedAt = schedule?.lastCallEndedAt && schedule.lastCallEndedAt <= now ? schedule.lastCallEndedAt : null;
+  const anchor = latestDate(onlineAt, endedAt);
+  return anchor ? new Date(Math.max(shift.start.getTime(), anchor.getTime())) : null;
+}
+
+export function dashboardCallStateAvailable(status: string, devices: CallDashboardDevice[], now: Date, provider: "nextiva" | "ringcentral" = "nextiva") {
+  if (status === "ON CALL") return true;
+  const fresh = devices.filter(device => +device.lastSeenAt >= +now - heartbeatFreshnessMs);
+  return fresh.length > 0 && fresh.every(device => device.state === "idle" &&
+    (provider === "ringcentral" || device.nextivaProcessDetected) && hasReliableTwoWayAudioDetection(device.bridgeVersion));
+}
+
 export function callDashboardStatus(input: {
   availabilityStatus: string;
   devices: CallDashboardDevice[];
@@ -216,10 +234,12 @@ export function callDashboardStatus(input: {
     : authoritativeDevice.nextivaProcessDetected && authoritativeDevice.state !== "unknown")
     ? authoritativeDevice
     : undefined;
-  const lastOnlineAt = latestAttendanceTransition(sortedEvents, ["Time In", "Login", "Break In", "Lunch Break In", "Off the Phone In"]);
+  const lastOnlineAt = latestAttendanceTransition(sortedEvents, ["Time In", "Login", "Break In", "Lunch Break In", "Off the Phone In", "Coaching In"]);
   const lastOfflineAt = latestAttendanceTransition(sortedEvents, ["Time Out", "Logout", "Break Out", "Lunch Break Out", "Off the Phone Out", "Non-Billable Off the Phone Out", "Coaching Out"]);
   const onlineAt = lastOnlineAt && (!lastOfflineAt || lastOnlineAt >= lastOfflineAt) ? lastOnlineAt : null;
   const offlineAt = lastOfflineAt && (!lastOnlineAt || lastOfflineAt >= lastOnlineAt) ? lastOfflineAt : null;
+  const checkoutAt = latestAttendanceTransition(sortedEvents, ["Time Out", "Logout"]);
+  const recordedOfflineAt = checkoutAt && (!lastOnlineAt || checkoutAt >= lastOnlineAt) ? checkoutAt : null;
 
   if (callDashboardV2Enabled() && (availabilityStatus === "BREAK" || availabilityStatus === "LUNCH")) {
     return {
@@ -231,7 +251,8 @@ export function callDashboardStatus(input: {
   }
 
   if (availabilityStatus === "OFFLINE") {
-    return { status: "OFFLINE" as const, statusStartedAt: withinShift(offlineAt), transitionUntil: null, detail: "Not timed in" };
+    return { status: "OFFLINE" as const, statusStartedAt: withinShift(recordedOfflineAt), transitionUntil: null,
+      detail: recordedOfflineAt ? "Timed out" : "No recorded Time Out for this offline state" };
   }
 
   if (active) {
@@ -299,14 +320,14 @@ export function callDashboardStatus(input: {
 
   const waitingUntil = schedule?.lastCallEndedAt && schedule.nextCallAllowedAt
     ? callDashboardV2Enabled() ? schedule.nextCallAllowedAt
-      : new Date(Math.min(schedule.nextCallAllowedAt.getTime(), schedule.lastCallEndedAt.getTime() + 30_000))
+      : new Date(Math.min(schedule.nextCallAllowedAt.getTime(), schedule.lastCallEndedAt.getTime() + POST_CALL_WAIT_MS))
     : null;
   if (ready && schedule?.lastCallEndedAt && schedule.lastCallEndedAt >= shift.start && waitingUntil && waitingUntil > now) {
     return {
       status: "CALL WAITING" as const,
       statusStartedAt: withinShift(schedule.lastCallEndedAt),
       transitionUntil: waitingUntil,
-      detail: "30-second redial pause",
+      detail: `${Math.round((waitingUntil.getTime() - schedule.lastCallEndedAt.getTime()) / 1000)}-second redial pause`,
     };
   }
 

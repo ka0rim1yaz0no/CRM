@@ -1,7 +1,7 @@
 import { accountTime, bucketForAttendanceSource, calculateSlotAttendance, recordsWithClosingBoundaries, type SlotAttendancePolicy } from "./timeAccounting";
 import type { AttendanceSource } from "../models/Attendance";
 
-export function earnedPayrollTime(records: Array<{ source: string; timeIn: Date }>, policy: SlotAttendancePolicy, now: Date, paidHours: number, allDeductions = false, excludeUndertimeAbsence = false) {
+export function earnedPayrollTime(records: Array<{ source: string; timeIn: Date }>, policy: SlotAttendancePolicy, now: Date, paidHours: number, allDeductions = false, excludeUndertimeAbsence = false, clipRestToShift = false) {
     const activity = accountTime(recordsWithClosingBoundaries(records, policy.closingBoundaries).flatMap(record => {
         const bucket = bucketForAttendanceSource(record.source as AttendanceSource);
         return bucket ? [{ at: record.timeIn, bucket }] : [];
@@ -10,8 +10,13 @@ export function earnedPayrollTime(records: Array<{ source: string; timeIn: Date 
     const presentMs = activity.milliseconds.online + activity.milliseconds.break + activity.milliseconds.lunch + activity.milliseconds.offPhone;
     const unpaidLunchMs = Math.min(activity.milliseconds.lunch, policy.lunchMinutes * 60_000);
     const grossHours = Math.min(paidHours, Math.max(0, presentMs - unpaidLunchMs) / 3_600_000);
-    const excess = (rows: typeof attendance.breakSessions, allowance: number) => rows.reduce((sum, row) => sum +
-        (row.open ? Math.ceil(Math.max(0, row.milliseconds - allowance * 60_000) / 60_000) : row.excessMinutes), 0);
+    const excess = (rows: typeof attendance.breakSessions, allowance: number) => rows.reduce((sum, row) => {
+        if (clipRestToShift) {
+            const milliseconds = Math.max(0, Math.min(+row.end, +policy.shiftEnd, +now) - Math.max(+row.start, +policy.shiftStart));
+            return sum + Math.max(0, Math.ceil(milliseconds / 60_000) - allowance);
+        }
+        return sum + (row.open ? Math.ceil(Math.max(0, row.milliseconds - allowance * 60_000) / 60_000) : row.excessMinutes);
+    }, 0);
     const excessBreakMinutes = excess(attendance.breakSessions, policy.breakMinutes);
     const excessLunchMinutes = excess(attendance.lunchSessions, policy.lunchMinutes);
     const nonBillableOffPhoneMinutes = attendance.nonBillableOffPhoneMinutes;

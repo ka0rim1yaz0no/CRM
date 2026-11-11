@@ -5,7 +5,7 @@ import { Attendance } from "../models/Attendance";
 import { Employee } from "../models/Employee";
 import { getCallBridgeDeviceModel, getCallBridgeScheduleModel } from "../models/CallBridge";
 import { getSystemSettings } from "./systemSettingsController";
-import { callDashboardStatus, currentAttendanceShift, offPhoneDashboardClock, offPhoneTimeInShift } from "../services/callDashboardService";
+import { callDashboardStatus, callWaitingStartedAt, dashboardCallStateAvailable, currentAttendanceShift, offPhoneDashboardClock, offPhoneTimeInShift } from "../services/callDashboardService";
 import { callDashboardV2Enabled, timeAccountingV2Enabled } from "../config/rolloutFlags";
 import { accountTime, bucketForAttendanceSource } from "../services/timeAccounting";
 import { verifyAdminDashboardSession } from "../config/adminDashboardSession";
@@ -92,6 +92,8 @@ async function getCallDashboardForBusiness(request: Request, response: Response)
       businessId: group.businesses[0]?.id || "", businessName: group.businesses[0]?.name || "",
       businesses: group.businesses, businessBreakdown, role: group.employee.role, team: group.employee.team,
       ...status, timeBucketsMs: accounted.milliseconds,
+      waitingStartedAt: callWaitingStartedAt(events, schedule, shift, now),
+      callStateAvailable: dashboardCallStateAvailable(status.status, employeeDevices, now),
       coachingActive: status.status === "OFF THE PHONE" && Boolean(coaching.active),
       offPhoneNonBillable: status.status === "OFF THE PHONE" && !coaching.active && offPhoneNonBillableAt(billing, +now),
       offPhoneNonBillableFrom: status.status === "OFF THE PHONE" && !coaching.active ? billing.active?.nonBillableFrom ?? null : null,
@@ -234,6 +236,8 @@ export async function getCallDashboard(request: Request, response: Response) {
       role: employee.role,
       team: employee.team,
       ...dashboardStatus,
+      waitingStartedAt: callWaitingStartedAt(statusAttendance, schedule, shift, now),
+      callStateAvailable: dashboardCallStateAvailable(dashboardStatus.status, employeeDevices, now, callProvider),
       coachingActive: dashboardStatus.status === "OFF THE PHONE" && Boolean(coaching.active),
       offPhoneNonBillable: dashboardStatus.status === "OFF THE PHONE" && !coaching.active && offPhoneNonBillableAt(billing, +now),
       offPhoneNonBillableFrom: dashboardStatus.status === "OFF THE PHONE" && !coaching.active ? billing.active?.nonBillableFrom ?? null : null,

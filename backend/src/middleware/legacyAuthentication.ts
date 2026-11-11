@@ -1,5 +1,5 @@
 import type { Request, Response, NextFunction } from "express";
-import { Types } from "mongoose";
+import { Types, type ClientSession } from "mongoose";
 import { verifyAdminDashboardSession } from "../config/adminDashboardSession";
 import { verifyAttendanceHubSession } from "../config/attendanceHubSession";
 import { findConfiguredAdmin } from "../config/adminUsers";
@@ -9,7 +9,7 @@ import { Task } from "../models/Task";
 import { Lead } from "../models/Lead";
 import { getAttendanceBusinessIdentity } from "../models/BusinessUserAccess";
 import { isSalesEmployee } from "../../../shared/leadAssignmentPolicy";
-import { uniquelyOwnedLegacyNames } from "../services/leadAssignment";
+import { uniquelyOwnedLegacyNames, matchesUniqueLegacyName } from "../services/leadAssignment";
 
 export function signedCrmIdentity(adminToken: unknown, employeeToken: unknown) {
   const expiry = (token: unknown): number => JSON.parse(Buffer.from(String(token).split(".")[0], "base64url").toString("utf8")).exp;
@@ -22,12 +22,12 @@ export function signedCrmIdentity(adminToken: unknown, employeeToken: unknown) {
   return { type: "employee" as const, code, name: "", access: "employee" as const, expiresAt: expiry(employeeToken) };
 }
 
-export async function signedEmployeeInBusiness(code: string, businessId: string) {
+export async function signedEmployeeInBusiness(code: string, businessId: string, session?: ClientSession) {
   const identity = await getAttendanceBusinessIdentity(code);
   const allowed = identity?.businessIds || [];
   if (identity && !allowed.includes(businessId)) return null;
   const employee = await Employee.findOne({ employeeCode: code, status: { $ne: "Archived" } })
-    .select("_id name employeeCode aliases role team businessAccessIds").maxTimeMS(3000).lean();
+    .select("_id name employeeCode aliases role team businessAccessIds availabilityStatus").maxTimeMS(3000).session(session || null).lean();
   if (!employee || (!allowed.length && employee.businessAccessIds?.length && !employee.businessAccessIds.includes(businessId))) return null;
   return employee;
 }
@@ -53,7 +53,7 @@ export async function authenticateLegacyAuthRoute(request: Request, response: Re
 
 // Explicit exceptions continue into handlers which validate their own scoped credentials.
 export function usesIndependentCredential(path: string, method: string) {
-  return (method === "POST" && ["/integrations/customer-registration-leads", "/call-bridge/claim", "/call-bridge/heartbeat", "/browser-activity/events/bulk", "/browser-activity/screenshots"].includes(path)) ||
+  return (method === "POST" && ["/integrations/customer-registration-leads", "/call-bridge/claim", "/call-bridge/heartbeat", "/call-bridge/native-dial/claim", "/browser-activity/events/bulk", "/browser-activity/screenshots"].includes(path)) ||
     (method === "GET" && path === "/browser-activity/tracking-status");
 }
 
@@ -123,6 +123,9 @@ export async function legacyAuthentication(request: Request, response: Response,
     const code = request.query.employeeCode || request.body?.employeeCode;
     if (code && code !== actor.code) return denied(response);
     if (["/call-bridge/status", "/call-bridge/attempts/latest", "/call-bridge/package"].includes(path) && request.method === "GET") return next();
+    if (path === "/call-bridge/verify-deadline-launch" && request.method === "POST") return next();
+    if (path === "/call-bridge/manual-call-hold" && request.method === "POST") return next();
+    if (["/call-bridge/native-dial", "/call-bridge/native-dial/cancel"].includes(path) && request.method === "POST") return next();
     if (["/call-bridge/pairings", "/call-bridge/activate", "/call-bridge/reserve", "/call-bridge/dial-start", "/call-bridge/dial-at-deadline", "/call-bridge/release", "/call-bridge/devices"].includes(path)) return next();
     return denied(response);
   }
@@ -154,7 +157,7 @@ export async function legacyAuthentication(request: Request, response: Response,
       if (/\/assign$/.test(path) && (request.method !== "PATCH" || !isSalesEmployee(employee!))) return denied(response);
       if (!Types.ObjectId.isValid(record[1])) return denied(response);
       const lead = await Lead.findById(record[1]).select("assignedAgent assignedAgentName status").lean();
-      const owns = lead && (String(lead.assignedAgent) === ownId || (!lead.assignedAgent && (await uniquelyOwnedLegacyNames(ownId, names)).includes(lead.assignedAgentName)));
+      const owns = lead && (String(lead.assignedAgent) === ownId || (!lead.assignedAgent && matchesUniqueLegacyName(await uniquelyOwnedLegacyNames(ownId, names), lead.assignedAgentName)));
       const existingReadRole = /outside.*sales|sales.*outside/i.test(`${employee!.role} ${employee!.team}`) || (lead?.status === "Completed" && /inside.*sales|sales.*inside/i.test(`${employee!.role} ${employee!.team}`));
       if (!owns && !(request.method === "GET" && existingReadRole)) return denied(response);
     } else if (request.method !== "GET" || (!/^\/my-leads(?:\/[^/]+)?$/.test(path) && !["/leads", "/leads/my", "/leads/counts", "/leads/workspace-capabilities", "/leads/call-stats/me", "/log/call-stats/me", "/log/call-summary/me"].includes(path))) return denied(response);

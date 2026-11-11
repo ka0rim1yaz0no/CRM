@@ -19,6 +19,7 @@ import { isLeadEligibleForAutoCall } from "../services/leadAutoCallEligibility";
 import { isSalesEmployee } from "../../../shared/leadAssignmentPolicy";
 import { callingWindow } from "../../../shared/leadCallingPolicy";
 import { getLeadDialBlock } from "./callBridgeController";
+import { autoCallControlSnapshot, automaticCallControlFilter, automaticCallVersionCondition, automaticCallPaused } from "../services/autoCallControl";
 
 export const DEADLINE_PREPARATION_MS = 12000;
 const pending = new Map<string, Set<string>>();
@@ -43,8 +44,13 @@ export async function dispatchCallAtDeadline(request: Request, response: Respons
     }
     const Schedule = getCallBridgeScheduleModel(), now = new Date();
     const original = await Schedule.findOne({employeeCode: code}).lean();
+    if (autoCallControlSnapshot(original).autoCallPaused) {
+        response.status(409).json({code: "AUTO_CALL_PAUSED", message: "Auto Call is held while manual calling or a pause is active."}); return;
+    }
+    const controlVersion = original?.autoCallControlVersion || 0;
     const replay = async () => {
         const row = await Schedule.findOne({employeeCode: code, reservedBusinessId: business, reservedAttemptId: attemptId,
+            ...automaticCallControlFilter(), $and: [automaticCallVersionCondition("$reservedAutoCallControlVersion")],
             lastDialStartedAt: {$ne: null}, dialIntentUntil: {$gt: new Date()}}).lean();
         if (!row?.lastDialStartedAt) return false;
         const lead = await Lead.findById(row.reservedLeadId).slice("comments", -10).slice("activity", 20).populate("assignedAgent", "name employeeCode aliases").populate("assignedTeam", "name").lean();
@@ -90,7 +96,8 @@ export async function dispatchCallAtDeadline(request: Request, response: Respons
             connected(); const at = new Date();
             if (+at < deadline || !callingWindow(at).permitted) conflict("CALL_DEADLINE_CHANGED");
             const row = await Schedule.findOneAndUpdate({employeeCode: code, lastCallEndedAt: new Date(endedAt), nextCallAllowedAt: new Date(deadline),
-                $and: [{ $or: [{callLeaseUntil: null}, {callLeaseUntil: {$lte: at}}] }, ...callTimingWriteConditions(at)]}, {$set: {
+                $and: [automaticCallVersionCondition(controlVersion), { $or: [{callLeaseUntil: null}, {callLeaseUntil: {$lte: at}}] }, ...callTimingWriteConditions(at)]}, {$set: {
+                reservedAutoCallControlVersion: controlVersion,
                 reservedAttemptId: attemptId, reservedBusinessId: business, reservedLeadId: head.leadId, reservedPhone: head.normalizedPhone,
                 reservationTokenHash: crypto.createHash("sha256").update(attemptId).digest("hex"), lastReservedAt: at, callLeaseUntil: new Date(+at + 45000),
                 lastDialStartedAt: at, dialIntentUntil: new Date(+at + 30000), nextCallAllowedAt: unconfirmedDialRetryAt(at),
@@ -127,5 +134,51 @@ export async function dispatchCallAtDeadline(request: Request, response: Respons
         });
     } finally {
         response.off("close", closed); await preparation?.close(); waiting.delete(attemptId); if (!waiting.size) pending.delete(code);
+    }
+}
+
+// Recheck a delayed, original response without issuing another grant or cooldown.
+export async function verifyDeadlineLaunch(request: Request, response: Response) {
+    const code = String(request.body.employeeCode || "").trim(), business = request.business?.id || "";
+    const attempt = String(request.body.reservationToken || ""), leadId = String(request.body.leadId || "");
+    const browserKey = String(request.body.browserDeviceKey || "").slice(0, 201);
+    const browserSessionId = String(request.body.browserSessionId || "").slice(0, 121);
+    if (verifyAttendanceHubSession(request.header("x-crm-attendance-session")) !== code ||
+        request.header("x-crm-user-code") !== code || request.header("x-crm-user-type") !== "employee" || !await signedEmployeeInBusiness(code, business)) {
+        response.status(403).json({code: "SIGNED_EMPLOYEE_REQUIRED", message: "A signed employee session in this business is required."}); return;
+    }
+    if (!isSupportedAutoCallClientVersion(request.header("x-crm-auto-call-version")) || !callTimingV2Enabled() || getCallProvider() !== "nextiva") {
+        response.status(409).json({code: "DEADLINE_CALLING_UNAVAILABLE", message: "Refresh the CRM to verify calling configuration."}); return;
+    }
+    if (!/^[0-9a-f-]{36}$/i.test(attempt) || !/^[0-9a-f]{24}$/i.test(leadId)) {
+        response.status(400).json({code: "INVALID_DEADLINE_ATTEMPT", message: "The original call authorization is required."}); return;
+    }
+    try {
+        if (await automaticCallPaused(code)) conflict("AUTO_CALL_PAUSED");
+        const now = new Date(), Schedule = getCallBridgeScheduleModel();
+        const filter = {employeeCode: code, reservedBusinessId: business, reservedAttemptId: attempt, reservedLeadId: leadId,
+            ...automaticCallControlFilter(), $and: [automaticCallVersionCondition("$reservedAutoCallControlVersion")],
+            reservationTokenHash: crypto.createHash("sha256").update(attempt).digest("hex"),
+            lastDialStartedAt: {$ne: null}, callLeaseUntil: {$gt: now}, dialIntentUntil: {$gt: now}};
+        const grant = await Schedule.findOne(filter).lean();
+        if (!grant || grant.lastCallStartedAt && (!grant.lastCallEndedAt || grant.lastCallStartedAt > grant.lastCallEndedAt)) conflict("CALL_LAUNCH_NO_LONGER_VALID");
+        const employee = await Employee.findOne({employeeCode: code, status: {$ne: "Archived"}}).select("name employeeCode aliases role team availabilityStatus").lean();
+        if (!employee || !callingWindow(new Date()).permitted || !isSalesEmployee(employee) || isAutoCallDisabledForEmployee(code) || !await attendanceAllowsCall(employee)) conflict("CALL_ATTENDANCE_CHANGED");
+        const lead = await Lead.findById(leadId).select("phone status followUpAt comments").lean();
+        if (!lead || normalizeCallingPhone(lead.phone) !== grant.reservedPhone || !isLeadEligibleForAutoCall(lead, new Date()) ||
+            await getLeadDialBlock(leadId, String(employee._id), [employee.name, employee.employeeCode, ...(employee.aliases || [])])) conflict("CALL_LEAD_NOT_ELIGIBLE");
+        const at = new Date(), devices = await getCallBridgeDeviceModel().find({employeeCode: code,
+            lastSeenAt: {$gte: new Date(+at - 20000)}, bridgeVersion: {$ne: "ringcentral-api-v1"}}).lean();
+        if (!devices.length || devices.some(device => device.state !== "idle" || !device.nextivaProcessDetected || !hasReliableTwoWayAudioDetection(device.bridgeVersion))) conflict("CALL_BRIDGE_NOT_READY");
+        if (devices.some(device => device.accountSwitchingEnabled) && !devices.some(device => device.accountSwitchingEnabled &&
+            device.businessIds.includes(business) && browserKey.length >= 24 && browserKey.length <= 200 &&
+            browserSessionId.length >= 16 && browserSessionId.length <= 120 && device.browserSessionId === browserSessionId &&
+            device.browserDeviceKeyHash === crypto.createHash("sha256").update(browserKey).digest("hex"))) conflict("CALL_BROWSER_SESSION_CHANGED");
+        if (!await Schedule.exists({...filter, callLeaseUntil: {$gt: new Date()}, dialIntentUntil: {$gt: new Date()}})) conflict("CALL_LAUNCH_NO_LONGER_VALID");
+        response.set("Cache-Control", "no-store").json({leadId, normalizedPhone: grant.reservedPhone, startedAt: grant.lastDialStartedAt,
+            dialIntentUntil: grant.dialIntentUntil, serverTime: new Date()});
+    } catch (error) {
+        response.status(error instanceof DeadlineConflict ? 409 : 503).json({code: error instanceof DeadlineConflict ? error.message : "CALL_LAUNCH_UNAVAILABLE",
+            message: "The original call authorization could not be confirmed. Checking current server state.", serverTime: new Date()});
     }
 }

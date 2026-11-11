@@ -50,8 +50,8 @@ function fixture(options = {}) {
         leadFetchRetryAtRef: refs.retry, leadPageRef: refs.page, hasMoreLeads: true,
         getActiveBusinessId: () => business, employeeLeadNames: ["fake-name"], requestedEmployeeLeadTab: "my",
         effectiveLeadSearch: "synthetic search", isGlobalLeadSearchActive: false, leadStateFilter: "CA", leadQueryKey: key,
-        LEAD_PAGE_SIZE: 50, AUTO_CALL_API_TIMEOUT_MS: 10000, isDefaultCallingView: false, performance: { now: () => now },
-        queryClient: { getQueryData: () => cache, setQueryData: (_key, update) => { cache = update(cache); commits.push(cache); } },
+        LEAD_PAGE_SIZE: 50, AUTO_CALL_API_TIMEOUT_MS: 10000, isEmployeeLeadWorkspaceView: false, isCancelledError: () => false, performance: { now: () => now },
+        queryClient: { getQueryData: () => cache, getQueryState: () => ({fetchStatus: 'idle'}), setQueryData: (_key, update) => { cache = update(cache); commits.push(cache); } },
         getMyLeads: async (params, requestOptions) => {
             requests.push(JSON.parse(JSON.stringify({ params, requestOptions })));
             await options.gate;

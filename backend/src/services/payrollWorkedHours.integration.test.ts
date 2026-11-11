@@ -128,11 +128,11 @@ for (const excludeUndertimeAbsence of [false, true]) test(`earned ${excludeUnder
     for (const [index, business] of businesses.entries()) {
         const login = await request("/auth/login", { employeeCode: code }, business); assert.equal(login.status, 200);
         for (let refresh = 0; refresh < 2; refresh++) {
-            const list = await request(`/payroll/records?payPeriod=${encodeURIComponent(period)}`, undefined, business);
+            const list = await request(`/payroll/records?payPeriod=${encodeURIComponent(period)}&basis=estimate`, undefined, business);
             assert.equal(list.status, 200); assert.equal(list.data[0].netPay, value.netPay); assert.equal(list.data[0].deductions, value.deductions);
             const dtr = await request(`/payroll/dtr/${code}?payPeriod=${encodeURIComponent(period)}`, undefined, business);
             assert.equal(dtr.status, 200); assert.equal(dtr.data.summary.deductibleMinutes, chargedMinutes); assert.equal(dtr.data.summary.netPay, value.netPay);
-            const response = await fetch(`${base}/employees/${login.data.user._id}/payments`, { headers: { "X-Business-Id": business, "X-CRM-Attendance-Session": login.data.attendanceHubSession } });
+            const response = await fetch(`${base}/employees/${login.data.user._id}/payments?basis=estimate`, { headers: { "X-Business-Id": business, "X-CRM-Attendance-Session": login.data.attendanceHubSession } });
             assert.equal(response.status, 200); const item = (await response.json()).items[0];
             assert.equal(item.netPay, value.netPay); assert.equal(item.deductions, value.deductions);
             const lines = payrollDeductionRows(item); assert.equal(lines.length, excludeUndertimeAbsence ? 4 : 6);
@@ -195,16 +195,16 @@ test("earned current pay and the whole-shift off-phone limit match Payroll, Paym
     for (const [index, business] of businesses.entries()) {
         const login = await request("/auth/login", { employeeCode: code }, business); assert.equal(login.status, 200);
         for (let refresh = 0; refresh < 2; refresh++) {
-            const list = await request(`/payroll/records?payPeriod=${encodeURIComponent(period)}`, undefined, business);
+            const list = await request(`/payroll/records?payPeriod=${encodeURIComponent(period)}&basis=estimate`, undefined, business);
             assert.equal(list.status, 200, JSON.stringify(list.data));
             assert.equal(list.data[0].earnedToDate, true); assert.equal(list.data[0].netPay, candidate.value.netPay);
             assert.equal(list.data[0].settlementRequired, true); assert.equal(list.data[0].status, originals[index]!.status);
-            const stats = await request(`/payroll/stats?payPeriod=${encodeURIComponent(period)}`, undefined, business);
+            const stats = await request(`/payroll/stats?payPeriod=${encodeURIComponent(period)}&basis=estimate`, undefined, business);
             assert.equal(stats.status, 200); assert.equal(stats.data.netPayroll, candidate.value.netPay);
             const dtr = await request(`/payroll/dtr/${code}?payPeriod=${encodeURIComponent(period)}`, undefined, business);
             assert.equal(dtr.status, 200); assert.equal(dtr.data.summary.netPay, candidate.value.netPay);
             assert.equal(dtr.data.summary.workedHours, candidate.value.workedHours);
-            const response = await fetch(`${base}/employees/${login.data.user._id}/payments`, { headers: { "X-Business-Id": business, "X-CRM-Attendance-Session": login.data.attendanceHubSession } });
+            const response = await fetch(`${base}/employees/${login.data.user._id}/payments?basis=estimate`, { headers: { "X-Business-Id": business, "X-CRM-Attendance-Session": login.data.attendanceHubSession } });
             assert.equal(response.status, 200); const payments = await response.json();
             assert.equal(payments.items[0].netPay, candidate.value.netPay); assert.equal(payments.items[0].deductions, candidate.value.deductions);
             assert.equal(payments.items[0].earnedToDate, true); assert.equal(payments.items[0].nonBillableOffPhoneMinutes, 1);
@@ -214,7 +214,9 @@ test("earned current pay and the whole-shift off-phone limit match Payroll, Paym
         assert.deepEqual(await saved(business), originals[index], "current earnings reads must not save or settle a payroll");
     }
     const blocked = await request(`/payroll/records/${id}/payment-status/preview`, { paid: true });
-    assert.equal(blocked.status, 200); assert.equal(blocked.data.canApply, false); assert.ok(blocked.data.blockers.some((message: string) => /Recompute/.test(message)));
+    assert.equal(blocked.status, 200); assert.equal(blocked.data.canApply, false);
+    assert.ok(blocked.data.blockers.some((message: string) => /still in progress/.test(message)));
+    assert.ok(![...blocked.data.blockers, ...blocked.data.warnings].some((message: string) => /Recompute|estimate differs/i.test(message)));
     const plan = await request("/payroll/recompute/preview", { payPeriod: period, overtimeApprovals: {} });
     assert.equal(plan.status, 200); assert.equal(plan.data.canApply, true, JSON.stringify(plan.data));
     const applied = await request("/payroll/recompute/confirm", { token: plan.data.token, payPeriod: period, overtimeApprovals: {}, confirm: true, reason: "Reviewed synthetic earned hours" });

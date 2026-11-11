@@ -2,7 +2,7 @@ import { api } from "../lib/api";
 import { getAuthUser } from "./authStorage";
 import { getActiveBusinessId } from "./businessStorage";
 import type { AttendanceRecord } from "./attendance";
-import { attendanceSessionCacheKey, retainAttendanceSnapshot } from "../lib/attendanceSessionCache";
+import { attendanceSessionCacheKey, mergeAttendanceHistory, retainAttendanceSnapshot } from "../lib/attendanceSessionCache";
 import { beginCallingAttendanceUpdate, callingAttendanceGeneration, observeCallingAttendance } from "../lib/callingAttendance";
 
 export const attendanceIntegrityEnabled = import.meta.env.VITE_CRM_ATTENDANCE_INTEGRITY === "true" ||
@@ -12,6 +12,11 @@ export type SessionEvent = { id: string; source: "Login" | "Logout" | "Time In" 
     "Lunch Break Out" | "Lunch Break In" | "Off the Phone Out" | "Non-Billable Off the Phone Out" | "Off the Phone In" | "Coaching Out" | "Coaching In"; at: string; commandId: string; sequence: number; sessionId?: string;
     attendanceStatus?: "On time" | "Late" | "Undertime" | ""; autoTimeOut?: boolean; shiftDayKey?: string };
 export type AttendanceSessionSnapshot = {
+    historyIncluded?: boolean;
+    statusOnly?: boolean;
+    policyRevision?: number;
+    policyFingerprint?: string;
+    changedDayKeys?: string[];
     profileCalendarEnabled?: boolean;
     offPhonePolicy?: import("../../shared/attendanceOffPhone").OffPhoneLimitPolicy;
     offPhoneBilling?: import("../../shared/attendanceOffPhone").OffPhoneBillingSnapshot | null;
@@ -56,6 +61,8 @@ export function attendanceSessionHeaders() {
         { "X-CRM-Attendance-Session": auth?.attendanceHubSession || "" };
 }
 const snapshots = new Map<string, AttendanceSessionSnapshot>();
+const statusSnapshots = new Map<string, AttendanceSessionSnapshot>();
+const statusReads = new Map<string, Promise<AttendanceSessionSnapshot>>();
 const pendingActions = new Map<string, AttendanceCommand>();
 function cacheKey(employeeId: string, businessId: string) {
     const auth = getAuthUser();
@@ -69,10 +76,44 @@ export async function getAttendanceSession(employeeId: string, businessId?: stri
     const business = businessId ?? getActiveBusinessId();
     const key = cacheKey(employeeId, business);
     const own = ownCallingScope(employeeId), generation = own ? callingAttendanceGeneration(own.code) : "";
-    const response = await api.get<AttendanceSessionSnapshot>(`/employees/${employeeId}/attendance/session`, { timeout: 10000, headers: { ...attendanceSessionHeaders(), "X-Business-Id": business } });
-    const result = retainAttendanceSnapshot(snapshots, key, response.data);
+    const previous = snapshots.get(key);
+    const headers = { ...attendanceSessionHeaders(), "X-Business-Id": business };
+    const url = `/employees/${employeeId}/attendance/session`;
+    const response = await api.get<AttendanceSessionSnapshot>(url, { timeout: 10000, headers,
+        params: previous?.historyIncluded !== false && previous?.policyRevision !== undefined ? {
+            knownRevision: previous.revision, knownFingerprint: previous.fingerprint, knownPolicyRevision: previous.policyRevision,
+            knownPolicyFingerprint: previous.policyFingerprint, knownServerTime: previous.serverTime,
+        } : undefined });
+    const current = snapshots.get(key);
+    let merged = current && current.revision > response.data.revision ? current : mergeAttendanceHistory(current, response.data);
+    if (!merged) {
+        const full = await api.get<AttendanceSessionSnapshot>(url, { timeout: 10000, headers });
+        if (full.data.historyIncluded === false) throw new Error("Attendance history could not be confirmed. Refresh and retry.");
+        merged = full.data;
+    }
+    const result = retainAttendanceSnapshot(snapshots, key, merged);
     if (own && ownCallingScope(employeeId)?.session === own.session) observeCallingAttendance(own.code, result, generation);
     return result;
+}
+
+// Calling needs fresh canonical status, not the employee's historical calendar.
+// Keep this cache separate so a compact reply cannot erase confirmed history.
+export async function getAttendanceStatus(employeeId: string, businessId?: string) {
+    const business = businessId ?? getActiveBusinessId(), key = cacheKey(employeeId, business);
+    const own = ownCallingScope(employeeId), generation = own ? callingAttendanceGeneration(own.code) : "";
+    const pendingKey = JSON.stringify([key, generation]);
+    const pending = statusReads.get(pendingKey);
+    if (pending) return pending;
+    const read = (async () => {
+        const response = await api.get<AttendanceSessionSnapshot>(`/employees/${employeeId}/attendance/session`, {
+            params: { view: "status" }, timeout: 10000, headers: { ...attendanceSessionHeaders(), "X-Business-Id": business },
+        });
+        const result = retainAttendanceSnapshot(statusSnapshots, key, response.data);
+        if (own && ownCallingScope(employeeId)?.session === own.session && getActiveBusinessId() === business) observeCallingAttendance(own.code, result, generation);
+        return result;
+    })();
+    statusReads.set(pendingKey, read);
+    try { return await read; } finally { if (statusReads.get(pendingKey) === read) statusReads.delete(pendingKey); }
 }
 export async function submitAttendanceCommand(employeeId: string, command: AttendanceCommand, businessId?: string) {
     const business = businessId ?? getActiveBusinessId();

@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { getCurrentBusinessId } from "./tenancy";
 import {
   isAutoCallDisabledForEmployee,
+  isAutoCallDisabledForBusiness,
   isSupportedAutoCallClientVersion,
   legacyAutoCallClientVersion,
   parseAutoCallDisabledEmployeeCodes,
@@ -22,6 +24,18 @@ test("accepts only the current auto-call browser client", () => {
   } finally {
     if (previous === undefined) delete process.env.CRM_CALL_TIMING_V2;
     else process.env.CRM_CALL_TIMING_V2 = previous;
+  }
+});
+
+test("business restrictions match stable workspace IDs without affecting other businesses", () => {
+  const previous = process.env.AUTO_CALL_DISABLED_BUSINESS_IDS;
+  try {
+    process.env.AUTO_CALL_DISABLED_BUSINESS_IDS = "business-a, business-b";
+    for (const id of ["business-a", " business-b "]) assert.equal(isAutoCallDisabledForBusiness(id), true);
+    for (const id of ["business-c", "business-aa", "", undefined]) assert.equal(isAutoCallDisabledForBusiness(id), false);
+  } finally {
+    if (previous === undefined) delete process.env.AUTO_CALL_DISABLED_BUSINESS_IDS;
+    else process.env.AUTO_CALL_DISABLED_BUSINESS_IDS = previous;
   }
 });
 
@@ -61,5 +75,26 @@ test("supports disabling auto-call for every employee", () => {
     } else {
       process.env.AUTO_CALL_DISABLED_EMPLOYEE_CODES = previousValue;
     }
+  }
+});
+
+test("employee restrictions can be scoped to the current business without blocking colleagues", () => {
+  const employeeCodes = process.env.AUTO_CALL_DISABLED_EMPLOYEE_CODES;
+  const businessIds = process.env.AUTO_CALL_DISABLED_BUSINESS_IDS;
+  try {
+    process.env.AUTO_CALL_DISABLED_BUSINESS_IDS = "";
+    const business = getCurrentBusinessId();
+    process.env.AUTO_CALL_DISABLED_EMPLOYEE_CODES = `${business}:synthetic-target,foreign-business:synthetic-other`;
+    assert.equal(isAutoCallDisabledForEmployee("synthetic-target"), true);
+    assert.equal(isAutoCallDisabledForEmployee("synthetic-other"), false);
+    assert.equal(isAutoCallDisabledForEmployee("synthetic-colleague"), false);
+    assert.equal(isAutoCallDisabledForEmployee(""), false);
+    process.env.AUTO_CALL_DISABLED_EMPLOYEE_CODES = "synthetic-target";
+    assert.equal(isAutoCallDisabledForEmployee("synthetic-target"), true, "unscoped legacy restrictions remain global");
+  } finally {
+    if (employeeCodes === undefined) delete process.env.AUTO_CALL_DISABLED_EMPLOYEE_CODES;
+    else process.env.AUTO_CALL_DISABLED_EMPLOYEE_CODES = employeeCodes;
+    if (businessIds === undefined) delete process.env.AUTO_CALL_DISABLED_BUSINESS_IDS;
+    else process.env.AUTO_CALL_DISABLED_BUSINESS_IDS = businessIds;
   }
 });

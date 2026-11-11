@@ -28,8 +28,8 @@ export async function syncCallBridgeBusinessIds(employeeCode: string, fallbackBu
   if (!employeeCode || businessIds.length === 0) return businessIds;
 
   await Promise.all([
-    getCallBridgeDeviceModel().updateMany({ employeeCode }, { $set: { businessIds } }),
-    getCallBridgePairingModel().updateMany({ employeeCode }, { $set: { businessIds } }),
+    getCallBridgeDeviceModel().updateMany({ employeeCode, businessIds: { $ne: businessIds } }, { $set: { businessIds } }),
+    getCallBridgePairingModel().updateMany({ employeeCode, businessIds: { $ne: businessIds } }, { $set: { businessIds } }),
   ]);
 
   return businessIds;
