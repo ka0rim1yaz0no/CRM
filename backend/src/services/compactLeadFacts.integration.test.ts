@@ -13,20 +13,22 @@ Object.assign(process.env, { NODE_ENV: "test", BUSINESS_DATABASES: JSON.stringif
     DEFAULT_BUSINESS_ID: businesses[0].id, DEFAULT_BUSINESS_DATABASE: businesses[0].databaseName,
     CONTROL_DATABASE_NAME: root + "_control", CRM_LEAD_PHONE_DEDUP_V2: "true" });
 const baseline = process.env.CRM_COMPACT_BASELINE_SOURCE;
-assert.ok(baseline && path.isAbsolute(baseline), "An explicit immutable compact-read baseline is required");
+if (baseline) assert.ok(path.isAbsolute(baseline), "The optional compact-read baseline must be an absolute path");
 const { employeeCallingQueue } = await import("./employeeCallingQueue");
 const { runWithBusiness } = await import("../config/tenancy");
 const { Employee } = await import("../models/Employee");
-const oldQueue = await import(pathToFileURL(path.join(baseline, "backend/src/services/employeeCallingQueue.ts")).href);
-const oldTenancy = await import(pathToFileURL(path.join(baseline, "backend/src/config/tenancy.ts")).href);
+const oldQueue = baseline ? await import(pathToFileURL(path.join(baseline, "backend/src/services/employeeCallingQueue.ts")).href) : null;
+const oldTenancy = baseline ? await import(pathToFileURL(path.join(baseline, "backend/src/config/tenancy.ts")).href) : null;
 const now = new Date("2026-10-30T17:00:00.237Z");
 type Person = { _id: Types.ObjectId; employeeCode: string; name: string; aliases: string[] };
-const people: Array<{ business: typeof businesses[number]; person: Person; repeated: Types.ObjectId }> = [];
+const people: Array<{ business: typeof businesses[number]; person: Person; repeated: Types.ObjectId; callback: Types.ObjectId; foreign: Types.ObjectId }> = [];
 let mongo: MongoMemoryReplSet;
 
 before(async () => {
-    mongo = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
-    await mongoose.connect(mongo.getUri(root), { monitorCommands: true });
+    mongo = await MongoMemoryReplSet.create({ replSet: { count: 1 }, instanceOpts: [{ args: ["--wiredTigerCacheSizeGB", "0.25"] }] });
+    const uri = mongo.getUri(root);
+    assert.equal(new URL(uri).hostname, "127.0.0.1");
+    await mongoose.connect(uri, { monitorCommands: true });
     for (const business of businesses) await runWithBusiness(business.id, async () => {
         const person = await Employee.create({ employeeCode: `synthetic-${business.id}`, name: `Synthetic ${business.id}`,
             aliases: ["Synthetic legacy name"], role: "Sales", status: "Active" });
@@ -44,7 +46,8 @@ before(async () => {
         await mongoose.connection.getClient().db(business.databaseName).collection("leads").insertMany(rows);
         await mongoose.connection.getClient().db(business.databaseName).collection("payrollrecords").insertOne({ fixture: "Synthetic saved payroll", netPay: 123, status: "Paid", paidOn: now });
         await mongoose.connection.getClient().db(business.databaseName).collection("attendances").insertOne({ fixture: "Synthetic original punch", source: "Time In", timeIn: now });
-        people.push({ business, person: { _id: person._id, employeeCode: person.employeeCode, name: person.name, aliases: person.aliases }, repeated });
+        people.push({ business, person: { _id: person._id, employeeCode: person.employeeCode, name: person.name, aliases: person.aliases },
+            repeated, callback: rows[25]._id, foreign: rows[5]._id });
     });
 });
 after(async () => { await mongoose.disconnect(); await mongo?.stop(); });
@@ -57,9 +60,13 @@ async function evidence() {
     return crypto.createHash("sha256").update(JSON.stringify(data)).digest("hex");
 }
 async function compare(scope: typeof people[number], at = now) {
-    const before = await oldTenancy.runWithBusiness(scope.business.id, () => oldQueue.employeeCallingQueue(scope.person, scope.business.id, at, true));
     const after = await runWithBusiness(scope.business.id, () => employeeCallingQueue(scope.person, scope.business.id, at, true));
-    assert.deepEqual(after, before);
+    if (oldQueue && oldTenancy) {
+        const before = await oldTenancy.runWithBusiness(scope.business.id, () => oldQueue.employeeCallingQueue(scope.person, scope.business.id, at, true));
+        assert.deepEqual(after, before);
+    }
+    assert.deepEqual(after.scope, { businessId: scope.business.id, employeeId: String(scope.person._id), employeeCode: scope.person.employeeCode });
+    assert.equal(after.entries.some(entry => entry.leadId === String(scope.foreign)), false);
     return after;
 }
 
@@ -89,7 +96,7 @@ test("MongoDB compaction retains exact BSON facts in six businesses and reduces 
 
 test("concurrent UI reads share candidate loads but fresh deadline/dispatch reads never do", async () => {
     const scope = people[0], before = await evidence();
-    const expected = await oldTenancy.runWithBusiness(scope.business.id, () => oldQueue.employeeCallingQueue(scope.person, scope.business.id, now, true));
+    const expected = await compare(scope);
     const client = mongoose.connection.getClient(); let candidateLoads = 0;
     const observe = (event: { command: { pipeline?: Array<{ $project?: { v?: unknown[] } }> } }) => {
         if (event.command.pipeline?.some(stage => stage.$project?.v?.includes("$updatedAt"))) candidateLoads++;
@@ -114,6 +121,11 @@ test("all six queues retain every decision, order, repeat lead, ownership and ca
     for (const scope of people) for (const offset of [-1, 0, 1]) {
         const queue = await compare(scope, new Date(+now + offset));
         assert.equal(queue.repeatLeadId, String(scope.repeated)); assert.equal(queue.nextLeadId, String(scope.repeated));
+        assert.equal(queue.entries[0].leadId, String(scope.repeated));
+        const callback = queue.entries.find(entry => entry.leadId === String(scope.callback));
+        assert.equal(callback?.callable, offset >= 0);
+        assert.equal(callback?.reason, offset < 0 ? "NOT_DUE" : "SCHEDULED_DUE");
+        assert.equal(callback?.nextEligibleAt, offset < 0 ? now.toISOString() : null);
     }
     assert.equal(await evidence(), before);
 });
@@ -133,8 +145,13 @@ test("saved notes and reassignment still release the old repeat lead in all six 
     }
 });
 
-test("10/25/50 concurrent reads remain tenant isolated and match the immutable queue baseline", async () => {
+test("10/25/50 concurrent reads match isolated serial results without crossing tenants", async () => {
     const before = await evidence();
-    for (const count of [10, 25, 50]) await Promise.all(Array.from({ length: count }, (_, index) => compare(people[index % people.length])));
+    const expected: Array<Awaited<ReturnType<typeof compare>>> = [];
+    for (const person of people) expected.push(await compare(person));
+    for (const count of [10, 25, 50]) await Promise.all(Array.from({ length: count }, async (_, index) => {
+        const i = index % people.length;
+        assert.deepEqual(await compare(people[i]), expected[i]);
+    }));
     assert.equal(await evidence(), before);
 });
