@@ -1,5 +1,5 @@
 $ErrorActionPreference = "Stop"
-$source = Join-Path $PSScriptRoot "..\callbridge\AssistlyCallBridge.ps1"
+$source = Join-Path $PSScriptRoot "../callbridge/AssistlyCallBridge.ps1"
 $tokens = $null; $parseErrors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($source, [ref]$tokens, [ref]$parseErrors)
 if ($parseErrors.Count) { throw "Bridge script failed parsing." }
@@ -8,7 +8,7 @@ foreach ($name in @("Save-NativeDialReceipt", "Invoke-NativeDialPoll", "Start-Na
     if (-not $definition) { throw "Native dial function is missing." }
     . ([scriptblock]::Create($definition.Extent.Text))
 }
-$outputs = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\outputs"))
+$outputs = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot "../outputs"))
 $InstallDirectory = Join-Path $outputs ("native-bridge-test-" + [guid]::NewGuid())
 $DialJournalPath = Join-Path $InstallDirectory "receipts.log"
 $config = [pscustomobject]@{ backendUrl = "https://synthetic.invalid"; businessId = "synthetic"; deviceId = "synthetic" }
