@@ -1,4 +1,5 @@
 import { savedPayrollPeriod } from "../../../shared/payrollPeriod";
+import type { PayrollEarningsView } from "../../../shared/payrollEarnings";
 
 type SavedPayroll = { _id: unknown; employeeId: string; payPeriod: string; grossPay: number; deductions: number; netPay: number; status: string };
 const detailFields = ["basicPay", "minuteRate", "hourlyRate", "paidHoursPerDay", "workingDays", "attendanceDays", "absentDays", "workedHours",
@@ -14,6 +15,14 @@ function signature(record: SavedPayroll) {
 function validAmounts(record: SavedPayroll) {
     return [record.grossPay, record.deductions, record.netPay].every(value => typeof value === "number" && Number.isFinite(value) && value >= 0 && Number.isSafeInteger(Math.round(value * 100))) &&
         Math.round(record.grossPay * 100) - Math.round(record.deductions * 100) === Math.round(record.netPay * 100);
+}
+
+export function savedPayrollPaymentRecord<T extends SavedPayroll>(record: T): Omit<T, keyof PayrollEarningsView> & PayrollEarningsView {
+    const valid = validAmounts(record);
+    return { ...record, currentCutoffDraft: undefined, earnedToDate: undefined, cutoffEstimate: undefined, earningsAsOf: undefined,
+        savedAmounts: undefined, settlementRequired: undefined,
+        earningsUnavailable: valid ? undefined : true,
+        earningsUnavailableReason: valid ? undefined : "Saved payroll amounts need review." };
 }
 
 export function payrollReadGroups<T extends SavedPayroll>(records: T[]) {

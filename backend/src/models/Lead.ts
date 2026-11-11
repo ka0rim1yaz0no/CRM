@@ -271,6 +271,7 @@ export type LeadDocument = {
 
   callCount: number;
   lastCallAt: Date | null;
+  lastCallOutcomeAt?: Date | null;
   callsByEmployee: LeadCallByEmployee[];
   callLogs: LeadCallLog[];
 
@@ -526,6 +527,8 @@ const leadSchema = new Schema<LeadDocument>(
       default: null,
     },
 
+    lastCallOutcomeAt: { type: Date, default: null },
+
     callsByEmployee: {
       type: [leadCallsByEmployeeSchema],
       default: [],
@@ -653,9 +656,11 @@ leadSchema.index({ status: 1, createdAt: -1 });
 leadSchema.index({ source: 1, createdAt: -1 });
 leadSchema.index({ email: 1 });
 leadSchema.index({ phone: 1 });
+leadSchema.index({ "comments.authorType": 1 }, { name: "employee_comment_lookup" });
 leadSchema.index({ assignedAgent: 1 });
 leadSchema.index({ assignedTeam: 1 });
 leadSchema.index({ "callsByEmployee.employee": 1 });
+leadSchema.index({ lastCallOutcomeAt: 1 }, { name: "outcome_calling_lookup" });
 leadSchema.index({ callCount: -1 });
 leadSchema.index({ lastCallAt: -1 });
 leadSchema.index({ activePhoneKey: 1 }, { unique: true, partialFilterExpression: { activePhoneKey: { $type: "string" } }, name: "active_phone_key_unique" });

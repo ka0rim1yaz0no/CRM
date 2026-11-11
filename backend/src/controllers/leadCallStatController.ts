@@ -3,7 +3,8 @@ import { Employee } from "../models/Employee";
 import { LeadCallStat, type LeadCallLogItem, type LeadCallStatDocument } from "../models/leadCallStat";
 import { getCallBridgeAttemptModel } from "../models/CallBridge";
 import { getCallProvider } from "../config/callProvider";
-import { Types } from "mongoose";
+import mongoose, { Types, type ClientSession } from "mongoose";
+import { matchesUniqueLegacyName, uniquelyOwnedLegacyNames } from "../services/leadAssignment";
 import type { Request, Response } from "express";
 
 type CallRequest = Request<{ id: string }> & {
@@ -71,7 +72,8 @@ function getEmployeeTeamValue(team: unknown) {
 async function holdLeadAfterCallOutcome(
     leadId: Types.ObjectId,
     employee: { _id: Types.ObjectId; name?: string; employeeCode?: string; role?: string; team?: unknown },
-    calledAt: Date
+    calledAt: Date,
+    session: ClientSession
 ) {
     const employeeName = employee.name || employee.employeeCode || "Employee";
     const employeeRole = employee.role || "";
@@ -81,12 +83,13 @@ async function holdLeadAfterCallOutcome(
         {
             $set: {
                 lastCallAt: calledAt,
+                lastCallOutcomeAt: calledAt,
                 "callsByEmployee.$.lastCallAt": calledAt,
                 "callsByEmployee.$.employeeName": employeeName,
                 "callsByEmployee.$.employeeRole": employeeRole,
                 "callsByEmployee.$.employeeTeam": employeeTeam,
             },
-        }
+        }, { session }
     );
 
     if (existingRow.matchedCount > 0) {
@@ -99,7 +102,7 @@ async function holdLeadAfterCallOutcome(
             callsByEmployee: { $not: { $elemMatch: { employee: employee._id } } },
         },
         {
-            $set: { lastCallAt: calledAt },
+            $set: { lastCallAt: calledAt, lastCallOutcomeAt: calledAt },
             $push: {
                 callsByEmployee: {
                     employee: employee._id,
@@ -110,7 +113,7 @@ async function holdLeadAfterCallOutcome(
                     lastCallAt: calledAt,
                 },
             },
-        }
+        }, { session }
     );
 }
 
@@ -190,7 +193,7 @@ async function createLeadCallLogUpdate(req: CallRequest, res: Response, outcome:
 
         const [lead, employee] = await Promise.all([
             Lead.findById(leadId).select("_id leadName businessName"),
-            Employee.findById(currentEmployeeId).select("_id name role team employeeCode"),
+            Employee.findById(currentEmployeeId).select("_id name aliases role team employeeCode"),
         ]);
         if (!lead) {
             return res.status(404).json({
@@ -297,7 +300,15 @@ async function createLeadCallLogUpdate(req: CallRequest, res: Response, outcome:
             update.$set.lastCallAt = now;
         }
 
-        const callStat = await LeadCallStat.findOneAndUpdate(
+        const callStat = await mongoose.connection.transaction(async session => {
+            const currentLead = await Lead.findById(leadId).select("assignedAgent assignedAgentName status").session(session).lean();
+            if (!currentLead || currentLead.status === "Archived") throw Object.assign(new Error("The lead is no longer available."), { statusCode: 409 });
+            if (res.locals.crmActor?.type === "employee") {
+                const owns = currentLead.assignedAgent ? String(currentLead.assignedAgent) === String(employee._id) :
+                    matchesUniqueLegacyName(await uniquelyOwnedLegacyNames(String(employee._id), [employee.name, employee.employeeCode, ...(employee.aliases || [])]), currentLead.assignedAgentName);
+                if (!owns) throw Object.assign(new Error("This lead is no longer assigned to you."), { statusCode: 403 });
+            }
+            const saved = await LeadCallStat.findOneAndUpdate(
             {
                 lead: lead._id,
             },
@@ -307,10 +318,13 @@ async function createLeadCallLogUpdate(req: CallRequest, res: Response, outcome:
                 upsert: true,
                 runValidators: true,
                 setDefaultsOnInsert: true,
+                session,
             }
         ).lean();
 
-        await holdLeadAfterCallOutcome(lead._id, employee, now);
+            await holdLeadAfterCallOutcome(lead._id, employee, now, session);
+            return saved;
+        });
 
         if (attempt) {
             attempt.phase = "classified";
@@ -327,9 +341,10 @@ async function createLeadCallLogUpdate(req: CallRequest, res: Response, outcome:
     } catch (error) {
         console.error("Lead call stat error:", error);
 
-        return res.status(500).json({
+        const rejected = error as { statusCode?: number; message?: string };
+        return res.status(rejected.statusCode === 403 || rejected.statusCode === 409 ? rejected.statusCode : 500).json({
             message:
-                outcome === "not_connected"
+                rejected.statusCode === 403 || rejected.statusCode === 409 ? rejected.message : outcome === "not_connected"
                     ? "Could not log not connected."
                     : outcome === "voicemail"
                       ? "Could not log voicemail."

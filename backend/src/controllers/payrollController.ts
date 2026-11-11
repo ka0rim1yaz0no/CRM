@@ -3,14 +3,16 @@ import { createHash } from "node:crypto";
 import { excessClickedSessionMinutes, calculateSlotAttendance, accountTime, bucketForAttendanceSource } from "../services/timeAccounting";
 import { attendanceDurationModelEnabled, payrollAccuracyEnabled, attendanceAccuracyFixesEnabled } from "../config/rolloutFlags";
 import { accuratePayrollRates, accuratePayrollDay, paidHoursPerDay, PayrollValidationError, type PayrollShiftSettings } from "../services/payrollAccuracy";
-import { earnedPayrollEnabled, earnedAllDeductionsEnabled } from "../config/payrollEarnings";
+import { earnedPayrollEnabled, earnedAllDeductionsEnabled, earnedUndertimeAbsenceExcluded, fixedHalfSalaryEnabled, currentCutoffLiveFrom, minuteAccrualEnabled, equalHalfCutoffAccrualEnabled } from "../config/payrollEarnings";
+import { fixedHalfSalaryBase } from "../../../shared/payrollFixedHalf";
+import { equalHalfCutoffRates, type EqualHalfCutoffRateDetails } from "../../../shared/payrollEqualHalf";
 import { legacyPayrollPolicy } from "../services/payrollLegacyPolicy";
 import { AttendanceLedger, AttendancePolicy } from "../models/AttendanceLedger";
 import { SystemSettings } from "../models/SystemSettings";
 import { projectAttendance } from "../services/attendanceSessionState";
 import { serverReadTime } from "../services/readSnapshot";
 import { attendancePolicy } from "../services/attendanceLedgerService";
-import { hubShiftBounds } from "../services/attendanceHubMath";
+import { hubShiftBounds, type HubSettings } from "../services/attendanceHubMath";
 import type { ClientSession, SortOrder } from "mongoose";
 import { Types } from "mongoose";
 import { getBusinessById, getCurrentBusinessId, runWithBusiness } from "../config/tenancy";
@@ -187,8 +189,22 @@ export function resolveCutoffForDate(referenceDate: Date, cycle = "Monthly", set
   return periods.find((period) => startOfDay(period.payDate).getTime() >= today.getTime()) || periods[periods.length - 1] || null;
 }
 
+export function resolveActiveCutoffForDate(referenceDate: Date, cycle = "Monthly", settings?: PayrollCutoffSettings) {
+  if (cycle !== "Semi-monthly") return null;
+  const today = startOfDay(referenceDate);
+  const matches = cutoffPeriodsNear(referenceDate, settings).filter(period => +startOfDay(period.start) <= +today && +startOfDay(period.end) >= +today);
+  return matches.length === 1 ? matches[0] : null;
+}
+
 function resolveCurrentCutoff(cycle = "Monthly", settings?: PayrollCutoffSettings) {
-  return resolveCutoffForDate(payrollCalendarToday(), cycle, settings);
+  const today = payrollCalendarToday(), from = currentCutoffLiveFrom();
+  const key = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
+  if (from && key >= from && cycle === "Semi-monthly") {
+    const active = resolveActiveCutoffForDate(today, cycle, settings);
+    if (!active) throw new PayrollValidationError("Configured cutoff dates must cover the current day exactly once.");
+    return active;
+  }
+  return resolveCutoffForDate(today, cycle, settings);
 }
 
 export function scheduledPayDateForPeriod(payPeriod: string, settings?: PayrollCutoffSettings) {
@@ -553,8 +569,22 @@ export function monthlyWorkingDaysForPayPeriod(payPeriod: string) {
   return countWorkingDays(cycle.start, cycle.end);
 }
 
-export function payrollRatesForCutoff(monthlySalaryValue: number, payPeriod: string, settings?: PayrollShiftSettings, policy?: { lunchMinutes: number }) {
-  if (payrollAccuracyEnabled()) return accuratePayrollRates(monthlySalaryValue, monthlyWorkingDaysForPayPeriod(payPeriod), settings || {}, policy || { lunchMinutes: NaN });
+export function payrollRatesForCutoff(monthlySalaryValue: number, payPeriod: string, settings?: PayrollShiftSettings, policy?: { lunchMinutes: number }): ReturnType<typeof accuratePayrollRates> & Partial<EqualHalfCutoffRateDetails> {
+  if (payrollAccuracyEnabled()) {
+    const rates = accuratePayrollRates(monthlySalaryValue, monthlyWorkingDaysForPayPeriod(payPeriod), settings || {}, policy || { lunchMinutes: NaN });
+    if (fixedHalfSalaryEnabled(payPeriod) || minuteAccrualEnabled(payPeriod)) {
+      const firstStart = (settings as PayrollShiftSettings & PayrollCutoffSettings | undefined)?.payrollFirstCutoffStartDay ?? 6;
+      const start = periodRange(payPeriod).start;
+      rates.cutoffBasePay = fixedHalfSalaryBase(monthlySalaryValue, start.getDate() === clampDay(firstStart, start.getFullYear(), start.getMonth()));
+    }
+    if (equalHalfCutoffAccrualEnabled(payPeriod)) {
+      const range = periodRange(payPeriod);
+      return { ...rates, ...equalHalfCutoffRates({ cutoffBasePay: rates.cutoffBasePay, monthlyWorkingDays: rates.monthlyWorkingDays,
+        cutoffWorkingDays: countWorkingDays(range.start, range.end), paidHoursPerDay: rates.paidHoursPerDay, monthlyMinuteRate: rates.minuteRate }) };
+    }
+    return rates;
+  }
+  if (equalHalfCutoffAccrualEnabled(payPeriod)) throw new PayrollValidationError("Equal-half accrual requires verified payroll rates and shift settings.");
   const monthlySalary = roundMoney(Math.max(Number(monthlySalaryValue) || 0, 0));
   const monthlyWorkingDays = monthlyWorkingDaysForPayPeriod(payPeriod);
   const cutoffBasePay = roundMoney(monthlySalary / 2);
@@ -626,8 +656,12 @@ function lastRecord<TRecord extends { source: string; timeIn: Date }>(records: T
   return [...records].reverse().find((record) => sources.includes(record.source));
 }
 
-export async function attendancePayrollDtr(employeeId: Types.ObjectId, payPeriod: string, session?: ClientSession) {
-  if (payrollAccuracyEnabled()) return accurateAttendancePayrollDtr(employeeId, payPeriod, session);
+export type PayrollReadContext = { settings: HubSettings & PayrollCutoffSettings;
+  policy: { breakMinutes: number; lunchMinutes: number; graceMinutes: number }; requireAssignedShiftMatch?: boolean };
+
+export async function attendancePayrollDtr(employeeId: Types.ObjectId, payPeriod: string, session?: ClientSession, readContext?: PayrollReadContext) {
+  if (payrollAccuracyEnabled()) return accurateAttendancePayrollDtr(employeeId, payPeriod, session, readContext);
+  if (readContext) throw new PayrollValidationError("Historical attendance requires revision-checked payroll reads.");
   const settings = await getSystemSettings();
   const { start, end } = periodRange(payPeriod);
   const durationModel = attendanceDurationModelEnabled();
@@ -802,8 +836,8 @@ export async function payrollCalculationContext(session?: ClientSession) {
   return { settings, policy };
 }
 
-async function accurateAttendancePayrollDtr(employeeId: Types.ObjectId, payPeriod: string, session?: ClientSession) {
-  const { settings, policy } = await payrollCalculationContext(session);
+async function accurateAttendancePayrollDtr(employeeId: Types.ObjectId, payPeriod: string, session?: ClientSession, readContext?: PayrollReadContext) {
+  const { settings, policy } = readContext || await payrollCalculationContext(session);
   const paidHours = paidHoursPerDay(settings, policy);
   const { start, end } = periodRange(payPeriod);
   const length = (end.getTime() - start.getTime()) / 86_400_000;
@@ -812,7 +846,10 @@ async function accurateAttendancePayrollDtr(employeeId: Types.ObjectId, payPerio
   if (!keys.length || keys.length > 93) throw new PayrollValidationError("Payroll range must contain between 1 and 93 shift days");
   const now = serverReadTime();
   const earned = earnedPayrollEnabled(payPeriod);
-  const allEarnedDeductions = earnedAllDeductionsEnabled(payPeriod);
+  const fixedSalary = fixedHalfSalaryEnabled(payPeriod);
+  const minuteAccrual = minuteAccrualEnabled(payPeriod);
+  const allEarnedDeductions = !minuteAccrual && (fixedSalary || earnedAllDeductionsEnabled(payPeriod));
+  const excludeUndertimeAbsence = !fixedSalary && earnedUndertimeAbsenceExcluded(payPeriod);
   const employee = await Employee.findById(employeeId, null, session ? { session } : undefined).select("employeeCode").lean();
   if (!employee) throw new PayrollValidationError("Employee not found");
   const firstBound = new Date(hubShiftBounds(keys[0], settings).start.getTime() - 86_400_000);
@@ -829,6 +866,10 @@ async function accurateAttendancePayrollDtr(employeeId: Types.ObjectId, payPerio
     const canonical: Record<string, Array<{ source: typeof local[number]["source"]; timeIn: Date; sequence?: number }>> = {};
     for (const session of projected.sessions) {
       const key = session.shift?.dayKey || attendanceSlotKey(session.startedAt, settings);
+      if (readContext?.requireAssignedShiftMatch && session.shift && keys.includes(key)) {
+        const expected = hubShiftBounds(key, settings);
+        if (Date.parse(session.shift.start) !== +expected.start || Date.parse(session.shift.end) !== +expected.end) mismatches.add(key);
+      }
       canonical[key] = [...(canonical[key] || []), ...session.events.map(event => ({ source: event.source, timeIn: new Date(event.at), sequence: event.sequence }))];
       if (session.lifecycle === "system-closed" && session.endedAt) closingBoundariesByDay.set(key, [...(closingBoundariesByDay.get(key) || []), new Date(session.endedAt)]);
     }
@@ -852,13 +893,14 @@ async function accurateAttendancePayrollDtr(employeeId: Types.ObjectId, payPerio
     const bounds = hubShiftBounds(key, settings);
     const weekend = isWeekendDateKey(key);
     const day = accuratePayrollDay(records, { ...policy, shiftStart: bounds.start, shiftEnd: bounds.end,
-      closingBoundaries: closingBoundariesByDay.get(key) }, now, paidHours, weekend, mismatches.has(key), allEarnedDeductions);
+      closingBoundaries: closingBoundariesByDay.get(key) }, now, paidHours, weekend, mismatches.has(key), allEarnedDeductions, excludeUndertimeAbsence, fixedSalary || minuteAccrual);
     const timeIn = firstRecord(records, ["Time In", "Login"]), timeOut = lastRecord(records, ["Time Out", "Logout"]);
     const status = earned && day.review && !day.integrityReview && now < bounds.end ? "In Progress" : day.status;
     return { dateKey: key, date: formatDtrDate(key), day: formatDtrDay(key), status: status as PayrollDtrRow["status"], isWeekend: weekend,
       timeIn: formatDtrTime(timeIn?.timeIn), timeOut: formatDtrTime(day.calculated.hasOpenSession ? null : timeOut?.timeIn),
       lunchHours: day.lunchHours, ...day.components, grossHours: day.grossHours, lateHours: day.components.lateMinutes / 60,
-      regularHours: earned && !weekend ? day.earned.workedHours : day.regularHours, overtimeHours: day.overtimeHours, missingHours: day.missingHours,
+      regularHours: fixedSalary && !weekend && now >= bounds.end ? Math.max(0, paidHours - day.earned.deductibleMinutes / 60)
+        : earned && !weekend ? day.earned.workedHours : day.regularHours, overtimeHours: day.overtimeHours, missingHours: day.missingHours,
       ...(earned ? { earnedGrossHours: weekend ? 0 : day.earned.grossHours,
         earnedDeductibleMinutes: weekend ? 0 : day.earned.deductibleMinutes,
         deductibleMinutes: weekend ? 0 : day.earned.deductibleMinutes, missingHours: weekend ? 0 : day.earned.deductibleMinutes / 60,
@@ -1128,7 +1170,7 @@ export async function getPayrollDtr(request: Request, response: Response) {
 
   if (payrollAccuracyEnabled()) {
     const { getAccuratePayrollDtr } = await import("../services/payrollRecomputeService");
-    response.json(await getAccuratePayrollDtr(employee, payPeriod));
+    response.json(await getAccuratePayrollDtr(employee, payPeriod, payrollAmountReadBasis(request.query.basis, "estimate")));
     return;
   }
   const { monthlyWorkingDays, cutoffBasePay, hourlyRate, minuteRate } = payrollRatesForCutoff(toMoney(employee.salary), payPeriod);
@@ -1164,9 +1206,21 @@ export async function getPayrollDtr(request: Request, response: Response) {
   });
 }
 
+export async function getEmployeeBasicPay(request: Request, response: Response) {
+  const employeeId = String(request.params.employeeId || "").trim();
+  const employee = await Employee.findOne({ employeeCode: employeeId, status: { $ne: "Archived" } }).select("employeeCode salary").lean();
+  if (!employee) { response.status(404).json({ message: "Employee not found" }); return; }
+  if (!Number.isFinite(employee.salary) || employee.salary < 0) {
+    response.status(422).json({ message: "The configured monthly salary needs administrator review." }); return;
+  }
+  response.set("Cache-Control", "no-store").json({ employeeId: employee.employeeCode, businessId: getCurrentBusinessId(), monthlySalary: employee.salary });
+}
+
 export async function updateEmployeeBasicPay(request: Request, response: Response) {
   const employeeId = String(request.params.employeeId || "").trim();
-  if (payrollAccuracyEnabled() && (request.body.basicPay === undefined || request.body.basicPay === "" || !Number.isFinite(Number(request.body.basicPay)) || Number(request.body.basicPay) < 0)) {
+  const input = request.body.basicPay;
+  if ((typeof input !== "number" && typeof input !== "string") || String(input).trim() === "" ||
+      !Number.isFinite(Number(input)) || Number(input) < 0 || !Number.isSafeInteger(Math.round(Number(input) * 100))) {
     response.status(422).json({ message: "A valid non-negative monthly salary is required" }); return;
   }
   const basicPay = toMoney(request.body.basicPay, -1);
@@ -1175,7 +1229,7 @@ export async function updateEmployeeBasicPay(request: Request, response: Respons
     return;
   }
 
-  const employee = await Employee.findOne({ employeeCode: employeeId });
+  const employee = await Employee.findOne({ employeeCode: employeeId, status: { $ne: "Archived" } });
   if (!employee) {
     response.status(404).json({ message: "Employee not found" });
     return;
@@ -1350,14 +1404,21 @@ export async function updatePayrollOvertime(request: Request, response: Response
   response.json(responseRecord || sourceRecord);
 }
 
-async function accuratePayrollReadForPeriod(employeeCodes: string[], payPeriod: string) {
+function payrollAmountReadBasis(value: unknown, fallback: "saved" | "estimate" | "payment" = "payment") {
+  if (value === undefined) return fallback;
+  if (value !== "saved" && value !== "estimate" && value !== "payment") throw new PayrollValidationError("Choose payroll payment amounts, saved payroll or a calculation estimate.");
+  return value;
+}
+
+async function accuratePayrollReadForPeriod(employeeCodes: string[], payPeriod: string, basis: "saved" | "estimate" | "payment" = "payment") {
   const period = savedPayrollPeriod(payPeriod);
   if (!period) throw new PayrollValidationError("Choose a dated payroll cutoff.");
   const saved = await PayrollRecord.find({ isArchived: false, employeeId: { $in: employeeCodes } }).maxTimeMS(5000).lean();
   const groups = payrollReadGroups(saved).groups.filter(group => group.period.start === period.start && group.period.end === period.end);
-  const { currentEarnedPayrollRecords } = await import("../services/payrollEarningsRead");
+  const { payrollPaymentReadRecords } = await import("../services/payrollPaymentRead");
   const settings = await getSystemSettings();
-  const records = await currentEarnedPayrollRecords(groups.flatMap(group => group.record ? [{ ...group.record, requiresReview: group.requiresReview }] : []), currentPeriod(settings.payrollBillingCycle, settings));
+  const selected = groups.flatMap(group => group.record ? [{ ...group.record, requiresReview: group.requiresReview }] : []);
+  const records = await payrollPaymentReadRecords(selected, currentPeriod(settings.payrollBillingCycle, settings), basis);
   return { records,
     reviewCount: groups.filter(group => group.requiresReview).length, groups };
 }
@@ -1420,16 +1481,17 @@ export async function listPayrollRosterGaps(request: Request, response: Response
 }
 
 export async function listPayrollStats(request: Request, response: Response) {
+  const basis = payrollAmountReadBasis(request.query.basis);
   if (!payrollAccuracyEnabled()) await seedPayroll();
   const settings = await getSystemSettings();
   const payPeriod = await payrollReadPeriod(request.query.payPeriod, settings);
   await syncEmployeePayrollRecords(payPeriod);
   const activeEmployees = await Employee.find({ status: { $ne: "Archived" } }).select("employeeCode");
   const activeEmployeeCodes = activeEmployees.map((employee) => employee.employeeCode);
-  const read = payrollAccuracyEnabled() ? await accuratePayrollReadForPeriod(activeEmployeeCodes, payPeriod) : null;
+  const read = payrollAccuracyEnabled() ? await accuratePayrollReadForPeriod(activeEmployeeCodes, payPeriod, basis) : null;
   const records = read?.records || await PayrollRecord.find({ isArchived: false, employeeId: { $in: activeEmployeeCodes }, payPeriod });
   const totalEmployees = activeEmployeeCodes.length;
-  const visible = records.filter(record => !("earningsUnavailable" in record && record.earningsUnavailable));
+  const visible = records.filter(record => !("earningsUnavailable" in record && record.earningsUnavailable) && !("requiresReview" in record && record.requiresReview));
   const gross = visible.reduce((sum, record) => sum + record.grossPay, 0);
   const deductions = visible.reduce((sum, record) => sum + record.deductions, 0);
   const net = visible.reduce((sum, record) => sum + record.netPay, 0);
@@ -1448,13 +1510,22 @@ export async function listPayrollStats(request: Request, response: Response) {
 }
 
 export async function listPayrollRecords(request: Request, response: Response) {
+  const savedForPayment = request.query.savedForPayment !== undefined;
+  const basis = payrollAmountReadBasis(request.query.basis, savedForPayment ? "saved" : "payment");
+  if (savedForPayment && basis !== "saved") throw new PayrollValidationError("Payment confirmation requires saved payroll amounts.");
+  if (savedForPayment && (!payrollAccuracyEnabled() || String(request.query.savedForPayment) !== "true" ||
+      typeof request.query.employeeId !== "string" || !request.query.employeeId.trim() || request.query.employeeId.length > 128 ||
+      typeof request.query.payPeriod !== "string" || !savedPayrollPeriod(request.query.payPeriod) || String(request.query.archived || "") === "true")) {
+    response.status(400).json({ message: "Choose one employee and an explicit dated cutoff for the saved payment preview." }); return;
+  }
+  if (savedForPayment) response.setHeader("Cache-Control", "no-store");
   if (!payrollAccuracyEnabled()) await seedPayroll();
   const settings = await getSystemSettings();
   const showArchived = String(request.query.archived || "") === "true";
   const requestedPayPeriod = showArchived ? String(request.query.payPeriod || "").trim() : await payrollReadPeriod(request.query.payPeriod, settings);
 
   if (!showArchived) {
-    await syncEmployeePayrollRecords(requestedPayPeriod || currentPeriod(settings.payrollBillingCycle, settings));
+    await syncEmployeePayrollRecords(requestedPayPeriod || currentPeriod(settings.payrollBillingCycle, settings), "", savedForPayment ? [String(request.query.employeeId).trim()] : []);
   }
 
   const search = String(request.query.search || "").trim();
@@ -1468,8 +1539,8 @@ export async function listPayrollRecords(request: Request, response: Response) {
   if (payrollAccuracyEnabled() && ["Not generated", "Review required"].includes(status)) { response.json([]); return; }
 
   if (payrollAccuracyEnabled() && !showArchived && savedPayrollPeriod(payPeriod)) {
-    const employees = await Employee.find({ status: { $ne: "Archived" } }).select("employeeCode").lean();
-    const read = await accuratePayrollReadForPeriod(employees.map(employee => employee.employeeCode), payPeriod);
+    const employees = await Employee.find({ status: { $ne: "Archived" }, ...(savedForPayment ? { employeeCode: String(request.query.employeeId).trim() } : {}) }).select("employeeCode").lean();
+    const read = await accuratePayrollReadForPeriod(employees.map(employee => employee.employeeCode), payPeriod, savedForPayment ? "saved" : basis);
     const term = search.toLowerCase();
     const records = read.records.filter(record => (!statuses.includes(status as PayrollStatus) || record.status === status || (status === "Pending" && record.status === "Review")) &&
       (!term || [record.employeeName, record.email, record.employeeId, record.department].some(value => String(value || "").toLowerCase().includes(term))));

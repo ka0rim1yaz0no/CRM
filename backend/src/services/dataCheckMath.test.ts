@@ -18,6 +18,20 @@ test("data check independently totals two breaks, lunch and online without deduc
   assert.equal(value.intervals.lunch[0].milliseconds, 3_600_000);
   assert.equal(value.issues.length, 0);
 });
+
+test("independent data check never deducts Coaching or spends its separate Off the Phone allowance", () => {
+  const previous = process.env.CRM_OFF_PHONE_PAID_LIMIT_FROM;
+  process.env.CRM_OFF_PHONE_PAID_LIMIT_FROM = "2026-10-01T00:00:00Z";
+  try {
+    const events = [event("Time In", "2026-10-19T15:00:00Z"), event("Coaching Out", "2026-10-19T15:10:00Z", 1),
+      event("Coaching In", "2026-10-19T15:40:00Z", 2), event("Off the Phone Out", "2026-10-19T16:00:00Z", 3),
+      event("Off the Phone In", "2026-10-19T16:20:00Z", 4), event("Time Out", "2026-10-20T00:00:00Z", 5)];
+    assert.equal(auditAttendance(events, date, policy, now).deductible, 0);
+  } finally {
+    if (previous === undefined) delete process.env.CRM_OFF_PHONE_PAID_LIMIT_FROM;
+    else process.env.CRM_OFF_PHONE_PAID_LIMIT_FROM = previous;
+  }
+});
 test("data check preserves nearest-minute rounding and detects a third break", () => {
   const minute = [...standard]; minute[2] = { ...minute[2], at: "2026-10-19T16:15:01Z" };
   assert.equal(auditAttendance(minute, date, policy, now).overBreak, 0);

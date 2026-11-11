@@ -1,5 +1,7 @@
 export type SavedDeductionSource = {
     calculationVersion?: string;
+    minuteRate?: number | null;
+    hourlyRate?: number | null;
     deductions: number;
     lateMinutes?: number;
     lateHours?: number;
@@ -13,7 +15,17 @@ export type SavedDeductionSource = {
 };
 
 export function payrollDeductionRows(record: SavedDeductionSource) {
-    const rows = record.calculationVersion === "earned-hours-v1" ? [
+    const fixedOverride = record.calculationVersion === "fixed-half-month-salary-v1" && record.workedMinutesOverride !== null && record.workedMinutesOverride !== undefined;
+    const rows = fixedOverride ? [
+        { label: "Adjusted time shortfall", minutes: Math.max(0, Math.round((record.scheduledHours ?? 0) * 60) - record.workedMinutesOverride! -
+            (record.nonBillableOffPhoneMinutes ?? 0) - (record.excessBreakMinutes ?? 0) - (record.excessLunchMinutes ?? 0)) },
+        { label: "Excess lunch", minutes: record.excessLunchMinutes ?? 0 },
+        { label: "Excess break", minutes: record.excessBreakMinutes ?? 0 },
+    ] : record.calculationVersion === "earned-hours-v1" || record.calculationVersion === "earned-minute-capped-v1" ? [
+        { label: "Excess lunch", minutes: record.excessLunchMinutes ?? 0 },
+        { label: "Excess break", minutes: record.excessBreakMinutes ?? 0 },
+    ] : record.calculationVersion === "earned-hours-late-rest-v1" ? [
+        { label: "Late", minutes: record.lateMinutes ?? Math.round((record.lateHours ?? 0) * 60) },
         { label: "Excess lunch", minutes: record.excessLunchMinutes ?? 0 },
         { label: "Excess break", minutes: record.excessBreakMinutes ?? 0 },
     ] : record.calculationVersion !== "earned-hours-all-deductions-v1" && record.workedMinutesOverride !== null && record.workedMinutesOverride !== undefined ? [
@@ -40,20 +52,41 @@ export function payrollDeductionRows(record: SavedDeductionSource) {
     return rows.map((row, index) => ({ ...row, amount: allocated[index] / 100 }));
 }
 
-export type PayrollDeductionDisplayRow = { label: string; minutes: number; amount: number | null; note?: string };
+export type PayrollDeductionDisplayRow = { label: string; minutes: number; amount: number | null; informationalAmount?: number; note?: string };
 
 // Earned pay already omits unworked time; keep it visible without allocating the deduction total to it again.
 export function payrollDeductionDisplayRows(record: SavedDeductionSource): PayrollDeductionDisplayRow[] {
     const charged = payrollDeductionRows(record);
-    if (record.calculationVersion !== "earned-hours-v1") return charged;
+    const lateAndRest = record.calculationVersion === "earned-hours-late-rest-v1";
+    const minuteAccrual = record.calculationVersion === "earned-minute-capped-v1";
+    if (record.calculationVersion !== "earned-hours-v1" && !lateAndRest && !minuteAccrual) return charged;
     const note = record.workedMinutesOverride !== null && record.workedMinutesOverride !== undefined
-        ? "Paid hours manually adjusted" : "Already excluded from earned pay";
-    const attendance = (label: string, minutes: number): PayrollDeductionDisplayRow => ({ label, minutes, amount: null, note });
+        ? "Paid hours manually adjusted" : undefined;
+    const rate = record.minuteRate ?? (record.hourlyRate == null ? undefined : record.hourlyRate / 60);
+    const attendance = (label: string, minutes: number): PayrollDeductionDisplayRow => {
+        const reference = (minuteAccrual || ["Undertime", "Absence"].includes(label)) && Number.isSafeInteger(minutes) && minutes >= 0 &&
+            typeof rate === "number" && Number.isFinite(rate) && rate >= 0 ? Math.round((minutes * rate + Number.EPSILON) * 100) / 100 : undefined;
+        return { label, minutes, amount: null, ...(reference !== undefined && Number.isFinite(reference) ? { informationalAmount: reference } : {}),
+            ...(minuteAccrual ? { note: "Already excluded from earned pay" } : note ? { note } : {}) };
+    };
     return [
-        attendance("Late", record.lateMinutes ?? Math.round((record.lateHours ?? 0) * 60)),
+        ...(lateAndRest ? charged.filter(row => row.label === "Late") : [attendance("Late", record.lateMinutes ?? Math.round((record.lateHours ?? 0) * 60))]),
         ...charged.filter(row => ["Excess lunch", "Excess break"].includes(row.label)),
         attendance("Undertime", record.earlyTimeOutMinutes ?? 0),
         attendance("Absence", record.absenceMinutes ?? 0),
-        ...charged.filter(row => !["Excess lunch", "Excess break"].includes(row.label)),
+        ...charged.filter(row => !["Late", "Excess lunch", "Excess break"].includes(row.label)),
     ];
+}
+
+// Reference values belong to the displayed total, never to the saved cash deduction field.
+export function payrollDeductionDisplayTotal(record: SavedDeductionSource): number | null {
+    if (!Number.isFinite(record.deductions) || record.deductions < 0) return null;
+    if (record.calculationVersion === "earned-minute-capped-v1") return Math.round(record.deductions * 100) / 100;
+    let cents = Math.round(record.deductions * 100);
+    for (const row of payrollDeductionDisplayRows(record)) {
+        if (row.amount !== null || !["Undertime", "Absence"].includes(row.label)) continue;
+        if (row.informationalAmount === undefined) { if (row.minutes > 0) return null; continue; }
+        cents += Math.round(row.informationalAmount * 100);
+    }
+    return Number.isSafeInteger(cents) ? cents / 100 : null;
 }

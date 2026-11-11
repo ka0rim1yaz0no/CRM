@@ -11,6 +11,9 @@ export async function runPayrollGeneration() {
             try { await generateFutureMissingPayroll(); }
             catch { console.error("AUTOMATIC_PAYROLL_GENERATION_DEFERRED"); }
         });
+        console.info("PAYROLL_GENERATION_PASS_COMPLETED");
+    } catch {
+        console.error("AUTOMATIC_PAYROLL_GENERATION_DEFERRED");
     } finally { running = false; }
 }
 export function startPayrollGenerationWorker() {
@@ -18,4 +21,5 @@ export function startPayrollGenerationWorker() {
     void runPayrollGeneration();
     timer = setInterval(() => void runPayrollGeneration(), 5 * 60_000);
     timer.unref();
+    console.info("PAYROLL_GENERATION_WORKER_STARTED");
 }

@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Request, Response } from "express";
-import { Types } from "mongoose";
+import { Types, type ClientSession } from "mongoose";
 import {
   autoCallDisabledReason,
   getCallProvider,
@@ -19,7 +19,7 @@ import {
   type CallBridgeDeviceDocument,
   type CallBridgeState,
 } from "../models/CallBridge";
-import { Employee, normalizeEmployeeAvailabilityStatus } from "../models/Employee";
+import { Employee } from "../models/Employee";
 import { Lead } from "../models/Lead";
 import {
   latestDate,
@@ -38,15 +38,19 @@ import { emitCallDashboardUpdated } from "../socket";
 import { resolveCallBridgeBusinessIds, syncCallBridgeBusinessIds } from "../services/callBridgeBusinessService";
 import { callTimingV2Enabled } from "../config/rolloutFlags";
 import { CallBridgeObservation } from "../models/CallBridgeObservation";
-import { canReserveCall, confirmedCallEnd, hasUnconfirmedCall, IDLE_CONFIRMATION_MS, POST_CALL_WAIT_MS, unconfirmedDialRetryAt } from "../services/callTiming";
+import { canReserveCall, confirmedCallEnd, hasUnconfirmedCall, IDLE_CONFIRMATION_MS, isConfirmedPostCallWait, POST_CALL_WAIT_MS, unconfirmedDialRetryAt } from "../services/callTiming";
 import { acquireCallBridgeLease, callTimingWriteConditions } from "../services/callBridgeReservation";
 import { bridgeAvailabilityChangedAt } from "../services/callDashboardService";
 import { employeeCallingQueue, normalizeCallingPhone } from "../services/employeeCallingQueue";
-import { withLeadDispatchOwnership } from "../services/leadAssignment";
+import { withLeadDispatchOwnership, type Snapshot } from "../services/leadAssignment";
+import { attendanceAllowsCall } from "../services/callAttendanceGuard";
 import { isSalesEmployee } from "../../../shared/leadAssignmentPolicy";
 import { callingWindow } from "../../../shared/leadCallingPolicy";
 import { verifyAttendanceHubSession } from "../config/attendanceHubSession";
+import { boundNativeDevice, supportsNativeDial } from "../services/nativeCallBridge";
 import { signedEmployeeInBusiness } from "../middleware/legacyAuthentication";
+import { manualCallEndPending } from "../services/manualCallReadiness";
+import { autoCallControlSnapshot, automaticCallControlFilter, automaticCallPaused, automaticCallVersionCondition, clearManualCallHold } from "../services/autoCallControl";
 import {
   hasReliableTwoWayAudioDetection,
   hasTrackedActiveCall,
@@ -68,6 +72,13 @@ const autoCallClientUpdateMessage = "Refresh the CRM to load the current auto-ca
 
 function cleanString(value: unknown, maxLength = 240) {
   return String(value || "").trim().slice(0, maxLength);
+}
+
+async function rejectPausedAutoCall(employeeCode: string, response: Response) {
+  if (!await automaticCallPaused(employeeCode)) return false;
+  response.status(409).set("Cache-Control", "no-store").json({ code: "AUTO_CALL_PAUSED", allowed: false,
+    message: "Auto Call is held while manual calling or a pause is active." });
+  return true;
 }
 
 function rejectUnsupportedAutoCallClient(request: Request, response: Response) {
@@ -122,47 +133,23 @@ function flexiblePhoneRegex(digits: string) {
   return new RegExp(`^\\D*${digits.split("").join("\\D*")}\\D*$`);
 }
 
-async function getLeadDialBlock(
+export async function getLeadDialBlock(
   leadId: string,
   employeeId: string,
-  employeeNames: string[] = []
+  employeeNames: string[] = [],
+  session?: ClientSession,
+  manual = false
 ): Promise<LeadDialBlock | null> {
   if (!leadId || !Types.ObjectId.isValid(leadId)) {
     return "LEAD_NOT_FOUND";
   }
 
   const lead = await Lead.findById(leadId)
-    .select("assignedAgent assignedAgentName phone status followUpAt comments.authorName comments.authorType comments.createdAt")
+    .select("assignedAgent assignedAgentName phone status followUpAt lastCallOutcomeAt comments.authorName comments.authorType comments.createdAt")
+    .session(session || null)
     .lean();
 
-  if (!lead) return "LEAD_NOT_FOUND";
-  const normalizedEmployeeNames = new Set(employeeNames.map((value) => cleanString(value).toLowerCase()).filter(Boolean));
-  const isAssignedToEmployee = lead.assignedAgent
-    ? String(lead.assignedAgent) === employeeId
-    : normalizedEmployeeNames.has(cleanString(lead.assignedAgentName).toLowerCase());
-
-  if (!isAssignedToEmployee) return "LEAD_NOT_ASSIGNED";
-  if (!normalizeCallingPhone(lead.phone)) return "LEAD_NOT_CALLABLE";
-  if (!isLeadEligibleForAutoCall(lead, new Date(), employeeNames)) {
-    const hasEmployeeComment = hasEmployeeCommentForAutoCall(lead, employeeNames);
-    return hasEmployeeComment ? "LEAD_ALREADY_COMMENTED" : "LEAD_NOT_CALLABLE";
-  }
-
-  const phoneCandidates = autoCallPhoneCandidates(lead.phone);
-  if (phoneCandidates.length > 0) {
-    const duplicateComments = await Lead.find({
-      _id: { $ne: lead._id },
-      $or: phoneCandidates.map((digits) => ({ phone: flexiblePhoneRegex(digits) })),
-      comments: { $elemMatch: { authorType: "employee" } },
-    }).select("comments.authorType comments.createdAt").lean();
-    const duplicateEmployeeComments = duplicateComments.flatMap((item) =>
-      (item.comments || []).filter((comment) => comment.authorType === "employee")
-    );
-
-    if (shouldBlockCommentedPhone(duplicateEmployeeComments, lead.followUpAt)) return "LEAD_ALREADY_COMMENTED";
-  }
-
-  return null;
+  return lead ? checkLeadDialSnapshot(lead, employeeId, employeeNames, session, manual) : "LEAD_NOT_FOUND";
 }
 
 function leadDialBlockMessage(block: LeadDialBlock) {
@@ -215,7 +202,7 @@ async function emitEmployeeCallDashboardUpdated(employeeCode: string, fallbackBu
 }
 
 function aggregateBridgeStatus(
-  devices: Array<Pick<CallBridgeDeviceDocument, "state" | "audioSessionActive" | "lastSeenAt" | "lastStateChangedAt" | "lastIdleAt" | "nextivaProcessDetected" | "deviceName" | "bridgeVersion">>,
+  devices: Array<Pick<CallBridgeDeviceDocument, "state" | "audioSessionActive" | "lastSeenAt" | "lastStateChangedAt" | "lastIdleAt" | "inactiveSince" | "nextivaProcessDetected" | "deviceName" | "bridgeVersion">>,
   schedule: { callLeaseUntil?: Date | null; nextCallAllowedAt?: Date | null; lastCallEndedAt?: Date | null; lastCallStartedAt?: Date | null; dialIntentUntil?: Date | null; lastDialStartedAt?: Date | null; lastObservedAttemptId?: string; lastObservedLeadId?: string } | null,
   now = new Date()
 ) {
@@ -270,9 +257,8 @@ function aggregateBridgeStatus(
     reason = "Call Bridge must confirm every connected device is idle.";
   } else if (freshDevices.length > 0 && delayActive) {
     state = "idle";
-    const confirmedWait = schedule?.lastCallEndedAt && nextCallAllowedAt?.getTime() === schedule.lastCallEndedAt.getTime() + POST_CALL_WAIT_MS &&
-      (!schedule.lastDialStartedAt || schedule.lastDialStartedAt <= schedule.lastCallEndedAt);
-    reason = confirmedWait ? "Waiting 30 seconds after the previous call." : "Waiting for the unconfirmed dial retry deadline.";
+    const confirmedWait = isConfirmedPostCallWait(schedule);
+    reason = confirmedWait ? `Waiting ${POST_CALL_WAIT_MS / 1000} seconds after the previous call.` : "Waiting for the unconfirmed dial retry deadline.";
     waitCode = confirmedWait ? "POST_CALL_COOLDOWN" : "DIAL_RETRY_WAIT";
   } else if (freshDevices.length > 0) {
     state = "idle";
@@ -297,6 +283,7 @@ function aggregateBridgeStatus(
     state,
     reason,
     waitCode,
+    idleConfirmationPending: manualCallEndPending(freshDevices, schedule, now),
     postCallWaitMs: POST_CALL_WAIT_MS,
     nextivaProcessDetected,
     deviceName: connectedDevice?.deviceName || "",
@@ -741,6 +728,8 @@ export async function updateCallBridgeHeartbeat(request: Request, response: Resp
     device.lastIdleAt = now;
   }
   device.bridgeVersion = cleanString(request.body.bridgeVersion, 40);
+  device.nativeDialProtocol = supportsNativeDial({ bridgeVersion: device.bridgeVersion,
+    nativeDialProtocol: request.body.nativeDialProtocol === 1 ? 1 : 0 }) ? 1 : 0;
   device.deviceName = cleanString(request.body.deviceName, 160) || device.deviceName;
   device.lastSeenAt = now;
   device.businessIds = currentBusinessIds;
@@ -811,6 +800,11 @@ export async function updateCallBridgeHeartbeat(request: Request, response: Resp
     );
   }
 
+  if (nextState === "idle" && heartbeatSchedule?.manualCallHoldId &&
+    (confirmedCallEndedAt || heartbeatSchedule.manualCallHoldCancelledAt || heartbeatSchedule.manualCallHoldUntil && heartbeatSchedule.manualCallHoldUntil <= now)) {
+    await clearManualCallHold(device.employeeCode, heartbeatSchedule.manualCallHoldId);
+  }
+
   if (previousState !== nextState || previousNextivaProcessDetected !== device.nextivaProcessDetected || previousAudioSessionActive !== device.audioSessionActive || membershipChanged) {
     emitCallDashboardUpdated(Array.from(new Set([...previousBusinessIds, ...currentBusinessIds])));
   }
@@ -826,18 +820,26 @@ export async function getCallBridgeStatus(request: Request, response: Response) 
     return;
   }
 
+  const manual = request.query.mode === "manual";
+  if (manual && verifyAttendanceHubSession(request.header("x-crm-attendance-session")) !== employeeCode) {
+    response.status(403).json({ message: "A signed employee session is required for manual calling." });
+    return;
+  }
+
   const [devices, schedule] = await Promise.all([
     devicesForEmployee(employeeCode),
     getCallBridgeScheduleModel().findOne({ employeeCode }).lean(),
   ]);
-  const currentBusinessIds = await syncCallBridgeBusinessIds(
+  const currentBusinessIds = await (manual ? resolveCallBridgeBusinessIds : syncCallBridgeBusinessIds)(
     employeeCode,
     devices.flatMap((device) => device.businessIds)
   );
 
-  if (isAutoCallDisabledForEmployee(employeeCode)) {
+  if (!manual && isAutoCallDisabledForEmployee(employeeCode)) {
     response.json({
       employeeCode,
+      ...autoCallControlSnapshot(schedule),
+      autoCallDisabled: true,
       businessIds: currentBusinessIds,
       provider: getCallProvider(),
       connected: false,
@@ -882,10 +884,23 @@ export async function getCallBridgeStatus(request: Request, response: Response) 
     return;
   }
 
+  const nativeRequested = request.header("x-crm-native-dial") === "1";
+  const nativeReady = Boolean(boundNativeDevice(devices.filter(device => new Date(device.lastSeenAt).getTime() >= Date.now() - heartbeatFreshnessMs),
+    request.business?.id || "", request.header("x-crm-bridge-browser-key") || "", request.header("x-crm-bridge-browser-session") || ""));
+  const status = aggregateBridgeStatus(devices, schedule);
   response.json({
     employeeCode,
     businessIds: currentBusinessIds,
-    ...aggregateBridgeStatus(devices, schedule),
+    deadlineDispatchEnabled: callTimingV2Enabled() && getCallProvider() === "nextiva",
+    deadlinePreparationMs: 12000,
+    nativeDialProtocol: 1,
+    nativeDialReady: nativeReady,
+    ...status,
+    ...autoCallControlSnapshot(schedule),
+    ...(!manual && autoCallControlSnapshot(schedule).autoCallPaused ? { ready: false, deadlineDispatchEnabled: false, waitCode: "AUTO_CALL_PAUSED",
+      reason: schedule?.manualCallHoldId ? "Auto Call resumes after the manual call ends." : "Auto Call is paused." } : {}),
+    ...(nativeRequested && !nativeReady ? { ready: false, deadlineDispatchEnabled: false,
+      reason: "Update and pair Call Bridge between calls to enable native dialing." } : {}),
   });
 }
 
@@ -972,6 +987,7 @@ export async function reserveCallBridgeCall(request: Request, response: Response
 
   if (rejectUnsupportedAutoCallClient(request, response)) return;
   if (rejectUnapprovedCallTiming(response)) return;
+  if (await rejectPausedAutoCall(employeeCode, response)) return;
 
 
   if (isAutoCallDisabledForEmployee(employeeCode)) {
@@ -1005,7 +1021,7 @@ export async function reserveCallBridgeCall(request: Request, response: Response
       : null,
   ]);
 
-  const employeeIsOnline = employee && normalizeEmployeeAvailabilityStatus(employee.availabilityStatus) === "ONLINE";
+  const employeeIsOnline = employee && await attendanceAllowsCall(employee);
   const employeeHasSalesRole = employee && isSalesEmployee(employee);
 
   if (!employeeIsOnline || !employeeHasSalesRole) {
@@ -1079,7 +1095,7 @@ export async function reserveCallBridgeCall(request: Request, response: Response
     (callTimingV2Enabled() && freshDevices.some((device) =>
       device.state !== "idle" || !device.nextivaProcessDetected ||
       !hasReliableTwoWayAudioDetection(device.bridgeVersion))) ||
-    (callTimingV2Enabled() && !canReserveCall(now, currentSchedule || {}, {
+    (callTimingV2Enabled() && !canReserveCall(new Date(), currentSchedule || {}, {
       state: freshDevices[0]?.state || "unknown", nextivaProcessDetected: Boolean(freshDevices[0]?.nextivaProcessDetected),
       fresh: Boolean(freshDevices[0]),
     })) ||
@@ -1095,10 +1111,11 @@ export async function reserveCallBridgeCall(request: Request, response: Response
     return;
   }
 
-  const leaseUntil = new Date(now.getTime() + callLeaseMs);
+  const reservedAt = new Date();
+  const leaseUntil = new Date(reservedAt.getTime() + callLeaseMs);
   const reservationToken = attemptId;
   const schedule = await acquireCallBridgeLease({
-    employeeCode, now, leaseUntil, reservationTokenHash: hashSecret(reservationToken),
+    employeeCode, now: reservedAt, leaseUntil, reservationTokenHash: hashSecret(reservationToken),
     attemptId, businessId, leadId, normalizedPhone: head.normalizedPhone, timingV2: callTimingV2Enabled(),
   });
 
@@ -1163,7 +1180,7 @@ export async function reserveCallBridgeCall(request: Request, response: Response
     state: "calling",
     callLeaseUntil: leaseUntil,
     reservationToken,
-    attemptId, serverTime: now, leadId, normalizedPhone: head.normalizedPhone,
+    attemptId, serverTime: new Date(), leadId, normalizedPhone: head.normalizedPhone,
   });
   await emitEmployeeCallDashboardUpdated(employeeCode, freshDevices.flatMap((device) => device.businessIds));
 }
@@ -1187,10 +1204,12 @@ export async function markCallBridgeDialStarted(request: Request, response: Resp
 
   if (rejectUnsupportedAutoCallClient(request, response)) return;
   if (rejectUnapprovedCallTiming(response)) return;
+  if (await rejectPausedAutoCall(employeeCode, response)) return;
 
   const now = new Date();
   const Schedule = getCallBridgeScheduleModel();
   const owned = await Schedule.findOne({ employeeCode, reservedBusinessId: businessId, reservedLeadId: leadId,
+    ...automaticCallControlFilter(), $and: [automaticCallVersionCondition("$reservedAutoCallControlVersion")],
     reservationTokenHash: hashSecret(reservationToken), callLeaseUntil: { $gt: now } }).lean();
   if (owned?.lastDialStartedAt && owned.dialIntentUntil && owned.dialIntentUntil > now) {
     response.json({ startedAt: owned.lastDialStartedAt, dialIntentUntil: owned.dialIntentUntil, serverTime: now,
@@ -1269,9 +1288,10 @@ export async function markCallBridgeDialStarted(request: Request, response: Resp
     const employeeNames = employee
       ? [employee.name, employee.employeeCode, ...(employee.aliases || [])].filter(Boolean)
       : [employeeCode];
-    const queue = employee ? await employeeCallingQueue(employee, businessId, now) : null;
+    const employeeIsOnline = employee && await attendanceAllowsCall(employee);
+    const queue = employee && employeeIsOnline ? await employeeCallingQueue(employee, businessId, now) : null;
     const head = queue?.entries.find(entry => entry.leadId === queue.nextLeadId);
-    if (!employee || normalizeEmployeeAvailabilityStatus(employee.availabilityStatus) !== "ONLINE" || !isSalesEmployee(employee) ||
+    if (!employee || !employeeIsOnline || !isSalesEmployee(employee) ||
       !owned || head?.leadId !== leadId || head.normalizedPhone !== owned.reservedPhone) {
       response.status(409).json({ code: "CALL_QUEUE_CHANGED", message: "The calling queue or employee availability changed before dialing.", serverTime: now });
       return;
@@ -1296,20 +1316,23 @@ export async function markCallBridgeDialStarted(request: Request, response: Resp
     }
   }
 
-  const dispatchEmployee = await Employee.findOne({ employeeCode, status: { $ne: "Archived" } }).select("_id").lean();
-  const schedule = dispatchEmployee ? await withLeadDispatchOwnership(leadId, String(dispatchEmployee._id), async session => Schedule.findOneAndUpdate(
+  const dispatchEmployee = await Employee.findOne({ employeeCode, status: { $ne: "Archived" } }).select("_id employeeCode availabilityStatus").lean();
+  const schedule = dispatchEmployee ? await withLeadDispatchOwnership(leadId, String(dispatchEmployee._id), async session => {
+    const dispatchAt = new Date();
+    return Schedule.findOneAndUpdate(
     {
       employeeCode,
-      callLeaseUntil: { $gt: now },
+      callLeaseUntil: { $gt: dispatchAt },
       lastDialStartedAt: null,
       reservedBusinessId: businessId,
       reservedLeadId: leadId,
-      $and: callTimingWriteConditions(now),
+      $and: [...callTimingWriteConditions(dispatchAt), automaticCallVersionCondition("$reservedAutoCallControlVersion")],
       ...(legacyClient || matchedTokenlessReservation ? {} : { reservationTokenHash: hashSecret(reservationToken) }),
     },
-    { $set: { lastDialStartedAt: now, dialIntentUntil: new Date(now.getTime() + dialIntentMs), nextCallAllowedAt: unconfirmedDialRetryAt(now) } },
+    { $set: { lastDialStartedAt: dispatchAt, dialIntentUntil: new Date(dispatchAt.getTime() + dialIntentMs), nextCallAllowedAt: unconfirmedDialRetryAt(dispatchAt) } },
     { returnDocument: "after", session }
-  ), { employeeCode, attemptId: owned?.reservedAttemptId || reservationToken }) : null;
+    );
+  }, { employeeCode, attemptId: owned?.reservedAttemptId || reservationToken }, session => attendanceAllowsCall(dispatchEmployee, session)) : null;
 
   if (!schedule) {
     if (callTimingV2Enabled() && reservationToken) {
@@ -1350,8 +1373,8 @@ export async function markCallBridgeDialStarted(request: Request, response: Resp
   }
 
   const devices = await devicesForEmployee(employeeCode);
-  response.json({ startedAt: now, dialIntentUntil: schedule.dialIntentUntil,
-    serverTime: now, alreadyStarted: false, leadId, normalizedPhone: schedule.reservedPhone });
+  response.json({ startedAt: schedule.lastDialStartedAt, dialIntentUntil: schedule.dialIntentUntil,
+    serverTime: new Date(), alreadyStarted: false, leadId, normalizedPhone: schedule.reservedPhone });
   await emitEmployeeCallDashboardUpdated(employeeCode, devices.flatMap((device) => device.businessIds));
 }
 
@@ -1391,9 +1414,10 @@ export async function releaseCallBridgeCall(request: Request, response: Response
 
   if (freshDevices.some(device => isTrustedBridgeActiveSignal(device, schedule)) || hasUnconfirmedCall(schedule || {})) {
     response.status(409).json({
+      code: "CALL_ACTIVE_RELEASE_BLOCKED",
       employeeCode,
       ...aggregateBridgeStatus(freshDevices, schedule, now),
-      reason: `The reservation cannot be released while a ${getCallProvider() === "ringcentral" ? "RingCentral" : "Nextiva"} call is active.`,
+      reason: "Call Bridge still reports an active or unresolved call. The reservation was not cleared.",
     });
     return;
   }
@@ -1488,4 +1512,45 @@ export async function downloadCallBridgePackage(_request: Request, response: Res
   response.status(404).json({
     message: "Call Bridge package is not built yet. Run npm run call-bridge:package, then try again.",
   });
+}
+
+export async function getTransactionalLeadDialBlock(lead: Snapshot, employeeId: string, employeeNames: string[], session: ClientSession, manual = false) {
+  if (!session.inTransaction()) throw Error("TRANSACTIONAL_LEAD_SNAPSHOT_REQUIRED");
+  return checkLeadDialSnapshot(lead, employeeId, employeeNames, session, manual);
+}
+
+export async function getReadOnlyManualLeadDialBlock(lead: Snapshot, employeeId: string, employeeNames: string[]) {
+  return checkLeadDialSnapshot(lead, employeeId, employeeNames, undefined, true);
+}
+
+async function checkLeadDialSnapshot(lead: Snapshot, employeeId: string, employeeNames: string[], session?: ClientSession, manual = false): Promise<LeadDialBlock | null> {
+  const normalizedEmployeeNames = new Set(employeeNames.map((value) => cleanString(value).toLowerCase()).filter(Boolean));
+  const isAssignedToEmployee = lead.assignedAgent
+    ? String(lead.assignedAgent) === employeeId
+    : normalizedEmployeeNames.has(cleanString(lead.assignedAgentName).toLowerCase());
+
+  if (!isAssignedToEmployee) return "LEAD_NOT_ASSIGNED";
+  if (lead.status === "Archived" || !normalizeCallingPhone(lead.phone)) return "LEAD_NOT_CALLABLE";
+  if (manual) return null;
+  if (!isLeadEligibleForAutoCall(lead, new Date(), employeeNames)) {
+    const hasEmployeeComment = hasEmployeeCommentForAutoCall(lead, employeeNames);
+    return hasEmployeeComment ? "LEAD_ALREADY_COMMENTED" : "LEAD_NOT_CALLABLE";
+  }
+
+  const phoneCandidates = autoCallPhoneCandidates(lead.phone);
+  if (phoneCandidates.length > 0) {
+    const duplicateComments = await Lead.find({
+      _id: { $ne: lead._id },
+      $and: [{ $or: phoneCandidates.map((digits) => ({ phone: flexiblePhoneRegex(digits) })) },
+        { $or: [{ comments: { $elemMatch: { authorType: "employee" } } }, { lastCallOutcomeAt: { $ne: null } }] }],
+    }).select("comments.authorType comments.createdAt lastCallOutcomeAt").session(session || null).lean();
+    const duplicateEmployeeComments = duplicateComments.flatMap((item) =>
+      [...(item.comments || []).filter((comment) => comment.authorType === "employee"),
+        ...(item.lastCallOutcomeAt ? [{ createdAt: item.lastCallOutcomeAt }] : [])]
+    );
+
+    if (shouldBlockCommentedPhone(duplicateEmployeeComments, lead.followUpAt)) return "LEAD_ALREADY_COMMENTED";
+  }
+
+  return null;
 }

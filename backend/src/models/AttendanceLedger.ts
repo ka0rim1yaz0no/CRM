@@ -15,7 +15,7 @@ export type AttendanceLedgerDocument = {
   audit: AttendanceAudit[]; commands: Array<{ id: string; actor: string; hash: string; revision: number; result: Record<string, unknown> }>;
   jobs: Array<{ revision: number; businessId: string; done: boolean; createdAt?: string; lastErrorCode?: string; lastErrorAt?: string }>; migrationRequired?: boolean;
   derived?: AttendanceDerivedDay[];
-  maintenance?: { active: boolean; derivedRefreshAt?: Date };
+  maintenance?: { active: boolean; derivedRefreshAt?: Date; coachingReturnAt?: Date };
   derivedBaseline?: AttendanceDerivedBaseline;
   legacyAdoption?: { backupId: string; fingerprint: string; sourceCount: number; duplicateCount: number;
     businessStreamsDiffer: boolean; historicalIssues: number; adoptedAt: string };
@@ -34,6 +34,7 @@ const schema = new Schema({
 schema.index({ employeeCode: 1, businessIds: 1 });
 schema.index({ "maintenance.active": 1, _id: 1 });
 schema.index({ "maintenance.derivedRefreshAt": 1, _id: 1 });
+schema.index({ "maintenance.coachingReturnAt": 1, _id: 1 });
 schema.index({ "jobs.done": 1, _id: 1 });
 schema.index({ "derived.policyRevision": 1, _id: 1 });
 export const AttendanceLedger = mongoose.models.AttendanceLedger as mongoose.Model<AttendanceLedgerDocument> ||

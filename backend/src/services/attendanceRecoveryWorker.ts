@@ -11,6 +11,7 @@ import { attendanceAutoTimeOutEnabled } from "../config/rolloutFlags";
 import { runAttendanceAutoTimeOut } from "./attendanceAutoTimeOutWorker";
 import { runAttendanceDerivedRefresh } from "./attendanceDerivedRefreshWorker";
 import { runAttendancePolicyRefresh } from "./attendancePolicyRefreshWorker";
+import { startAttendanceCoachingWorker } from "./attendanceCoachingWorker";
 import { attendanceWorkerCounter, attendanceWorkerFailure, trackAttendanceWorker } from "./attendanceWorkerHealth";
 
 export async function runAttendanceRecovery(now = new Date(), deliver = deliverAttendanceLedger) {
@@ -19,8 +20,9 @@ export async function runAttendanceRecovery(now = new Date(), deliver = deliverA
 async function runRecovery(now: Date, deliver: typeof deliverAttendanceLedger) {
   if (!attendanceIntegrityEnabled() || attendanceAutoTimeOutEnabled()) return 0;
   const accuracy = attendanceAccuracyFixesEnabled(); const budget = attendanceWorkerBudget();
+  const fields = "_id employeeCode businessIds canonicalBusinessId revision events corrections closures";
   const ledgers = accuracy ? await attendanceWorkerBatch("recovery", activeAttendanceWorkerFilter(),
-    "_id employeeCode businessIds canonicalBusinessId revision events corrections closures") : await AttendanceLedger.find({}).lean();
+    fields) : await AttendanceLedger.find({}).select(fields).lean();
   let closed = 0;
   for (const ledger of ledgers) {
     if (accuracy && !budget()) break;
@@ -53,6 +55,7 @@ async function runRecovery(now: Date, deliver: typeof deliverAttendanceLedger) {
 let timer: NodeJS.Timeout | null = null;
 let running = false;
 export function startAttendanceIntegrityWorker() {
+  startAttendanceCoachingWorker();
   if (!timer) logAttendanceFlags();
   if (timer || !attendanceIntegrityEnabled()) return;
   const cycle = async () => {

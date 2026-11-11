@@ -1,4 +1,4 @@
-export const CALLING_QUEUE_POLICY_VERSION = "2026-10-23-authoritative-queue-v7";
+export const CALLING_QUEUE_POLICY_VERSION = "2026-10-31-repeat-unnoted-queue-v8";
 export const AUTO_CALL_COMMENT_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 
 export type CallingPolicyLead = {
@@ -6,6 +6,7 @@ export type CallingPolicyLead = {
     status?: string;
     createdAt?: Date | string | null;
     followUpAt?: Date | string | null;
+    lastCallOutcomeAt?: Date | string | null;
     comments?: Array<{ authorType?: string; createdAt?: Date | string | null }>;
 };
 export type CallingDecision = {
@@ -36,7 +37,8 @@ export function evaluateCallingLead(lead: CallingPolicyLead, now: Date): Calling
     const due = parseCallingSchedule(lead.followUpAt);
     if (scheduled && !Number.isFinite(due)) return no("INVALID_SCHEDULE");
     const comments = (lead.comments || []).filter(comment => comment.authorType === "employee");
-    const times = comments.map(comment => time(comment.createdAt));
+    const times = [...comments.map(comment => time(comment.createdAt)),
+        ...(lead.lastCallOutcomeAt !== null && lead.lastCallOutcomeAt !== undefined ? [time(lead.lastCallOutcomeAt)] : [])];
     if (times.some(value => !Number.isFinite(value))) return no("INVALID_COMMENT");
     const latest = times.length ? Math.max(...times) : null;
     const future = scheduled && due > +now;
@@ -48,8 +50,8 @@ export function evaluateCallingLead(lead: CallingPolicyLead, now: Date): Calling
     return { callable: true, reason, priority: reason === "SCHEDULED_DUE" ? 0 : reason === "NEW" ? 1 : 2, nextEligibleAt: null };
 }
 
-export function compareCallingLeads(a: CallingPolicyLead, b: CallingPolicyLead, now: Date) {
-    const first = evaluateCallingLead(a, now), second = evaluateCallingLead(b, now);
+export function compareCallingLeads(a: CallingPolicyLead, b: CallingPolicyLead, now: Date,
+    first = evaluateCallingLead(a, now), second = evaluateCallingLead(b, now)) {
     if (first.priority !== second.priority) return first.priority - second.priority;
     if (first.reason === "SCHEDULED_DUE" && second.reason === "SCHEDULED_DUE") {
         const due = time(a.followUpAt) - time(b.followUpAt);

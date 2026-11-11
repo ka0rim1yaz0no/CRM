@@ -38,7 +38,7 @@ export function attendanceUndoPlan(snapshot: AttendanceSessionSnapshot, target: 
     const current = snapshot.records.find(event => event.id === target.id)!;
     const group = snapshot.records.filter(event => event.commandId === current.commandId);
     const session = snapshot.sessions.find(item => item.events.some(event => event.id === current.id));
-    const pairs = [["Break Out", "Break In"], ["Lunch Break Out", "Lunch Break In"], ["Off the Phone Out", "Off the Phone In", "Non-Billable Off the Phone Out"]];
+    const pairs = [["Break Out", "Break In"], ["Lunch Break Out", "Lunch Break In"], ["Off the Phone Out", "Off the Phone In", "Non-Billable Off the Phone Out"], ["Coaching Out", "Coaching In"]];
     const pair = pairs.find(sources => sources.includes(current.source));
     const isLatest = snapshot.records.at(-1)?.commandId === current.commandId;
     if (!session || !pair || group.length !== 1 || (current.source === pair[1] && isLatest)) {

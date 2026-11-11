@@ -1,4 +1,5 @@
 import { api } from "../lib/api";
+import { ADMIN_LEAD_READ_TIMEOUT_MS, readAdminLeadRequest } from "../lib/adminLeadRead";
 import type { CallingDecision } from "../../shared/leadCallingPolicy";
 import type { Employee } from "./employees";
 import type { Team } from "./teams";
@@ -14,6 +15,7 @@ export type LeadStatus =
     | "Archived";
 
 export type Lead = {
+    lastCallOutcomeAt?: string | null;
     _id: string;
     leadName: string;
     position: string;
@@ -215,6 +217,13 @@ export type LeadBulkRestoreResult = {
 
 export type LeadBulkAssignResult = {
     assignedCount: number;
+    updatedRecordCount?: number;
+    conflictCount?: number;
+    unchangedCount?: number;
+    unchangedRecordCount?: number;
+    matchedCount?: number;
+    requestedCount?: number;
+    missingCount?: number;
 };
 
 export type LeadPermanentDeleteResult = {
@@ -232,6 +241,7 @@ export type LeadImportResult = {
     importedCount: number;
     skippedCount: number;
     duplicateCount?: number;
+    mergedCount?: number;
     leads: Lead[];
 };
 
@@ -249,6 +259,9 @@ export type MyLeadsPage = {
 };
 
 export type CallingQueueSnapshot = {
+    refreshDependencies?: { version: 1; leadIds: string[]; phones: string[] };
+    refreshDependenciesFingerprint?: string;
+    refreshDependenciesUnchanged?: boolean;
     policyVersion: string;
     scope: { employeeId: string; employeeCode: string; businessId: string };
     version: string;
@@ -279,6 +292,7 @@ export type AdminLeadsPage = {
     limit: number;
     total: number;
     stateOptions: LeadStateOption[];
+    cityOptions?: string[];
     hasMore: boolean;
     nextPage: number | null;
 };
@@ -411,9 +425,10 @@ export async function getLeads(
         status?: LeadStatus;
         statuses?: LeadStatus[];
         unassigned?: boolean;
-    } = {}
+    } = {}, context: LeadAssignmentContext = {}
 ) {
     const response = await api.get<Lead[]>("/leads", {
+        headers: assignmentHeaders(context),
         params: {
             ...params,
             assignedAgentNames: params.assignedAgentNames?.join(","),
@@ -440,17 +455,23 @@ export async function getAdminLeads(params: {
     limit?: number;
     search?: string;
     tab?: AdminLeadApiTab;
-    queue?: "ALL" | "NEW" | "Follow up";
+    queue?: "ALL" | Exclude<LeadStatus, "Archived">;
     statusFilter?: LeadStatus | "ALL";
     dateFrom?: string;
     dateTo?: string;
     state?: string;
+    city?: string;
+    category?: string;
+    windowStartPage?: number;
+    windowEndPage?: number;
     unassigned?: boolean;
     exportFile?: boolean;
-}, context: LeadAssignmentContext = {}) {
+}, context: LeadAssignmentContext & {signal?: AbortSignal} = {}) {
     const endpoint = params.tab && params.tab !== "leads" ? `/admin-leads/${params.tab}` : "/admin-leads";
-    const response = await api.get<AdminLeadsPage>(endpoint, {
+    const response = await readAdminLeadRequest(signal => api.get<AdminLeadsPage>(endpoint, {
         headers: assignmentHeaders(context),
+        signal,
+        timeout: ADMIN_LEAD_READ_TIMEOUT_MS,
         params: {
             ...params,
             tab: undefined,
@@ -458,7 +479,19 @@ export async function getAdminLeads(params: {
             exportFile: undefined,
             assignedAgentNames: params.assignedAgentNames?.join(","),
         },
-    });
+    }), context.signal);
+    return response.data;
+}
+
+export type AdminLeadSelection = {leadIds: string[]; total: number; assignmentRevisions: Record<string, number>};
+
+export async function getAdminLeadSelection(params: Parameters<typeof getAdminLeads>[0], context: LeadAssignmentContext & {signal?: AbortSignal} = {}) {
+    const endpoint = params.tab && params.tab !== "leads" ? `/admin-leads/${params.tab}` : "/admin-leads";
+    const response = await readAdminLeadRequest(signal => api.get<AdminLeadSelection>(endpoint, {
+        headers: assignmentHeaders(context), signal, timeout: ADMIN_LEAD_READ_TIMEOUT_MS,
+        params: {...params, page: undefined, limit: undefined, windowStartPage: undefined, windowEndPage: undefined,
+            exportFile: undefined, tab: undefined, selectionOnly: "true", assignedAgentNames: params.assignedAgentNames?.join(",")},
+    }), context.signal);
     return response.data;
 }
 
@@ -477,6 +510,7 @@ export async function getAdminLeadCounts(params: {
     assignedAgentNames?: string[];
     search?: string;
     state?: string;
+    city?: string;
     unassigned?: boolean;
 } = {}, context: LeadAssignmentContext = {}) {
     const response = await api.get<LeadCountResult>("/admin-leads/counts", {
@@ -495,8 +529,8 @@ export async function getAgentLeadDashboard(params: { month?: string; dateFrom?:
     return response.data;
 }
 
-export async function getLead(id: string, options: LeadAssignmentContext & { timeoutMs?: number } = {}) {
-    const response = await api.get<Lead>(`/leads/${id}`, { timeout: options.timeoutMs, headers: assignmentHeaders(options) });
+export async function getLead(id: string, options: LeadAssignmentContext & { timeoutMs?: number; signal?: AbortSignal } = {}) {
+    const response = await api.get<Lead>(`/leads/${id}`, { timeout: options.timeoutMs, signal: options.signal, headers: assignmentHeaders(options) });
     return response.data;
 }
 
@@ -513,7 +547,12 @@ export async function getMyLeads(params: {
     state?: string;
     autoCallEligible?: boolean;
     callingQueue?: boolean;
-}, options: { timeoutMs?: number; businessId?: string; employeeSession?: string } = {}) {
+    queueControl?: boolean;
+    workspaceView?: boolean;
+    windowStartPage?: number;
+    windowEndPage?: number;
+    knownRefreshDependencies?: string;
+}, options: { timeoutMs?: number; businessId?: string; employeeSession?: string; signal?: AbortSignal } = {}) {
     const endpoint = params.tab && params.tab !== "my" ? `/my-leads/${params.tab}` : "/my-leads";
     const response = await api.get<MyLeadsPage>(endpoint, {
         params: {
@@ -522,6 +561,7 @@ export async function getMyLeads(params: {
             employeeNames: params.employeeNames?.join(","),
         },
         timeout: options.timeoutMs,
+        signal: options.signal,
         headers: { ...(options.businessId ? { "X-Business-Id": options.businessId } : {}),
             ...(options.employeeSession ? { "X-CRM-Attendance-Session": options.employeeSession } : {}) },
     });
@@ -566,7 +606,7 @@ export async function importLeads(leads: LeadImportInput[]) {
 }
 
 export async function updateLead(id: string, lead: LeadInput, context: LeadAssignmentContext = {}) {
-    const response = await api.put<Lead>(`/leads/${id}`, lead, { headers: assignmentHeaders(context) });
+    const response = await api.put<Lead>(`/leads/${id}`, lead, { timeout: 15000, headers: assignmentHeaders(context) });
     return response.data;
 }
 
@@ -575,12 +615,12 @@ export async function assignLead(
     assignment: { assignedAgent: string; assignedAgentName?: string; expectedAssignmentRevision?: number } & LeadActivityActorInput,
     context: LeadAssignmentContext = {}
 ) {
-    const response = await api.patch<Lead>(`/leads/${id}/assign`, assignment, { headers: assignmentHeaders(context) });
+    const response = await api.patch<Lead>(`/leads/${id}/assign`, assignment, { timeout: 15000, headers: assignmentHeaders(context) });
     return response.data;
 }
 
 export async function archiveLead(id: string, actor: LeadActivityActorInput = {}, context: LeadAssignmentContext = {}) {
-    const response = await api.patch<Lead>(`/leads/${id}/archive`, actor, { headers: assignmentHeaders(context) });
+    const response = await api.patch<Lead>(`/leads/${id}/archive`, actor, { timeout: 15000, headers: assignmentHeaders(context) });
     return response.data;
 }
 
@@ -594,12 +634,12 @@ export async function permanentlyDeleteLead(id: string) {
     return response.data;
 }
 
-export async function bulkArchiveLeads(leadIds: string[]) {
+export async function bulkArchiveLeads(leadIds: string[], context: LeadAssignmentContext = {}) {
     const response = await api.patch<LeadBulkArchiveResult>("/leads/bulk/archive", {
         leadIds,
         activityActorName: "Admin",
         activityActorType: "admin",
-    });
+    }, { headers: assignmentHeaders(context) });
     return response.data;
 }
 
@@ -627,12 +667,12 @@ export async function archiveAllActiveLeads() {
     return response.data;
 }
 
-export async function bulkRestoreLeads(leadIds: string[]) {
+export async function bulkRestoreLeads(leadIds: string[], context: LeadAssignmentContext = {}) {
     const response = await api.patch<LeadBulkRestoreResult>("/leads/bulk/restore", {
         leadIds,
         activityActorName: "Admin",
         activityActorType: "admin",
-    });
+    }, { headers: assignmentHeaders(context) });
     return response.data;
 }
 
@@ -657,13 +697,13 @@ export async function bulkAssignLeads(input: { leadIds: string[]; assignedAgent:
     return response.data;
 }
 
-export async function bulkPermanentlyDeleteArchivedLeads(leadIds: string[]) {
-    const response = await api.delete<LeadPermanentDeleteResult>("/leads/bulk/permanent", { data: { leadIds } });
+export async function bulkPermanentlyDeleteArchivedLeads(leadIds: string[], context: LeadAssignmentContext = {}) {
+    const response = await api.delete<LeadPermanentDeleteResult>("/leads/bulk/permanent", { data: { leadIds }, headers: assignmentHeaders(context) });
     return response.data;
 }
 
-export async function bulkPermanentlyDeleteActiveLeads(leadIds: string[]) {
-    const response = await api.delete<LeadPermanentDeleteResult>("/leads/bulk/active/permanent", { data: { leadIds } });
+export async function bulkPermanentlyDeleteActiveLeads(leadIds: string[], context: LeadAssignmentContext = {}) {
+    const response = await api.delete<LeadPermanentDeleteResult>("/leads/bulk/active/permanent", { data: { leadIds }, headers: assignmentHeaders(context) });
     return response.data;
 }
 
@@ -698,7 +738,7 @@ export async function scheduleLeadFollowUp(
     followUp: { followUpAt: string; followUpNote?: string; followUpPriority?: number } & LeadActivityActorInput,
     options: { businessId?: string; employeeSession?: string } = {}
 ) {
-    const response = await api.patch<Lead>(`/leads/${id}/follow-up`, followUp, { headers: { ...(options.businessId ? { "X-Business-Id": options.businessId } : {}), ...(options.employeeSession ? { "X-CRM-Attendance-Session": options.employeeSession } : {}) } });
+    const response = await api.patch<Lead>(`/leads/${id}/follow-up`, followUp, { timeout: 15000, headers: { ...(options.businessId ? { "X-Business-Id": options.businessId } : {}), ...(options.employeeSession ? { "X-CRM-Attendance-Session": options.employeeSession } : {}) } });
     return response.data;
 }
 
@@ -707,7 +747,7 @@ export async function addLeadComment(
     comment: { body: string; authorName?: string; authorType?: "admin" | "employee" },
     options: LeadAssignmentContext = {}
 ) {
-    const response = await api.post<Lead>(`/leads/${id}/comments`, comment, { headers: assignmentHeaders(options) });
+    const response = await api.post<Lead>(`/leads/${id}/comments`, comment, { timeout: 15000, headers: assignmentHeaders(options) });
     return response.data;
 }
 
@@ -722,9 +762,21 @@ export async function recordLeadCall(
     actor: LeadActivityActorInput & { callOutcome?: "confirmed" | "failed" } = {},
     options: { timeoutMs?: number; businessId?: string; employeeSession?: string } = {}
 ) {
-    const response = await api.post<Lead>(`/leads/${id}/calls`, actor, { timeout: options.timeoutMs,
-        headers: { ...(options.businessId ? { "X-Business-Id": options.businessId } : {}), ...(options.employeeSession ? { "X-CRM-Attendance-Session": options.employeeSession } : {}) } });
-    return response.data;
+    const requestedTimeout = Number(options.timeoutMs);
+    const timeoutMs = Number.isFinite(requestedTimeout) && requestedTimeout > 0 ? Math.min(requestedTimeout, 30000) : 10000;
+    const controller = new AbortController();
+    let timer: number | undefined;
+    // Logging must settle even when the transport never delivers its timeout or abort event.
+    const transport = Promise.resolve().then(() => api.post<Lead>(`/leads/${id}/calls`, actor, { timeout: timeoutMs, signal: controller.signal,
+        headers: { ...(options.businessId ? { "X-Business-Id": options.businessId } : {}), ...(options.employeeSession ? { "X-CRM-Attendance-Session": options.employeeSession } : {}) } }));
+    const deadline = new Promise<never>((_resolve, reject) => {
+        timer = window.setTimeout(() => {
+            reject(Object.assign(new Error("Call activity logging timed out. Calling state will be rechecked."), { code: "CALL_LOG_TIMEOUT" }));
+            controller.abort();
+        }, timeoutMs);
+    });
+    try { return (await Promise.race([transport, deadline])).data; }
+    finally { window.clearTimeout(timer); }
 }
 
 export async function updateLeadComment(id: string, commentId: string, comment: { body: string } & LeadActivityActorInput) {
@@ -733,7 +785,7 @@ export async function updateLeadComment(id: string, commentId: string, comment: 
 }
 
 export async function updateLeadStatus(id: string, status: LeadStatus, actor: LeadActivityActorInput = {}, options: { businessId?: string; employeeSession?: string } = {}) {
-    const response = await api.patch<Lead>(`/leads/${id}/status`, { status, ...actor }, { headers: { ...(options.businessId ? { "X-Business-Id": options.businessId } : {}), ...(options.employeeSession ? { "X-CRM-Attendance-Session": options.employeeSession } : {}) } });
+    const response = await api.patch<Lead>(`/leads/${id}/status`, { status, ...actor }, { timeout: 15000, headers: { ...(options.businessId ? { "X-Business-Id": options.businessId } : {}), ...(options.employeeSession ? { "X-CRM-Attendance-Session": options.employeeSession } : {}) } });
     return response.data;
 }
 
@@ -970,29 +1022,29 @@ export async function getMyLeadCallSummary(params: LeadCallSummaryParams = {}) {
     return response.data;
 }
 
-export async function logConnectedLeadCall(leadId: string, employeeId: string) {
+export async function logConnectedLeadCall(leadId: string, employeeId: string, context: LeadAssignmentContext = {}) {
     const response = await api.patch<LeadCallStat>(`/log/${leadId}/log-call`, {
         employeeId,
         clickedAt: new Date().toISOString(),
-    });
+    }, { timeout: 15000, headers: assignmentHeaders(context) });
 
     return response.data;
 }
 
-export async function logLeadNotConnected(leadId: string, employeeId: string) {
+export async function logLeadNotConnected(leadId: string, employeeId: string, context: LeadAssignmentContext = {}) {
     const response = await api.patch<LeadCallStat>(`/log/${leadId}/not-connected`, {
         employeeId,
         clickedAt: new Date().toISOString(),
-    });
+    }, { timeout: 15000, headers: assignmentHeaders(context) });
 
     return response.data;
 }
 
-export async function logLeadVoicemail(leadId: string, employeeId: string) {
+export async function logLeadVoicemail(leadId: string, employeeId: string, context: LeadAssignmentContext = {}) {
     const response = await api.patch<LeadCallStat>(`/log/${leadId}/voicemail`, {
         employeeId,
         clickedAt: new Date().toISOString(),
-    });
+    }, { timeout: 15000, headers: assignmentHeaders(context) });
 
     return response.data;
 }

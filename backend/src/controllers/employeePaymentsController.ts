@@ -20,5 +20,7 @@ export async function getEmployeePayments(request: Request, response: Response) 
     if (!Number.isSafeInteger(page) || page < 1 || page > 10000) { response.status(400).json({ message: "Invalid payment page." }); return; }
     const view = String(request.query.view || "current");
     if (view !== "current" && view !== "history") { response.status(400).json({ message: "Invalid payment cutoff view." }); return; }
-    response.json(await employeePayments(employee.employeeCode, page, view));
+    const basis = request.query.basis ?? "payment";
+    if (basis !== "saved" && basis !== "estimate" && basis !== "payment") { response.status(400).json({ message: "Invalid payment amount basis." }); return; }
+    response.json(await employeePayments(employee.employeeCode, page, view, basis));
 }

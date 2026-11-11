@@ -1,7 +1,7 @@
 import type { FormEvent, UIEvent } from "react";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { FiArchive, FiCalendar, FiCheckCircle, FiClock, FiEdit2, FiMail, FiMessageCircle, FiPhone, FiPlus, FiSave, FiSearch, FiStar, FiUserPlus, FiVoicemail, FiX } from "react-icons/fi";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { isCancelledError, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { FiArchive, FiCalendar, FiCheckCircle, FiClock, FiEdit2, FiLoader, FiMail, FiMessageCircle, FiPhone, FiPlus, FiSave, FiSearch, FiStar, FiUserPlus, FiVoicemail, FiX } from "react-icons/fi";
 import { useLocation, useSearchParams } from "react-router";
 import MainLayout from "../layout";
 import { getAuthUser } from "../../api/authStorage";
@@ -13,16 +13,20 @@ import { useToast } from "../../lib/toast";
 import { useFeatureFlags } from "../../hooks/useFeatureFlags";
 import { formatLeadScheduleDateTime, formatLeadScheduleDateTimeInput, getCurrentLeadScheduleDateTimeInput, parseLeadScheduleDateTimeInput, formatPhDateTime } from "../../lib/dateTime";
 import { AUTO_CALL_API_TIMEOUT_MS, clearAutoCallPendingComment, getEmployeeCommentMarker, startAutoCallPendingComment, isSalesRole } from "../../lib/employeeAutoCall";
-import { getPhoneCallUrl } from "../../lib/phoneNumber";
+import { normalizePhoneForCall } from "../../lib/phoneNumber";
+import { callLeadThroughBridge } from "../../lib/nativeLeadCall";
 import { socket } from "../../lib/socket";
 import { getActiveBusinessId } from "../../api/businessStorage";
-import { callingQueueKey, callingProgress, setCallingWork, subscribeCallingWorkflow, trackCallingSave, getLeadNoteDraft, setLeadNoteDraft, clearSavedLeadNoteDraft } from "../../lib/callingWorkflow";
-import { fetchCallingQueue, useCallingQueue } from "../../lib/useCallingQueue";
+import { callingQueueKey, setCallingWork, setCallingDraft, trackCallingSave, getLeadNoteDraft, setLeadNoteDraft, clearSavedLeadNoteDraft } from "../../lib/callingWorkflow";
+import CallingStatus from "../../components/CallingStatus";
+import { useCallingQueue } from "../../lib/useCallingQueue";
 import { isEligibleLeadRecipient, leadBelongsToEmployee } from "../../../shared/leadAssignmentPolicy";
 import { reportRequestError } from "../../lib/requestErrorToast";
 import { useEmployeeLeadSelection } from "../../components/EmployeeLeadSelection";
 import { getLeadWorkspaceCapabilities } from "../../api/leads";
 import { latestLead, synchronizeLeadWorkspace } from "../../lib/leadWorkspaceCache";
+import { createLeadDetailReadGuard } from "../../lib/leadDetailReadGuard";
+import { readEmployeeLeadWindow } from "../../lib/employeeLeadWindow";
 
 const tabs: Array<LeadStatus | "ALL"> = [
     "NEW",
@@ -45,7 +49,8 @@ const employeeStatusOptions: LeadStatus[] = [
 ];
 
 type CallLoggerConfirmAction = "connected" | "not_connected" | "voicemail";
-type LeadActionName = "archive" | "assignment" | "details" | "schedule" | "status";
+type LeadActionName = "archive" | "assignment" | "details" | "schedule" | "status" | "outcome";
+type CallOutcomeInput = { leadId: string; employeeId: string; employeeCode: string; businessId: string; employeeSession: string };
 
 type LeadChangedPayload = {
     action: string;
@@ -294,8 +299,10 @@ export default function Leads() {
     const employeeTeam = authUser?.userType === "employee" ? authUser.user.team : undefined;
     const callingQueueQuery = useCallingQueue(callingScope, isSalesRole(String(authUser?.user.role || ""), String(employeeTeam || "")));
     const authoritativeQueue = callingQueueQuery.data?.callingQueue;
-    const autoCallStatus = useSyncExternalStore(subscribeCallingWorkflow, () => callingProgress(callingScope));
     const requestedLeadId = searchParams.get("lead") || "";
+    const leadDetailReadGuard = useMemo(() => createLeadDetailReadGuard({ businessId: displayedBusinessId, employeeId,
+        employeeSession: authUser?.attendanceHubSession || undefined }), [displayedBusinessId, employeeId, authUser?.attendanceHubSession]);
+    const [, refreshLeadDetailAccess] = useState(0);
     const routedAutoCallContext = location.state as { autoCallLead?: Lead; autoCallBusinessId?: string; autoCallEmployeeId?: string } | null;
     const routedAutoCallLead = routedAutoCallContext?.autoCallBusinessId === displayedBusinessId && routedAutoCallContext.autoCallEmployeeId === employeeId
         ? routedAutoCallContext.autoCallLead : undefined;
@@ -333,6 +340,7 @@ export default function Leads() {
     const leadFetchInFlightRef = useRef(false);
     const leadFetchRetryAtRef = useRef(0);
     const [activeLeadAction, setActiveLeadAction] = useState<LeadActionName | null>(null);
+    const [callLoggerConfirmAction, setCallLoggerConfirmAction] = useState<CallLoggerConfirmAction | null>(null);
     const [passAgentId, setPassAgentId] = useState("");
     const [passConfirm, setPassConfirm] = useState<{ lead: Lead; agent: Employee; businessId: string; employeeSession?: string } | null>(null);
     const [followUpDateTime, setFollowUpDateTime] = useState("");
@@ -370,11 +378,20 @@ export default function Leads() {
     const isGlobalLeadSearchActive = isGlobalLeadSearch && Boolean(effectiveLeadSearch);
     const employeeLeadTab = getEmployeeLeadTab(activeTab);
     const requestedEmployeeLeadTab = isGlobalLeadSearchActive ? "all" : employeeLeadTab;
-    const isDefaultCallingView = activeTab === "NEW" && !effectiveLeadSearch && leadStateFilter === "ALL";
+    const isEmployeeLeadWorkspaceView = activeTab === "NEW" && !isGlobalLeadSearchActive;
     const leadQueryKey = useMemo(
-        () => isDefaultCallingView ? callingQueueKey({ employeeId, businessId: displayedBusinessId }) : ["leads", employeeId, employeeLeadNames.join("|"), requestedEmployeeLeadTab, activeTab, effectiveLeadSearch, isGlobalLeadSearchActive, leadStateFilter, displayedBusinessId] as const,
-        [isDefaultCallingView, activeTab, effectiveLeadSearch, employeeId, employeeLeadNames, isGlobalLeadSearchActive, leadStateFilter, requestedEmployeeLeadTab, displayedBusinessId]
+        () => ["leads", employeeId, employeeLeadNames.join("|"), requestedEmployeeLeadTab, activeTab, effectiveLeadSearch, isGlobalLeadSearchActive, leadStateFilter, displayedBusinessId] as const,
+        [activeTab, effectiveLeadSearch, employeeId, employeeLeadNames, isGlobalLeadSearchActive, leadStateFilter, requestedEmployeeLeadTab, displayedBusinessId]
     );
+    const readLeadPages = useCallback((page: number, signal?: AbortSignal) => {
+        const params = {employeeId, employeeNames: employeeLeadNames, tab: requestedEmployeeLeadTab, page, limit: LEAD_PAGE_SIZE,
+            search: effectiveLeadSearch || undefined, searchAll: isGlobalLeadSearchActive || undefined,
+            includeArchived: isGlobalLeadSearchActive || undefined, state: leadStateFilter !== "ALL" ? leadStateFilter : undefined};
+        const read = (params: Parameters<typeof getMyLeads>[0], signal?: AbortSignal) => getMyLeads(params,
+            {businessId: displayedBusinessId, employeeSession: authUser?.attendanceHubSession || undefined, timeoutMs: AUTO_CALL_API_TIMEOUT_MS, signal});
+        return isEmployeeLeadWorkspaceView ? readEmployeeLeadWindow(read, params, page, signal) : read(params, signal);
+    }, [employeeId, employeeLeadNames, requestedEmployeeLeadTab, effectiveLeadSearch, isGlobalLeadSearchActive, leadStateFilter,
+        displayedBusinessId, authUser?.attendanceHubSession, isEmployeeLeadWorkspaceView]);
     const leadPagingScope = JSON.stringify(leadQueryKey);
     const leadPagingScopeRef = useRef<string | null>(leadPagingScope);
     useLayoutEffect(() => {
@@ -383,29 +400,20 @@ export default function Leads() {
     }, [leadPagingScope]);
     const { data: leadPageData, isLoading, isError } = useQuery({
         queryKey: leadQueryKey,
-        queryFn: () => isDefaultCallingView ? fetchCallingQueue(callingScope, authUser?.attendanceHubSession || undefined) :
-            getMyLeads({
-                employeeId,
-                employeeNames: employeeLeadNames,
-                tab: requestedEmployeeLeadTab,
-                page: 1,
-                limit: LEAD_PAGE_SIZE,
-                search: effectiveLeadSearch || undefined,
-                searchAll: isGlobalLeadSearchActive || undefined,
-                includeArchived: isGlobalLeadSearchActive || undefined,
-                state: leadStateFilter !== "ALL" ? leadStateFilter : undefined,
-                callingQueue: isDefaultCallingView || undefined,
-            }, { businessId: displayedBusinessId, employeeSession: authUser?.attendanceHubSession || undefined }),
+        queryFn: ({signal}) => readLeadPages(isEmployeeLeadWorkspaceView ? queryClient.getQueryData<MyLeadsPage>(leadQueryKey)?.page || 1 : 1, signal),
         enabled: Boolean(employeeId),
-        refetchInterval: isDefaultCallingView ? false : 30000,
+        refetchInterval: 30000,
         refetchOnReconnect: "always",
     });
     const leads = leadPageData?.leads || EMPTY_QUERY_ROWS;
     const leadStateOptions = leadPageData?.stateOptions || EMPTY_QUERY_ROWS;
     const { data: requestedLead } = useQuery({
         queryKey: ["lead", displayedBusinessId, requestedLeadId],
-        queryFn: () => getLead(requestedLeadId, { businessId: displayedBusinessId, employeeSession: authUser?.attendanceHubSession || undefined }),
-        enabled: Boolean(employeeId && requestedLeadId),
+        queryFn: ({ signal }) => !leadDetailReadGuard.canRead(requestedLeadId) ? null :
+            getLead(requestedLeadId, { businessId: displayedBusinessId, employeeSession: authUser?.attendanceHubSession || undefined, signal }),
+        enabled: query => Boolean(employeeId && requestedLeadId && leadDetailReadGuard.canRead(requestedLeadId)) &&
+            ![403, 404].includes((query.state.error as { response?: { status?: number } } | null)?.response?.status || 0),
+        retry: (failures, error) => failures < 2 && ![401, 403, 404].includes((error as { response?: { status?: number } })?.response?.status || 0),
     });
     const { data: leadCounts = {} } = useQuery({
         queryKey: ["lead-counts", employeeId, displayedBusinessId, employeeLeadNames.join("|"), leadStateFilter],
@@ -524,7 +532,7 @@ export default function Leads() {
         const currentPage = queryClient.getQueryData<MyLeadsPage>(leadQueryKey);
         const scopeIsCurrent = () => leadPagingScopeRef.current === leadPagingScope && getActiveBusinessId() === displayedBusinessId;
         if (!employeeId || !scopeIsCurrent() || leadFetchInFlightRef.current || !hasMoreLeads ||
-            !currentPage?.hasMore || leadFetchRetryAtRef.current > Date.now()) {
+            !currentPage?.hasMore || queryClient.getQueryState(leadQueryKey)?.fetchStatus === "fetching" || leadFetchRetryAtRef.current > Date.now()) {
             return false;
         }
 
@@ -533,6 +541,16 @@ export default function Leads() {
         setIsFetchingMoreLeads(true);
 
         try {
+            if (isEmployeeLeadWorkspaceView) {
+                const nextLeadPage = await queryClient.fetchQuery({queryKey: leadQueryKey,
+                    queryFn: ({signal}) => readLeadPages(nextPage, signal), staleTime: 0});
+                if (!scopeIsCurrent()) return false;
+                leadPageRef.current = nextLeadPage.page;
+                setLeadPage(nextLeadPage.page);
+                setHasMoreLeads(nextLeadPage.hasMore);
+                leadFetchRetryAtRef.current = 0;
+                return true;
+            }
             const nextLeadPage = await getMyLeads({
                 employeeId,
                 employeeNames: employeeLeadNames,
@@ -543,7 +561,6 @@ export default function Leads() {
                 searchAll: isGlobalLeadSearchActive || undefined,
                 includeArchived: isGlobalLeadSearchActive || undefined,
                 state: leadStateFilter !== "ALL" ? leadStateFilter : undefined,
-                callingQueue: isDefaultCallingView || undefined,
             }, { timeoutMs: AUTO_CALL_API_TIMEOUT_MS, businessId: displayedBusinessId });
             // A refetch can replace an appended page while this request is pending.
             if (!scopeIsCurrent() || queryClient.getQueryData<MyLeadsPage>(leadQueryKey)?.page !== currentPage.page) return false;
@@ -558,8 +575,8 @@ export default function Leads() {
             setHasMoreLeads(nextLeadPage.hasMore);
             leadFetchRetryAtRef.current = 0;
             return true;
-        } catch {
-            if (scopeIsCurrent()) {
+        } catch (error) {
+            if (scopeIsCurrent() && !isCancelledError(error)) {
                 leadFetchRetryAtRef.current = Date.now() + 5_000;
                 showToast({ tone: "error", message: "Could not load more leads. Please try again." });
             }
@@ -570,10 +587,10 @@ export default function Leads() {
                 setIsFetchingMoreLeads(false);
             }
         }
-    }, [employeeId, displayedBusinessId, leadPagingScope, hasMoreLeads, employeeLeadNames, requestedEmployeeLeadTab, effectiveLeadSearch, isGlobalLeadSearchActive, leadStateFilter, queryClient, leadQueryKey, showToast, isDefaultCallingView]);
+    }, [employeeId, displayedBusinessId, leadPagingScope, hasMoreLeads, employeeLeadNames, requestedEmployeeLeadTab, effectiveLeadSearch, isGlobalLeadSearchActive, leadStateFilter, queryClient, leadQueryKey, showToast, isEmployeeLeadWorkspaceView, readLeadPages]);
 
     const [previousLeadPagingScope1, setPreviousLeadPagingScope1] = useState<readonly unknown[] | null>(null);
-    const leadPagingScope1Inputs = [employeeId, employeeLeadNameKey, effectiveLeadSearch, isGlobalLeadSearchActive, leadStateFilter, requestedEmployeeLeadTab];
+    const leadPagingScope1Inputs = [employeeId, employeeLeadNameKey, effectiveLeadSearch, isGlobalLeadSearchActive, leadStateFilter, requestedEmployeeLeadTab, displayedBusinessId];
     if (previousLeadPagingScope1 === null || leadPagingScope1Inputs.some((input, index) => !Object.is(input, previousLeadPagingScope1[index]))) {
         setPreviousLeadPagingScope1(leadPagingScope1Inputs);
         setLeadPage(1);
@@ -583,7 +600,7 @@ export default function Leads() {
         leadPageRef.current = 1;
         leadFetchInFlightRef.current = false;
         leadFetchRetryAtRef.current = 0;
-    }, [employeeId, employeeLeadNameKey, effectiveLeadSearch, isGlobalLeadSearchActive, leadStateFilter, requestedEmployeeLeadTab]);
+    }, [employeeId, employeeLeadNameKey, effectiveLeadSearch, isGlobalLeadSearchActive, leadStateFilter, requestedEmployeeLeadTab, displayedBusinessId]);
 
     const [previousLeadStateSelection, setPreviousLeadStateSelection] = useState<readonly unknown[] | null>(null);
     const leadStateSelectionInputs = [leadStateFilter, leadStateOptions];
@@ -696,6 +713,9 @@ export default function Leads() {
                 : false;
             const queueHasLead = Boolean(changedLeadId && queryClient.getQueryData<MyLeadsPage>(callingQueueKey({ employeeId, businessId: displayedBusinessId }))?.leads.some(lead => lead._id === changedLeadId));
             const isAssignedHere = Boolean(changedLead && leadBelongsToEmployee(changedLead, String(employeeId), [...employeeLeadNames]));
+            if (changedLeadId && isAssignedHere && leadDetailReadGuard.ownedAgain(changedLeadId, changedLead?.assignmentRevision || 0)) {
+                refreshLeadDetailAccess(value => value + 1);
+            }
 
             if (payload.action === "call-outcome-classified" && changedLeadId) {
                 void queryClient.invalidateQueries({ queryKey: ["lead-call-stat", changedLeadId] });
@@ -742,7 +762,7 @@ export default function Leads() {
             socket.off("lead-call-stat:updated", handleLeadCallStatUpdated);
             socket.off("connect", refresh);
         };
-    }, [employeeId, employeeLeadNames, leadQueryKey, leadStateFilter, queryClient, displayedBusinessId]);
+    }, [employeeId, employeeLeadNames, leadQueryKey, leadStateFilter, queryClient, displayedBusinessId, leadDetailReadGuard]);
 
     const createEmployeeOwnedLeadInput = (lead: LeadInput): LeadInput => ({
         ...lead,
@@ -794,7 +814,14 @@ export default function Leads() {
     });
 
     const recordCallMutation = useMutation({
-        mutationFn: (id: string) => recordLeadCall(id, { activityActorName: employeeName, activityActorType: "employee" }, { businessId: displayedBusinessId, employeeSession: authUser?.attendanceHubSession || undefined }),
+        mutationFn: async (lead: Lead) => {
+            const phone = normalizePhoneForCall(lead.phone);
+            if (!phone) throw new Error("This lead does not have a valid calling number");
+            const confirmed = await callLeadThroughBridge(callingScope, lead._id, phone);
+            startAutoCallPendingComment(`${displayedBusinessId}:${confirmed.employeeCode}`, lead._id, getEmployeeCommentMarker(lead.comments));
+            return recordLeadCall(lead._id, { activityActorName: employeeName, activityActorType: "employee", callOutcome: "confirmed" },
+                { businessId: displayedBusinessId, employeeSession: authUser?.attendanceHubSession || undefined });
+        },
         onMutate: () => ({ scope: callingScope }),
         onSuccess: async (updatedLead, _variables, context) => {
             if (getActiveBusinessId() !== context.scope.businessId) { await synchronizeSavedLead(updatedLead, context.scope); return; }
@@ -802,6 +829,7 @@ export default function Leads() {
             await synchronizeSavedLead(updatedLead, context.scope);
             invalidateEmployeeLeads();
         },
+        onError: (error) => reportRequestError(error, error instanceof Error ? error.message : "The call could not be confirmed"),
     });
 
     const updateDetailsMutation = useMutation({
@@ -939,6 +967,15 @@ export default function Leads() {
     });
 
     const passLeadMutation = useMutation({
+        onMutate: async ({ lead, businessId, employeeSession }: { lead: Lead; agent: Employee; businessId: string; employeeSession?: string }) => {
+            if (!leadDetailReadGuard.matchesScope(businessId, employeeSession)) throw new Error("Your lead workspace changed. Reopen the lead before reassigning.");
+            // Ownership changes before route cleanup commits. Keep the old detail
+            // observer from recreating a read after the successful handoff.
+            const ticket = leadDetailReadGuard.block(lead._id, lead.assignmentRevision || 0);
+            refreshLeadDetailAccess(value => value + 1);
+            await queryClient.cancelQueries({ queryKey: ["lead", businessId, lead._id], exact: true });
+            return { guard: leadDetailReadGuard, ticket };
+        },
         mutationFn: ({ lead, agent, businessId, employeeSession }: { lead: Lead; agent: Employee; businessId: string; employeeSession?: string }) =>
             assignLead(
                 lead._id,
@@ -966,7 +1003,10 @@ export default function Leads() {
             invalidateEmployeeLeads();
             showToast({ tone: "success", message: `Lead reassigned to ${updatedLead.assignedAgent?.name || updatedLead.assignedAgentName}.` });
         },
-        onError: (error) => {
+        onError: (error, _variables, context) => {
+            if (context?.guard.restore(context.ticket)) {
+                refreshLeadDetailAccess(value => value + 1);
+            }
             reportRequestError(error, "Could not reassign the lead.");
             invalidateEmployeeLeads();
         },
@@ -988,21 +1028,25 @@ export default function Leads() {
             if (archived.has(nextSearch.get("lead") || "")) { nextSearch.delete("lead"); setSearchParams(nextSearch, { replace: true }); }
             invalidateEmployeeLeads();
         } });
-    const editingMessage = activeLeadAction || addCommentMutation.isPending || bulkSelection.pending ? "Saving lead changes"
-        : bulkSelection.confirming ? "Confirming archive"
-        : commentDraft.trim() || isDetailEditing || scheduleDirty || (selectedLead && statusDraft !== selectedLead.status) ? "Unsaved lead changes" : "";
+    const editingMessage = activeLeadAction || addCommentMutation.isPending || bulkSelection.pending ? "Saving lead changes" : "";
+    const draftMessage = commentDraft.trim() || isDetailEditing || scheduleDirty || (selectedLead && statusDraft !== selectedLead.status) ||
+        bulkSelection.confirming || callLoggerConfirmAction || passConfirm || isLeadModalOpen ? "Unsaved lead changes" : "";
     useLayoutEffect(() => {
         setCallingWork({ employeeId, businessId: displayedBusinessId }, callingWorkOwner.current, editingMessage);
-    }, [employeeId, displayedBusinessId, editingMessage]);
+        setCallingDraft({ employeeId, businessId: displayedBusinessId }, callingWorkOwner.current, draftMessage);
+    }, [employeeId, displayedBusinessId, editingMessage, draftMessage]);
     useEffect(() => {
-        if (!editingMessage) return;
+        if (!editingMessage && !draftMessage) return;
         const protectDraft = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = ""; };
         window.addEventListener("beforeunload", protectDraft);
         return () => window.removeEventListener("beforeunload", protectDraft);
-    }, [editingMessage]);
+    }, [editingMessage, draftMessage]);
     useLayoutEffect(() => {
         const owner = callingWorkOwner.current;
-        return () => setCallingWork({ employeeId, businessId: displayedBusinessId }, owner, "");
+        return () => {
+            setCallingWork({ employeeId, businessId: displayedBusinessId }, owner, "");
+            setCallingDraft({ employeeId, businessId: displayedBusinessId }, owner, "");
+        };
     }, [employeeId, displayedBusinessId]);
 
     const startCommentSave = (leadId: string, body: string) => {
@@ -1030,7 +1074,8 @@ export default function Leads() {
     const runLeadActionAfterComment = async (
         leadId: string,
         actionName: LeadActionName,
-        action: () => Promise<unknown>
+        action: () => Promise<unknown>,
+        saveDraft = true
     ) => {
         if (leadActionPendingRef.current) {
             return;
@@ -1052,11 +1097,12 @@ export default function Leads() {
             }
 
             const unsavedComment = selectedLead?._id === leadId ? commentDraft.trim() : "";
-            if (unsavedComment && unsavedComment !== savedCommentBody) {
+            if (saveDraft && unsavedComment && unsavedComment !== savedCommentBody) {
                 await startCommentSave(leadId, unsavedComment);
             }
 
-            if (getActiveBusinessId() !== callingScope.businessId || getAuthUser()?.user.employeeCode !== employeeCode) return;
+            if (getActiveBusinessId() !== callingScope.businessId || getAuthUser()?.user.employeeCode !== employeeCode ||
+                getAuthUser()?.attendanceHubSession !== authUser?.attendanceHubSession) return;
             const save = action();
             trackCallingSave(callingScope, save);
             await save;
@@ -1075,7 +1121,7 @@ export default function Leads() {
         (() => {
             setDetailDraft(createLeadDetailDraft(selectedLead));
             setIsDetailEditing(false);
-            const retained = getLeadNoteDraft(callingScope);
+            const retained = selectedLead ? getLeadNoteDraft(callingScope, selectedLead._id) : null;
             setCommentDraft(retained && retained.lead._id === selectedLead?._id ? retained.body : "");
             setPassAgentId("");
             setPassConfirm(null);
@@ -1203,7 +1249,7 @@ export default function Leads() {
     if (previousLeadPageAvailability === null || leadPageAvailabilityInputs.some((input, index) => !Object.is(input, previousLeadPageAvailability[index]))) {
         setPreviousLeadPageAvailability(leadPageAvailabilityInputs);
         (() => {
-            if (!isLoading && leadPage === 1) {
+            if (!isLoading) {
                 setHasMoreLeads(Boolean(leadPageData?.hasMore));
             }
         })();
@@ -1509,8 +1555,6 @@ export default function Leads() {
     //     return selectedLeadCallLogs.some((log) => isSameLocalDay(log.calledAt));
     // }, [selectedLeadCallLogs]);
 
-    const [callLoggerConfirmAction, setCallLoggerConfirmAction] =
-        useState<CallLoggerConfirmAction | null>(null);
 
     const latestSelectedLeadCallLog = useMemo(() => {
         return [...selectedLeadCallLogs].sort((first, second) => {
@@ -1523,25 +1567,25 @@ export default function Leads() {
 
     const handleCallStatSuccess = async (
         callStat: Awaited<ReturnType<typeof logConnectedLeadCall>>,
-        fallbackLeadId: string,
+        input: CallOutcomeInput,
         successMessage: string
     ) => {
-        showToast({
-            tone: "success",
-            message: successMessage,
-        });
-
         const statLeadId =
             typeof callStat.lead === "string"
                 ? callStat.lead
                 : callStat.lead?._id;
 
-        const leadIdToUpdate = statLeadId || fallbackLeadId;
-        clearAutoCallPendingComment(`${displayedBusinessId}:${employeeCode}`, leadIdToUpdate);
+        const leadIdToUpdate = statLeadId || input.leadId;
+        const savedScope = { businessId: input.businessId, employeeId: input.employeeId };
+        clearAutoCallPendingComment(`${input.businessId}:${input.employeeCode}`, leadIdToUpdate);
+        void queryClient.invalidateQueries({ queryKey: callingQueueKey(savedScope) });
+        void queryClient.invalidateQueries({ queryKey: ["lead", input.businessId, leadIdToUpdate] });
+        if (getActiveBusinessId() !== input.businessId || getAuthUser()?.attendanceHubSession !== input.employeeSession) return;
+        showToast({ tone: "success", message: successMessage });
 
         queryClient.setQueryData(["lead-call-stat", leadIdToUpdate], callStat);
 
-        await Promise.all([
+        void Promise.all([
             queryClient.invalidateQueries({
                 queryKey: ["lead-call-stat", leadIdToUpdate],
             }),
@@ -1560,7 +1604,7 @@ export default function Leads() {
                 queryKey: ["agent-lead-dashboard"],
                 exact: false,
             }),
-        ]);
+        ]).catch(() => undefined);
     };
 
     const handleCallStatError = (error: unknown) => {
@@ -1579,18 +1623,12 @@ export default function Leads() {
     };
 
     const logConnectedCallMutation = useMutation({
-        mutationFn: ({
-            leadId,
-            employeeId,
-        }: {
-            leadId: string;
-            employeeId: string;
-        }) => logConnectedLeadCall(leadId, employeeId),
+        mutationFn: (input: CallOutcomeInput) => logConnectedLeadCall(input.leadId, input.employeeId, input),
 
         onSuccess: async (callStat, variables) => {
             await handleCallStatSuccess(
                 callStat,
-                variables.leadId,
+                variables,
                 "Connected logged."
             );
         },
@@ -1599,18 +1637,12 @@ export default function Leads() {
     });
 
     const logNotConnectedMutation = useMutation({
-        mutationFn: ({
-            leadId,
-            employeeId,
-        }: {
-            leadId: string;
-            employeeId: string;
-        }) => logLeadNotConnected(leadId, employeeId),
+        mutationFn: (input: CallOutcomeInput) => logLeadNotConnected(input.leadId, input.employeeId, input),
 
         onSuccess: async (callStat, variables) => {
             await handleCallStatSuccess(
                 callStat,
-                variables.leadId,
+                variables,
                 "Not connected logged."
             );
         },
@@ -1619,18 +1651,12 @@ export default function Leads() {
     });
 
     const logVoicemailMutation = useMutation({
-        mutationFn: ({
-            leadId,
-            employeeId,
-        }: {
-            leadId: string;
-            employeeId: string;
-        }) => logLeadVoicemail(leadId, employeeId),
+        mutationFn: (input: CallOutcomeInput) => logLeadVoicemail(input.leadId, input.employeeId, input),
 
         onSuccess: async (callStat, variables) => {
             await handleCallStatSuccess(
                 callStat,
-                variables.leadId,
+                variables,
                 "Voicemail logged."
             );
         },
@@ -1753,10 +1779,12 @@ export default function Leads() {
             return;
         }
 
-        logConnectedCallMutation.mutate({
+        const leadId = selectedLead._id;
+        void runLeadActionAfterComment(leadId, "outcome", () => logConnectedCallMutation.mutateAsync({
             leadId: selectedLead._id,
             employeeId: currentEmployeeId,
-        });
+            employeeCode, businessId: displayedBusinessId, employeeSession: authUser?.attendanceHubSession || "",
+        }), false);
     };
 
     const handleLogNotConnected = () => {
@@ -1782,10 +1810,12 @@ export default function Leads() {
             return;
         }
 
-        logNotConnectedMutation.mutate({
+        const leadId = selectedLead._id;
+        void runLeadActionAfterComment(leadId, "outcome", () => logNotConnectedMutation.mutateAsync({
             leadId: selectedLead._id,
             employeeId: currentEmployeeId,
-        });
+            employeeCode, businessId: displayedBusinessId, employeeSession: authUser?.attendanceHubSession || "",
+        }), false);
     };
 
     const handleLogVoicemail = () => {
@@ -1811,10 +1841,12 @@ export default function Leads() {
             return;
         }
 
-        logVoicemailMutation.mutate({
+        const leadId = selectedLead._id;
+        void runLeadActionAfterComment(leadId, "outcome", () => logVoicemailMutation.mutateAsync({
             leadId: selectedLead._id,
             employeeId: currentEmployeeId,
-        });
+            employeeCode, businessId: displayedBusinessId, employeeSession: authUser?.attendanceHubSession || "",
+        }), false);
     };
 
 
@@ -1824,9 +1856,9 @@ export default function Leads() {
                 {isSalesRole(String(authUser?.user.role || ""), String(employeeTeam || "")) && <div className="mb-3 flex min-h-12 flex-wrap items-center justify-between gap-2 border-b border-white/15 pb-3 text-sm" role="status" aria-live="polite">
                     <div className="min-w-0">
                         <span className="font-semibold">Next auto-call: </span>
-                        <span>{authoritativeQueue?.nextLead ? authoritativeQueue.nextLead.leadName || authoritativeQueue.nextLead.businessName : callingQueueQuery.isError ? "Queue refresh failed" : callingQueueQuery.isLoading ? "Loading queue" : authoritativeQueue?.waitReason === "REFRESHING_QUEUE" ? "Updating queue" : "No eligible assigned leads"}</span>
+                        <span>{authoritativeQueue?.nextLead ? authoritativeQueue.nextLead.leadName || authoritativeQueue.nextLead.businessName : authoritativeQueue ? "No eligible assigned leads" : "--"}</span>
                         {authoritativeQueue?.nextReason && <span className="ml-2 text-xs opacity-70">{authoritativeQueue.nextReason === "SCHEDULED_DUE" ? "Scheduled follow-up due" : authoritativeQueue.nextReason === "NEW" ? "NEW lead" : "Follow-up available"}</span>}
-                        <p className="mt-1 text-xs opacity-70">{editingMessage || (callingQueueQuery.isError ? "Queue refresh failed. Retrying" : autoCallStatus)}</p>
+                        <CallingStatus scope={callingScope} hold={editingMessage} queueError={callingQueueQuery.isError} />
                     </div>
                     {authoritativeQueue?.nextLeadId && <button type="button" className="flex h-8 shrink-0 items-center gap-2 rounded-md border border-white/20 px-3 text-xs disabled:opacity-40" disabled={Boolean(editingMessage)} onClick={() => selectLead(authoritativeQueue.nextLeadId!)}><FiPhone aria-hidden="true" />View next lead</button>}
                 </div>}
@@ -1970,7 +2002,7 @@ export default function Leads() {
                             )}
                             {filteredLeads.map((lead) => {
                                 const isFavorite = isLeadFavorite(lead, employeeId);
-                                const decision = leadPageData?.callingQueue?.entries.find(entry => entry.leadId === lead._id);
+                                const decision = authoritativeQueue?.entries.find(entry => entry.leadId === lead._id);
                                 const isNext = authoritativeQueue?.nextLeadId === lead._id;
 
                                 return (
@@ -2189,26 +2221,17 @@ export default function Leads() {
                                                         </button>
                                                     </>
                                                 )}
-                                                <a
-                                                    className="flex size-9 items-center justify-center rounded-lg border border-white/10 bg-white/[0.06] text-white/70 transition hover:bg-white/10 hover:text-white"
-                                                    href={getPhoneCallUrl(selectedLead.phone)}
-                                                    onClick={() => {
-                                                        if (selectedLead.phone) {
-                                                            if (selectedLead.status === "Follow up") {
-                                                                startAutoCallPendingComment(
-                                                                    `${displayedBusinessId}:${employeeCode}`,
-                                                                    selectedLead._id,
-                                                                    getEmployeeCommentMarker(selectedLead.comments)
-                                                                );
-                                                            }
-                                                            recordCallMutation.mutate(selectedLead._id);
-                                                        }
-                                                    }}
-                                                    aria-label="Call lead"
-                                                    title="Call lead"
+                                                <button
+                                                    type="button"
+                                                    className="flex size-9 items-center justify-center rounded-lg border border-white/10 bg-white/[0.06] text-white/70 transition hover:bg-white/10 hover:text-white disabled:opacity-50"
+                                                    disabled={recordCallMutation.isPending || !normalizePhoneForCall(selectedLead.phone)}
+                                                    onClick={() => recordCallMutation.mutate(selectedLead)}
+                                                    aria-busy={recordCallMutation.isPending}
+                                                    aria-label={recordCallMutation.isPending ? "Waiting for Nextiva" : "Call lead"}
+                                                    title={recordCallMutation.isPending ? "Waiting for Nextiva" : normalizePhoneForCall(selectedLead.phone) ? "Call lead" : "No valid phone number"}
                                                 >
-                                                    <FiPhone className="size-4" aria-hidden="true" />
-                                                </a>
+                                                    {recordCallMutation.isPending ? <FiLoader className="size-4 motion-safe:animate-spin" aria-hidden="true" /> : <FiPhone className="size-4" aria-hidden="true" />}
+                                                </button>
                                                 <a
                                                     className="flex size-9 items-center justify-center rounded-lg border border-white/10 bg-white/[0.06] text-white/70 transition hover:bg-white/10 hover:text-white"
                                                     href={`mailto:${selectedLead.email}`}

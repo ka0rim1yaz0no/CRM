@@ -7,7 +7,7 @@ export type LegacyAttendanceRow = { id: string; source: string; at: string; crea
   eventId?: string; archived: boolean; reversed: boolean };
 export type LegacyAttendanceReplica = { businessId: string; employeeId: string | null; records: LegacyAttendanceRow[] };
 export type LegacyAdoptionPolicy = { shiftStart: string; shiftEnd: string; recoveryTime: string };
-const sources = new Set(["Login", "Logout", "Time In", "Time Out", "Break Out", "Break In", "Lunch Break Out", "Lunch Break In", "Off the Phone Out", "Non-Billable Off the Phone Out", "Off the Phone In"]);
+const sources = new Set(["Login", "Logout", "Time In", "Time Out", "Break Out", "Break In", "Lunch Break Out", "Lunch Break In", "Off the Phone Out", "Non-Billable Off the Phone Out", "Off the Phone In", "Coaching Out", "Coaching In"]);
 const digest = (value: unknown) => crypto.createHash("sha256").update(JSON.stringify(value)).digest("hex");
 
 export function prepareLegacyAttendanceAdoption(identityKey: string, replicas: LegacyAttendanceReplica[], policy: LegacyAdoptionPolicy) {

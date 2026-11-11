@@ -5,10 +5,10 @@ import { attendanceDurationModelEnabled, attendanceAccuracyFixesEnabled } from "
 
 type Policy = { shiftStart: string; shiftEnd: string; graceMinutes: number; breakMinutes: number; lunchMinutes: number };
 
-export function attendanceDashboardPresentation(snapshot: { records: SessionEvent[];
-  sessions: Array<{ shift: AssignedShift | null; events: SessionEvent[]; lifecycle?: string; endedAt?: string | null }> }, policy: Policy, now: Date) {
-  const settings: HubSettings = { officialShiftStartTime: policy.shiftStart, officialShiftEndTime: policy.shiftEnd,
-    lateGraceMinutes: policy.graceMinutes, breakMinutes: policy.breakMinutes, lunchMinutes: policy.lunchMinutes, attendanceTimeZone: "Asia/Manila" };
+type AttendanceReadSnapshot = { records: SessionEvent[];
+  sessions: Array<{ shift: AssignedShift | null; events: SessionEvent[]; lifecycle?: string; endedAt?: string | null }> };
+
+export function groupAttendanceByShiftDay(snapshot: AttendanceReadSnapshot, settings: HubSettings) {
   const assigned = new Map(snapshot.sessions.flatMap((session) => session.events.map((event) => [event.id, session.shift?.dayKey] as const)));
   const grouped = new Map<string, SessionEvent[]>();
   for (const event of snapshot.records) {
@@ -17,6 +17,13 @@ export function attendanceDashboardPresentation(snapshot: { records: SessionEven
     events.push(event);
     grouped.set(day, events);
   }
+  return grouped;
+}
+
+export function attendanceDashboardPresentation(snapshot: AttendanceReadSnapshot, policy: Policy, now: Date) {
+  const settings: HubSettings = { officialShiftStartTime: policy.shiftStart, officialShiftEndTime: policy.shiftEnd,
+    lateGraceMinutes: policy.graceMinutes, breakMinutes: policy.breakMinutes, lunchMinutes: policy.lunchMinutes, attendanceTimeZone: "Asia/Manila" };
+  const grouped = groupAttendanceByShiftDay(snapshot, settings);
   const dashboardDays = [...grouped].map(([dayKey, events]) => {
     const closingBoundaries = snapshot.sessions.filter(session => session.shift?.dayKey === dayKey && session.lifecycle === "system-closed" && session.endedAt).map(session => new Date(session.endedAt!));
     const day = calculateHubDay(dayKey, events.map((event) => ({ ...event, at: new Date(event.at) })), settings, now, false, closingBoundaries);
@@ -38,6 +45,7 @@ export function attendanceDashboardPresentation(snapshot: { records: SessionEven
     }));
     return { dayKey, shiftStart: day.shiftStart, shiftEnd: day.shiftEnd, eventIds: records.map((event) => event.id),
       timeIn: day.timeIn, timeOut: day.timeOut, milliseconds: day.milliseconds, overBreakRows,
+      ...(day.coachingMs === undefined ? {} : { coachingMs: day.coachingMs }),
       breakMinutes: day.breakMinutes, lunchMinutes: day.lunchMinutes };
   }).sort((a, b) => a.dayKey.localeCompare(b.dayKey));
   return { dashboardDays, currentShiftDay: hubDayKey(now, settings) };

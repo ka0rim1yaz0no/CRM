@@ -256,11 +256,12 @@ test("earlier Add Time Out replaces later actions in one session, and Undo resto
             ["Break In", "2026-10-21T16:20:00Z"], ["Lunch Break Out", "2026-10-21T18:00:00Z"], ["Lunch Break In", "2026-10-21T19:01:00Z"],
             ["Non-Billable Off the Phone Out", "2026-10-21T20:00:00Z"], ["Off the Phone In", "2026-10-21T20:05:01Z"],
             ["Time In", "2026-10-22T15:00:00Z"], ["Break Out", "2026-10-22T17:00:00Z"]]);
+        const canonicalPayment = { grossPay: 15000, deductions: 50, netPay: 14950, status: "Paid" as const, paidOn: "Oct 22, 2026" };
         const originalSaved: unknown[] = [];
         for (let index = 0; index < 6; index++) originalSaved.push(await runWithBusiness(businesses[index], async () => {
             const payPeriod = (await employeePayments(data.code)).currentPayPeriod;
             await PayrollRecord.create({ employeeId: data.code, employeeName: "Synthetic Missing Checkout", department: "Fixture", payType: "Semi-monthly",
-                payPeriod, grossPay: 15000, deductions: 50, netPay: 14950, status: index % 2 ? "Paid" : "Pending", paidOn: index % 2 ? "Oct 22, 2026" : "-" });
+                payPeriod, ...canonicalPayment, ...(index % 2 ? { status: "Pending", paidOn: "-" } : {}) });
             return PayrollRecord.findOne({ employeeId: data.code }).lean();
         }));
         const before = await (await data.request(0, data.endpoint(0, "session"))).json();
@@ -294,8 +295,10 @@ test("earlier Add Time Out replaces later actions in one session, and Undo resto
                 await runWithBusiness(businesses[index], async () => {
                     assert.deepEqual(await PayrollRecord.findOne({ employeeId: data.code }).lean(), originalSaved[index]);
                     const payments = await employeePayments(data.code);
+                    assert.equal(payments.business.id, businesses[index]);
                     assert.equal(payments.items.length, 1);
-                    assert.deepEqual([payments.items[0].grossPay, payments.items[0].deductions, payments.items[0].netPay, payments.items[0].status], [15000, 50, 14950, index % 2 ? "Paid" : "Pending"]);
+                    const { grossPay, deductions, netPay, status, paidOn } = payments.items[0];
+                    assert.deepEqual({ grossPay, deductions, netPay, status, paidOn }, canonicalPayment);
                     assert.equal((await Employee.findById(data.people[index]._id).lean())?.availabilityStatus, "BREAK");
                 });
             }

@@ -1,4 +1,5 @@
-export const POST_CALL_WAIT_MS = 30_000;
+import { POST_CALL_WAIT_MS } from "../../../shared/callTimingPolicy";
+export { POST_CALL_WAIT_MS };
 export const IDLE_CONFIRMATION_MS = 8_000;
 export const HEARTBEAT_INTERVAL_MS = 5_000;
 
@@ -15,23 +16,37 @@ export function confirmedCallEnd(firstIdleAt: Date, now: Date) {
 // An unconfirmed dial has no observed call end. Give it one 30-second window
 // from dial start; expiration and release do not stack extra delays.
 export function unconfirmedDialRetryAt(dialStartedAt: Date) {
-  return new Date(dialStartedAt.getTime() + POST_CALL_WAIT_MS);
+  return new Date(dialStartedAt.getTime() + 30_000);
 }
 
 export function hasUnconfirmedCall(schedule: { lastCallStartedAt?: Date | null; lastCallEndedAt?: Date | null }) {
   return Boolean(schedule.lastCallStartedAt && (!schedule.lastCallEndedAt || schedule.lastCallStartedAt > schedule.lastCallEndedAt));
 }
 
-export function canReserveCall(now: Date, schedule: {
+type CallSchedule = {
   callLeaseUntil?: Date | null;
   nextCallAllowedAt?: Date | null;
   dialIntentUntil?: Date | null;
   lastCallStartedAt?: Date | null;
   lastCallEndedAt?: Date | null;
-}, bridge?: { state: string; nextivaProcessDetected: boolean; fresh: boolean }) {
+  lastDialStartedAt?: Date | null;
+};
+
+export function isConfirmedPostCallWait(schedule: CallSchedule | null | undefined) {
+  if (!schedule?.lastCallEndedAt) return false;
+  const endedAt = schedule.lastCallEndedAt;
+  return schedule.nextCallAllowedAt?.getTime() === +endedAt + POST_CALL_WAIT_MS &&
+    (!schedule.lastDialStartedAt || schedule.lastDialStartedAt <= endedAt);
+}
+
+export function canReserveCall(now: Date, schedule: CallSchedule, bridge?: { state: string; nextivaProcessDetected: boolean; fresh: boolean }) {
   return (!schedule.callLeaseUntil || schedule.callLeaseUntil <= now) &&
     (!schedule.nextCallAllowedAt || schedule.nextCallAllowedAt <= now) &&
     (!schedule.dialIntentUntil || schedule.dialIntentUntil <= now) &&
     !hasUnconfirmedCall(schedule) &&
     (!bridge || (bridge.fresh && bridge.state === "idle" && bridge.nextivaProcessDetected));
+}
+
+export function canReserveManualCall(now: Date, schedule: CallSchedule) {
+  return canReserveCall(now, isConfirmedPostCallWait(schedule) ? { ...schedule, nextCallAllowedAt: null } : schedule);
 }

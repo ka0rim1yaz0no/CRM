@@ -217,6 +217,10 @@ export default function Settings() {
             return { label: "Configuration required", detail: "Refresh or contact an administrator to enable the approved call timing configuration.", ready: false };
         }
 
+        if (bridgeStatus?.autoCallDisabled) {
+            return { label: "Paused", detail: bridgeStatus.reason, ready: false };
+        }
+
         if (!bridgeStatus?.connected) {
             return {
                 label: "Not connected",
@@ -250,7 +254,7 @@ export default function Settings() {
         if (callTimingV2Enabled && bridgeStatus.nextCallAllowedAt && bridgeStatus.serverTime) {
             const secondsLeft = Math.max(0, Math.ceil((new Date(bridgeStatus.nextCallAllowedAt).getTime() - estimatedServerNow) / 1_000));
             if (secondsLeft > 0) {
-                return { label: bridgeStatus.waitCode === "DIAL_RETRY_WAIT" ? `Retry eligible in ${secondsLeft}s` : `Next call in ${secondsLeft}s`,
+                return { label: "Call Waiting",
                     detail: bridgeStatus.waitCode === "DIAL_RETRY_WAIT" ? "Waiting for the server's unconfirmed-attempt retry deadline." : "Waiting for the server's confirmed call-end deadline.", ready: false };
             }
         }

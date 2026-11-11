@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { FiPhoneCall } from "react-icons/fi";
-import { getCallDashboard, type CallDashboardRow } from "../api/callDashboard";
+import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
+import { FiAlertTriangle, FiPhoneCall } from "react-icons/fi";
+import { getCallDashboard, getOfflineClockEvidence, type CallDashboardRow } from "../api/callDashboard";
 import { socket } from "../lib/socket";
 import { formatPhDate, formatPhTime } from "../lib/dateTime";
 
@@ -17,8 +17,7 @@ function duration(milliseconds: number) {
 
 function statusClasses(status: CallDashboardRow["status"] | "UNVERIFIED") {
     if (status === "ON CALL") return "border-emerald-200 bg-emerald-50 text-emerald-800";
-    if (status === "ONLINE") return "border-green-200 bg-green-50 text-green-800";
-    if (status === "READY") return "border-green-200 bg-green-50 text-green-800";
+    if (status === "ONLINE" || status === "READY" || status === "UNVERIFIED") return "border-sky-200 bg-sky-50 text-sky-800";
     if (status === "CALL WAITING") return "border-sky-200 bg-sky-50 text-sky-800";
     if (status === "OFF THE PHONE") return "border-amber-200 bg-amber-50 text-amber-800";
     if (status === "BREAK") return "border-orange-200 bg-orange-50 text-orange-800";
@@ -36,6 +35,20 @@ function visibleStatus(row: CallDashboardRow, now: number, shiftStart: number, s
         (typeof row.heartbeatAgeMs === "number" && row.heartbeatAgeMs + snapshotAge > 20_000))) {
         return { status: "UNVERIFIED" as const, startedAt: 0, detail: "Call status needs a fresh bridge confirmation. Refreshing." };
     }
+    if (dashboardV2 && row.status === "UNVERIFIED") {
+        return { status: row.status, startedAt: 0, detail: "Call status unavailable. Waiting for fresh Call Bridge confirmation." };
+    }
+    if (dashboardV2 && ["ONLINE", "READY", "CALL WAITING"].includes(row.status) && (row.callStateAvailable === false ||
+        row.bridgeHealth && row.bridgeHealth !== "fresh")) {
+        return { status: "UNVERIFIED" as const, startedAt: 0, detail: "Call Bridge state is unavailable. New calls remain blocked." };
+    }
+    if (["ONLINE", "READY", "CALL WAITING"].includes(row.status)) return {
+        status: "CALL WAITING" as const,
+        startedAt: now < shiftStart || now >= shiftEnd ? 0 : row.waitingStartedAt === undefined ? row.statusStartedAt ? Date.parse(row.statusStartedAt) : 0
+            : row.waitingStartedAt ? Date.parse(row.waitingStartedAt) : 0,
+        detail: row.status === "CALL WAITING" && row.transitionUntil && Date.parse(row.transitionUntil) > now
+            ? `Next call in ${Math.max(0, Math.ceil((Date.parse(row.transitionUntil) - now) / 1000))}s` : row.detail,
+    };
     if (dashboardV2) return {
         status: row.status,
         startedAt: row.statusStartedAt ? new Date(row.statusStartedAt).getTime() : 0,
@@ -49,9 +62,9 @@ function visibleStatus(row: CallDashboardRow, now: number, shiftStart: number, s
     const deadline = row.transitionUntil ? new Date(row.transitionUntil).getTime() : 0;
     if (deadline && now >= deadline) {
         return {
-            status: row.status === "CALL WAITING" ? "ONLINE" as const : row.status,
-            startedAt: deadline,
-            detail: row.status === "CALL WAITING" ? "Ready to dial" : "Dial not confirmed",
+            status: row.status,
+            startedAt: row.statusStartedAt ? Date.parse(row.statusStartedAt) : 0,
+            detail: "Dial not confirmed",
         };
     }
     return {
@@ -61,6 +74,17 @@ function visibleStatus(row: CallDashboardRow, now: number, shiftStart: number, s
     };
 }
 
+function displayStatus(row: CallDashboardRow, status: CallDashboardRow["status"]) {
+    if (status === "UNVERIFIED" && ["OFFLINE", "BREAK", "LUNCH", "OFF THE PHONE"].includes(row.status)) return row.status;
+    return status === "UNVERIFIED" || status === "ONLINE" || status === "READY" ? "CALL WAITING" : status;
+}
+function statusLabel(row: CallDashboardRow, rawStatus: CallDashboardRow["status"]) {
+    const status = displayStatus(row, rawStatus);
+    if (status === "OFF THE PHONE" && row.offPhoneNonBillable) return "NON-BILLABLE OFF PHONE";
+    if (status === "OFF THE PHONE" && row.coachingActive) return "COACHING";
+    return status;
+}
+
 export default function CallDashboardPanel({ businessId, businessName }: { businessId: string; businessName?: string }) {
     const queryClient = useQueryClient();
     const lastDeadlineRefresh = useRef(0);
@@ -68,7 +92,7 @@ export default function CallDashboardPanel({ businessId, businessName }: { busin
     const { data, isLoading, isError } = useQuery({
         queryKey: ["admin-call-dashboard", businessId],
         queryFn: async () => {
-            const snapshot = { ...(await getCallDashboard()), receivedAt: performance.now() };
+            const snapshot = { ...(await getCallDashboard(businessId)), receivedAt: performance.now() };
             const previous = queryClient.getQueryData<typeof snapshot>(["admin-call-dashboard", businessId]);
             return previous && new Date(previous.generatedAt).getTime() > new Date(snapshot.generatedAt).getTime()
                 ? previous : snapshot;
@@ -77,6 +101,22 @@ export default function CallDashboardPanel({ businessId, businessName }: { busin
         refetchInterval: query => query.state.data?.employees.some(row => row.status === "ON CALL" || row.status === "CALL WAITING") ? 2_000 : 5_000,
         refetchOnWindowFocus: true,
     });
+    const serverNow = data ? new Date(data.serverTime || data.generatedAt).getTime() + Math.max(0, clock - data.receivedAt) : 0;
+    const shiftStart = data ? new Date(data.shift.start).getTime() : 0;
+    const shiftEnd = data ? new Date(data.shift.end).getTime() : 0;
+    const withinShift = serverNow >= shiftStart && serverNow < shiftEnd;
+    const missingOfflineClocks = withinShift ? data?.employees.filter(row => row.status === "OFFLINE" && !row.statusStartedAt && row.businessId === businessId) || [] : [];
+    const offlineClockReads = useQueries({ queries: missingOfflineClocks.map(row => ({
+        queryKey: ["admin-offline-clock", businessId, row.employeeId],
+        queryFn: ({ signal }: { signal: AbortSignal }) => getOfflineClockEvidence(row.employeeId, businessId, signal),
+        refetchInterval: 15_000,
+        refetchOnMount: "always" as const,
+        refetchOnWindowFocus: "always" as const,
+        staleTime: 0,
+        gcTime: 60_000,
+        retry: false,
+    })) });
+    const offlineClocks = new Map(missingOfflineClocks.map((row, index) => [row.employeeId, offlineClockReads[index]]));
 
     useEffect(() => {
         const interval = window.setInterval(() => setClock(performance.now()), 1_000);
@@ -104,7 +144,6 @@ export default function CallDashboardPanel({ businessId, businessName }: { busin
         };
     }, [businessId, queryClient]);
 
-    const serverNow = data ? new Date(data.serverTime || data.generatedAt).getTime() + Math.max(0, clock - data.receivedAt) : 0;
     const nextDeadline = dashboardV2 ? data?.employees.reduce((earliest, row) => {
         const deadline = row.transitionUntil ? new Date(row.transitionUntil).getTime() : 0;
         return deadline > 0 && (earliest === 0 || deadline < earliest) ? deadline : earliest;
@@ -115,34 +154,37 @@ export default function CallDashboardPanel({ businessId, businessName }: { busin
             void queryClient.invalidateQueries({ queryKey: ["admin-call-dashboard", businessId] });
         }
     }, [businessId, nextDeadline, serverNow, queryClient]);
-    const shiftStart = data ? new Date(data.shift.start).getTime() : 0;
-    const shiftEnd = data ? new Date(data.shift.end).getTime() : 0;
     const snapshotStale = Boolean(dashboardV2 && data && serverNow - new Date(data.generatedAt).getTime() > 45_000);
     const displayNow = snapshotStale && data
         ? new Date(data.serverTime || data.generatedAt).getTime() + 45_000 : serverNow;
     const rows = data?.employees.map((row) => ({ row, visible: visibleStatus(row, serverNow, shiftStart, shiftEnd, new Date(data.generatedAt).getTime()) })) || [];
+    const countStatus = (status: CallDashboardRow["status"]) => rows.filter(({ row, visible }) => displayStatus(row, visible.status) === status).length;
     const counts = {
-        onCall: rows.filter(({ visible }) => visible.status === "ON CALL").length,
-        online: rows.filter(({ visible }) => visible.status === "ONLINE").length,
-        ready: rows.filter(({ visible }) => visible.status === "READY").length,
-        waiting: rows.filter(({ visible }) => visible.status === "CALL WAITING").length,
-        away: rows.filter(({ visible }) => visible.status === "OFF THE PHONE").length,
-        break: rows.filter(({ visible }) => visible.status === "BREAK").length,
-        lunch: rows.filter(({ visible }) => visible.status === "LUNCH").length,
-        offline: rows.filter(({ visible }) => visible.status === "OFFLINE").length,
-        unverified: rows.filter(({ visible }) => visible.status === "UNVERIFIED").length,
+        onCall: countStatus("ON CALL"),
+        waiting: countStatus("CALL WAITING"),
+        away: countStatus("OFF THE PHONE"),
+        break: countStatus("BREAK"),
+        lunch: countStatus("LUNCH"),
+        offline: countStatus("OFFLINE"),
     };
     const displayRows = rows.map(({ row, visible }) => {
         const nonBillable = displayNow < shiftEnd && (row.offPhoneNonBillable || Boolean(row.offPhoneNonBillableFrom && displayNow >= Date.parse(row.offPhoneNonBillableFrom)));
         const startedAt = visible.status === "OFF THE PHONE" && nonBillable && row.offPhoneNonBillableFrom ? Date.parse(row.offPhoneNonBillableFrom) : visible.startedAt;
         const activeOffPhoneAt = row.offPhoneActiveStartedAt ? new Date(row.offPhoneActiveStartedAt).getTime() : 0;
         const offPhoneMs = row.offPhoneCompletedMs + (activeOffPhoneAt ? Math.max(0, Math.min(displayNow, shiftEnd) - activeOffPhoneAt) : 0);
+        const offlineRead = row.status === "OFFLINE" && !row.statusStartedAt ? offlineClocks.get(row.employeeId) : undefined;
+        const offlineEvidence = offlineRead && !offlineRead.isError ? offlineRead.data : undefined;
+        const recordedCheckout = visible.status === "OFFLINE" && offlineEvidence?.state === "recorded" &&
+            Date.parse(offlineEvidence.startedAt) <= displayNow ? Date.parse(offlineEvidence.startedAt) : 0;
+        const clockStartedAt = recordedCheckout || startedAt;
 
         return {
             row: { ...row, offPhoneNonBillable: nonBillable },
             visible,
-            statusTime: startedAt ? duration(Math.min(displayNow, shiftEnd) - Math.max(startedAt, shiftStart)) : "--:--:--",
-            statusTimeTitle: startedAt ? formatPhTime(new Date(startedAt)) : "No recorded status transition",
+            statusTime: !withinShift ? duration(0) : clockStartedAt ? duration(Math.min(displayNow, shiftEnd) - Math.max(clockStartedAt, shiftStart)) :
+                visible.status === "OFFLINE" ? offlineRead?.isPending ? "Checking" : offlineEvidence?.state === "not-recorded" ? "Not recorded" : "Unavailable" : "--:--:--",
+            statusTimeTitle: recordedCheckout ? `Recorded checkout: ${formatPhDate(new Date(recordedCheckout))} ${formatPhTime(new Date(recordedCheckout))}` :
+                startedAt ? formatPhTime(new Date(startedAt)) : "No confirmed status transition available",
             offPhoneTime: duration(offPhoneMs),
         };
     });
@@ -160,14 +202,11 @@ export default function CallDashboardPanel({ businessId, businessName }: { busin
                 </div>
                 {data && <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs font-medium text-slate-600">
                     <span><span className="mr-1 inline-block size-2 rounded-full bg-emerald-500" />{counts.onCall} on call</span>
-                    <span><span className="mr-1 inline-block size-2 rounded-full bg-green-500" />{counts.online} online</span>
                     <span><span className="mr-1 inline-block size-2 rounded-full bg-sky-500" />{counts.waiting} waiting</span>
-                    {dashboardV2 && <span><span className="mr-1 inline-block size-2 rounded-full bg-lime-500" />{counts.ready} ready</span>}
                     <span><span className="mr-1 inline-block size-2 rounded-full bg-amber-500" />{counts.away} off phone</span>
                     {dashboardV2 && <><span><span className="mr-1 inline-block size-2 rounded-full bg-orange-500" />{counts.break} break</span>
                     <span><span className="mr-1 inline-block size-2 rounded-full bg-violet-500" />{counts.lunch} lunch</span></>}
                     <span><span className="mr-1 inline-block size-2 rounded-full bg-slate-400" />{counts.offline} offline</span>
-                    {counts.unverified > 0 && <span>{counts.unverified} unverified</span>}
                 </div>}
             </div>
             {snapshotStale && <p className="border-b border-amber-200 bg-amber-50 px-4 py-2 text-xs text-amber-900" role="status">Call data is stale. Reconnecting to the server.</p>}
@@ -198,7 +237,7 @@ export default function CallDashboardPanel({ businessId, businessName }: { busin
                                     </div>
                                 </td>
                                 <td className="px-4 py-2.5">
-                                    <span title={visible.detail} className={`inline-flex rounded-md border px-2 py-1 text-xs font-semibold ${statusClasses(visible.status)}`}>{visible.status === "OFF THE PHONE" && row.offPhoneNonBillable ? "NON-BILLABLE OFF PHONE" : visible.status}</span>
+                                    <span title={visible.detail} className={`inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs font-semibold ${statusClasses(visible.status)}`}>{visible.status === "UNVERIFIED" && <FiAlertTriangle aria-label="Call state unavailable" />}{statusLabel(row, visible.status)}</span>
                                 </td>
                                 <td className="px-4 py-2.5 text-right font-mono text-sm tabular-nums" title={statusTimeTitle}>{statusTime}</td>
                                 <td className="px-4 py-2.5 text-right font-mono text-sm tabular-nums">{offPhoneTime}</td>
@@ -224,7 +263,8 @@ export default function CallDashboardPanel({ businessId, businessName }: { busin
                                 </div>
                             </div>
                             <span title={visible.detail} className={`inline-flex max-w-[9rem] shrink-0 rounded-md border px-2 py-1 text-xs font-semibold ${statusClasses(visible.status)}`}>
-                                {visible.status === "OFF THE PHONE" && row.offPhoneNonBillable ? "NON-BILLABLE OFF PHONE" : visible.status}
+                                {visible.status === "UNVERIFIED" && <FiAlertTriangle aria-label="Call state unavailable" className="mr-1 size-3 shrink-0" />}
+                                {statusLabel(row, visible.status)}
                             </span>
                         </div>
                         <dl className="mt-3 grid grid-cols-2 gap-3 rounded-md border border-slate-200 bg-slate-50 p-3">

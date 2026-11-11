@@ -29,13 +29,14 @@ function display(overrides = {}) {
 
 test("Settings distinguishes call-end cooldown, unconfirmed retry, unknown provider, attendance and due callbacks", () => {
     const idle = { connected: true, nextivaProcessDetected: true, state: "idle", ready: false, serverTime: new Date(base).toISOString(), nextCallAllowedAt: new Date(base + 30000).toISOString() };
-    assert.equal(display({ bridgeStatus: { ...idle, waitCode: "POST_CALL_COOLDOWN" } }).label, "Next call in 30s");
-    assert.equal(display({ bridgeStatus: { ...idle, waitCode: "DIAL_RETRY_WAIT" } }).label, "Retry eligible in 30s");
+    assert.equal(display({ bridgeStatus: { ...idle, waitCode: "POST_CALL_COOLDOWN" } }).label, "Call Waiting");
+    assert.equal(display({ bridgeStatus: { ...idle, waitCode: "DIAL_RETRY_WAIT" } }).label, "Call Waiting");
     assert.equal(display({ bridgeStatus: { ...idle, state: "unknown", reason: "Previous end unconfirmed" } }).label, "Waiting for confirmation");
     assert.equal(display({ bridgeStatus: { ...idle, state: "active" } }).label, "On a call");
     assert.equal(display({ bridgeStatus: { ...idle, state: "calling" } }).label, "Dial unconfirmed");
     assert.equal(display({ availabilityStatus: "OFFLINE", bridgeStatus: { ...idle, state: "active" } }).label, "OFFLINE");
     assert.equal(display({ callTimingV2Enabled: false }).label, "Configuration required");
+    assert.equal(display({ bridgeStatus: { connected: false, autoCallDisabled: true, reason: "Disabled for this business" } }).label, "Paused");
     assert.equal(display({ nextAutoCallLead: { queue: "Follow up", reason: "SCHEDULED_DUE" } }).label, "Ready: Scheduled follow-up");
 });
 

@@ -1,6 +1,9 @@
 import type { FormEvent } from "react";
 import { payrollDeductionDisplayRows } from "../../../../shared/payrollPresentation";
+import { payrollDeductionDisplayTotal } from "../../../lib/payrollDeductionPresentation";
 import { isEarnedPayrollVersion } from "../../../../shared/payrollEarnings";
+import { savedPayrollPeriod } from "../../../../shared/payrollPeriod";
+import { payrollDtrPresentation } from "../../../lib/payrollDtrPresentation";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useSearchParams } from "react-router";
@@ -36,6 +39,7 @@ import {
 import AdminLayout from "../adminLayout";
 import PayrollRecomputeDialog from "../../../components/admin/PayrollRecomputeDialog";
 import PayrollHoursDialog from "../../../components/admin/PayrollHoursDialog";
+import PayrollBasicPayDialog from "../../../components/admin/PayrollBasicPayDialog";
 import PayrollPaymentDialog from "../../../components/admin/PayrollPaymentDialog";
 import PayrollDraftPreviewDialog from "../../../components/admin/PayrollDraftPreviewDialog";
 import PayrollGenerationDialog from "../../../components/admin/PayrollGenerationDialog";
@@ -57,7 +61,6 @@ import {
     restorePayrollRecord,
     runPayroll,
     updatePayrollOvertime,
-    updateEmployeeBasicPay,
     updatePayrollWorkedMinutes,
     type PayrollItemCategory,
     type PayrollDtrRow,
@@ -72,6 +75,7 @@ import { getSystemSettings, type SystemSettings } from "../../../api/systemSetti
 import { DataTableSortHeader } from "../../../components/admin/DataTable";
 import { formatCurrency } from "../../../lib/currency";
 import { formatPayrollHours } from "../../../lib/payrollFormatting";
+import { payrollSavedTableRows } from "../../../lib/payrollSavedDisplay";
 import { createDirectConversation, sendMessage, uploadMessageAttachment } from "../../../api/messages";
 import { getAuthUser } from "../../../api/authStorage";
 import { getActiveBusinessId } from "../../../api/businessStorage";
@@ -437,6 +441,7 @@ function PayslipDocument({
     const overtimePay = earnedBasis ? Math.round(overtimeHours * hourlyRate * 100) / 100 : Math.max(0, Math.round((record.grossPay - savedBasePay) * 100) / 100);
     const basePay = earnedBasis ? Math.round((record.grossPay - overtimePay) * 100) / 100 : savedBasePay;
     const deductionRows = payslipDeductionRows(record);
+    const displayedDeductionTotal = payrollDeductionDisplayTotal(record);
 
     return (
         <div className="payslip-print bg-white p-8 text-[11px] leading-tight text-slate-950">
@@ -444,8 +449,8 @@ function PayslipDocument({
                 <div className="flex items-start justify-between gap-6 bg-slate-950 px-6 py-5 text-[#ffffff]">
                     <div>
                         <p className="text-[0.62rem] font-semibold uppercase tracking-[0.24em] text-[#ddd6fe]">Assistly Payroll</p>
-                        <h1 className="mt-2 text-2xl font-bold tracking-tight text-[#ffffff]">{record.earnedToDate ? "Provisional Payslip" : "Payslip"}</h1>
-                        {record.earnedToDate && record.earningsAsOf && <p className="mt-1 text-xs">Earned as of {new Date(record.earningsAsOf).toLocaleString("en-PH", { timeZone: "Asia/Manila" })} PH</p>}
+                        <h1 className="mt-2 text-2xl font-bold tracking-tight text-[#ffffff]">{record.earnedToDate || record.cutoffEstimate ? "Provisional Payslip" : "Payslip"}</h1>
+                        {(record.earnedToDate || record.cutoffEstimate) && record.earningsAsOf && <p className="mt-1 text-xs">{record.cutoffEstimate ? "Estimated" : "Earned"} as of {new Date(record.earningsAsOf).toLocaleString("en-PH", { timeZone: "Asia/Manila" })} PH</p>}
                         <p className="mt-2 max-w-[28rem] text-[0.68rem] leading-5 text-[#e5e7eb]">3rd FL Our Lady of Lourdes Bldg. 7 Harrison Rd, Carantes St, Claudio, Baguio, Benguet</p>
                     </div>
                     <div className="min-w-[11rem] rounded-lg border border-white/15 bg-white/10 p-4 text-right">
@@ -521,15 +526,16 @@ function PayslipDocument({
                             </tr>
                         </thead>
                         <tbody>
-                            {deductionRows.map((item) => (
-                                <tr key={item.label}>
+                            {deductionRows.map((item) => {
+                                const displayedAmount = item.amount ?? item.informationalAmount;
+                                return <tr key={item.label}>
                                     <td className="border border-slate-200 px-3 py-2">{item.label}{item.label !== "Other saved deductions" && ` (${item.minutes} min)`}{item.note && <small className="mt-0.5 block text-[0.62rem] leading-snug text-slate-600">{item.note}</small>}</td>
-                                    <td className="border border-slate-200 px-3 py-2 text-right font-semibold">{item.amount === null ? "--" : money(item.amount)}</td>
-                                </tr>
-                            ))}
+                                    <td className="border border-slate-200 px-3 py-2 text-right font-semibold">{displayedAmount === undefined ? "--" : money(displayedAmount)}</td>
+                                </tr>;
+                            })}
                             <tr className="bg-slate-50">
-                                <td className="border border-slate-200 px-3 py-2 font-bold">Total Deductions ({record.deductibleMinutes ?? 0} min)</td>
-                                <td className="border border-slate-200 px-3 py-2 text-right font-bold">{money(record.deductions)}</td>
+                                <td className="border border-slate-200 px-3 py-2 font-bold">Total Deductions</td>
+                                <td className="border border-slate-200 px-3 py-2 text-right font-bold">{displayedDeductionTotal === null ? "Unavailable" : money(displayedDeductionTotal)}</td>
                             </tr>
                         </tbody>
                     </table>
@@ -653,8 +659,12 @@ export default function PayrollPage() {
     const [selectedRecordIds, setSelectedRecordIds] = useState<string[]>([]);
     const [bankEditEmployee, setBankEditEmployee] = useState<Employee | null>(null);
     const [bankForm, setBankForm] = useState(emptyBankForm);
-    const [basicPayTarget, setBasicPayTarget] = useState<PayrollRecord | null>(null);
-    const [basicPayInput, setBasicPayInput] = useState("");
+    const [basicPayTarget, setBasicPayTarget] = useState<{ record: PayrollRecord; businessId: string } | null>(null);
+    const [basicPayNotice, setBasicPayNotice] = useState("");
+    const [basicPayBusiness, setBasicPayBusiness] = useState(businessId);
+    if (basicPayBusiness !== businessId) {
+        setBasicPayBusiness(businessId); setBasicPayTarget(null); setBasicPayNotice("");
+    }
     const [payslipDeliveryStatus, setPayslipDeliveryStatus] = useState("");
     const [workedMinutesTarget, setWorkedMinutesTarget] = useState<PayrollRecord | null>(null);
     const [workedMinutesInput, setWorkedMinutesInput] = useState("");
@@ -664,9 +674,10 @@ export default function PayrollPage() {
     const [recomputePeriod, setRecomputePeriod] = useState("");
     const [hoursTarget, setHoursTarget] = useState<{ record: PayrollRecord; businessId: string } | null>(null);
     const { data: accuracyConfig } = useQuery({ queryKey: ["payroll-accuracy-config"], queryFn: getPayrollAccuracyConfig });
-    const cutoffQuery = useQuery({ queryKey: ["payroll-cutoffs", businessId], queryFn: getPayrollCutoffs, enabled: accuracyConfig?.cutoffSelectionEnabled === true, refetchOnMount: "always", refetchInterval: 60_000, refetchIntervalInBackground: false });
+    const cutoffQuery = useQuery({ queryKey: ["payroll-cutoffs", businessId], queryFn: ({ signal }) => getPayrollCutoffs({ businessId, signal }), enabled: accuracyConfig?.cutoffSelectionEnabled === true, refetchOnMount: "always", refetchInterval: 60_000, refetchIntervalInBackground: false });
     const requestedPayPeriod = searchParams.get("payPeriod");
     const selectedPayPeriod = accuracyConfig?.cutoffSelectionEnabled ? requestedPayPeriod && requestedPayPeriod !== "current" ? requestedPayPeriod : cutoffQuery.data?.currentPayPeriod : undefined;
+    const liveCutoffView = Boolean(accuracyConfig?.currentCutoffLiveFrom && (savedPayrollPeriod(selectedPayPeriod || "")?.start || "") >= accuracyConfig.currentCutoffLiveFrom);
     const rosterMode = accuracyConfig?.enabled === true && Boolean(selectedPayPeriod) && selectedPayPeriod === cutoffQuery.data?.currentPayPeriod;
     const cutoffReady = !accuracyConfig?.cutoffSelectionEnabled || Boolean(selectedPayPeriod);
     const openRecompute = (payPeriod = "") => { setRecomputePeriod(payPeriod); setRecomputeOpen(true); };
@@ -680,17 +691,21 @@ export default function PayrollPage() {
         sortDir,
         archived: activeTab === "Archived",
         payPeriod: activeTab === "Archived" ? undefined : selectedPayPeriod,
+        basis: "payment" as const,
     };
 
-    const { data: stats } = useQuery({ queryKey: ["payroll-stats", businessId, selectedPayPeriod], queryFn: () => getPayrollStats(selectedPayPeriod), enabled: cutoffReady,
+    const { data: stats } = useQuery({ queryKey: ["payroll-stats", businessId, selectedPayPeriod, "payment"], queryFn: ({ signal }) => getPayrollStats(selectedPayPeriod, { businessId, signal, basis: "payment" }), enabled: cutoffReady,
         refetchInterval: 30_000, refetchIntervalInBackground: false });
-    const { data: systemSettings } = useQuery({ queryKey: ["system-settings"], queryFn: getSystemSettings });
-    const { data: employees = EMPTY_QUERY_ROWS, isLoading: areRecordsLoading, isError: areRecordsError, error: recordsError } = useQuery({
+    const { data: systemSettings } = useQuery({ queryKey: ["system-settings", businessId], queryFn: ({ signal }) => getSystemSettings({ businessId, signal }) });
+    const { data: payrollRecords = EMPTY_QUERY_ROWS, isLoading: areRecordsLoading, isError: areRecordsError, error: recordsError } = useQuery({
         queryKey: ["payroll-records", businessId, recordQueryParams],
-        queryFn: () => ["Not generated", "Review required", "Not ready"].includes(statusFilter) ? Promise.resolve<PayrollRecord[]>([]) : getPayrollRecords(recordQueryParams),
+        queryFn: ({ signal }) => ["Not generated", "Review required", "Not ready"].includes(statusFilter) ? Promise.resolve<PayrollRecord[]>([]) : getPayrollRecords(recordQueryParams, { businessId, signal }),
         enabled: (activeTab === "Employee Payroll" && cutoffReady) || activeTab === "Archived",
-        refetchInterval: query => query.state.data?.some(row => row.earnedToDate) ? 30_000 : false,
+        refetchInterval: activeTab === "Employee Payroll" ? 30_000 : false,
+        refetchOnMount: "always",
+        refetchIntervalInBackground: false,
     });
+    const employees = useMemo(() => payrollSavedTableRows(payrollRecords, sortBy, sortDir), [payrollRecords, sortBy, sortDir]);
     const rosterQuery = useQuery({ queryKey: ["payroll-roster-gaps", businessId, selectedPayPeriod, search, statusFilter],
         queryFn: () => getPayrollRosterGaps({ payPeriod: selectedPayPeriod, search, status: statusFilter === "All statuses" ? undefined : statusFilter }, { businessId, serverRosterEnabled: accuracyConfig?.employeeRosterEnabled === true }),
         enabled: activeTab === "Employee Payroll" && rosterMode && cutoffReady });
@@ -699,14 +714,17 @@ export default function PayrollPage() {
     const isPayrollError = areRecordsError || (activeTab === "Employee Payroll" && cutoffQuery.isError) || (rosterMode && rosterQuery.isError);
     const payrollError = recordsError || cutoffQuery.error || rosterQuery.error;
     const { data: employeeDtr, isLoading: isDtrLoading, isError: isDtrError, error: dtrError } = useQuery({
-        queryKey: ["payroll-dtr", dtrRecord?.employeeId, dtrRecord?.payPeriod],
-        queryFn: () => getPayrollDtr(dtrRecord?.employeeId || "", dtrRecord?.payPeriod),
+        queryKey: ["payroll-dtr", businessId, dtrRecord?.employeeId, dtrRecord?.payPeriod, "payment"],
+        queryFn: ({ signal }) => getPayrollDtr(dtrRecord?.employeeId || "", dtrRecord?.payPeriod, { businessId, signal, basis: "payment" }),
         enabled: Boolean(dtrRecord?.employeeId),
+        refetchInterval: query => query.state.data?.summary.currentCutoffDraft ? 30_000 : false,
+        refetchIntervalInBackground: false,
     });
+    const dtrBreakdown = employeeDtr ? payrollDtrPresentation(employeeDtr) : undefined;
     const { data: payslipDtr, isFetching: isPayslipDtrLoading, isError: isPayslipDtrError, error: payslipDtrError } = useQuery({
-        queryKey: ["payroll-payslip-dtr", payslipRecord?.employeeId, payslipCutoffPeriod],
-        queryFn: () => getPayrollDtr(payslipRecord?.employeeId || "", payslipCutoffPeriod),
-        enabled: Boolean(payslipRecord?.employeeId && payslipCutoffPeriod),
+        queryKey: ["payroll-payslip-dtr", businessId, payslipRecord?.employeeId, payslipCutoffPeriod, accuracyConfig?.enabled ? "payment" : "legacy"],
+        queryFn: ({ signal }) => getPayrollDtr(payslipRecord?.employeeId || "", payslipCutoffPeriod, { businessId, signal, basis: accuracyConfig?.enabled ? "payment" : undefined }),
+        enabled: Boolean(payslipRecord?.employeeId && payslipCutoffPeriod && accuracyConfig),
     });
     const { data: payrollItems = EMPTY_QUERY_ROWS, isLoading: areItemsLoading, isError: areItemsError } = useQuery({
         queryKey: ["payroll-items", itemCategory],
@@ -755,6 +773,7 @@ export default function PayrollPage() {
         return {
             ...payslipRecord,
             earnedToDate: payslipDtr.summary.earnedToDate,
+            cutoffEstimate: payslipDtr.summary.cutoffEstimate,
             earningsAsOf: payslipDtr.summary.earningsAsOf,
             earningsUnavailable: payslipDtr.summary.earningsUnavailable,
             calculationVersion: payslipDtr.summary.calculationVersion || payslipRecord.calculationVersion,
@@ -796,14 +815,6 @@ export default function PayrollPage() {
         onSuccess: (record) => {
             refreshPayroll();
             setDtrRecord(record);
-        },
-    });
-    const updateBasicPayMutation = useMutation({
-        mutationFn: ({ employeeId, basicPay }: { employeeId: string; basicPay: number }) => updateEmployeeBasicPay(employeeId, basicPay),
-        onSuccess: () => {
-            refreshPayroll();
-            setBasicPayTarget(null);
-            setBasicPayInput("");
         },
     });
     const updateWorkedMinutesMutation = useMutation({
@@ -930,7 +941,7 @@ export default function PayrollPage() {
         { label: "Employees", value: String(rosterMode ? stats?.totalEmployees ?? payrollRows.length : stats?.recordedEmployees ?? stats?.totalEmployees ?? employees.length), icon: FiUsers },
         ...(rosterMode ? [{ label: "Generated", value: String(stats?.recordedEmployees ?? employees.length), icon: FiFileText }] : []),
         { label: "Gross", value: money(stats?.totalPayroll ?? 0), icon: FiBriefcase },
-        { label: "Deductions", value: money(stats?.totalDeductions ?? 0), icon: FiTarget },
+        { label: "Applied deductions", value: money(stats?.totalDeductions ?? 0), icon: FiTarget },
         { label: "Net", value: money(stats?.netPayroll ?? 0), icon: FiCreditCard },
         { label: "Paid", value: String(stats?.paidEmployees ?? 0), icon: FiCheckCircle },
     ];
@@ -1068,6 +1079,7 @@ export default function PayrollPage() {
     const approvePotentialOvertime = () => {
         if (accuracyConfig?.enabled) { setDtrRecord(null); openRecompute(dtrRecord?.payPeriod); return; }
         if (!dtrRecord || !employeeDtr) return;
+        if (employeeDtr.summary.cutoffEstimate) return;
         updateOvertimeMutation.mutate({ id: dtrRecord._id, overtimeHours: employeeDtr.summary.overtimeHours });
     };
 
@@ -1220,6 +1232,7 @@ export default function PayrollPage() {
 
                 {runPayrollMutation.error && <p role="alert" className="mt-3 rounded-md border border-red-200 bg-red-50 p-3 text-sm !text-red-800">{payrollErrorMessage(runPayrollMutation.error)}</p>}
                 {(restoreRecordMutation.error || restoreItemMutation.error) && <p role="alert" className="mt-3 rounded-md border border-red-200 bg-red-50 p-3 text-sm !text-red-800">{payrollErrorMessage(restoreRecordMutation.error || restoreItemMutation.error)}</p>}
+                {basicPayNotice && <p role="status" className="mt-3 rounded-md border border-emerald-200 bg-emerald-50 p-3 text-sm !text-emerald-900">{basicPayNotice}</p>}
                 <div className="mt-5 grid gap-4 xl:h-[calc(100vh-15.5rem)] xl:min-h-[34rem] xl:grid-cols-[minmax(14.5rem,16.5rem)_1fr]">
                     <aside className="relative z-20 flex min-h-0 flex-col overflow-hidden rounded-lg border border-violet-200/80 bg-white/82 shadow-xl shadow-violet-200/35 backdrop-blur">
                         <div className="border-b border-violet-200/80 px-4 py-4">
@@ -1340,7 +1353,7 @@ export default function PayrollPage() {
                                             <th className="w-[11%] px-3 py-3">Basic Pay</th>
                                             <th className="w-[5%] px-3 py-3">Days</th>
                                             <th className="w-[8%] px-3 py-3">Hours</th>
-                                            <th className="w-[12%] px-3 py-3"><DataTableSortHeader field="netPay" sortBy={sortBy} sortDir={sortDir} onSort={changeSort}>Net Pay</DataTableSortHeader></th>
+                                            <th className="w-[12%] px-3 py-3"><DataTableSortHeader field="netPay" sortBy={sortBy} sortDir={sortDir} onSort={changeSort}>{liveCutoffView ? "Net Pay" : "Saved Net Pay"}</DataTableSortHeader></th>
                                             <th className="w-[10%] px-3 py-3"><DataTableSortHeader field="status" sortBy={sortBy} sortDir={sortDir} onSort={changeSort}>Status</DataTableSortHeader></th>
                                             <th className="w-[18%] px-3 py-3 text-center">Actions</th>
                                         </tr>
@@ -1400,11 +1413,11 @@ export default function PayrollPage() {
                                                     <td className="px-3 py-2.5 font-semibold !text-slate-950">{money(employee.basicPay ?? employee.grossPay)}</td>
                                                     <td className="px-3 py-2.5 !text-slate-700">{employee.attendanceDays ?? 0}</td>
                                                     <td className="whitespace-nowrap px-3 py-2.5 tabular-nums !text-slate-700">{formatPayrollHours(employee.workedHours)}</td>
-                                                    <td className="px-3 py-2.5 font-semibold !text-slate-950" title={employee.earningsAsOf ? `Earned as of ${new Date(employee.earningsAsOf).toLocaleString("en-PH", { timeZone: "Asia/Manila" })} PH` : undefined}>{employee.earningsUnavailable ? "Unavailable" : money(employee.netPay)}{employee.earnedToDate && <small className="block text-[10px] font-normal text-slate-600">Earned to date</small>}</td>
+                                                    <td className="px-3 py-2.5 font-semibold !text-slate-950">{employee.earningsUnavailable ? <button type="button" onClick={() => setDtrRecord(employee)} title={employee.earningsUnavailableReason || "Review saved payroll amounts."} className="inline-flex items-center gap-1 text-amber-800"><FiAlertCircle />Needs review</button> : money(employee.netPay)}</td>
                                                     <td className="px-3 py-2.5"><span className="inline-flex items-center gap-1.5"><StatusBadge status={payrollPaymentStatus(employee.status)} />{employee.requiresReview && <FiAlertCircle className="size-3.5 !text-amber-700" role="img" aria-label="Conflicting saved payroll entries" title="Conflicting saved payroll entries" />}</span></td>
                                                     <td className="px-3 py-2.5 text-center" onClick={(event) => event.stopPropagation()}>
                                                         <div className="flex flex-nowrap justify-center gap-0.5">
-                                                            <button className="inline-flex size-7 items-center justify-center rounded-md !text-slate-600 transition hover:bg-slate-100 hover:!text-slate-950" type="button" onClick={() => { setBasicPayTarget(employee); setBasicPayInput(String(employee.calculationSnapshot?.monthlySalary ?? (employee.basicPay ?? employee.grossPay ?? 0) * 2)); }} aria-label={`Edit basic pay for ${employee.employeeName}`} title="Edit monthly salary">
+                                                            <button className="inline-flex size-7 items-center justify-center rounded-md !text-slate-600 transition hover:bg-slate-100 hover:!text-slate-950" type="button" onClick={() => { setBasicPayNotice(""); setBasicPayTarget({ record: employee, businessId }); }} aria-label={`Edit basic pay for ${employee.employeeName}`} title="Edit monthly salary">
                                                                 <FiEdit2 className="size-3.5" />
                                                             </button>
                                                             <button className="inline-flex size-7 items-center justify-center rounded-md !text-[#2563eb] transition hover:bg-[#2563eb]/10 hover:!text-[#1d4ed8]" type="button" onClick={() => setDtrRecord(employee)} aria-label={`View DTR for ${employee.employeeName}`} title="View DTR">
@@ -1415,15 +1428,16 @@ export default function PayrollPage() {
                                                             </button>
                                                             <button
                                                                 className={[
-                                                                    "inline-flex size-7 items-center justify-center rounded-md transition",
+                                                                    "inline-flex size-7 items-center justify-center rounded-md transition disabled:opacity-40",
                                                                     employee.status === "Paid"
                                                                         ? "!text-amber-600 hover:bg-amber-100 hover:!text-amber-700"
                                                                         : "!text-emerald-600 hover:bg-emerald-100 hover:!text-emerald-700",
                                                                 ].join(" ")}
                                                                 type="button"
-                                                                onClick={() => setPaymentTarget({ action: employee.status === "Paid" ? "unpaid" : "paid", record: employee, businessId: getActiveBusinessId() })}
+                                                                onClick={() => setPaymentTarget({ action: employee.status === "Paid" ? "unpaid" : "paid", record: employee, businessId })}
+                                                                disabled={!accuracyConfig}
                                                                 aria-label={employee.status === "Paid" ? `Set ${employee.employeeName} unpaid` : `Mark ${employee.employeeName} paid`}
-                                                                title={employee.status === "Paid" ? "Set unpaid" : "Mark paid"}
+                                                                title={!accuracyConfig ? "Loading payment settings" : employee.status === "Paid" ? "Set unpaid" : "Mark paid"}
                                                             >
                                                                 {employee.status === "Paid" ? <FiRotateCcw className="size-3.5" /> : <FiCheck className="size-3.5" />}
                                                             </button>
@@ -1621,7 +1635,7 @@ export default function PayrollPage() {
                                     <p className="mt-1 text-sm !text-slate-600">{employeeDtr?.payPeriod || dtrRecord.payPeriod} · PH Time</p>
                                 </div>
                                 <div className="flex flex-wrap items-center justify-end gap-2">
-                                    {employeeDtr && (employeeDtr.potentialOvertimeHours ?? employeeDtr.summary.overtimeHours) > 0 && (
+                                    {employeeDtr && !employeeDtr.summary.cutoffEstimate && (employeeDtr.potentialOvertimeHours ?? employeeDtr.summary.overtimeHours) > 0 && (
                                         <button
                                             className="h-9 rounded-lg bg-[linear-gradient(135deg,#842cff,#4a0ebd)] px-3 text-sm font-semibold text-white transition hover:brightness-110 disabled:opacity-60"
                                             type="button"
@@ -1655,50 +1669,79 @@ export default function PayrollPage() {
                             <div className="content-scroll min-h-0 flex-1 overflow-auto p-5">
                                 {isDtrLoading && <p className="rounded-lg border border-slate-300 bg-slate-50 p-4 text-sm font-semibold !text-black">Loading DTR...</p>}
                                 {isDtrError && <p className="rounded-lg border border-rose-300 bg-rose-50 p-4 text-sm font-semibold text-rose-700">{(dtrError as { response?: { data?: { message?: string } } })?.response?.data?.message || "Unable to load DTR."}</p>}
-                                {employeeDtr && (
+                                {employeeDtr && dtrBreakdown && (
                                     <div className="space-y-4">
-                                        {accuracyConfig?.enabled && employeeDtr.storedCutoff && <p className="rounded-md border border-sky-200 bg-sky-50 p-3 text-sm !text-sky-900">{employeeDtr.summary.earningsUnavailable ? "Current earnings are unavailable. Saved payroll is unchanged." : employeeDtr.summary.earnedToDate ? "Earned-to-date amounts. Payment status is unchanged." : `Totals are the saved cutoff. ${employeeDtr.currentAttendanceWarning ? "Current attendance is unavailable." : "Attendance rows reflect current evidence; preview a recompute to compare changes."}`}</p>}
+                                        {accuracyConfig?.enabled && employeeDtr.storedCutoff && <p className="rounded-md border border-sky-200 bg-sky-50 p-3 text-sm !text-sky-900">{dtrBreakdown.datedReference ? "Hours and deductions below are from dated attendance within this cutoff. Saved payment amounts and paid status are unchanged." : employeeDtr.summary.earningsUnavailable ? `${employeeDtr.summary.earningsUnavailableReason || "Current earnings need review."} Saved payroll is unchanged.` : employeeDtr.summary.cutoffEstimate ? "Current cutoff estimate. Saved payroll and payment status are unchanged." : employeeDtr.summary.earnedToDate ? "Earned-to-date amounts. Payment status is unchanged." : `Totals are the saved cutoff. ${employeeDtr.currentAttendanceWarning ? "Current attendance is unavailable." : "Attendance rows reflect current evidence; preview a recompute to compare changes."}`}</p>}
                                         {employeeDtr.currentAttendanceWarning && <p role="alert" className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm !text-amber-900">{employeeDtr.currentAttendanceWarning}. Saved pay has not changed.</p>}
                                         <div className="grid gap-3 md:grid-cols-4">
                                             {[
-                                                ["Cutoff Working Days", employeeDtr.summary.workingDays ?? "Unavailable"],
-                                                ["Monthly Rate Days", employeeDtr.summary.monthlyWorkingDays],
-                                                ["Paid hours / day", employeeDtr.summary.paidHoursPerDay ?? "Not snapshotted"],
-                                                ["Basic Pay", money(employeeDtr.summary.basicPay)],
-                                                ["Days Present", employeeDtr.summary.attendanceDays],
-                                                ["Absent", formatDays(employeeDtr.summary.absentDays)],
-                                                ["Late", `${employeeDtr.summary.lateMinutes} min`],
-                                                ["Excess Lunch", `${employeeDtr.summary.excessLunchMinutes} min`],
-                                                ["Excess Break", `${employeeDtr.summary.excessBreakMinutes} min`],
-                                                ["Non-billable Off the Phone", `${employeeDtr.summary.nonBillableOffPhoneMinutes ?? 0} min`],
-                                                ["Absence", `${employeeDtr.summary.absenceMinutes} min`],
-                                                ["Early Time Out", `${employeeDtr.summary.earlyTimeOutMinutes} min`],
+                                                ["Cutoff Working Days", dtrBreakdown.summary.workingDays ?? "Unavailable"],
+                                                ["Monthly Rate Days", dtrBreakdown.summary.monthlyWorkingDays],
+                                                ["Paid hours / day", dtrBreakdown.summary.paidHoursPerDay ?? "Not snapshotted"],
+                                                ["Basic Pay", money(dtrBreakdown.summary.basicPay)],
+                                                ["Days Present", dtrBreakdown.summary.attendanceDays],
+                                                ["Absent", formatDays(dtrBreakdown.summary.absentDays)],
+                                                ["Late", `${dtrBreakdown.summary.lateMinutes} min`],
+                                                ["Excess Lunch", `${dtrBreakdown.summary.excessLunchMinutes} min`],
+                                                ["Excess Break", `${dtrBreakdown.summary.excessBreakMinutes} min`],
+                                                ["Non-billable Off the Phone", `${dtrBreakdown.summary.nonBillableOffPhoneMinutes ?? 0} min`],
+                                                ["Absence", `${dtrBreakdown.summary.absenceMinutes} min`],
+                                                ["Early Time Out", `${dtrBreakdown.summary.earlyTimeOutMinutes} min`],
                                                 ["Current Attendance Review", employeeDtr.currentAttendanceReviewDays ?? (employeeDtr.storedCutoff ? "Unavailable" : employeeDtr.summary.incompleteShiftDays)],
                                                 ...(employeeDtr.storedCutoff ? [["Saved Cutoff Review Days", employeeDtr.summary.incompleteShiftDays]] : []),
-                                                ["Regular Hours", formatHoursMinutes(employeeDtr.summary.workedHours)],
+                                                ...(dtrBreakdown.datedReference ? [
+                                                    ["Recorded In-Shift Hours", formatHoursMinutes(dtrBreakdown.summary.recordedInShiftHours ?? 0)],
+                                                    ["Unpaid Lunch", formatHoursMinutes(dtrBreakdown.summary.unpaidLunchHours ?? 0)],
+                                                ] : []),
+                                                ["Regular Hours", formatHoursMinutes(dtrBreakdown.summary.workedHours)],
                                                 ["Potential OT", employeeDtr.currentAttendanceWarning ? "Unavailable" : formatHoursMinutes(employeeDtr.potentialOvertimeHours ?? employeeDtr.summary.overtimeHours)],
                                                 ["Approved OT", formatHoursMinutes(dtrRecord.overtimeHours || 0)],
-                                                ["Hourly Rate", money(employeeDtr.summary.hourlyRate)],
-                                                ["Per Minute", money(employeeDtr.summary.minuteRate)],
-                                                ["Deductions", money(employeeDtr.summary.deductions)],
-                                                ["Net Pay", money(employeeDtr.summary.netPay)],
+                                                ["Hourly Rate", money(dtrBreakdown.summary.hourlyRate)],
+                                                ["Per Minute", money(dtrBreakdown.summary.minuteRate)],
+                                                ["Total deductions", payrollDeductionDisplayTotal(dtrBreakdown.summary) === null ? "Unavailable" : money(payrollDeductionDisplayTotal(dtrBreakdown.summary)!)],
+                                                [dtrBreakdown.datedReference ? "Saved cash deductions" : "Applied to net pay", money(dtrBreakdown.paymentSummary.deductions)],
+                                                [dtrBreakdown.datedReference ? "Saved Net Pay" : "Net Pay", money(dtrBreakdown.paymentSummary.netPay)],
                                             ].map(([label, value]) => (
                                                 <div key={label} className="rounded-lg border border-slate-300 bg-slate-50 px-3 py-2.5">
                                                     <p className="text-[0.62rem] font-semibold uppercase tracking-[0.12em] !text-slate-500">{label}</p>
-                                                    <p className="mt-1 text-sm font-semibold !text-black">{employeeDtr.summary.earningsUnavailable && ["Net Pay", "Deductions", "Regular Hours"].includes(String(label)) ? "Unavailable" : value}</p>
+                                                    <p className="mt-1 text-sm font-semibold !text-black">{!dtrBreakdown.datedReference && employeeDtr.summary.earningsUnavailable && ["Net Pay", "Total deductions", "Applied to net pay", "Regular Hours"].includes(String(label)) ? "Unavailable" : value}</p>
                                                 </div>
                                             ))}
                                         </div>
 
-                                        {!employeeDtr.summary.earningsUnavailable && <section aria-label="Deduction breakdown" className="border-t border-slate-200 pt-4">
+                                        {(dtrBreakdown.datedReference || !employeeDtr.summary.earningsUnavailable) && <section aria-label="Deduction breakdown" className="border-t border-slate-200 pt-4">
                                             <h3 className="text-sm font-semibold !text-black">Deduction breakdown</h3>
                                             <dl className="mt-2 grid gap-x-6 gap-y-2 sm:grid-cols-2">
-                                                {payrollDeductionDisplayRows(employeeDtr.summary).map(row => <div key={row.label} className="flex items-start justify-between gap-4 border-b border-slate-100 py-2 text-sm !text-black">
+                                                {payrollDeductionDisplayRows(dtrBreakdown.summary).map(row => {
+                                                    const displayedAmount = row.amount ?? row.informationalAmount;
+                                                    return <div key={row.label} className="flex items-start justify-between gap-4 border-b border-slate-100 py-2 text-sm !text-black">
                                                     <dt>{row.label} ({row.minutes} min){row.note && <small className="mt-0.5 block text-xs text-slate-600">{row.note}</small>}</dt>
-                                                    <dd className="shrink-0 font-semibold tabular-nums">{row.amount === null ? "--" : money(row.amount)}</dd>
-                                                </div>)}
+                                                    <dd className="shrink-0 text-right font-semibold tabular-nums">{displayedAmount === undefined ? "--" : money(displayedAmount)}</dd>
+                                                </div>;
+                                                })}
+                                                <div className="flex items-start justify-between gap-4 border-b border-slate-100 py-2 text-sm !text-black"><dt>Total deductions</dt><dd className="shrink-0 font-semibold tabular-nums">{payrollDeductionDisplayTotal(dtrBreakdown.summary) === null ? "Unavailable" : money(payrollDeductionDisplayTotal(dtrBreakdown.summary)!)}</dd></div>
+                                                {!dtrBreakdown.datedReference && <div className="flex items-start justify-between gap-4 border-b border-slate-100 py-2 text-sm !text-black"><dt>Applied to net pay</dt><dd className="shrink-0 font-semibold tabular-nums">{money(employeeDtr.summary.deductions)}</dd></div>}
                                             </dl>
                                         </section>}
+                                        {employeeDtr.attendanceComparison && <section aria-label="Saved cutoff attendance comparison" className="border-t border-slate-200 pt-4">
+                                            <h3 className="text-sm font-semibold !text-black">Attendance comparison</h3>
+                                            <p className="mt-1 text-xs text-slate-600">Reference calculation only. Restored amounts and payment status are unchanged.</p>
+                                            <div className="mt-3 overflow-x-auto">
+                                                <table className="w-full min-w-[28rem] text-left text-sm !text-black">
+                                                    <thead><tr className="border-b border-slate-300"><th className="py-2">Item</th><th className="py-2 text-right">Saved cutoff</th><th className="py-2 text-right">Attendance calculation</th></tr></thead>
+                                                    <tbody>
+                                                        <tr className="border-b border-slate-200"><th className="py-2 font-medium">Worked hours</th><td className="py-2 text-right tabular-nums">{formatHoursMinutes(employeeDtr.summary.workedHours)}</td><td className="py-2 text-right tabular-nums">{formatHoursMinutes(employeeDtr.attendanceComparison.summary.workedHours)}</td></tr>
+                                                        {payrollDeductionDisplayRows(employeeDtr.attendanceComparison.summary).map(row => {
+                                                            const savedRow = payrollDeductionDisplayRows(employeeDtr.summary).find(item => item.label === row.label);
+                                                            return <tr key={row.label} className="border-b border-slate-200"><th className="py-2 font-medium">{row.label} ({row.minutes} min)</th><td className="py-2 text-right tabular-nums">{savedRow?.amount == null ? "--" : money(savedRow.amount)}</td><td className="py-2 text-right tabular-nums">{row.amount == null ? "--" : money(row.amount)}</td></tr>;
+                                                        })}
+                                                        <tr className="border-b border-slate-300 font-semibold"><th className="py-2">Applied deductions</th><td className="py-2 text-right tabular-nums">{money(employeeDtr.summary.deductions)}</td><td className="py-2 text-right tabular-nums">{money(employeeDtr.attendanceComparison.summary.deductions)}</td></tr>
+                                                        <tr className="font-semibold"><th className="py-2">Net Pay</th><td className="py-2 text-right tabular-nums">{money(employeeDtr.summary.netPay)}</td><td className="py-2 text-right tabular-nums">{money(employeeDtr.attendanceComparison.summary.netPay)}</td></tr>
+                                                    </tbody>
+                                                </table>
+                                            </div>
+                                        </section>}
+                                        {employeeDtr.attendanceComparisonWarning && <section aria-label="Attendance comparison unavailable" className="border-t border-slate-200 pt-4"><h3 className="text-sm font-semibold !text-black">Attendance comparison</h3><p className="mt-1 text-sm text-slate-600">{employeeDtr.attendanceComparisonWarning} Restored amounts are unchanged.</p></section>}
                                         <div className="overflow-hidden rounded-lg border border-slate-300">
                                             <div className="max-h-[46vh] overflow-auto">
                                                 <table className="w-full min-w-[58rem] text-left text-sm">
@@ -1891,7 +1934,7 @@ export default function PayrollPage() {
                                 </div>
 
                                 {isPayslipDtrError && <p role="alert" className="mt-3 rounded-md border border-red-200 bg-red-50 p-3 text-sm !text-red-800">{payrollErrorMessage(payslipDtrError)}</p>}
-                                {accuracyConfig?.enabled && payslipDtr?.storedCutoff && <p className="mt-3 text-sm text-white/80">{payslipDtr.summary.earningsUnavailable ? "Current earnings need review. Printing and sending are unavailable." : payslipDtr.summary.earnedToDate ? "Provisional earned-to-date pay. Saved payroll and payment status are unchanged." : "Saved cutoff amounts. Attendance edits require an approved recompute before this payslip changes."}</p>}
+                                {accuracyConfig?.enabled && payslipDtr?.storedCutoff && <p className="mt-3 text-sm text-white/80">{payslipDtr.summary.earningsUnavailable ? "Current earnings need review. Printing and sending are unavailable." : payslipDtr.summary.cutoffEstimate ? "Provisional cutoff estimate. Saved payroll and payment status are unchanged." : payslipDtr.summary.earnedToDate ? "Provisional earned-to-date pay. Saved payroll and payment status are unchanged." : "Saved cutoff amounts. Attendance edits require an approved recompute before this payslip changes."}</p>}
                                 {accuracyConfig?.enabled && payslipDtr && !payslipDtr.storedCutoff && <p role="alert" className="mt-3 text-sm text-white/80">Preview only. Approve this cutoff before printing or sending its payslip.</p>}
                                 {payslipDeliveryStatus && (
                                     <p className="mt-3 rounded-lg border border-white/10 bg-white/[0.06] px-3 py-2 text-sm font-semibold text-white/80">{payslipDeliveryStatus}</p>
@@ -1900,7 +1943,7 @@ export default function PayrollPage() {
                                 <div className="mt-4 grid gap-3 sm:grid-cols-3">
                                     {[
                                         ["Gross Pay", money(payslipPreviewRecord.grossPay)],
-                                        ["Deductions", money(payslipPreviewRecord.deductions)],
+                                        ["Total deductions", payrollDeductionDisplayTotal(payslipPreviewRecord) === null ? "Unavailable" : money(payrollDeductionDisplayTotal(payslipPreviewRecord)!)],
                                         ["Net Pay", money(payslipPreviewRecord.netPay)],
                                     ].map(([label, value]) => (
                                         <div key={label} className="rounded-lg border border-white/10 bg-white/[0.055] px-4 py-3">
@@ -2134,26 +2177,12 @@ export default function PayrollPage() {
                     </div>
                 )}
 
-                {basicPayTarget && (
-                    <div className="modal-backdrop-enter fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4 backdrop-blur-sm" onMouseDown={(event) => { if (event.target === event.currentTarget) setBasicPayTarget(null); }}>
-                        <form className="modal-panel-enter w-full max-w-[28rem] overflow-hidden rounded-lg border border-white/10 bg-[#0d1018] shadow-2xl shadow-black/40" onSubmit={(event) => { event.preventDefault(); const value = Number(basicPayInput); if (Number.isFinite(value) && value >= 0) updateBasicPayMutation.mutate({ employeeId: basicPayTarget.employeeId, basicPay: value }); }}>
-                            <div className="flex items-center justify-between border-b border-white/10 px-5 py-4">
-                                <div><p className="text-xs font-semibold uppercase tracking-[0.14em] text-white/35">Monthly Basic Pay</p><h3 className="mt-1 text-lg font-semibold text-white">{basicPayTarget.employeeName}</h3></div>
-                                <button className="flex size-8 items-center justify-center rounded-lg border border-white/10 bg-white/[0.05] text-white/60" type="button" onClick={() => setBasicPayTarget(null)} aria-label="Close"><FiX className="size-4" /></button>
-                            </div>
-                            <div className="p-5">
-                                <label className="text-xs font-semibold uppercase tracking-[0.14em] text-white/45">Monthly salary for each 6th-5th cycle</label>
-                                <input className="mt-2 h-11 w-full rounded-lg border border-white/10 bg-black/20 px-3 text-sm font-semibold text-white outline-none focus:border-[#842cff]" type="number" min="0" step="0.01" required autoFocus value={basicPayInput} onChange={(event) => setBasicPayInput(event.target.value)} />
-                                <p className="mt-2 text-xs leading-5 text-white/45">Rates use monthly working days and the configured paid shift hours. Generated cutoffs change only after a confirmed recompute.</p>
-                                {updateBasicPayMutation.error && <p role="alert" className="mt-3 text-sm !text-red-700">{payrollErrorMessage(updateBasicPayMutation.error)}</p>}
-                            </div>
-                            <div className="flex justify-end gap-2 border-t border-white/10 px-5 py-3">
-                                <button className="h-10 rounded-lg border border-white/10 bg-white/[0.05] px-4 text-sm font-semibold text-white/60" type="button" onClick={() => setBasicPayTarget(null)}>Cancel</button>
-                                <button className="h-10 rounded-lg bg-[#842cff] px-4 text-sm font-semibold text-white disabled:opacity-60" type="submit" disabled={updateBasicPayMutation.isPending}>Save Basic Pay</button>
-                            </div>
-                        </form>
-                    </div>
-                )}
+                {basicPayTarget && basicPayTarget.businessId === businessId && <PayrollBasicPayDialog
+                    key={`${basicPayTarget.businessId}:${basicPayTarget.record.employeeId}`} record={basicPayTarget.record} businessId={basicPayTarget.businessId}
+                    savedCutoffsProtected={accuracyConfig?.enabled !== false} onClose={() => setBasicPayTarget(null)} onSaved={() => {
+                        refreshPayroll(); setBasicPayTarget(null);
+                        setBasicPayNotice(accuracyConfig?.enabled !== false ? "Monthly salary saved. Saved cutoff amounts remain unchanged until a confirmed recompute." : "Monthly salary saved.");
+                    }} />}
 
                 {deleteTarget && (
                     <div

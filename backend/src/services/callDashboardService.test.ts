@@ -6,6 +6,22 @@ import { accountTime, bucketForAttendanceSource } from "./timeAccounting";
 
 const at = (value: string) => new Date(value);
 
+test("offline clocks require a recorded checkout, never a break, lunch or Coaching start", () => {
+  const shift = { start: at("2026-10-30T15:00:00Z"), end: at("2026-10-31T00:00:00Z") }, now = at("2026-10-30T17:00:00Z");
+  for (const source of ["Break Out", "Lunch Break Out", "Off the Phone Out", "Coaching Out"]) {
+    const status = callDashboardStatus({ availabilityStatus: "OFFLINE", devices: [], now, shift,
+      attendance: [{ source, timeIn: at("2026-10-30T16:30:00Z") }] });
+    assert.equal(status.statusStartedAt, null, source);
+  }
+  const checkout = at("2026-10-30T16:30:00Z");
+  for (const source of ["Time Out", "Logout"]) {
+    const status = callDashboardStatus({ availabilityStatus: "OFFLINE", devices: [], now, shift,
+      attendance: [{ source: "Time In", timeIn: shift.start }, { source, timeIn: checkout }] });
+    assert.equal(status.statusStartedAt?.getTime(), +checkout);
+    assert.equal(+now - status.statusStartedAt!.getTime(), 30 * 60_000);
+  }
+});
+
 test("a new early Time In overrides the prior shift's clipped off-phone state without changing its totals", () => {
   const shift = { start: at("2026-10-22T15:00:00Z"), end: at("2026-10-23T00:00:00Z") };
   const now = at("2026-10-23T14:58:00Z");
@@ -183,6 +199,27 @@ test("v2 starts a pending-dial online timer when the dial begins", () => {
   }
 });
 
+test("a persistent untracked audio stream is not presented as confirmed multi-hour call time", () => {
+  const previous = process.env.CRM_CALL_DASHBOARD_V2;
+  process.env.CRM_CALL_DASHBOARD_V2 = "true";
+  try {
+    const start = at("2026-10-28T17:00:00Z"), now = at("2026-10-28T19:30:00Z");
+    const base = { availabilityStatus: "ONLINE", attendance: [{ source: "Time In", timeIn: at("2026-10-28T15:00:00Z") }],
+      now, shift: { start: at("2026-10-28T15:00:00Z"), end: at("2026-10-29T00:00:00Z") },
+      devices: [{ bridgeVersion: "0.4.2", state: "active", audioSessionActive: true, nextivaProcessDetected: true,
+        lastSeenAt: now, lastStateChangedAt: start, lastIdleAt: at("2026-10-28T16:59:58Z") }],
+      schedule: { lastCallStartedAt: start } };
+    const before = JSON.stringify(base), unverified = callDashboardStatus(base);
+    assert.equal(unverified.status, "UNVERIFIED"); assert.equal(unverified.statusStartedAt, null);
+    assert.equal(JSON.stringify(base), before, "display uncertainty never ends or clears a call");
+    const tracked = callDashboardStatus({ ...base, schedule: { ...base.schedule, lastDialStartedAt: at("2026-10-28T16:59:59Z") } });
+    assert.equal(tracked.status, "ON CALL", "a genuinely tracked long call is not forcibly stopped");
+    assert.equal(tracked.statusStartedAt?.toISOString(), start.toISOString());
+  } finally {
+    if (previous === undefined) delete process.env.CRM_CALL_DASHBOARD_V2; else process.env.CRM_CALL_DASHBOARD_V2 = previous;
+  }
+});
+
 test("bridge availability timestamp changes only when readiness or connectivity changes", () => {
   const previous = { state: "idle", nextivaProcessDetected: true,
     lastSeenAt: at("2026-10-15T16:52:10Z"),
@@ -263,6 +300,41 @@ test("v2 unavailable-bridge timer starts when call waiting expires", () => {
   }
 });
 
+test("v2 READY and disconnected ONLINE timers restart at the Coaching return", () => {
+  const previous = process.env.CRM_CALL_DASHBOARD_V2;
+  process.env.CRM_CALL_DASHBOARD_V2 = "true";
+  try {
+    const shift = { start: at("2026-10-29T15:00:00Z"), end: at("2026-10-30T00:00:00Z") };
+    const coachingStartedAt = at("2026-10-29T16:00:00Z");
+    for (const minutes of [5, 20]) {
+      const returnedAt = new Date(+coachingStartedAt + minutes * 60_000);
+      const now = new Date(+returnedAt + 2 * 60_000);
+      const base = { availabilityStatus: "ONLINE", shift, now,
+        attendance: [{ source: "Time In", timeIn: shift.start },
+          { source: "Coaching Out", timeIn: coachingStartedAt }, { source: "Coaching In", timeIn: returnedAt }] };
+      const device = { bridgeVersion: "0.4.2", state: "idle", audioSessionActive: false,
+        nextivaProcessDetected: true, lastSeenAt: now, lastStateChangedAt: coachingStartedAt,
+        lastBridgeAvailabilityChangedAt: coachingStartedAt, lastIdleAt: coachingStartedAt };
+      for (const devices of [[device], []]) {
+        const result = callDashboardStatus({ ...base, devices });
+        assert.equal(result.status, devices.length ? "READY" : "ONLINE");
+        assert.equal(result.statusStartedAt?.toISOString(), returnedAt.toISOString());
+        assert.equal(+now - +result.statusStartedAt!, 2 * 60_000, "elapsed time excludes Coaching");
+        const refreshed = callDashboardStatus({ ...base, devices, now: new Date(+now + 1000) });
+        assert.equal(refreshed.statusStartedAt?.toISOString(), returnedAt.toISOString(), "refresh keeps the original return boundary");
+      }
+      const reconnectedAt = new Date(+returnedAt + 60_000);
+      const reconnected = callDashboardStatus({ ...base, devices: [{ ...device,
+        lastStateChangedAt: reconnectedAt, lastBridgeAvailabilityChangedAt: reconnectedAt }] });
+      assert.equal(reconnected.status, "READY");
+      assert.equal(reconnected.statusStartedAt?.toISOString(), reconnectedAt.toISOString(), "newer bridge changes still take precedence");
+    }
+  } finally {
+    if (previous === undefined) delete process.env.CRM_CALL_DASHBOARD_V2;
+    else process.env.CRM_CALL_DASHBOARD_V2 = previous;
+  }
+});
+
 test("active off-phone time is split so the dashboard can tick it between polls", () => {
   const clock = offPhoneDashboardClock({ totalMs: 5 * 60_000, state: "offPhone",
     stateSince: at("2026-10-15T16:28:00Z"), shiftEnd: at("2026-10-16T00:00:00Z"),
@@ -274,7 +346,7 @@ test("active off-phone time is split so the dashboard can tick it between polls"
     now: at("2026-10-15T16:30:00Z") }), { completedMs: 5 * 60_000, activeStartedAt: null });
 });
 
-test("call waiting is only the 30 seconds after a call ends", () => {
+test("call waiting uses the 15-second post-call interval", () => {
   const shift = { start: at("2026-09-15T15:00:00Z"), end: at("2026-09-16T00:00:00Z") };
   const endedAt = at("2026-09-15T16:02:00Z");
   const device = {
@@ -290,7 +362,7 @@ test("call waiting is only the 30 seconds after a call ends", () => {
     devices: [device],
     shift,
   };
-  const schedule = { lastCallEndedAt: endedAt, nextCallAllowedAt: at("2026-09-15T16:02:30Z") };
+  const schedule = { lastCallEndedAt: endedAt, nextCallAllowedAt: at("2026-09-15T16:02:15Z") };
   const waiting = callDashboardStatus({ ...base, schedule, now: at("2026-09-15T16:02:10Z") });
   assert.equal(waiting.status, "CALL WAITING");
   assert.equal(waiting.statusStartedAt?.toISOString(), endedAt.toISOString());

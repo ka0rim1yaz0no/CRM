@@ -17,6 +17,7 @@ function Send-Heartbeat {
     $records.Add([pscustomobject]@{ State = $State; Audio = $Detection.AudioSessionActive; Sample = $sampleIndex })
 }
 function Write-BridgeLog { param($Message) }
+function Invoke-NativeDialPoll { param($Config, $Token) }
 function Get-Date { [DateTime]::Parse("2026-10-22T03:00:00Z").AddMilliseconds($sampleIndex * 500) }
 function Start-Sleep {
     param([int]$Seconds, [int]$Milliseconds)
@@ -25,6 +26,7 @@ function Start-Sleep {
 $reportedState = "unknown"
 $inactiveSamples = 0
 $lastHeartbeatAt = [DateTime]::MinValue
+$lastNativePollAt = [DateTime]::MinValue
 $Once = $false
 $config = $null
 $token = "synthetic-unused-token"

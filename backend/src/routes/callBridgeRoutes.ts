@@ -1,4 +1,6 @@
 import { Router, type Request, type Response, type NextFunction } from "express";
+import { dispatchCallAtDeadline, verifyDeadlineLaunch } from "../controllers/callDeadlineController";
+import { requestNativeDial, claimNativeDial, cancelNativeDial, beginManualCallHold } from "../controllers/nativeCallBridgeController";
 import {
   activateCallBridgeForEmployee,
   claimCallBridgePairing,
@@ -62,11 +64,17 @@ function logDialStartFailure(request: Request, response: Response, next: NextFun
 callBridgeRouter.post("/pairings", createCallBridgePairing);
 callBridgeRouter.post("/claim", claimCallBridgePairing);
 callBridgeRouter.post("/activate", activateCallBridgeForEmployee);
+callBridgeRouter.post("/manual-call-hold", beginManualCallHold);
 callBridgeRouter.post("/heartbeat", updateCallBridgeHeartbeat);
+callBridgeRouter.post("/native-dial", requestNativeDial);
+callBridgeRouter.post("/native-dial/claim", claimNativeDial);
+callBridgeRouter.post("/native-dial/cancel", cancelNativeDial);
 callBridgeRouter.get("/status", getCallBridgeStatus);
 callBridgeRouter.get("/attempts/latest", getLatestCallBridgeAttempt);
 callBridgeRouter.post("/reserve", logReserveConflict, reserveCallBridgeCall);
 callBridgeRouter.post("/dial-start", logDialStartFailure, markCallBridgeDialStarted);
+callBridgeRouter.post("/dial-at-deadline", logDialStartFailure, dispatchCallAtDeadline);
+callBridgeRouter.post("/verify-deadline-launch", logDialStartFailure, verifyDeadlineLaunch);
 callBridgeRouter.post("/release", releaseCallBridgeCall);
 callBridgeRouter.delete("/devices", revokeCallBridgeDevices);
 callBridgeRouter.get("/package", downloadCallBridgePackage);

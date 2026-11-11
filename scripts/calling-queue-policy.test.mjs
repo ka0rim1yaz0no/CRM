@@ -8,6 +8,21 @@ const now = new Date("2026-10-22T17:00:00Z");
 const lead = (id, fields = {}) => ({ _id: id, status: "NEW", createdAt: now, comments: [], ...fields });
 const employeeComment = time => ({ authorType: "employee", createdAt: time });
 
+test("precomputed policy ranks preserve exact ordering for every eligibility state and due boundary", () => {
+    const rows = Array.from({ length: 400 }, (_, i) => lead(`synthetic-${i}`, {
+        status: ["NEW", "Follow up", "Dead", "Qualified"][i % 4],
+        createdAt: new Date(+now - (i % 11) * 1000),
+        followUpAt: [null, new Date(+now - 1), new Date(+now + 1), "invalid"][i % 4],
+        comments: i % 3 === 0 ? [employeeComment(new Date(+now - (i % 2 ? 1 : AUTO_CALL_COMMENT_COOLDOWN_MS)))] : [],
+    }));
+    for (const at of [now, new Date(+now + 1)]) {
+        const ranks = new Map(rows.map(row => [row._id, evaluateCallingLead(row, at)]));
+        const baseline = rows.slice().sort((a, b) => compareCallingLeads(a, b, at));
+        const cached = rows.slice().sort((a, b) => compareCallingLeads(a, b, at, ranks.get(a._id), ranks.get(b._id)));
+        assert.deepEqual(cached, baseline);
+    }
+});
+
 test("due callbacks precede NEW then unscheduled follow-ups, with stable UTC/ID tie breaking", () => {
     const rows = [lead("new-b"), lead("follow-up", { status: "Follow up" }), lead("new-a"),
         lead("due-later", { status: "Follow up", followUpAt: new Date(+now - 1) }),

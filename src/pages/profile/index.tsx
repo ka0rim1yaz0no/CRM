@@ -23,6 +23,7 @@ import { BankAccountInput, ProfileContactActions, ProfileFieldGroup, ProfileMobi
 import AvailabilityBadge from "../../components/AvailabilityBadge";
 import MetricValue from "../../components/MetricValue";
 import EmployeePayments from "../../components/EmployeePayments";
+import EmployeeAttendanceCalendar from "../../components/EmployeeAttendanceCalendar";
 import "./profileUpgrade.css";
 
 const emptyProfileForm: EmployeeProfileInput = {
@@ -266,7 +267,7 @@ export default function Profile() {
     const [authUser, setAuthUser] = useState(() => getAuthUser());
     const employee = authUser?.userType === "employee" ? authUser.user : null;
     const employeeId = employee?._id || "";
-    const [activeProfileTab, setActiveProfileTab] = useState<"overview" | "notices" | "leave" | "payments">("overview");
+    const [activeProfileTab, setActiveProfileTab] = useState<"overview" | "notices" | "leave" | "payments" | "attendance">("overview");
     const [profileForm, setProfileForm] = useState<EmployeeProfileInput>(emptyProfileForm);
     const [isProfileEditing, setIsProfileEditing] = useState(false);
     const [profileSuccessMessage, setProfileSuccessMessage] = useState("");
@@ -283,7 +284,7 @@ export default function Profile() {
     const dropdownMenuRef = useRef<HTMLDivElement>(null);
     const profileImageInputRef = useRef<HTMLInputElement>(null);
     const profileDetailsRef = useRef<HTMLElement>(null);
-    const selectProfileTab = (tab: "overview" | "notices" | "leave" | "payments") => {
+    const selectProfileTab = (tab: "overview" | "notices" | "leave" | "payments" | "attendance") => {
         setActiveProfileTab(tab);
         setSearchParams((previous) => { const next = new URLSearchParams(previous); next.set("tab", tab); if (tab !== "notices") next.delete("notice"); return next; });
     };
@@ -433,7 +434,7 @@ export default function Profile() {
     if (previousProfileRoute === null || profileRouteInputs.some((input, index) => !Object.is(input, previousProfileRoute[index]))) {
         setPreviousProfileRoute(profileRouteInputs);
         (() => {
-            if (requestedProfileTab === "notices" || requestedProfileTab === "leave" || requestedProfileTab === "overview" || requestedProfileTab === "payments") {
+            if (requestedProfileTab === "notices" || requestedProfileTab === "leave" || requestedProfileTab === "overview" || requestedProfileTab === "payments" || requestedProfileTab === "attendance") {
                 setActiveProfileTab(requestedProfileTab);
             } else {
                 setActiveProfileTab("overview");
@@ -710,6 +711,7 @@ export default function Profile() {
                         ["leave", `Leave${pendingLeaveCount > 0 ? ` (${pendingLeaveCount})` : ""}`],
                         ["notices", `Notices${unreadNoticeCount > 0 ? ` (${unreadNoticeCount})` : ""}`],
                         ["payments", "Payments"],
+                        ["attendance", "Attendance"],
                     ].map(([tab, label]) => (
                         <button
                             key={tab}
@@ -725,22 +727,22 @@ export default function Profile() {
                                     : "text-white/60 hover:bg-white/[0.06] hover:text-white",
                             ].join(" ")}
                             type="button"
-                            onClick={() => selectProfileTab(tab as "overview" | "leave" | "notices" | "payments")}
+                            onClick={() => selectProfileTab(tab as "overview" | "leave" | "notices" | "payments" | "attendance")}
                             onKeyDown={(event) => {
                                 if (!profileUpgradeEnabled || !["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
-                                event.preventDefault(); const tabs = ["overview", "leave", "notices", "payments"] as const; const index = tabs.indexOf(activeProfileTab);
+                                event.preventDefault(); const tabs = ["overview", "leave", "notices", "payments", "attendance"] as const; const index = tabs.indexOf(activeProfileTab);
                                 const next = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : (index + (event.key === "ArrowRight" ? 1 : tabs.length - 1)) % tabs.length;
                                 selectProfileTab(tabs[next]); document.getElementById(`profile-tab-${tabs[next]}`)?.focus();
                             }}
                         >
-                            {profileUpgradeEnabled && (tab === "overview" ? <FiBriefcase aria-hidden="true" /> : tab === "leave" ? <FiCalendar aria-hidden="true" /> : tab === "payments" ? <FiCreditCard aria-hidden="true" /> : <FiBell aria-hidden="true" />)}
+                            {profileUpgradeEnabled && (tab === "overview" ? <FiBriefcase aria-hidden="true" /> : tab === "leave" ? <FiCalendar aria-hidden="true" /> : tab === "payments" ? <FiCreditCard aria-hidden="true" /> : tab === "attendance" ? <FiClock aria-hidden="true" /> : <FiBell aria-hidden="true" />)}
                             {label}
                         </button>
                     ))}
                 </div>
 
                 <div role={profileUpgradeEnabled ? "tabpanel" : undefined} id={profileUpgradeEnabled ? `profile-panel-${activeProfileTab}` : undefined} aria-labelledby={profileUpgradeEnabled ? `profile-tab-${activeProfileTab}` : undefined}>
-                {activeProfileTab === "payments" ? <EmployeePayments /> : activeProfileTab === "overview" ? (
+                {activeProfileTab === "attendance" ? <EmployeeAttendanceCalendar /> : activeProfileTab === "payments" ? <EmployeePayments /> : activeProfileTab === "overview" ? (
                     <div className="profile-overview grid gap-5 xl:grid-cols-[22rem_1fr]">
                         <aside className="space-y-5">
                             <section className="theme-surface-bg rounded-lg border border-white/10 p-5">

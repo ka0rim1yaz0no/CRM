@@ -9,7 +9,10 @@ afterEach(() => { mock.restoreAll(); for (const flag of ["CRM_ATTENDANCE_ACCURAC
 const args = (uri: string) => ["--dry-run", "--uri", uri, "--ledger-database", "fake", "--business", "fake-a=fake_a", "--as-of", "2026-10-21T01:00:00Z"];
 test("accuracy CLI rejects nonlocal, credential-bearing and apply targets before connecting", async () => {
   let calls = 0; mock.method(mongo.MongoClient.prototype, "connect", async () => { calls++; });
-  for (const uri of ["mongodb://remote.example.invalid/fake", "mongodb+srv://remote.example.invalid/fake", "mongodb://user:dummy@localhost/fake"]) {
+  const credentialBearing = new URL("mongodb://localhost/fake");
+  credentialBearing.username = "synthetic-user";
+  credentialBearing.password = "synthetic-password";
+  for (const uri of ["mongodb://remote.example.invalid/fake", "mongodb+srv://remote.example.invalid/fake", credentialBearing.href]) {
     await assert.rejects(attendanceAccuracyDryRun(args(uri)), /loopback Mongo/);
   }
   await assert.rejects(attendanceAccuracyDryRun([...args("mongodb://127.0.0.1:1/fake"), "--apply"]));

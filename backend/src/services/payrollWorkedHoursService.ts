@@ -17,7 +17,8 @@ import { attendancePayrollDtr } from "../controllers/payrollController";
 import { savedPayrollPeriod } from "../../../shared/payrollPeriod";
 import { adjustedPayrollHours } from "../../../shared/payrollWorkedHours";
 import { earnedPayrollEnabled, earnedPayrollVersion } from "../config/payrollEarnings";
-import { isEarnedPayrollVersion } from "../../../shared/payrollEarnings";
+import { isEarnedPayrollVersion, isFixedHalfSalaryVersion } from "../../../shared/payrollEarnings";
+import { fixedHalfSalaryAmounts } from "../../../shared/payrollFixedHalf";
 
 const fail = (statusCode: number, message: string) => Object.assign(new Error(message), { statusCode });
 const hash = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
@@ -66,6 +67,9 @@ async function buildHoursPlan(id: string, workedMinutes: unknown, session?: Clie
             const history = await EmployeePaymentHistoryPolicy.findById("employee-payment-history", null, session ? { session } : undefined).lean();
             if (history && period.start < history.fromDate) throw new PayrollValidationError("This cutoff is before the enabled payment history boundary.");
             const attendance = await attendancePayrollDtr(employee._id, source.payPeriod, session);
+            if (isFixedHalfSalaryVersion(record.calculationVersion) && attendance.rows.some(row => !row.isWeekend && ["Scheduled", "In Progress"].includes(row.status))) {
+                throw new PayrollValidationError("Review total paid hours after the fixed-salary cutoff has completed. Future hours were not charged.");
+            }
             const currentLedger = await AttendanceLedger.findOne({ employeeCode: source.employeeId, businessIds: businessId }, null, session ? { session } : undefined).lean();
             if (currentLedger?.migrationRequired) throw new PayrollValidationError("Attendance synchronization needs review before editing payroll.");
             const rate = record.minuteRate;
@@ -73,12 +77,18 @@ async function buildHoursPlan(id: string, workedMinutes: unknown, session?: Clie
             let adjusted;
             try { adjusted = adjustedPayrollHours(record, workedMinutes); }
             catch (error) { throw new PayrollValidationError((error as Error).message); }
-            const grossPay = isEarnedPayrollVersion(record.calculationVersion) ? roundMoney((adjusted.earnedGrossHours! + (record.overtimeApproved ? record.overtimeHours : 0)) * rate * 60) : record.grossPay;
-            const deductions = Math.min(grossPay, roundMoney(adjusted.deductibleMinutes * rate));
+            let fixedAmounts;
+            if (isFixedHalfSalaryVersion(record.calculationVersion)) {
+                try { fixedAmounts = fixedHalfSalaryAmounts(record.basicPay, rate, adjusted.deductibleMinutes, record.overtimeApproved ? record.overtimeHours : 0); }
+                catch (error) { throw new PayrollValidationError((error as Error).message); }
+                if (workedMinutes === 0 && fixedAmounts.netPay > 0) throw new PayrollValidationError("Zero paid hours require a reviewed absence-proration calculation. No positive pay was inferred.");
+            }
+            const grossPay = fixedAmounts?.grossPay ?? (isEarnedPayrollVersion(record.calculationVersion) ? roundMoney((adjusted.earnedGrossHours! + (record.overtimeApproved ? record.overtimeHours : 0)) * rate * 60) : record.grossPay);
+            const deductions = fixedAmounts?.deductions ?? Math.min(grossPay, roundMoney(adjusted.deductibleMinutes * rate));
             const value = { ...adjusted, grossPay, deductions, netPay: roundMoney(grossPay - deductions),
                 calculationSnapshot: { ...record.calculationSnapshot, workedHoursAdjustment: {
                     workedMinutes, scheduledMinutes: Math.round(record.scheduledHours * 60), minuteRate: rate,
-                    formula: isEarnedPayrollVersion(record.calculationVersion) ? "Reviewed paid hours at the saved hourly rate; saved attendance deductions follow the cutoff calculation version; payment status unchanged." : "Scheduled minutes minus total worked minutes (including non-billable off-phone shortfall once), plus saved excess break and lunch; gross pay and payment status unchanged.",
+                    formula: isFixedHalfSalaryVersion(record.calculationVersion) ? "Fixed half-month base minus scheduled-to-paid minute shortfall once at the saved monthly minute rate. Excess rest and non-billable Off the Phone are already included in that shortfall; payment status unchanged." : isEarnedPayrollVersion(record.calculationVersion) ? "Reviewed paid hours at the saved hourly rate; saved attendance deductions follow the cutoff calculation version; payment status unchanged." : "Scheduled minutes minus total worked minutes (including non-billable off-phone shortfall once), plus saved excess break and lunch; gross pay and payment status unchanged.",
                 } } };
             return { businessId, id: String(record._id), beforeHash: hash(record), value,
                 attendanceHash: hash({ summary: attendance.summary, rows: attendance.rows, ledger: currentLedger }) };

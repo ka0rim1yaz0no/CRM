@@ -1,13 +1,15 @@
 import { currentPeriod, periodRange, scheduledPayDateForPeriod } from "../controllers/payrollController";
 import { getSystemSettings } from "../controllers/systemSettingsController";
-import { getCurrentBusiness, runForEachBusiness } from "../config/tenancy";
+import { getBusinessById, getCurrentBusiness, runForEachBusiness, runWithBusiness } from "../config/tenancy";
 import { EmployeePaymentHistoryPolicy } from "../models/EmployeePaymentHistoryPolicy";
 import { PayrollRecord, type PayrollRecordDocument } from "../models/Payroll";
 import type { EmployeePayment, EmployeePayments } from "../../../shared/employeePayments";
 import { savedPayrollPeriod, isConfiguredSavedPayrollPeriod } from "../../../shared/payrollPeriod";
 import { payrollReadGroups } from "./payrollReadPolicy";
-import { currentEarnedPayrollRecords } from "./payrollEarningsRead";
+import { payrollPaymentReadRecords, type PayrollAmountReadBasis } from "./payrollPaymentRead";
 import type { PayrollEarningsView } from "../../../shared/payrollEarnings";
+import { AttendanceLedger } from "../models/AttendanceLedger";
+import { getAttendanceBusinessIdentity } from "../models/BusinessUserAccess";
 
 const policyId = "employee-payment-history";
 export function payrollDateKey(date: Date) {
@@ -40,7 +42,9 @@ function paymentDto(record: PayrollRecordDocument & PayrollEarningsView & { _id:
     const minuteKeys = ["lateMinutes", "excessLunchMinutes", "excessBreakMinutes", "nonBillableOffPhoneMinutes", "earlyTimeOutMinutes", "absenceMinutes"] as const;
     if (minuteKeys.some(key => record[key] !== undefined && savedNumber(record[key]) === null)) return null;
     return {
-        earnedToDate: record.earnedToDate, earningsAsOf: record.earningsAsOf, earningsUnavailable: record.earningsUnavailable,
+        currentCutoffDraft: record.currentCutoffDraft,
+        earnedToDate: record.earnedToDate, cutoffEstimate: record.cutoffEstimate, earningsAsOf: record.earningsAsOf, earningsUnavailable: record.earningsUnavailable,
+        earningsUnavailableReason: record.earningsUnavailableReason,
         settlementRequired: record.settlementRequired, savedAmounts: record.savedAmounts,
         id: String(record._id), payPeriod: record.payPeriod, cutoffStart: range.start, cutoffEnd: range.end,
         payType: record.payType, department: record.department, grossPay: record.grossPay, deductions: record.deductions, netPay: record.netPay,
@@ -62,7 +66,7 @@ function paymentDto(record: PayrollRecordDocument & PayrollEarningsView & { _id:
     };
 }
 
-export async function employeePayments(employeeCode: string, page = 1, view: "current" | "history" = "current"): Promise<EmployeePayments> {
+async function businessEmployeePayments(employeeCode: string, page: number, view: "current" | "history", basis: PayrollAmountReadBasis): Promise<EmployeePayments> {
     const settings = await getSystemSettings();
     const policy = await EmployeePaymentHistoryPolicy.findById(policyId).lean();
     const business = getCurrentBusiness();
@@ -71,7 +75,8 @@ export async function employeePayments(employeeCode: string, page = 1, view: "cu
         initialPayPeriod: policy?.initialPayPeriod || null, setupPending: !policy, items: [], total: 0, page, view, pageSize: 20, reviewCount: 0, asOf: new Date().toISOString() };
     if (!policy) return result;
     const records = await PayrollRecord.find({ employeeId: employeeCode, isArchived: false }).select(
-        "employeeId payPeriod payType department grossPay basicPay deductions netPay calculationVersion calculationSnapshot.monthlySalary hourlyRate minuteRate paidHoursPerDay " +
+        "employeeId payPeriod payType department grossPay basicPay deductions netPay calculationVersion payrollOwnerBusinessId " +
+        "calculationSnapshot.monthlySalary calculationSnapshot.inheritedPayrollInputs calculationSnapshot.payrollInputsBusinessId hourlyRate minuteRate paidHoursPerDay " +
         "workingDays attendanceDays absentDays workedHours workedMinutesOverride scheduledHours overtimeHours overtimeApproved deductibleMinutes incompleteShiftDays " +
         "lateMinutes lateHours excessLunchMinutes excessBreakMinutes nonBillableOffPhoneMinutes earlyTimeOutMinutes absenceMinutes status paidOn updatedAt"
     ).maxTimeMS(5000).lean();
@@ -81,7 +86,8 @@ export async function employeePayments(employeeCode: string, page = 1, view: "cu
     for (const group of groups) {
         if (group.period.start < policy.fromDate || !isConfiguredSavedPayrollPeriod(group.period, settings)) continue;
         if (view === "current" && (!current || group.period.start !== current.start || group.period.end !== current.end)) continue;
-        const projected = group.record ? (await currentEarnedPayrollRecords([{ ...group.record, requiresReview: group.requiresReview }], result.currentPayPeriod))[0] : null;
+        const source = group.record ? { ...group.record, requiresReview: group.requiresReview } : null;
+        const projected = source ? (await payrollPaymentReadRecords([source], result.currentPayPeriod, basis))[0] : null;
         const item = projected ? paymentDto(projected, settings) : null;
         if (group.requiresReview || !item) result.reviewCount++;
         if (item) items.push({ ...item, requiresReview: group.requiresReview });
@@ -90,4 +96,18 @@ export async function employeePayments(employeeCode: string, page = 1, view: "cu
     result.total = items.length;
     result.items = items.slice((page - 1) * result.pageSize, page * result.pageSize);
     return result;
+}
+
+export async function employeePayments(employeeCode: string, page = 1, view: "current" | "history" = "current", basis: PayrollAmountReadBasis = "payment"): Promise<EmployeePayments> {
+    const business = getCurrentBusiness(), mapping = await getAttendanceBusinessIdentity(employeeCode);
+    if (!mapping?.businessIds.includes(business.id)) return businessEmployeePayments(employeeCode, page, view, basis);
+    const ledger = await AttendanceLedger.findById(`access:${mapping.id}`)
+        .select("employeeCode canonicalBusinessId businessIds migrationRequired").lean();
+    const source = ledger && ledger.employeeCode === employeeCode && !ledger.migrationRequired &&
+        ledger.businessIds.includes(ledger.canonicalBusinessId) &&
+        mapping.businessIds.includes(ledger.canonicalBusinessId) ? getBusinessById(ledger.canonicalBusinessId) : null;
+    if (!source || source.id === business.id) return businessEmployeePayments(employeeCode, page, view, basis);
+    const payments = await runWithBusiness(source.id, () => businessEmployeePayments(employeeCode, page, view, basis));
+    // Keep the selected-business binding while reading the employee's one shared payroll history.
+    return { ...payments, business: { id: business.id, name: business.name } };
 }

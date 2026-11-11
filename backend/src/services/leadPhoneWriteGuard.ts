@@ -62,7 +62,7 @@ export function installLeadPhoneWriteGuard(schema: Schema<LeadDocument>) {
         const update = this.getUpdate();
         if (!update || Array.isArray(update)) { invalidate(); return; }
         const fields = Object.values(update).flatMap(value => value && typeof value === "object" ? Object.keys(value) : []);
-        if (fields.some(field => /^(phone|status|followUpAt|assignedAgent|assignedAgentName|createdAt|googlePlaceId|providerPlaceId|businessName|businessAddress|callCount|callLogs|comments|notes)(\.|$)/.test(field))) invalidate();
+        if (fields.some(field => /^(phone|status|followUpAt|assignedAgent|assignedAgentName|createdAt|googlePlaceId|providerPlaceId|businessName|businessAddress|callCount|callLogs|comments|notes|lastCallOutcomeAt)(\.|$)/.test(field))) invalidate();
     });
     schema.pre("save", async function () {
         if (!leadPhoneDedupEnabled() || (!this.isNew && !this.isModified("phone") && !this.isModified("status"))) return;

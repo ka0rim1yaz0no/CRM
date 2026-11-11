@@ -5,6 +5,7 @@ import { rateLimit, ipKeyGenerator } from "express-rate-limit";
 import { verifyAdminDashboardSession } from "../config/adminDashboardSession";
 import { verifyAttendanceHubSession } from "../config/attendanceHubSession";
 import { securityHardeningEnabled } from "../config/rolloutFlags";
+import { getCallBridgeDeviceModel } from "../models/CallBridge";
 
 function numberSetting(name: string, fallback: number, maximum: number) {
   const value = Number(process.env[name]);
@@ -14,10 +15,20 @@ function guarded(middleware: RequestHandler): RequestHandler {
   return (request, response, next) => securityHardeningEnabled() ? middleware(request, response, next) : next();
 }
 function hash(value: string) { return crypto.createHash("sha256").update(value).digest("hex"); }
-function apiKey(request: Request) {
+export async function securityRequestKey(request: Request) {
   const identity = verifyAdminDashboardSession(request.header("x-crm-admin-session"))?.employeeCode
     || verifyAttendanceHubSession(request.header("x-crm-attendance-session"));
-  return identity ? `session:${hash(identity)}` : ipKeyGenerator(request.ip || "127.0.0.1");
+  if (identity) return `session:${hash(identity)}`;
+  if (request.method === "POST" && ["/call-bridge/heartbeat", "/call-bridge/native-dial/claim"].includes(request.path)) {
+    const authorization = String(request.header("authorization") || "");
+    const token = authorization.startsWith("Bearer ") ? authorization.slice(7) : "";
+    if (token.length >= 24 && token.length <= 256) {
+      try {
+        if (await getCallBridgeDeviceModel().exists({ tokenHash: hash(token) }).maxTimeMS(1000)) return `bridge:${hash(token)}`;
+      } catch { /* Failed credential reads retain the stricter shared-IP limit. */ }
+    }
+  }
+  return ipKeyGenerator(request.ip || "127.0.0.1");
 }
 export function securityMiddleware() {
   const windowMs = numberSetting("CRM_SECURITY_LOGIN_WINDOW_MS", 15 * 60_000, 24 * 60 * 60_000);
@@ -25,7 +36,7 @@ export function securityMiddleware() {
     legacyHeaders: false, skipSuccessfulRequests: true, message: { message: "Too many login attempts. Please wait before trying again." } };
   return {
     headers: guarded(helmet({ crossOriginResourcePolicy: { policy: "same-site" }, strictTransportSecurity: process.env.NODE_ENV === "production" ? undefined : false })),
-    apiLimit: guarded(rateLimit({ windowMs: 60_000, limit: numberSetting("CRM_SECURITY_API_MAX", 600, 60_000), keyGenerator: apiKey,
+    apiLimit: guarded(rateLimit({ windowMs: 60_000, limit: numberSetting("CRM_SECURITY_API_MAX", 600, 60_000), keyGenerator: securityRequestKey,
       standardHeaders: "draft-8", legacyHeaders: false, skip: request => request.method === "OPTIONS" || request.path === "/health",
       message: { message: "Too many requests. Please try again shortly." } })),
     loginIpLimit: guarded(rateLimit({ ...loginOptions, limit: numberSetting("CRM_SECURITY_LOGIN_IP_MAX", loginOptions.limit, 1_000), requestPropertyName: "loginIpLimit" })),

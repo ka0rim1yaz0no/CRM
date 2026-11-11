@@ -8,7 +8,10 @@ test("review restore preserves namespaces and cannot target the original or a re
   assert.equal(restored.pathname, "/");
   assert.equal(restored.searchParams.get("replicaSet"), "testset");
   assert.equal(new URL(uri).pathname, "/crm");
-  for (const invalid of ["mongodb://127.0.0.1:27017/crm", "mongodb://example.invalid:27119/crm", "mongodb+srv://127.0.0.1:27119/crm", "mongodb://user:password@127.0.0.1:27119/crm"]) assert.throws(() => localReviewRestoreUri(invalid));
+  const credentialBearing = new URL(uri);
+  credentialBearing.username = "synthetic-user";
+  credentialBearing.password = "synthetic-password";
+  for (const invalid of ["mongodb://127.0.0.1:27017/crm", "mongodb://example.invalid:27119/crm", "mongodb+srv://127.0.0.1:27119/crm", credentialBearing.href]) assert.throws(() => localReviewRestoreUri(invalid));
 });
 
 test("local review resolves every verified business, including newly added explicit mappings", () => {

@@ -12,6 +12,7 @@ export async function runAttendanceDerivedRefresh(now = new Date(), deliver = de
 async function runRefresh(now: Date, deliver: typeof deliverAttendanceLedger) {
   if (!attendanceIntegrityEnabled() || !attendanceDurationModelEnabled()) return 0;
   const accuracy = attendanceAccuracyFixesEnabled(); const budget = attendanceWorkerBudget();
+  const fields = "_id employeeCode businessIds canonicalBusinessId revision events corrections closures derived migrationRequired";
   const ledgers = accuracy ? await attendanceWorkerBatch("derived-refresh", { migrationRequired: { $ne: true }, $or: [
     { "maintenance.derivedRefreshAt": { $lte: now } },
     { maintenance: { $exists: false }, derived: { $elemMatch: { accuracyVersion: 1, hasOpenSession: false, shiftEnd: { $lte: now.toISOString() } } },
@@ -19,8 +20,7 @@ async function runRefresh(now: Date, deliver: typeof deliverAttendanceLedger) {
         { $eq: ["$$day.accuracyVersion", 1] }, { $eq: ["$$day.hasOpenSession", false] },
         { $lt: ["$$day.computedAt", "$$day.shiftEnd"] }, { $lte: ["$$day.shiftEnd", now.toISOString()] },
       ] } } }] } },
-  ] }, "_id employeeCode businessIds canonicalBusinessId revision events corrections closures derived migrationRequired")
-    : await AttendanceLedger.find({ migrationRequired: { $ne: true }, "derived.0": { $exists: true } }).lean();
+  ] }, fields) : await AttendanceLedger.find({ migrationRequired: { $ne: true }, "derived.0": { $exists: true } }).select(fields).lean();
   let refreshed = 0;
   for (const ledger of ledgers) {
     if (accuracy && !budget()) break;

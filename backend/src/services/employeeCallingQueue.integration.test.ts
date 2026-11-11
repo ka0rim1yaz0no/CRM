@@ -23,6 +23,8 @@ const { Lead } = await import("../models/Lead");
 const { getCallBridgeDeviceModel, getCallBridgeScheduleModel } = await import("../models/CallBridge");
 const { setBusinessAccessForEmployeeCode } = await import("../models/BusinessUserAccess");
 const { createAttendanceHubSession } = await import("../config/attendanceHubSession");
+const { getAttendanceBusinessIdentity } = await import("../models/BusinessUserAccess");
+const { AttendanceLedger } = await import("../models/AttendanceLedger");
 const { CALLING_QUEUE_POLICY_VERSION } = await import("../../../shared/leadCallingPolicy");
 let mongo: MongoMemoryReplSet, server: http.Server, base = "";
 before(async () => {
@@ -44,6 +46,11 @@ beforeEach(async () => {
 async function fixture(business = businesses[0], code = `synthetic-${crypto.randomUUID()}`) {
     await setBusinessAccessForEmployeeCode(code, businesses);
     const employee = await runWithBusiness(business, () => Employee.create({ name: code, employeeCode: code, role: "Sales", status: "Active", availabilityStatus: "ONLINE" }));
+    const identity = await getAttendanceBusinessIdentity(code);
+    assert.ok(identity);
+    const at = new Date(+now - 100000).toISOString();
+    await AttendanceLedger.updateOne({ _id: `access:${identity.id}` }, { $setOnInsert: { employeeCode: code, canonicalBusinessId: business, businessIds: businesses,
+        revision: 1, events: [{ id: crypto.randomUUID(), source: "Time In", at, recordedAt: at, commandId: crypto.randomUUID(), sequence: 1 }] } }, { upsert: true });
     const bridgeToken = crypto.randomBytes(24).toString("hex");
     await getCallBridgeDeviceModel().findOneAndUpdate({ employeeCode: code, deviceId: code }, { $set: { employeeCode: code, employeeName: code,
         deviceName: "Synthetic device", deviceId: code, tokenHash: crypto.createHash("sha256").update(bridgeToken).digest("hex"), businessIds: businesses,
@@ -62,6 +69,225 @@ type TestQueue = { nextLeadId: string | null; version: string; nextDecision: { n
 type QueueEntry = { leadId: string; reason: string; callable: boolean };
 const reservation = (code: string, queue: TestQueue, id = queue.nextLeadId, attemptId = crypto.randomUUID()) => ({ employeeCode: code, leadId: id,
     attemptId, queueVersion: queue.version, normalizedPhone: queue.nextDecision?.normalizedPhone });
+
+test("without a saved note the same NEW or follow-up lead remains next after a real 30-second cooldown in six businesses", async context => {
+    context.mock.timers.enable({ apis: ["Date"], now });
+    try {
+        let index = 0;
+        for (const business of businesses) for (const status of ["NEW", "Follow up"]) {
+            context.mock.timers.setTime(+now);
+            await runWithBusiness(business, () => Lead.deleteMany({}));
+            const f = await fixture(business), phone = `+1202555${String(1000 + index++ * 2).padStart(4, "0")}`;
+            const lead = await f.add({ status, phone, createdAt: new Date(+now - 1000) });
+            const next = await f.add({ status, phone: `+1202555${String(1001 + (index - 1) * 2).padStart(4, "0")}`, createdAt: new Date(+now - 100000) });
+            assert.equal((await f.queue()).callingQueue.nextLeadId, String(lead._id));
+            const recorded = await f.request(`/leads/${lead._id}/calls`, { callOutcome: "confirmed" });
+            assert.equal(recorded.status, 201);
+            const saved = await recorded.json(); assert.equal(saved.comments.length, 0); assert.equal(saved.callCount, 1);
+            assert.equal((await f.queue()).callingQueue.nextLeadId, String(lead._id), "call history alone must not exclude an unnoted lead");
+            await getCallBridgeScheduleModel().create({ employeeCode: f.code, lastCallEndedAt: now, nextCallAllowedAt: new Date(+now + 30000) });
+            context.mock.timers.setTime(+now + 29999);
+            await getCallBridgeDeviceModel().updateOne({ employeeCode: f.code }, { $set: { lastSeenAt: new Date() } });
+            assert.equal((await f.request("/call-bridge/reserve", reservation(f.code, (await f.queue()).callingQueue))).status, 409, "29.999 seconds cannot reserve early");
+            context.mock.timers.setTime(+now + 30000);
+            await getCallBridgeDeviceModel().updateOne({ employeeCode: f.code }, { $set: { lastSeenAt: new Date() } });
+            const repeatQueue = (await f.queue()).callingQueue;
+            assert.equal(repeatQueue.nextLeadId, String(lead._id));
+            const repeated = await f.request("/call-bridge/reserve", reservation(f.code, repeatQueue));
+            assert.equal(repeated.status, 200); assert.equal((await repeated.json()).leadId, String(lead._id));
+            const note = await f.request(`/leads/${lead._id}/comments`, { body: "Synthetic saved employee note" });
+            assert.equal(note.status, 200);
+            const refreshed = (await f.queue()).callingQueue;
+            assert.equal(refreshed.nextLeadId, String(next._id), "a saved note advances the authoritative queue");
+            assert.equal(refreshed.entries.find((entry: QueueEntry) => entry.leadId === String(lead._id)).reason, "COMMENT_COOLDOWN");
+            assert.equal((await f.request("/call-bridge/reserve", reservation(f.code, repeatQueue))).status, 409, "a stale view cannot repeat a newly noted lead");
+        }
+    } finally { context.mock.timers.reset(); }
+});
+
+test("new leads and newly due callbacks cannot displace the last called unnoted lead in any business", async context => {
+    context.mock.timers.enable({ apis: ["Date"], now });
+    try {
+        for (const business of businesses) {
+            context.mock.timers.setTime(+now);
+            const f = await fixture(business), lead = await f.add();
+            assert.equal((await f.request(`/leads/${lead._id}/calls`, { callOutcome: "confirmed" })).status, 201);
+            const fresh = await f.add({ phone: "+12025550122", createdAt: new Date(+now + 1) });
+            const callback = await f.add({ phone: "+12025550123", status: "Follow up", followUpAt: new Date(+now + 30000) });
+            const refreshed = (await f.queue()).callingQueue;
+            assert.equal(refreshed.nextLeadId, String(lead._id), "a new NEW lead must not replace the unnoted call target");
+            await getCallBridgeScheduleModel().create({ employeeCode: f.code, lastCallEndedAt: now, nextCallAllowedAt: new Date(+now + 30000) });
+            context.mock.timers.setTime(+now + 30000);
+            await getCallBridgeDeviceModel().updateOne({ employeeCode: f.code }, { $set: { lastSeenAt: new Date() } });
+            const due = (await f.queue()).callingQueue;
+            assert.equal(due.nextLeadId, String(lead._id), "a newly due callback must not replace the unnoted call target");
+            assert.equal((await f.request("/call-bridge/reserve", reservation(f.code, due, String(fresh._id)))).status, 409);
+            assert.equal((await f.request("/call-bridge/reserve", reservation(f.code, due))).status, 200);
+            assert.equal((await f.request(`/leads/${lead._id}/comments`, { body: "Synthetic saved employee note" })).status, 200);
+            assert.equal((await f.queue()).callingQueue.nextLeadId, String(callback._id), "saving a note restores normal callback priority");
+        }
+    } finally { context.mock.timers.reset(); }
+});
+
+test("repeat selection survives refresh and business switches without changing attendance or saved payroll", async context => {
+    context.mock.timers.enable({ apis: ["Date"], now });
+    try {
+        const code = `synthetic-${crypto.randomUUID()}`, views = [];
+        for (const business of businesses) {
+            const f = await fixture(business, code), lead = await f.add();
+            assert.equal((await f.request(`/leads/${lead._id}/calls`, { callOutcome: "confirmed" })).status, 201);
+            await f.add({ phone: "+12025550122", createdAt: new Date(+now + 1) });
+            const db = mongoose.connection.getClient().db(process.env.DEFAULT_BUSINESS_DATABASE + "_" + businesses.indexOf(business));
+            await db.collection("payrollrecords").insertOne({ status: "Paid", netPay: 99, paidOn: now });
+            views.push({ f, lead, db });
+        }
+        const attendance = JSON.stringify(await AttendanceLedger.find({ employeeCode: code }).lean());
+        for (const { f, lead, db } of [...views].reverse()) {
+            const leads = JSON.stringify(await runWithBusiness(f.business, () => Lead.find().sort({ _id: 1 }).lean()));
+            const payroll = JSON.stringify(await db.collection("payrollrecords").find().toArray());
+            for (let read = 0; read < 2; read++) assert.equal((await f.queue()).callingQueue.nextLeadId, String(lead._id));
+            assert.equal(JSON.stringify(await runWithBusiness(f.business, () => Lead.find().sort({ _id: 1 }).lean())), leads);
+            assert.equal(JSON.stringify(await db.collection("payrollrecords").find().toArray()), payroll);
+        }
+        assert.equal(JSON.stringify(await AttendanceLedger.find({ employeeCode: code }).lean()), attendance);
+        assert.equal(await getCallBridgeScheduleModel().countDocuments({ employeeCode: code }), 0, "queue reads must not create retention records or call leases");
+    } finally { context.mock.timers.reset(); }
+});
+
+test("releasing an ineligible latest call never resurrects an older unnoted call", async context => {
+    context.mock.timers.enable({ apis: ["Date"], now });
+    try {
+        for (const scenario of ["noted", "closed", "archived", "reassigned", "future", "invalid-phone", "duplicate-comment"] as const) {
+            context.mock.timers.setTime(+now);
+            await runWithBusiness(businesses[0], () => Lead.deleteMany({}));
+            const f = await fixture(), old = await f.add({ createdAt: new Date(+now - 100000) });
+            assert.equal((await f.request(`/leads/${old._id}/calls`, { callOutcome: "confirmed" })).status, 201);
+            context.mock.timers.setTime(+now + 1);
+            const latest = await f.add({ phone: "+12025550122" });
+            assert.equal((await f.request(`/leads/${latest._id}/calls`, { callOutcome: "confirmed" })).status, 201);
+            const fresh = await f.add({ phone: "+12025550123", createdAt: new Date(+now + 2) });
+            assert.equal((await f.queue()).callingQueue.nextLeadId, String(latest._id), scenario);
+            await runWithBusiness(f.business, async () => {
+                if (scenario === "noted") await Lead.updateOne({ _id: latest._id }, { $push: { comments: { authorType: "employee", authorName: f.code, body: "Synthetic note", createdAt: new Date() } } });
+                if (scenario === "closed") await Lead.updateOne({ _id: latest._id }, { $set: { status: "Dead" } });
+                if (scenario === "archived") await Lead.updateOne({ _id: latest._id }, { $set: { status: "Archived" } });
+                if (scenario === "reassigned") await Lead.updateOne({ _id: latest._id }, { $set: { assignedAgent: new mongoose.Types.ObjectId() } });
+                if (scenario === "future") await Lead.updateOne({ _id: latest._id }, { $set: { followUpAt: new Date(+now + 60000) } });
+                if (scenario === "invalid-phone") await Lead.updateOne({ _id: latest._id }, { $set: { phone: "invalid" } });
+                if (scenario === "duplicate-comment") await Lead.create({ businessName: "Synthetic duplicate", phone: latest.phone, status: "Qualified", comments: [{ authorType: "employee", authorName: f.code, body: "Synthetic note", createdAt: new Date() }] });
+            });
+            const released = (await f.queue()).callingQueue;
+            assert.equal(released.nextLeadId, String(fresh._id), scenario);
+            assert.equal((await f.request("/call-bridge/reserve", reservation(f.code, released, String(latest._id)))).status, 409, scenario);
+        }
+    } finally { context.mock.timers.reset(); }
+});
+
+test("an unnoted repeat target waits for another employee's phone lease rather than skipping to a new lead", async context => {
+    context.mock.timers.enable({ apis: ["Date"], now });
+    const previous = process.env.CRM_LEAD_PHONE_DEDUP_V2;
+    process.env.CRM_LEAD_PHONE_DEDUP_V2 = "true";
+    try {
+        const f = await fixture(), lead = await f.add();
+        assert.equal((await f.request(`/leads/${lead._id}/calls`, { callOutcome: "confirmed" })).status, 201);
+        const fresh = await f.add({ phone: "+12025550122", createdAt: new Date(+now + 1) });
+        const other = await fixture();
+        await getCallBridgeScheduleModel().create({ employeeCode: other.code, reservedBusinessId: f.business, reservedPhone: lead.phone, callLeaseUntil: new Date(+now + 10000) });
+        const blocked = (await f.queue()).callingQueue;
+        assert.equal(blocked.nextLeadId, null);
+        assert.equal(blocked.repeatLeadId, String(lead._id));
+        assert.equal(blocked.waitReason, "WAITING_FOR_REPEAT_LEAD");
+        assert.equal((await f.request("/call-bridge/reserve", reservation(f.code, blocked, String(fresh._id)))).status, 409);
+        await getCallBridgeScheduleModel().updateOne({ employeeCode: other.code }, { $set: { callLeaseUntil: null, reservedPhone: "" } });
+        assert.equal((await f.queue()).callingQueue.nextLeadId, String(lead._id));
+    } finally {
+        if (previous === undefined) delete process.env.CRM_LEAD_PHONE_DEDUP_V2; else process.env.CRM_LEAD_PHONE_DEDUP_V2 = previous;
+        context.mock.timers.reset();
+    }
+});
+
+test("only a confirmed employee call without a newer employee note is retained", async context => {
+    context.mock.timers.enable({ apis: ["Date"], now });
+    try {
+        const f = await fixture(), lead = await f.add({ comments: [{ authorType: "employee", authorName: f.code, body: "Synthetic old note", createdAt: new Date(+now - 2 * 86400000) }] });
+        const fresh = await f.add({ phone: "+12025550122", createdAt: new Date(+now - 1) });
+        assert.equal((await f.request(`/leads/${lead._id}/calls`, { callOutcome: "failed" })).status, 201);
+        assert.equal((await f.queue()).callingQueue.nextLeadId, String(fresh._id), "failed launches must not retain a target");
+        assert.equal((await f.request(`/leads/${lead._id}/calls`, { callOutcome: "confirmed" })).status, 201);
+        await runWithBusiness(f.business, () => Lead.updateOne({ _id: lead._id }, { $push: { comments: { authorType: "admin", authorName: "Synthetic admin", body: "Synthetic admin note", createdAt: new Date() } } }));
+        assert.equal((await f.queue()).callingQueue.nextLeadId, String(lead._id), "old notes and admin notes do not complete the current employee call");
+        assert.equal((await f.request(`/leads/${lead._id}/comments`, { body: "Synthetic current saved employee note" })).status, 200);
+        context.mock.timers.setTime(+now + 2 * 86400000);
+        assert.equal((await f.queue()).callingQueue.nextLeadId, String(fresh._id), "expiry of comment cooldown must not restore the previous repeat target");
+    } finally { context.mock.timers.reset(); }
+});
+
+test("refresh dependencies retain hidden duplicate candidates and reveal only this employee's owned queue inputs in six businesses", async () => {
+    const previous = process.env.CRM_LEAD_PHONE_DEDUP_V2;
+    process.env.CRM_LEAD_PHONE_DEDUP_V2 = "true";
+    try {
+        for (const business of businesses) {
+            const f = await fixture(business), own = await f.add({ phone: "+12025550121" });
+            const other = await fixture(business), unrelated = await other.add({ phone: "+12025550123" });
+            // Historical duplicates must be seeded directly in this isolated
+            // replica; the current application correctly refuses to create one.
+            await runWithBusiness(business, () => Lead.collection.insertOne({ businessName: "Synthetic legacy duplicate", phone: own.phone,
+                assignedAgent: other.employee._id, assignedAgentName: other.code, status: "NEW", comments: [], activity: [],
+                notes: "Synthetic existing work makes this the canonical copy", callCount: 2, createdAt: new Date(+now - 200000) }));
+            const before = JSON.stringify(await runWithBusiness(business, () => Lead.find({}).sort({ _id: 1 }).lean()));
+            const result = (await f.queue()).callingQueue;
+            assert.equal(result.refreshDependencies.version, 1);
+            assert.ok(result.refreshDependencies.leadIds.includes(String(own._id)));
+            assert.ok(result.refreshDependencies.phones.includes(own.phone));
+            assert.equal(result.entries.some((row: QueueEntry) => row.leadId === String(own._id)), false);
+            assert.equal(result.refreshDependencies.leadIds.includes(String(unrelated._id)), false);
+            assert.equal(result.refreshDependencies.phones.includes(unrelated.phone), false);
+            assert.equal(JSON.stringify(await runWithBusiness(business, () => Lead.find({}).sort({ _id: 1 }).lean())), before);
+        }
+    } finally {
+        if (previous === undefined) delete process.env.CRM_LEAD_PHONE_DEDUP_V2; else process.env.CRM_LEAD_PHONE_DEDUP_V2 = previous;
+    }
+});
+
+test("six scoped queues omit unchanged dependency lists but keep fresh decisions, and new inputs always restore full metadata", async context => {
+    context.mock.timers.enable({ apis: ["Date"], now });
+    try {
+        for (const business of businesses) {
+            const f = await fixture(business); await f.add();
+            const full = (await f.queue()).callingQueue;
+            assert.match(full.refreshDependenciesFingerprint || "", /^[a-f0-9]{64}$/);
+            const reduced = (await (await f.request("/my-leads?callingQueue=true&knownRefreshDependencies=" + full.refreshDependenciesFingerprint)).json()).callingQueue;
+            assert.equal(reduced.refreshDependencies, undefined); assert.equal(reduced.refreshDependenciesUnchanged, true);
+            const { refreshDependenciesUnchanged: unchanged, ...rest } = reduced; assert.equal(unchanged, true);
+            assert.deepEqual({ ...rest, refreshDependencies: full.refreshDependencies }, full);
+            const before = JSON.stringify(await runWithBusiness(business, () => Lead.find({}).sort({ _id: 1 }).lean()));
+            assert.equal((await (await f.request("/my-leads?callingQueue=true&knownRefreshDependencies=" + "0".repeat(64))).json()).callingQueue.refreshDependencies.version, 1);
+            assert.equal(JSON.stringify(await runWithBusiness(business, () => Lead.find({}).sort({ _id: 1 }).lean())), before);
+            await f.add({ phone: "+12025550128" });
+            const changed = (await (await f.request("/my-leads?callingQueue=true&knownRefreshDependencies=" + full.refreshDependenciesFingerprint)).json()).callingQueue;
+            assert.notEqual(changed.refreshDependenciesFingerprint, full.refreshDependenciesFingerprint);
+            assert.equal(changed.refreshDependenciesUnchanged, undefined); assert.equal(changed.refreshDependencies.leadIds.length, 2);
+        }
+    } finally { context.mock.timers.reset(); }
+});
+
+test("release conflicts distinguish protected calls from obsolete ownership and never clear either reservation", async context => {
+    context.mock.timers.enable({ apis: ["Date"], now });
+    try {
+        const f = await fixture(); await f.add();
+        const q = (await f.queue()).callingQueue, body = reservation(f.code, q);
+        const accepted = await f.request("/call-bridge/reserve", body); assert.equal(accepted.status, 200);
+        const token = (await accepted.json()).reservationToken;
+        const before = JSON.stringify(await getCallBridgeScheduleModel().findOne({ employeeCode: f.code }).lean());
+        const wrong = await f.request("/call-bridge/release", { employeeCode: f.code, leadId: q.nextLeadId, reservationToken: crypto.randomUUID() });
+        assert.equal(wrong.status, 409); assert.equal((await wrong.json()).code, "CALL_RESERVATION_MISMATCH");
+        assert.equal(JSON.stringify(await getCallBridgeScheduleModel().findOne({ employeeCode: f.code }).lean()), before);
+        await getCallBridgeDeviceModel().updateOne({ employeeCode: f.code }, { $set: { state: "active", audioSessionActive: true } });
+        const blocked = await f.request("/call-bridge/release", { employeeCode: f.code, leadId: q.nextLeadId, reservationToken: token });
+        assert.equal(blocked.status, 409); assert.equal((await blocked.json()).code, "CALL_ACTIVE_RELEASE_BLOCKED");
+        assert.equal(JSON.stringify(await getCallBridgeScheduleModel().findOne({ employeeCode: f.code }).lean()), before);
+    } finally { context.mock.timers.reset(); }
+});
 
 test("six businesses share one deterministic due/NEW/follow-up queue and preserve visible waiting rows", async context => {
     context.mock.timers.enable({ apis: ["Date"], now });
@@ -83,6 +309,28 @@ test("six businesses share one deterministic due/NEW/follow-up queue and preserv
             const accepted = await f.request("/call-bridge/reserve", reservation(f.code, q));
             assert.equal(accepted.status, 200);
             assert.equal((await accepted.json()).leadId, q.nextLeadId);
+        }
+    } finally { context.mock.timers.reset(); }
+});
+
+test("cached queue display facts invalidate on saved comments and can never authorize a stale dial in any business", async context => {
+    context.mock.timers.enable({ apis: ["Date"], now });
+    try {
+        for (const business of businesses) {
+            const f = await fixture(business), lead = await f.add();
+            const first = (await f.queue()).callingQueue;
+            assert.equal(first.nextLeadId, String(lead._id));
+            const comment = { authorName: f.code, authorType: "employee", body: "Synthetic cooldown evidence", createdAt: now };
+            await runWithBusiness(business, () => Lead.updateOne({ _id: lead._id }, { $push: { comments: comment } }));
+            assert.equal((await f.queue()).callingQueue.nextLeadId, null, "saved API/model writes invalidate display facts immediately");
+            await runWithBusiness(business, () => Lead.updateOne({ _id: lead._id }, { $set: { comments: [] } }));
+            const available = (await f.queue()).callingQueue;
+            assert.equal(available.nextLeadId, String(lead._id));
+            await runWithBusiness(business, () => Lead.collection.updateOne({ _id: lead._id }, { $set: { comments: [comment] } }));
+            const denied = await f.request("/call-bridge/reserve", reservation(f.code, available));
+            assert.equal(denied.status, 409, "dispatch rechecks database facts even before a display-cache TTL expires");
+            assert.equal((await denied.json()).code, "CALL_QUEUE_CHANGED");
+            assert.equal(await getCallBridgeScheduleModel().countDocuments({ employeeCode: f.code }), 0);
         }
     } finally { context.mock.timers.reset(); }
 });
@@ -308,7 +556,7 @@ test("the automatic caller is explicitly restricted to the approved timing confi
     } finally { process.env.CRM_CALL_TIMING_V2 = "true"; context.mock.timers.reset(); }
 });
 
-test("six-business HTTP timing: confirmed end, saves, refresh, due priority and exactly one dispatch at 30000ms", async context => {
+test("six-business HTTP timing: confirmed end, saves, refresh, due priority and exactly one dispatch at 15000ms", async context => {
     context.mock.timers.enable({ apis: ["Date"], now });
     try {
         for (const business of businesses) {
@@ -335,7 +583,7 @@ test("six-business HTTP timing: confirmed end, saves, refresh, due priority and 
             await heartbeat(127999, false);
             assert.equal((await getCallBridgeScheduleModel().findOne({ employeeCode: f.code }))?.lastCallEndedAt, null);
             await heartbeat(128000, false);
-            const endedAt = new Date(+now + 120000), deadline = new Date(+now + 150000);
+            const endedAt = new Date(+now + 120000), deadline = new Date(+now + 135000);
             const status = async () => (await (await f.request(`/call-bridge/status?employeeCode=${f.code}`)).json());
             for (const elapsed of [130000, 131000, 132000]) {
                 context.mock.timers.setTime(+now + elapsed);
@@ -346,13 +594,13 @@ test("six-business HTTP timing: confirmed end, saves, refresh, due priority and 
                 assert.equal(refreshed.lastCallEndedAt, endedAt.toISOString());
                 assert.equal(refreshed.nextCallAllowedAt, deadline.toISOString(), "read/refresh/note/status/schedule cannot restart the cooldown");
             }
-            await heartbeat(149999, false);
+            await heartbeat(134999, false);
             const queue = (await f.queue()).callingQueue;
             assert.equal(queue.nextLeadId, String(due._id));
             const early = await f.request("/call-bridge/reserve", reservation(f.code, queue));
             assert.equal(early.status, 409);
             assert.equal((await early.json()).nextCallAllowedAt, deadline.toISOString());
-            await heartbeat(150000, false);
+            await heartbeat(135000, false);
             const attempts = await Promise.all([f.request("/call-bridge/reserve", reservation(f.code, queue)), f.request("/call-bridge/reserve", reservation(f.code, queue))]);
             assert.equal(attempts.filter(response => response.status === 200).length, 1);
             const accepted = await attempts.find(response => response.status === 200)!.json();
@@ -362,7 +610,7 @@ test("six-business HTTP timing: confirmed end, saves, refresh, due priority and 
             assert.equal(dial.startedAt, deadline.toISOString());
             context.diagnostic(JSON.stringify({ layer: "HTTP/Mongo/fake-server-clock", business, endedAt: endedAt.toISOString(),
                 confirmationAt: new Date(+now + 128000).toISOString(), nextCallAllowedAt: deadline.toISOString(),
-                rejectedAt: new Date(+now + 149999).toISOString(), attemptedDialAt: dial.startedAt, eligibleHead: "SCHEDULED_DUE", cooldownMs: +deadline - +endedAt, schedulingJitterMs: +new Date(dial.startedAt) - +deadline, realCalls: 0 }));
+                rejectedAt: new Date(+now + 134999).toISOString(), attemptedDialAt: dial.startedAt, eligibleHead: "SCHEDULED_DUE", cooldownMs: +deadline - +endedAt, schedulingJitterMs: +new Date(dial.startedAt) - +deadline, realCalls: 0 }));
         }
     } finally { context.mock.timers.reset(); }
 });
@@ -393,5 +641,62 @@ test("releasing a reserved or unconfirmed attempt never starts a second cooldown
             const retry = await f.request("/call-bridge/reserve", reservation(f.code, q));
             assert.equal(retry.status, 200, "the original retry deadline, not release time plus 30 seconds, permits retry");
         }
+    } finally { context.mock.timers.reset(); }
+});
+
+const { LeadCallStat } = await import("../models/leadCallStat");
+const { getBusinessConnection } = await import("../config/tenancy");
+test("only a successfully saved note or outcome releases the repeat target in all six businesses", async context => {
+    context.mock.timers.enable({ apis: ["Date"], now });
+    try { for (const business of businesses) for (const outcome of ["log-call", "not-connected", "voicemail"]) {
+        const f = await fixture(business), lead = await f.add(), next = await f.add({ phone: "+12025550122", createdAt: new Date(+now - 200000) });
+        assert.equal((await f.request(`/leads/${lead._id}/calls`, { callOutcome: "confirmed" })).status, 201);
+        const before = (await f.queue()).callingQueue; assert.equal(before.nextLeadId, String(lead._id));
+        const ledger = JSON.stringify(await AttendanceLedger.find().sort({ _id: 1 }).lean());
+        const response = await f.request(`/log/${lead._id}/${outcome}`, { employeeId: String(f.employee._id) }, CALLING_QUEUE_POLICY_VERSION, "PATCH");
+        assert.equal(response.status, 200, JSON.stringify(await response.json()));
+        const saved = await runWithBusiness(business, () => Lead.findById(lead._id).lean());
+        assert.equal(saved?.comments.length, 0, "logging a tag must never fabricate or auto-save a comment");
+        assert.equal(+saved!.lastCallOutcomeAt!, +now);
+        for (let read = 0; read < 2; read++) {
+            const current = (await f.queue()).callingQueue;
+            assert.equal(current.nextLeadId, String(next._id));
+            assert.equal(current.entries.find((entry: QueueEntry) => entry.leadId === String(lead._id)).callable, false);
+        }
+        assert.equal((await f.request("/call-bridge/reserve", reservation(f.code, before))).status, 409);
+        assert.equal(JSON.stringify(await AttendanceLedger.find().sort({ _id: 1 }).lean()), ledger);
+        await runWithBusiness(business, () => Lead.deleteMany({}));
+    } } finally { context.mock.timers.reset(); }
+});
+
+test("a failed outcome metadata write rolls back the statistic and never releases an unnoted lead", async context => {
+    context.mock.timers.enable({ apis: ["Date"], now });
+    try {
+        const f = await fixture(), lead = await f.add();
+        await runWithBusiness(f.business, () => LeadCallStat.createIndexes());
+        assert.equal((await f.request(`/leads/${lead._id}/calls`, { callOutcome: "confirmed" })).status, 201);
+        const model = getBusinessConnection(f.business).model("Lead") as typeof Lead;
+        const original = model.updateOne.bind(model);
+        const mocked = context.mock.method(model, "updateOne", (...args: Parameters<typeof Lead.updateOne>) => {
+            if ((args[1] as { $set?: { lastCallOutcomeAt?: unknown } })?.$set?.lastCallOutcomeAt) throw Error("SYNTHETIC_OUTCOME_WRITE_FAILED");
+            return original(...args);
+        });
+        try {
+            assert.equal((await f.request(`/log/${lead._id}/voicemail`, { employeeId: String(f.employee._id) }, CALLING_QUEUE_POLICY_VERSION, "PATCH")).status, 500);
+        } finally { mocked.mock.restore(); }
+        assert.equal(await runWithBusiness(f.business, () => LeadCallStat.countDocuments({ lead: lead._id })), 0);
+        assert.equal((await f.queue()).callingQueue.nextLeadId, String(lead._id));
+        assert.equal((await runWithBusiness(f.business, () => Lead.findById(lead._id).lean()))?.lastCallOutcomeAt, null);
+    } finally { context.mock.timers.reset(); }
+});
+
+test("saved outcome timestamps cannot be forged through lead editing and foreign tags cannot release another employee's queue", async context => {
+    context.mock.timers.enable({ apis: ["Date"], now });
+    try {
+        const own = await fixture(), other = await fixture(), lead = await own.add(), foreign = await other.add({ phone: "+12025550123" });
+        assert.equal((await own.request(`/log/${foreign._id}/not-connected`, { employeeId: String(other.employee._id) }, CALLING_QUEUE_POLICY_VERSION, "PATCH")).status, 403);
+        const input = { ...lead.toObject(), phone: lead.phone, lastCallOutcomeAt: now, assignedAgent: String(own.employee._id) };
+        assert.equal((await own.request(`/leads/${lead._id}`, input, CALLING_QUEUE_POLICY_VERSION, "PUT")).status, 200);
+        assert.equal((await runWithBusiness(own.business, () => Lead.findById(lead._id).lean()))?.lastCallOutcomeAt, null);
     } finally { context.mock.timers.reset(); }
 });

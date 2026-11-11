@@ -2,19 +2,21 @@ import assert from 'node:assert/strict';import test from 'node:test';import {rea
 const compile=source=>ts.transpileModule(source,{compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.CommonJS}}).outputText;
 const source=readFileSync(new URL('../src/api/payrollPayment.ts',import.meta.url),'utf8'),periods={};
 runInNewContext(compile(readFileSync(new URL('../shared/payrollPeriod.ts',import.meta.url),'utf8')),{exports:periods});
-const businesses=Array.from({length:6},(_,i)=>'synthetic-'+i),period='Oct 21, 2026 - Nov 5, 2026';
+const businesses=Array.from({length:7},(_,i)=>'synthetic-'+i),period='Oct 21, 2026 - Nov 5, 2026';
 function fixture(view=businesses[3],owner=businesses[0]){
  let business=view,auth={userType:'admin',sessionToken:'synthetic-admin-session',user:{employeeCode:'synthetic-admin'},allowedBusinesses:businesses.map(id=>({id,name:id}))};
  const records=new Map(businesses.map(id=>[id,[{_id:'record-'+id,employeeId:'synthetic-employee',payPeriod:period,payrollOwnerBusinessId:owner,grossPay:1000,deductions:20,netPay:980,status:'Pending'}]])),calls=[],exports={};
- let hook=()=>{},canApply=true,warnings=[],responseOverride=value=>value;
+ let hook=()=>{},canApply=true,warnings=[],responseOverride=value=>value;const timers=new Map();
  const api={async get(url,config){calls.push({method:'get',url,config});await hook('get',config);return{data:records.get(config.headers['X-Business-Id'])};},
   async post(url,body,config){calls.push({method:'post',url,body,config});await hook(url.endsWith('/preview')?'preview':'confirm',config);if(url.endsWith('/confirm'))return{data:{applied:true}};
    const id=url.split('/')[3],rows=businesses.map(id=>({businessId:id,businessName:id,grossPay:1000,deductions:20,netPay:980,status:'Pending',paidOn:'-',savedCopies:1,currentAttendanceReviewDays:0}));
    return{data:responseOverride({id,payPeriod:period,paid:body.paid,paidOn:'Oct 28, 2026',token:'synthetic-preview',businessIds:businesses,canApply,blockers:canApply?[]:['Synthetic financial conflict'],warnings,rows})};}};
  const modules={'../lib/api':{api},'./authStorage':{getAuthUser:()=>auth},'./businessStorage':{getActiveBusinessId:()=>business},'../../shared/payrollPeriod':periods};
- runInNewContext(compile(source),{exports,require:name=>{assert.ok(modules[name],name);return modules[name];}});
- return{prepare:(record=structuredClone(records.get(view)[0]))=>exports.preparePayrollPayment(record,true,view),records,calls,auth:()=>auth,
-  setAuth:value=>auth=value,setBusiness:value=>business=value,onRequest:fn=>hook=fn,setCanApply:value=>canApply=value,setWarnings:value=>warnings=value,override:fn=>responseOverride=fn};
+ runInNewContext(compile(source),{exports,AbortController,setTimeout:(fn,ms)=>{const handle=setTimeout(fn,ms);timers.set(handle,fn);return handle;},
+  clearTimeout:handle=>{timers.delete(handle);clearTimeout(handle);},require:name=>{assert.ok(modules[name],name);return modules[name];}});
+ return{prepare:(record=structuredClone(records.get(view)[0]),signal)=>exports.preparePayrollPayment(record,true,view,signal),records,calls,auth:()=>auth,
+  setAuth:value=>auth=value,setBusiness:value=>business=value,onRequest:fn=>hook=fn,setCanApply:value=>canApply=value,setWarnings:value=>warnings=value,override:fn=>responseOverride=fn,
+  expirePreview:()=>{assert.ok(timers.size);for(const fn of timers.values())fn();},activeTimers:()=>timers.size};
 }
 test('all six views resolve the matching owner ID without switching the visible business or writing a preview',async()=>{
  for(const view of businesses){const f=fixture(view),before=JSON.stringify([...f.records]),context=await f.prepare();
@@ -22,6 +24,25 @@ test('all six views resolve the matching owner ID without switching the visible 
   assert.equal(f.calls.filter(call=>call.method==='get').length,view===businesses[0]?1:2);assert.equal(f.calls.at(-1).url,'/payroll/records/record-'+businesses[0]+'/payment-status/preview');
   for(const call of f.calls){assert.equal(call.config.headers['X-CRM-Admin-Session'],'synthetic-admin-session');assert.equal(call.config.headers['X-CRM-Attendance-Session'],'');assert.equal(call.config.headers['Cache-Control'],'no-store');}
   assert.equal(JSON.stringify([...f.records]),before);
+ }
+});
+
+test('new current approval uses the exact fresh preview while saved ownership and every business copy remain verified',async()=>{
+ const active='Nov 6, 2026 - Nov 20, 2026';
+ for(const view of businesses){
+  const f=fixture(view);for(const records of f.records.values())for(const record of records)record.payPeriod=active;
+  const shown={...structuredClone(f.records.get(view)[0]),currentCutoffDraft:true,cutoffEstimate:true,savedAmounts:{grossPay:1000,deductions:20,netPay:980},grossPay:1000,deductions:50,netPay:950};
+  f.override(preview=>({...preview,payPeriod:active,currentCutoffDraft:true,rows:preview.rows.map(row=>({...row,grossPay:1000,deductions:40,netPay:960}))}));
+  const before=JSON.stringify([...f.records]),context=await f.prepare(shown);assert.equal(context.preview.rows[0].netPay,960);assert.equal(context.preview.currentCutoffDraft,true);
+  await context.confirm('Synthetic reviewed current cutoff amount',true);assert.equal(f.calls.filter(call=>call.url.endsWith('/confirm')).length,1);assert.equal(JSON.stringify([...f.records]),before);
+ }
+});
+
+test('current preview cannot bypass a missing live-draft context or conflicting business amounts',async()=>{
+ for(const mode of ['no-draft-context','bad-money','business-conflict']){
+  const f=fixture(),shown={...structuredClone(f.records.get(businesses[3])[0]),currentCutoffDraft:mode!=='no-draft-context',cutoffEstimate:true,savedAmounts:{grossPay:1000,deductions:20,netPay:980}};
+  f.override(preview=>({...preview,currentCutoffDraft:true,rows:preview.rows.map(row=>({...row,netPay:mode==='bad-money'?999:mode==='business-conflict'&&row.businessId===businesses[3]?979:980}))}));
+  await assert.rejects(f.prepare(shown),/Current payroll preview changed/);assert.ok(!f.calls.some(call=>call.url.endsWith('/confirm')));
  }
 });
 
@@ -42,6 +63,51 @@ test('earned projections compare saved amounts across all six businesses despite
   assert.ok(!f.calls.some(call=>call.url.endsWith('/confirm')));
   assert.notEqual(JSON.stringify([...f.records]),before);
  }
+});
+
+test('cutoff estimates compare saved amounts instead of rejecting the corrected unsaved calculation',async()=>{
+ for(const view of businesses){
+  const f=fixture(view);
+  for(const rows of f.records.values())for(const row of rows)Object.assign(row,{cutoffEstimate:true,
+   savedAmounts:{grossPay:1000,deductions:20,netPay:980},grossPay:500,deductions:10,netPay:490});
+  f.setCanApply(false);const context=await f.prepare();
+  assert.equal(context.preview.canApply,false);assert.equal(context.preview.rows[0].netPay,980);
+  assert.deepEqual(Array.from(context.preview.blockers),['Synthetic financial conflict']);
+  await assert.rejects(context.confirm('No automatic settlement',true));
+  assert.ok(!f.calls.some(call=>call.url.endsWith('/confirm')));
+ }
+});
+
+test('targeted saved payroll reads do not recalculate every employee before a payment preview',async()=>{
+ const f=fixture();await f.prepare();
+ for(const call of f.calls.filter(call=>call.method==='get')){
+  assert.equal(call.config.params.employeeId,'synthetic-employee');assert.equal(call.config.params.savedForPayment,true);
+  assert.equal(call.config.params.payPeriod,period);
+ }
+});
+
+test('an unavailable estimate can show its real backend blocker without pretending the saved amount changed',async()=>{
+ const f=fixture();for(const rows of f.records.values())for(const row of rows)Object.assign(row,{cutoffEstimate:true,earningsUnavailable:true});
+ f.setCanApply(false);const context=await f.prepare();assert.equal(context.preview.canApply,false);
+ assert.deepEqual(Array.from(context.preview.blockers),['Synthetic financial conflict']);await assert.rejects(context.confirm('No bypass',true));
+});
+
+test('one preparation deadline bounds a stalled preview and never sends a confirmation',async()=>{
+ const f=fixture();f.onRequest((stage,config)=>stage==='get'?new Promise((resolve,reject)=>{
+  config.signal.addEventListener('abort',()=>reject(new Error('Synthetic cancelled read')),{once:true});
+ }):undefined);
+ const pending=f.prepare();f.expirePreview();await assert.rejects(pending,/took too long.*No payment status was changed/);
+ assert.equal(f.activeTimers(),0);assert.ok(!f.calls.some(call=>call.method==='post'));
+});
+
+test('closing an aborted preview releases its deadline without granting a payment capability',async()=>{
+ const f=fixture(),controller=new AbortController();controller.abort();
+ await assert.rejects(f.prepare(undefined,controller.signal),/cancelled/);assert.equal(f.activeTimers(),0);assert.equal(f.calls.length,0);
+});
+
+test('a completed preview clears its deadline and confirmation does not inherit the old query signal',async()=>{
+ const f=fixture(),context=await f.prepare();assert.equal(f.activeTimers(),0);await context.confirm('Synthetic checked payment',false);
+ assert.equal(f.calls.at(-1).config.signal,undefined);
 });
 
 test('missing, invalid, changed or raced saved amounts remain blocked for earned projections',async()=>{

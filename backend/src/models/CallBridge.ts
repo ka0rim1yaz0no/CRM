@@ -29,6 +29,7 @@ export type CallBridgeDeviceDocument = {
   nextivaProcessDetected: boolean;
   audioSessionActive: boolean;
   bridgeVersion: string;
+  nativeDialProtocol?: number;
   lastSeenAt: Date;
   lastStateChangedAt: Date;
   lastBridgeAvailabilityChangedAt?: Date | null;
@@ -38,6 +39,13 @@ export type CallBridgeDeviceDocument = {
 
 export type CallBridgeScheduleDocument = {
   employeeCode: string;
+  autoCallPaused?: boolean;
+  autoCallControlVersion?: number;
+  manualCallHoldId?: string;
+  manualCallHoldUntil?: Date | null;
+  manualCallHoldCancelledAt?: Date | null;
+  manualCallCancelledAttemptId?: string;
+  reservedAutoCallControlVersion?: number;
   callLeaseUntil: Date | null;
   reservedAttemptId: string;
   reservedBusinessId: string;
@@ -52,6 +60,14 @@ export type CallBridgeScheduleDocument = {
   lastCallStartedAt: Date | null;
   lastObservedAttemptId?: string;
   lastObservedLeadId?: string;
+  nativeAttemptId?: string;
+  nativeManual?: boolean;
+  nativeLeadWorkHash?: string;
+  nativeDeviceId?: string;
+  nativeBrowserSessionId?: string;
+  nativeBrowserKeyHash?: string;
+  nativeClaimedAt?: Date | null;
+  nativeCancelledAt?: Date | null;
 };
 
 export type CallBridgeAttemptPhase =
@@ -142,6 +158,7 @@ const deviceSchema = new Schema<CallBridgeDeviceDocument>(
     nextivaProcessDetected: { type: Boolean, default: false },
     audioSessionActive: { type: Boolean, default: false },
     bridgeVersion: { type: String, trim: true, default: "" },
+    nativeDialProtocol: { type: Number, default: 0 },
     lastSeenAt: { type: Date, required: true, default: Date.now, index: true },
     lastStateChangedAt: { type: Date, required: true, default: Date.now },
     lastBridgeAvailabilityChangedAt: { type: Date, default: null },
@@ -158,6 +175,13 @@ deviceSchema.index({ browserDeviceKeyHash: 1 }, { unique: true, sparse: true });
 const scheduleSchema = new Schema<CallBridgeScheduleDocument>(
   {
     employeeCode: { type: String, required: true, trim: true, unique: true, index: true },
+    autoCallPaused: { type: Boolean, default: false },
+    autoCallControlVersion: { type: Number, default: 0 },
+    manualCallHoldId: { type: String, default: "" },
+    manualCallHoldUntil: { type: Date, default: null },
+    manualCallHoldCancelledAt: { type: Date, default: null },
+    manualCallCancelledAttemptId: { type: String, default: "" },
+    reservedAutoCallControlVersion: { type: Number, default: 0 },
     callLeaseUntil: { type: Date, default: null },
     reservedAttemptId: { type: String, trim: true, default: "" },
     reservedBusinessId: { type: String, trim: true, default: "" },
@@ -165,6 +189,14 @@ const scheduleSchema = new Schema<CallBridgeScheduleDocument>(
     reservedPhone: { type: String, trim: true, default: "" },
     lastObservedAttemptId: { type: String, trim: true, default: "" },
     lastObservedLeadId: { type: String, trim: true, default: "" },
+    nativeAttemptId: { type: String, default: "" },
+    nativeManual: { type: Boolean, default: false },
+    nativeLeadWorkHash: { type: String, default: "" },
+    nativeDeviceId: { type: String, default: "" },
+    nativeBrowserSessionId: { type: String, default: "" },
+    nativeBrowserKeyHash: { type: String, default: "" },
+    nativeClaimedAt: { type: Date, default: null },
+    nativeCancelledAt: { type: Date, default: null },
     reservationTokenHash: { type: String, trim: true, default: "" },
     nextCallAllowedAt: { type: Date, default: null },
     lastReservedAt: { type: Date, default: null },

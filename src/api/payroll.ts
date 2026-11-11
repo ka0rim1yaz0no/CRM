@@ -100,6 +100,9 @@ export type PayrollDtrRow = {
 
 export type PayrollDtr = {
     storedCutoff?: boolean;
+    attendanceComparison?: { asOf: string; summary: PayrollDtr["summary"]; referenceOnly?: true;
+        basis?: "dated-earned-minutes"; fromDate?: string; toDate?: string };
+    attendanceComparisonWarning?: string;
     currentAttendanceWarning?: string;
     currentAttendanceReviewDays?: number | null;
     potentialOvertimeHours?: number;
@@ -122,6 +125,9 @@ export type PayrollDtr = {
         workingDays: number | null;
         monthlyWorkingDays: number;
         workedHours: number;
+        earnedGrossHours?: number;
+        recordedInShiftHours?: number;
+        unpaidLunchHours?: number;
         workedMinutesOverride?: number | null;
         overtimeHours: number;
         missingHours: number;
@@ -150,7 +156,7 @@ export type PayrollPreview = { payPeriod: string; token: string; totalDifference
         before: { grossPay: number; deductions: number; netPay: number }; after: { grossPay: number; deductions: number; netPay: number };
         difference: number; potentialOvertimeHours: number; approvedOvertimeHours: number;
         nonBillableOffPhone?: { before: { minutes: number; amount: number }; after: { minutes: number; amount: number }; minuteRate: number } }> };
-export async function getPayrollAccuracyConfig() { return (await api.get<{ enabled: boolean; workedHoursEditingEnabled?: boolean; paymentStatusPreviewEnabled?: boolean; cutoffSelectionEnabled?: boolean; employeeRosterEnabled?: boolean; automaticPreviewsEnabled?: boolean; missingGenerationEnabled?: boolean }>("/payroll/accuracy-config")).data; }
+export async function getPayrollAccuracyConfig() { return (await api.get<{ enabled: boolean; currentCutoffLiveFrom?: string; workedHoursEditingEnabled?: boolean; paymentStatusPreviewEnabled?: boolean; cutoffSelectionEnabled?: boolean; employeeRosterEnabled?: boolean; automaticPreviewsEnabled?: boolean; missingGenerationEnabled?: boolean }>("/payroll/accuracy-config")).data; }
 export async function previewMissingPayroll(payPeriod: string, businessId: string, signal?: AbortSignal) {
     const result = (await api.post<import("../../shared/payrollGeneration").PayrollGenerationPlan>("/payroll/missing/preview", { payPeriod }, { headers: { "X-Business-Id": businessId }, signal })).data;
     if (result.businessId !== businessId || result.payPeriod !== payPeriod) throw new Error("Payroll context changed. Refresh Payroll.");
@@ -168,7 +174,10 @@ export async function getCurrentPayrollPreviews(payPeriod: string, businessId: s
 }
 export type PayrollCutoffs = { currentPayPeriod: string; defaultPayPeriod: string; historyFrom: string | null;
     items: Array<{ payPeriod: string; start: string; end: string; recordedEmployees: number; visibleEmployees?: number }> };
-export async function getPayrollCutoffs() { return (await api.get<PayrollCutoffs>("/payroll/cutoffs")).data; }
+export async function getPayrollCutoffs(options: { businessId?: string; signal?: AbortSignal } = {}) {
+    return (await api.get<PayrollCutoffs>("/payroll/cutoffs", { signal: options.signal,
+        headers: options.businessId ? { "X-Business-Id": options.businessId } : undefined })).data;
+}
 export type PayrollRosterGap = { employeeId: string; employeeName: string; email: string; department: string; payPeriod: string; state: "not-generated" | "conflict" | "unavailable" };
 export async function getPayrollRosterGaps(params: { payPeriod?: string; search?: string; status?: string }, options: { businessId: string; serverRosterEnabled: boolean }) {
     const headers = { "X-Business-Id": options.businessId };
@@ -180,7 +189,7 @@ export async function getPayrollRosterGaps(params: { payPeriod?: string; search?
         employeeId: person.employeeCode, employeeName: person.name, email: person.email || "", department: person.team || "", payPeriod: params.payPeriod!, state: "unavailable" as const,
     })).filter(row => (!params.status || params.status === "Not ready") && (!term || [row.employeeId, row.employeeName, row.email, row.department].some(value => value.toLowerCase().includes(term))));
 }
-export type PayrollPaymentPreview = { id: string; payPeriod: string; paid: boolean; paidOn: string; token: string; businessIds: string[]; canApply: boolean;
+export type PayrollPaymentPreview = { id: string; payPeriod: string; paid: boolean; paidOn: string; token: string; businessIds: string[]; canApply: boolean; currentCutoffDraft?: boolean;
     blockers: string[]; warnings: string[]; rows: Array<{ businessId: string; businessName: string; grossPay: number; deductions: number; netPay: number;
         status: string; paidOn: string; savedCopies: number; currentAttendanceReviewDays: number | null }> };
 export async function previewPayrollPaymentStatus(id: string, paid: boolean, businessId: string, signal?: AbortSignal) {
@@ -211,8 +220,9 @@ export async function confirmPayrollCutoff(preview: PayrollPreview, reason: stri
 export type PayrollRecordInput = Omit<PayrollRecord, "_id" | "netPay" | "createdAt" | "updatedAt">;
 export type PayrollItemInput = Omit<PayrollListItem, "_id">;
 
-export async function getPayrollStats(payPeriod?: string) {
-    const response = await api.get<PayrollStats>("/payroll/stats", { params: { payPeriod } });
+export async function getPayrollStats(payPeriod?: string, options: { businessId?: string; signal?: AbortSignal; basis?: "saved" | "estimate" | "payment" } = {}) {
+    const response = await api.get<PayrollStats>("/payroll/stats", { params: { payPeriod, basis: options.basis || "payment" }, signal: options.signal,
+        headers: options.businessId ? { "X-Business-Id": options.businessId } : undefined });
     return response.data;
 }
 
@@ -223,14 +233,15 @@ export async function getPayrollRecords(params?: {
     sortBy?: string;
     sortDir?: "asc" | "desc";
     archived?: boolean;
-}, options: { businessId?: string } = {}) {
-    const response = await api.get<PayrollRecord[]>("/payroll/records", { params, headers: options.businessId ? { "X-Business-Id": options.businessId } : undefined });
+    basis?: "saved" | "estimate" | "payment";
+}, options: { businessId?: string; signal?: AbortSignal } = {}) {
+    const response = await api.get<PayrollRecord[]>("/payroll/records", { params, signal: options.signal, headers: options.businessId ? { "X-Business-Id": options.businessId } : undefined });
     return response.data;
 }
 
-export async function getPayrollDtr(employeeId: string, payPeriod?: string, options: { businessId?: string; signal?: AbortSignal } = {}) {
+export async function getPayrollDtr(employeeId: string, payPeriod?: string, options: { businessId?: string; signal?: AbortSignal; basis?: "saved" | "estimate" | "payment" } = {}) {
     const response = await api.get<PayrollDtr>(`/payroll/dtr/${encodeURIComponent(employeeId)}`, {
-        params: { payPeriod }, signal: options.signal,
+        params: { payPeriod, basis: options.basis }, signal: options.signal,
         ...(options.businessId ? { headers: { "X-Business-Id": options.businessId } } : {}),
     });
     return response.data;
@@ -256,8 +267,24 @@ export async function updatePayrollOvertime(id: string, overtimeHours: number) {
     return response.data;
 }
 
-export async function updateEmployeeBasicPay(employeeId: string, basicPay: number) {
-    const response = await api.patch<PayrollRecord>(`/payroll/employees/${encodeURIComponent(employeeId)}/basic-pay`, { basicPay });
+export type EmployeeBasicPay = { employeeId: string; businessId: string; monthlySalary: number };
+
+export async function getEmployeeBasicPay(employeeId: string, options: { businessId: string; signal?: AbortSignal }) {
+    const response = await api.get<EmployeeBasicPay>(`/payroll/employees/${encodeURIComponent(employeeId)}/basic-pay`, {
+        signal: options.signal, timeout: 10000, headers: { "X-Business-Id": options.businessId },
+    });
+    const data = response.data;
+    if (!data || data.employeeId !== employeeId || data.businessId !== options.businessId || typeof data.monthlySalary !== "number" ||
+        !Number.isFinite(data.monthlySalary) || data.monthlySalary < 0 || !Number.isSafeInteger(Math.round(data.monthlySalary * 100))) {
+        throw Error("The current monthly salary could not be verified. Reload before editing.");
+    }
+    return response.data;
+}
+
+export async function updateEmployeeBasicPay(employeeId: string, basicPay: number, options: { businessId?: string } = {}) {
+    const response = await api.patch<PayrollRecord | null>(`/payroll/employees/${encodeURIComponent(employeeId)}/basic-pay`, { basicPay }, {
+        timeout: 15000, headers: options.businessId ? { "X-Business-Id": options.businessId } : undefined,
+    });
     return response.data;
 }
 

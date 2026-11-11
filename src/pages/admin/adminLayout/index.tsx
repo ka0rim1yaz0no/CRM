@@ -14,7 +14,8 @@ import { getDataCheckConfig } from "../../../api/dataCheck";
 import { getAdminLeads } from "../../../api/leads";
 import { useFeatureFlags } from "../../../hooks/useFeatureFlags";
 import { useClickOutside } from "../../../hooks/useClickOutside";
-import { canSelectSearchResult } from "../../../../shared/workspaceSearch";
+import { canSelectSearchResult, sameFormattedSearchValue } from "../../../../shared/workspaceSearch";
+import { normalizeLeadPhone } from "../../../../shared/leadPhonePolicy";
 import { emitToast } from "../../../lib/toast";
 import { useMessageNotifications } from "../../../hooks/useMessageNotifications";
 import { useAttendanceWorkspaceRefresh } from "../../../hooks/useAttendanceWorkspaceRefresh";
@@ -228,29 +229,33 @@ export default function AdminLayout({ children }: Props) {
         !completedEvaluationKeys.has(`${reminder.employeeCode}-${reminder.milestoneMonth}-${reminder.dueDate.toISOString().slice(0, 10)}`)
     );
     const normalizedAdminSearch = debouncedAdminSearch.trim();
+    const adminSearchBusinessId = getActiveBusinessId();
     const { data: adminLeadSearchData, isFetching: isAdminLeadSearchFetching } = useQuery({
-        queryKey: ["admin-header-lead-search", normalizedAdminSearch],
-        queryFn: () => getAdminLeads({ search: normalizedAdminSearch, tab: "all", page: 1, limit: 8 }),
+        queryKey: ["admin-header-lead-search", adminSearchBusinessId, normalizedAdminSearch],
+        queryFn: () => getAdminLeads({ search: normalizedAdminSearch, tab: "all", page: 1, limit: 8 },
+            { businessId: adminSearchBusinessId, adminSession: authUser?.userType === "admin" ? authUser.sessionToken || "" : "" }),
         enabled: fullAdmin && normalizedAdminSearch.length >= 2,
         staleTime: 15_000,
     });
     const matchingEmployees = useMemo(() => {
-        if (normalizedAdminSearch.length < 2) return [];
-        const search = normalizedAdminSearch.toLowerCase();
+        if (debouncedAdminSearch.trim().length < 2) return [];
+        const search = debouncedAdminSearch.trim().toLowerCase();
         return evaluationEmployees.filter((employee) =>
-            [employee.name, employee.employeeCode, employee.email, employee.role, employee.team]
+            [employee.name, employee.employeeCode, employee.role, employee.team]
                 .filter(Boolean)
-                .some((value) => String(value).trim().toLowerCase() === search)
+                .some((value) => sameFormattedSearchValue(value, search)) || String(employee.email || "").trim().toLowerCase() === search
         ).slice(0, 5);
-    }, [evaluationEmployees, normalizedAdminSearch]);
+    }, [evaluationEmployees, debouncedAdminSearch]);
     const matchingLeads = useMemo(() => {
-        const search = normalizedAdminSearch.toLowerCase();
+        const search = debouncedAdminSearch.trim().toLowerCase();
+        const phone = normalizeLeadPhone(debouncedAdminSearch);
         return (adminLeadSearchData?.leads || []).filter((lead) =>
-            [lead.businessName, lead.leadName, lead.email, lead.phone]
+            [lead.businessName, lead.leadName, lead.phone]
                 .filter(Boolean)
-                .some((value) => String(value).trim().toLowerCase() === search)
+                .some((value) => sameFormattedSearchValue(value, search)) || Boolean(phone && normalizeLeadPhone(lead.phone) === phone) ||
+                String(lead.email || "").trim().toLowerCase() === search
         );
-    }, [adminLeadSearchData?.leads, normalizedAdminSearch]);
+    }, [adminLeadSearchData?.leads, debouncedAdminSearch]);
     const visibleNavSections = adminNavSections
         .map((section) => ({
             ...section,
@@ -344,18 +349,24 @@ export default function AdminLayout({ children }: Props) {
         }
 
         const normalizedSearch = search.toLowerCase();
-        const exactEmployee = matchingEmployees.find((employee) =>
-            [employee.name, employee.employeeCode, employee.email]
+        const normalizedPhoneSearch = normalizeLeadPhone(search);
+        const exactEmployees = matchingEmployees.filter((employee) =>
+            [employee.name, employee.employeeCode]
                 .filter(Boolean)
-                .some((value) => String(value).toLowerCase() === normalizedSearch)
+                .some((value) => sameFormattedSearchValue(value, normalizedSearch)) || String(employee.email || "").trim().toLowerCase() === normalizedSearch
         );
-        const exactLead = matchingLeads.find((lead) =>
-            [lead.businessName, lead.leadName, lead.email, lead.phone]
+        const exactLeads = matchingLeads.filter((lead) =>
+            [lead.businessName, lead.leadName, lead.phone]
                 .filter(Boolean)
-                .some((value) => String(value).toLowerCase() === normalizedSearch)
+                .some((value) => sameFormattedSearchValue(value, normalizedSearch)) || Boolean(normalizedPhoneSearch && normalizeLeadPhone(lead.phone) === normalizedPhoneSearch) ||
+                String(lead.email || "").trim().toLowerCase() === normalizedSearch
         );
-        const employee = exactEmployee;
-        const lead = exactLead;
+        if (exactEmployees.length + exactLeads.length > 1) {
+            setIsAdminSearchOpen(true);
+            return;
+        }
+        const employee = exactEmployees[0];
+        const lead = exactLeads[0];
 
         if (!employee && !lead) {
             setIsAdminSearchOpen(true);

@@ -18,6 +18,13 @@ export default function PayrollPaymentDialog({ record, businessId, paid, currenc
         retry: false, refetchOnWindowFocus: false });
     const context = query.data, preview = context?.preview;
     const money = (value: number) => new Intl.NumberFormat("en-PH", { style: "currency", currency: currencyCode }).format(value);
+    useEffect(() => {
+        const reviewed = preview?.currentCutoffDraft && preview.rows.find(row => row.businessId === businessId);
+        if (!reviewed) return;
+        queryClient.setQueriesData<PayrollRecord[]>({ queryKey: ["payroll-records", businessId] }, records => records?.map(item => item._id === record._id ? {
+            ...item, grossPay: reviewed.grossPay, deductions: reviewed.deductions, netPay: reviewed.netPay,
+        } : item));
+    }, [preview, businessId, record._id, queryClient]);
     const errorText = (failure: unknown) => {
         const item = failure as { response?: { data?: { message?: string } }; message?: string };
         return item.response?.data?.message || item.message || "Unable to update payment status.";
@@ -36,8 +43,16 @@ export default function PayrollPaymentDialog({ record, businessId, paid, currenc
         saving.current = true; setBusy(true); setError("");
         try {
             await context!.confirm(reason.trim(), acknowledged);
-            await Promise.all(["payroll-records", "payroll-stats", "payroll-dtr", "payroll-payslip-dtr", "payroll-compute", "employee-payments"].map(key => queryClient.invalidateQueries({ queryKey: [key] })));
-            if (mounted.current) onClose();
+            if (!mounted.current || !validScope()) return;
+            const saved = preview.rows.find(row => row.businessId === businessId)!;
+            queryClient.setQueriesData<PayrollRecord[]>({ queryKey: ["payroll-records", businessId] }, records => records?.map(item => item._id === record._id ? {
+                ...item, status: paid ? "Paid" as const : "Pending" as const, paidOn: preview.paidOn,
+                grossPay: saved.grossPay, deductions: saved.deductions, netPay: saved.netPay,
+                currentCutoffDraft: undefined, earnedToDate: undefined, cutoffEstimate: undefined, earningsAsOf: undefined, savedAmounts: undefined, settlementRequired: undefined,
+                earningsUnavailable: undefined, earningsUnavailableReason: undefined,
+            } : item));
+            void Promise.allSettled(["payroll-records", "payroll-stats", "payroll-dtr", "payroll-payslip-dtr", "payroll-compute", "employee-payments"].map(key => queryClient.invalidateQueries({ queryKey: [key] })));
+            onClose();
         } catch (failure) { if (mounted.current) { setError(errorText(failure)); setStale(true); setConfirmed(false); setAcknowledged(false); } }
         finally { saving.current = false; if (mounted.current) setBusy(false); }
     };
@@ -58,7 +73,7 @@ export default function PayrollPaymentDialog({ record, businessId, paid, currenc
                     <dl className="grid grid-cols-2 gap-3 text-sm"><div><dt className="text-slate-600">Payment status</dt><dd className="mt-1 font-semibold">{paid ? "Paid" : "Pending"}</dd></div>
                         <div><dt className="text-slate-600">Paid date</dt><dd className="mt-1 font-semibold">{preview.paidOn}</dd></div>
                         <div className="col-span-2"><dt className="text-slate-600">Owning business</dt><dd className="mt-1 font-semibold">{context?.paymentBusinessName}</dd></div>
-                        <div className="col-span-2 border-t border-slate-200 pt-3"><dt className="text-slate-600">Saved net pay</dt>
+                        <div className="col-span-2 border-t border-slate-200 pt-3"><dt className="text-slate-600">{preview.currentCutoffDraft ? "Net pay for approval" : "Saved net pay"}</dt>
                             <dd className="mt-1 text-lg font-semibold tabular-nums">{money((preview.rows.find(row => row.businessId === businessId) || preview.rows[0])?.netPay ?? record.netPay)}</dd></div></dl>
                     <div className="overflow-x-auto"><table className="w-full min-w-[26rem] text-left text-sm"><thead className="border-b border-slate-200 text-xs text-slate-600"><tr>
                         <th className="py-2">Business</th><th className="py-2 text-right">Gross</th><th className="py-2 text-right">Deductions</th><th className="py-2 text-right">Net pay</th></tr></thead>
@@ -70,8 +85,8 @@ export default function PayrollPaymentDialog({ record, businessId, paid, currenc
                     {preview.canApply && <>
                         <label htmlFor="payroll-payment-reason" className="block text-sm font-semibold">Reason</label>
                         <textarea id="payroll-payment-reason" value={reason} maxLength={1000} disabled={busy} onChange={event => setReason(event.target.value)} className="min-h-20 w-full rounded-md border border-slate-300 p-3 text-sm" />
-                        {preview.warnings.length > 0 && <label className="flex items-start gap-2 text-sm"><input type="checkbox" checked={acknowledged} disabled={busy} onChange={event => setAcknowledged(event.target.checked)} className="mt-1" />I acknowledge the attendance history and approve the saved amounts without recalculating pay.</label>}
-                        <label className="flex items-start gap-2 text-sm"><input type="checkbox" checked={confirmed} disabled={busy} onChange={event => setConfirmed(event.target.checked)} className="mt-1" />Confirm payment status only; amounts and attendance stay unchanged.</label>
+                        {preview.warnings.length > 0 && <label className="flex items-start gap-2 text-sm"><input type="checkbox" checked={acknowledged} disabled={busy} onChange={event => setAcknowledged(event.target.checked)} className="mt-1" />{preview.currentCutoffDraft ? "I have reviewed the warnings and approve the current cutoff amounts shown above." : "I have reviewed the warnings and approve the saved payroll amounts shown above without recalculating pay."}</label>}
+                        <label className="flex items-start gap-2 text-sm"><input type="checkbox" checked={confirmed} disabled={busy} onChange={event => setConfirmed(event.target.checked)} className="mt-1" />{preview.currentCutoffDraft ? "Confirm the reviewed current cutoff amounts and mark Paid; attendance stays unchanged." : "Confirm payment status only; amounts and attendance stay unchanged."}</label>
                     </>}
                 </>}
             </div>

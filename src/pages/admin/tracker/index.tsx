@@ -68,6 +68,8 @@ type LiveSession = {
     employeeName: string;
     status: LiveSessionStatus;
     message: string;
+    requestedAt?: number;
+    delivered?: boolean;
 };
 
 type LiveShareSignal = {
@@ -296,6 +298,7 @@ export default function AdminTracker() {
     const livePeerRef = useRef<RTCPeerConnection | null>(null);
     const liveSessionRef = useRef<LiveSession | null>(null);
     const liveStreamRef = useRef<MediaStream | null>(null);
+    const liveCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
     const startIso = startDateTime ? parsePhDateTimeInput(startDateTime)?.toISOString() : undefined;
     const endIso = endDateTime ? parsePhDateTimeInput(endDateTime)?.toISOString() : undefined;
     const authUser = getAuthUser();
@@ -403,6 +406,7 @@ export default function AdminTracker() {
         liveStreamRef.current = null;
         livePeerRef.current?.close();
         livePeerRef.current = null;
+        liveCandidatesRef.current = [];
     };
 
     const createViewerPeer = (requestId: string) => {
@@ -466,6 +470,21 @@ export default function AdminTracker() {
     useEffect(() => {
         const registerPresence = () => {
             socket.emit("presence:register", { userType: "admin", adminName: "Admin" });
+            const session = liveSessionRef.current;
+            if (session && (session.status === "requesting" && Date.now() - (session.requestedAt || 0) < 30_000 ||
+                session.status === "connecting" || session.status === "live")) {
+                socket.emit("live-share:request", { requestId: session.requestId, employeeId: session.employeeId });
+            }
+        };
+        const handleDelivery = (payload: { requestId?: string; state?: string }) => {
+            if (payload.requestId !== liveSessionRef.current?.requestId) return;
+            setLiveSession(session => {
+                if (!session || session.status !== "requesting") return session;
+                const delivered = session.delivered || payload.state === "received";
+                return { ...session, delivered, message: delivered ? "Live View prompt displayed. Waiting for employee permission..." :
+                    payload.state === "offline" ? "Employee browser is not connected in this business. Waiting for reconnection..." :
+                        "Request sent. Waiting for the employee's browser to display the prompt..." };
+            });
         };
         const handleAccepted = (payload: { requestId?: string }) => {
             if (payload.requestId !== liveSessionRef.current?.requestId) {
@@ -523,21 +542,26 @@ export default function AdminTracker() {
                 return;
             }
 
-            const peer = livePeerRef.current || createViewerPeer(payload.requestId);
-
-            if (payload.description?.type === "offer") {
-                await peer.setRemoteDescription(new RTCSessionDescription(payload.description));
-                const answer = await peer.createAnswer();
-                await peer.setLocalDescription(answer);
-                socket.emit("live-share:signal", {
-                    requestId: payload.requestId,
-                    description: peer.localDescription ? { type: peer.localDescription.type, sdp: peer.localDescription.sdp } : answer,
-                });
-                return;
-            }
-
-            if (payload.candidate) {
-                await peer.addIceCandidate(new RTCIceCandidate(payload.candidate));
+            try {
+                if (payload.description?.type === "offer") {
+                    const peer = livePeerRef.current || createViewerPeer(payload.requestId);
+                    await peer.setRemoteDescription(new RTCSessionDescription(payload.description));
+                    for (const candidate of liveCandidatesRef.current.splice(0)) await peer.addIceCandidate(new RTCIceCandidate(candidate));
+                    const answer = await peer.createAnswer();
+                    await peer.setLocalDescription(answer);
+                    if (liveSessionRef.current?.requestId !== requestId || livePeerRef.current !== peer) return;
+                    socket.emit("live-share:signal", {
+                        requestId: payload.requestId,
+                        description: peer.localDescription ? { type: peer.localDescription.type, sdp: peer.localDescription.sdp } : answer,
+                    });
+                } else if (payload.candidate) {
+                    if (livePeerRef.current?.remoteDescription) await livePeerRef.current.addIceCandidate(new RTCIceCandidate(payload.candidate));
+                    else if (liveCandidatesRef.current.length < 64) liveCandidatesRef.current.push(payload.candidate);
+                }
+            } catch {
+                if (liveSessionRef.current?.requestId !== requestId) return;
+                cleanupLiveView(true, "connection-failed");
+                setLiveSession(session => session ? { ...session, status: "error", message: "The live stream could not connect. Start a new request." } : session);
             }
         };
         const handleError = (payload: { requestId?: string; message?: string }) => {
@@ -548,19 +572,21 @@ export default function AdminTracker() {
             setLiveSession((session) => (session ? { ...session, status: "error", message: payload.message || "Live share failed." } : session));
         };
 
-        connectAuthenticatedSocket();
         socket.on("connect", registerPresence);
+        socket.on("live-share:delivery", handleDelivery);
         socket.on("live-share:accepted", handleAccepted);
         socket.on("live-share:declined", handleDeclined);
         socket.on("live-share:stopped", handleStopped);
         socket.on("live-share:signal", handleSignal);
         socket.on("live-share:error", handleError);
+        connectAuthenticatedSocket();
         if (socket.connected) {
             registerPresence();
         }
 
         return () => {
             socket.off("connect", registerPresence);
+            socket.off("live-share:delivery", handleDelivery);
             socket.off("live-share:accepted", handleAccepted);
             socket.off("live-share:declined", handleDeclined);
             socket.off("live-share:stopped", handleStopped);
@@ -605,25 +631,24 @@ export default function AdminTracker() {
             employeeId: selectedEmployee._id,
             employeeName: selectedEmployee.name,
             status: "requesting",
+            requestedAt: Date.now(),
             message: "Waiting for the employee to allow Live View...",
         };
 
         liveSessionRef.current = nextSession;
         setLiveSession(nextSession);
         connectAuthenticatedSocket();
-        socket.emit("presence:register", { userType: "admin", adminName: "Admin" });
-        socket.emit("live-share:request", {
-            requestId,
-            employeeId: selectedEmployee._id,
-            employeeName: selectedEmployee.name,
-            adminName: "Admin",
-        });
+        if (socket.connected) {
+            socket.emit("live-share:request", { requestId, employeeId: selectedEmployee._id });
+        }
 
         window.setTimeout(() => {
             if (liveSessionRef.current?.requestId === requestId && liveSessionRef.current.status === "requesting") {
+                cleanupLiveView(true, "request-expired");
                 setLiveSession((session) =>
                     session?.requestId === requestId
-                        ? { ...session, status: "error", message: "No response yet. The employee must be logged into CRM and click Allow Live View." }
+                        ? { ...session, status: "error", message: session.delivered ? "The request expired without employee permission. Start a new request when they are ready." :
+                            "The employee browser did not confirm the prompt. Check their CRM connection in this business, then send a new request." }
                         : session
                 );
             }

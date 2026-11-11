@@ -18,9 +18,9 @@ async function runCycle(now: Date, deliver: typeof deliverAttendanceLedger): Pro
   // Only adopted canonical ledgers are candidates; never seed or mutate legacy attendance here.
   const accuracy = attendanceAccuracyFixesEnabled();
   const budget = attendanceWorkerBudget();
+  const fields = "_id employeeCode businessIds canonicalBusinessId revision events corrections closures migrationRequired";
   const ledgers = accuracy ? await attendanceWorkerBatch("auto-time-out", activeAttendanceWorkerFilter(),
-    "_id employeeCode businessIds canonicalBusinessId revision events corrections closures migrationRequired")
-    : await AttendanceLedger.find({ migrationRequired: { $ne: true } }).lean();
+    fields) : await AttendanceLedger.find({ migrationRequired: { $ne: true } }).select(fields).lean();
   for (const ledger of ledgers) {
     if (accuracy && !budget()) break;
     if (accuracy) markAttendanceWorkerCandidate("auto-time-out", ledger._id);

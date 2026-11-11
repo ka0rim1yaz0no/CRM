@@ -52,8 +52,9 @@ export const attendanceTimeZoneOptions = [
     { value: "UTC", label: "UTC" },
 ];
 
-export async function getSystemSettings() {
-    const response = await api.get<SystemSettings>("/system-settings");
+export async function getSystemSettings(options: { businessId?: string; signal?: AbortSignal } = {}) {
+    const response = await api.get<SystemSettings>("/system-settings", { signal: options.signal,
+        headers: options.businessId ? { "X-Business-Id": options.businessId } : undefined });
     return response.data;
 }
 

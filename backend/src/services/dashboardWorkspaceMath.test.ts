@@ -39,12 +39,12 @@ test("source guard ignores checkout line endings, but still detects code changes
   assert.notEqual(sourceHash("fixture\n"), sourceHash("changed\n"));
 });
 
-test("reviewed call dashboard shift billing and unchanged endpoint route stay pinned", () => {
+test("reviewed shift-bounded dashboard clocks, Coaching billing and unchanged endpoint route stay pinned", () => {
   const root = new URL("../../../", import.meta.url);
   for (const [path, hash] of [
-    ["src/components/CallDashboardPanel.tsx", "F24A65F6C7D03ACF43902B98BB33AF2A6D40583DAEEC4BD02D7C384437F03821"],
-    ["src/api/callDashboard.ts", "BC1888966F3AC47FFE81C5404464ED9DB8E2505C8E2C737AB7D0408E4D2CF94B"],
-    ["backend/src/controllers/callDashboardController.ts", "B27574A6DDF77B820942E057A313B3381BEFA6C30E1A5359A58A1C293B52586A"],
+    ["src/components/CallDashboardPanel.tsx", "1CEB51A2DDC7DDAF4235221951A5419B7641EFE3A760545E5A63EFA9CDA49E7A"],
+    ["src/api/callDashboard.ts", "FE0AF48258C0C08BDC1B0B2DE206F21E677C7FAC6E611173EF914184D3E0F805"],
+    ["backend/src/controllers/callDashboardController.ts", "6E1A12233EB3659A6A76DBE77EB96477D6903CCF73AA13C20E0BD29DE6DE6669"],
     ["backend/src/routes/callDashboardRoutes.ts", "18BAE4DB7FE451D0275ABCB3E7BFA53F4DC7C9D1901C39666BFD8B26C3C0BF19"],
   ]) assert.equal(sourceHash(fs.readFileSync(new URL(path, root), "utf8")), hash, path);
 });

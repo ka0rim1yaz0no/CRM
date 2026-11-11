@@ -24,10 +24,10 @@ async function runRefresh(now: Date, deliver: typeof deliverAttendanceLedger) {
   const policy = await attendancePolicy();
   // Only already-derived canonical history is eligible; this does not apply the historical backfill.
   const accuracy = attendanceAccuracyFixesEnabled(); const budget = attendanceWorkerBudget();
+  const fields = "_id employeeCode businessIds canonicalBusinessId revision derived";
   const ledgers = accuracy ? await attendanceWorkerBatch("policy-refresh", { migrationRequired: { $ne: true },
     derived: { $elemMatch: { accuracyVersion: 1, policyRevision: { $ne: policy.revision } } } },
-    "_id employeeCode businessIds canonicalBusinessId revision derived")
-    : await AttendanceLedger.find({ migrationRequired: { $ne: true }, "derived.0": { $exists: true } }).lean();
+    fields) : await AttendanceLedger.find({ migrationRequired: { $ne: true }, "derived.0": { $exists: true } }).select(fields).lean();
   for (const ledger of ledgers) {
     if (accuracy && !budget()) break;
     if (accuracy) markAttendanceWorkerCandidate("policy-refresh", ledger._id);

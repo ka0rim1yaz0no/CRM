@@ -8,24 +8,33 @@ import { getBusinessAccessForEmployeeCode } from "../models/BusinessUserAccess";
 import { getBusinessById, getCurrentBusinessId, runWithBusiness } from "../config/tenancy";
 import { verifyAdminDashboardSession } from "../config/adminDashboardSession";
 import { attendanceIntegrityEnabled } from "../config/rolloutFlags";
-import { attendancePayrollDtr } from "../controllers/payrollController";
+import { attendancePayrollDtr, currentPeriod } from "../controllers/payrollController";
 import { savedPayrollPeriod } from "../../../shared/payrollPeriod";
 import { payrollPaymentAliasBlocker, payrollPaymentStatus, payrollPaymentAmountsValid } from "../../../shared/payrollPaymentStatus";
 import { payrollReadGroups } from "./payrollReadPolicy";
 import { PayrollValidationError } from "./payrollAccuracy";
 import { lockPayrollAttendance, payrollAttendanceFenceKeys } from "./payrollAttendanceFence";
 import { withReadSnapshot, serverReadTime } from "./readSnapshot";
-import { currentEarnedPayrollRecords } from "./payrollEarningsRead";
-import { currentPeriod } from "../controllers/payrollController";
 import { getSystemSettings } from "../controllers/systemSettingsController";
-import { earnedPayrollEnabled } from "../config/payrollEarnings";
+import { earnedPayrollEnabled, minuteAccrualEnabled } from "../config/payrollEarnings";
 import { hubShiftBounds } from "./attendanceHubMath";
+import { calculatePayrollCandidate, calculationFingerprint } from "./payrollRecomputeService";
+import { liveCurrentPayrollRecord } from "./payrollPaymentRead";
+import { inheritedCurrentPayrollInputs } from "./payrollCanonicalInputs";
 
 const fail = (statusCode: number, message: string) => Object.assign(new Error(message), { statusCode });
 const hash = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 const amounts = (record: { grossPay: number; deductions: number; netPay: number }) => ({ grossPay: record.grossPay, deductions: record.deductions, netPay: record.netPay });
 type PaymentRow = { businessId: string; businessName: string; grossPay: number; deductions: number; netPay: number; status: string; paidOn: string; savedCopies: number; currentAttendanceReviewDays: number | null };
-type PaymentTarget = { businessId: string; attendanceHash: string; records: Array<{ id: string; beforeHash: string }> };
+type PaymentCalculation = Awaited<ReturnType<typeof calculatePayrollCandidate>>;
+type PaymentCalculationValue = PaymentCalculation["value"] & { calculationSnapshot: PaymentCalculation["value"]["calculationSnapshot"] & { inheritedPayrollInputs?: boolean; payrollInputsBusinessId?: string } };
+type PaymentTarget = { businessId: string; attendanceHash: string; calculation?: PaymentCalculationValue; records: Array<{ id: string; beforeHash: string }> };
+
+function paymentCalculationFields(value: PaymentCalculationValue) {
+    const fields: Partial<PaymentCalculationValue> = { ...value };
+    for (const key of ["employeeName", "email", "employeeId", "department", "payType", "payPeriod", "isArchived", "status", "paidOn"] as const) delete fields[key];
+    return fields;
+}
 
 async function buildPaymentPlan(id: string, paid: unknown, session?: ClientSession) {
     const sourceBusiness = getCurrentBusinessId();
@@ -43,12 +52,23 @@ async function buildPaymentPlan(id: string, paid: unknown, session?: ClientSessi
     const businessIds = [...new Set<string>(frozen === undefined ? [...access, ...(ledger?.businessIds || []), getCurrentBusinessId()] : frozen as string[])].sort();
     if (!businessIds.includes(getCurrentBusinessId()) || businessIds.some(id => !getBusinessById(id))) throw new PayrollValidationError("Cutoff business membership needs review.");
     const blockers: string[] = [], warnings: string[] = [];
+    const settings = await getSystemSettings(session);
+    const currentCutoffDraft = paid && liveCurrentPayrollRecord(source, currentPeriod(settings.payrollBillingCycle, settings));
+    let sourceCalculation: PaymentCalculation | undefined;
+    if (currentCutoffDraft) {
+        try {
+            const employee = await Employee.findOne({ employeeCode: source.employeeId }, null, session ? { session } : undefined).lean();
+            if (!employee) throw new PayrollValidationError("The payroll owner employee is unavailable.");
+            const savedSalary = minuteAccrualEnabled(source.payPeriod) ? employee.salary : source.calculationSnapshot?.monthlySalary;
+            const salary = typeof savedSalary === "number" && Number.isFinite(savedSalary) && savedSalary >= 0 ? savedSalary : employee.salary;
+            sourceCalculation = await calculatePayrollCandidate({ ...employee, salary }, source.payPeriod, undefined, session);
+        } catch (error) {
+            if (!(error instanceof PayrollValidationError)) throw error;
+            blockers.push(error.message);
+        }
+    }
     if (paid && !["Paid", "Completed"].includes(source.status)) {
-        const settings = await getSystemSettings(session);
         if (earnedPayrollEnabled(source.payPeriod) && serverReadTime() < hubShiftBounds(period.end, settings).end) blockers.push("This cutoff is still in progress. Earned pay is provisional until the final shift ends.");
-        const shown = (await currentEarnedPayrollRecords([source], currentPeriod(settings.payrollBillingCycle, settings), session))[0];
-        if (shown.earningsUnavailable) blockers.push("Current earned pay cannot be verified. Review attendance before payment.");
-        else if (shown.settlementRequired) blockers.push("Earned pay changed. Preview and confirm Recompute cutoff before marking the saved payroll Paid.");
     }
     const rows: PaymentRow[] = [], targets: PaymentTarget[] = [];
     const paidOn = paid ? serverReadTime().toLocaleDateString("en-US", { timeZone: "Asia/Manila", month: "short", day: "numeric", year: "numeric" }) : "-";
@@ -72,32 +92,59 @@ async function buildPaymentPlan(id: string, paid: unknown, session?: ClientSessi
             if (zeroDraft) warnings.push("An overlapping zero-value draft remains untouched; it is not a second payment.");
             else blockers.push("Other payable saved payroll overlaps this cutoff. Resolve the payment history first.");
         }
-        if (group.records.some(record => record.status === "Review" || record.incompleteShiftDays > 0)) warnings.push("Saved attendance review history is retained; this action changes payment status only.");
-        if (group.records.length > 1) warnings.push("Equivalent payment copies will share the payment status; their attendance history and amounts stay unchanged.");
-        const employee = await Employee.findOne({ employeeCode: source.employeeId }, null, session ? { session } : undefined).select("_id").lean();
+        if (group.records.some(record => record.status === "Review" || record.incompleteShiftDays > 0)) warnings.push(currentCutoffDraft ? "Saved attendance review history is retained with the reviewed current calculation." : "Saved attendance review history is retained; this action changes payment status only.");
+        if (group.records.length > 1) warnings.push(currentCutoffDraft ? "Equivalent payment copies will share the approved current calculation and payment status; attendance is unchanged." : "Equivalent payment copies will share the payment status; their attendance history and amounts stay unchanged.");
+        const employee = await Employee.findOne({ employeeCode: source.employeeId }, null, session ? { session } : undefined).lean();
         if (!employee) { blockers.push("Employee is missing from a saved cutoff business."); return; }
+        let calculation: PaymentCalculationValue | undefined;
+        const inherited = currentCutoffDraft && sourceCalculation ? await inheritedCurrentPayrollInputs(selected, session) : null;
+        if (currentCutoffDraft && sourceCalculation) {
+            try {
+                if (inherited) {
+                    const selectedSalary = minuteAccrualEnabled(selected.payPeriod) ? employee.salary : selected.calculationSnapshot?.monthlySalary;
+                    if (inherited.owner !== sourceBusiness || employee.salary !== sourceCalculation.value.calculationSnapshot.monthlySalary || selectedSalary !== sourceCalculation.value.calculationSnapshot.monthlySalary) {
+                        throw new PayrollValidationError("Shared current payroll owner or salary inputs changed.");
+                    }
+                    calculation = { ...sourceCalculation.value, calculationSnapshot: { ...sourceCalculation.value.calculationSnapshot,
+                        inheritedPayrollInputs: true, payrollInputsBusinessId: sourceBusiness } };
+                } else {
+                    const savedSalary = minuteAccrualEnabled(selected.payPeriod) ? employee.salary : selected.calculationSnapshot?.monthlySalary;
+                    const salary = typeof savedSalary === "number" && Number.isFinite(savedSalary) && savedSalary >= 0 ? savedSalary : employee.salary;
+                    const candidate = await calculatePayrollCandidate({ ...employee, salary }, selected.payPeriod, undefined, session);
+                    if (calculationFingerprint(candidate) !== calculationFingerprint(sourceCalculation)) throw new PayrollValidationError("Current payroll inputs differ between businesses. No payment was changed.");
+                    calculation = candidate.value;
+                }
+            } catch (error) {
+                if (!(error instanceof PayrollValidationError)) throw error;
+                blockers.push(error.message);
+            }
+        }
         let currentReviewDays: number | null = null, attendanceHash = "unavailable";
         try {
-            const attendance = await attendancePayrollDtr(employee._id, source.payPeriod, session);
+            const attendance = inherited && sourceCalculation ? sourceCalculation.dtr : await attendancePayrollDtr(employee._id, source.payPeriod, session);
             currentReviewDays = attendance.summary.incompleteShiftDays;
             attendanceHash = hash({ rows: attendance.rows, summary: attendance.summary });
-            if (currentReviewDays) warnings.push("Attendance still needs attention. Saved payroll will not be recalculated or cleared by this payment confirmation.");
+            if (currentReviewDays) {
+                if (currentCutoffDraft) blockers.push("Current attendance needs review before its calculation can be frozen as Paid.");
+                else warnings.push("Attendance still needs attention. Saved payroll will not be recalculated or cleared by this payment confirmation.");
+            }
         } catch (error) {
             if (!(error instanceof PayrollValidationError)) throw error;
-            warnings.push("Current attendance cannot be verified. Only the saved payroll amount can be confirmed.");
+            if (currentCutoffDraft) blockers.push("Current attendance cannot be verified. No current payment can be confirmed.");
+            else warnings.push("Current attendance cannot be verified. Only the saved payroll amount can be confirmed.");
         }
-        const currentLedger = await AttendanceLedger.findOne({ employeeCode: source.employeeId, businessIds: businessId }, null, session ? { session } : undefined).select("revision events corrections closures migrationRequired").lean();
+        const currentLedger = inherited?.ledger || await AttendanceLedger.findOne({ employeeCode: source.employeeId, businessIds: businessId }, null, session ? { session } : undefined).select("revision events corrections closures migrationRequired").lean();
         if (currentLedger?.migrationRequired) warnings.push("Attendance synchronization still needs attention; no attendance records will be changed.");
-        rows.push({ businessId, businessName: getBusinessById(businessId)!.name, ...amounts(selected), status: payrollPaymentStatus(selected.status),
+        rows.push({ businessId, businessName: getBusinessById(businessId)!.name, ...amounts(calculation || selected), status: payrollPaymentStatus(selected.status),
             paidOn: selected.paidOn, savedCopies: group.records.length, currentAttendanceReviewDays: currentReviewDays });
-        targets.push({ businessId, attendanceHash: hash([attendanceHash, currentLedger]), records: group.records.map(record => ({ id: String(record._id), beforeHash: hash(record) })) });
+        targets.push({ businessId, attendanceHash: hash([attendanceHash, currentLedger]), ...(calculation ? { calculation } : {}), records: group.records.map(record => ({ id: String(record._id), beforeHash: hash(record) })) });
     });
     if (paid && source.status === "Paid") blockers.push("This cutoff is already marked Paid.");
     if (!paid && payrollPaymentStatus(source.status) === "Pending") blockers.push("This cutoff is already unpaid.");
     const uniqueBlockers = [...new Set(blockers)], uniqueWarnings = [...new Set(warnings)];
-    return { id, employeeCode: source.employeeId, payPeriod: source.payPeriod, paid, paidOn, businessIds, targets, rows,
+    return { id, employeeCode: source.employeeId, payPeriod: source.payPeriod, paid, paidOn, currentCutoffDraft, businessIds, targets, rows,
         warnings: uniqueWarnings, blockers: uniqueBlockers, canApply: rows.length === businessIds.length && !uniqueBlockers.length,
-        token: hash({ id, business: sourceBusiness, paid, paidOn, targets, rows, warnings: uniqueWarnings, blockers: uniqueBlockers }) };
+        token: hash({ id, business: sourceBusiness, paid, paidOn, currentCutoffDraft, targets, rows, warnings: uniqueWarnings, blockers: uniqueBlockers }) };
 }
 
 export async function previewPayrollPaymentStatus(id: string, paid: unknown) {
@@ -128,8 +175,12 @@ export async function confirmPayrollPaymentStatus(request: Request) {
                     const current = await PayrollRecord.findById(record.id).session(session).lean();
                     if (!current || hash(current) !== record.beforeHash) throw fail(409, "Payroll changed. Refresh the payment preview.");
                     const after = { status: verified.paid ? "Paid" : "Pending", paidOn: verified.paidOn };
-                    await PayrollRecord.updateOne({ _id: current._id }, { $set: after, $push: { calculationAudit: { at: new Date().toISOString(), actor: actor.employeeCode, reason,
-                        before: { status: current.status, paidOn: current.paidOn }, after: { ...after, attendanceAcknowledged: request.body.acknowledgeAttendance === true, savedAmountsUnchanged: true } } } }, { session, runValidators: true });
+                    const calculation = target.calculation ? paymentCalculationFields(target.calculation) : undefined;
+                    const calculationSnapshot = calculation?.calculationSnapshot ? { ...calculation.calculationSnapshot,
+                        ...(current.calculationSnapshot?.businessIds ? { businessIds: current.calculationSnapshot.businessIds } : {}), generatedInProgress: false } : undefined;
+                    await PayrollRecord.updateOne({ _id: current._id }, { $set: { ...calculation, ...(calculationSnapshot ? { calculationSnapshot } : {}), ...after }, $push: { calculationAudit: { at: new Date().toISOString(), actor: actor.employeeCode, reason,
+                        before: { status: current.status, paidOn: current.paidOn, ...(calculation ? amounts(current) : {}) },
+                        after: { ...after, ...(calculation ? { ...amounts(target.calculation!), currentCalculationFrozen: true } : {}), attendanceAcknowledged: request.body.acknowledgeAttendance === true, savedAmountsUnchanged: !calculation } } } }, { session, runValidators: true });
                 }
             });
         }, { readConcern: { level: "snapshot" }, writeConcern: { w: "majority" } });

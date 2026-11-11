@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  currentPeriod,
+  resolveActiveCutoffForDate,
   excessClickedSessionMinutes,
   monthlyWorkingDaysForPayPeriod,
   periodRange,
@@ -11,6 +13,37 @@ import {
   visiblePayrollDtrRows,
   workedMinutesInsideShift,
 } from "./payrollController";
+
+test("calendar current cutoff rolls over on the 6th instead of waiting for the restored cutoff payday", context => {
+  const before = process.env.CRM_CURRENT_CUTOFF_LIVE_FROM;
+  process.env.CRM_CURRENT_CUTOFF_LIVE_FROM = "2026-11-06";
+  context.mock.timers.enable({ apis: ["Date"], now: new Date("2026-11-10T04:00:00Z") });
+  try {
+    assert.equal(currentPeriod("Semi-monthly"), "Nov 6, 2026 - Nov 20, 2026");
+    assert.equal(localDateKey(scheduledPayDateForPeriod("Oct 21, 2026 - Nov 5, 2026")), "2026-11-10");
+  } finally {
+    context.mock.timers.reset();
+    if (before === undefined) delete process.env.CRM_CURRENT_CUTOFF_LIVE_FROM;
+    else process.env.CRM_CURRENT_CUTOFF_LIVE_FROM = before;
+  }
+});
+
+test("active cutoff follows attendance dates at month year and leap boundaries while pay dates stay separate", () => {
+  for (const [day, start, end] of [
+    ["2026-11-05", "2026-10-21", "2026-11-05"], ["2026-11-06", "2026-11-06", "2026-11-20"],
+    ["2026-11-10", "2026-11-06", "2026-11-20"], ["2026-11-20", "2026-11-06", "2026-11-20"],
+    ["2026-11-21", "2026-11-21", "2026-12-05"], ["2027-01-01", "2026-12-21", "2027-01-05"],
+    ["2028-02-29", "2028-02-21", "2028-03-05"],
+  ]) {
+    const [year, month, date] = day.split("-").map(Number), active = resolveActiveCutoffForDate(new Date(year, month - 1, date), "Semi-monthly");
+    assert.equal(localDateKey(active?.start || null), start); assert.equal(localDateKey(active?.end || null), end);
+  }
+});
+
+test("ambiguous or gapped current cutoff dates cannot silently select a payday window", () => {
+  assert.equal(resolveActiveCutoffForDate(new Date(2026, 10, 10), "Semi-monthly", { payrollFirstCutoffStartDay: 6, payrollFirstCutoffEndDay: 20, payrollSecondCutoffStartDay: 1, payrollSecondCutoffEndDay: 15 }), null);
+  assert.equal(resolveActiveCutoffForDate(new Date(2026, 10, 10), "Semi-monthly", { payrollFirstCutoffStartDay: 11, payrollFirstCutoffEndDay: 20, payrollSecondCutoffStartDay: 21, payrollSecondCutoffEndDay: 5 }), null);
+});
 
 function attendance(source: string, minute: number) {
   return { source, timeIn: new Date(Date.UTC(2026, 9, 9, 0, minute)) };

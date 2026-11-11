@@ -13,6 +13,7 @@ import { assertCredentialEncryptionConfiguration } from "./services/credentialEn
 import { assertAttendanceFlagConfiguration } from "./config/attendanceFlags";
 import { applyLeadWorkspaceSwitch } from "./config/leadWorkspaceRuntime";
 import { startPayrollGenerationWorker } from "./services/payrollGenerationWorker";
+import { startAttendanceCoachingWorker } from "./services/attendanceCoachingWorker";
 
 assertAttendanceFlagConfiguration();
 const port = Number(process.env.PORT || 4000);
@@ -28,6 +29,8 @@ const app = createApp();
 const httpServer = createServer(app);
 
 createSocketServer(httpServer);
+// Coaching's return deadline must not depend on the optional general worker group.
+startAttendanceCoachingWorker();
 let workersStarted = false;
 const startWorkers = () => {
   if (workersStarted) return;
@@ -36,7 +39,6 @@ const startWorkers = () => {
   startHempSurveyLeadQueueWorker();
   startAttendanceReconciliationWorker();
   startAttendanceIntegrityWorker();
-  startPayrollGenerationWorker();
 };
 if (process.env.CRM_LEAD_WORKSPACE_SWITCH_FILE) {
   await applyLeadWorkspaceSwitch(startWorkers);
@@ -44,6 +46,9 @@ if (process.env.CRM_LEAD_WORKSPACE_SWITCH_FILE) {
     console.error("LEAD_WORKSPACE_SWITCH_FAILED");
   }); });
 } else startWorkers();
+
+// Payroll keeps its own opt-in policy and must not start the unrelated general worker group.
+startPayrollGenerationWorker();
 
 httpServer.listen(port, host, () => {
   console.log(`API server running on http://${host}:${port}`);

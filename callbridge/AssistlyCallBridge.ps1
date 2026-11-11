@@ -1,15 +1,17 @@
 param(
     [switch]$Once,
+    [switch]$ProbeOnly,
     [ValidateSet("", "idle", "active", "unknown")]
     [string]$MockStatus = ""
 )
 
 $ErrorActionPreference = "Stop"
 Import-Module Microsoft.PowerShell.Security -ErrorAction Stop
-$BridgeVersion = "0.4.2"
+$BridgeVersion = "0.5.0"
 $InstallDirectory = Join-Path $env:LOCALAPPDATA "Assistly\CallBridge"
 $ConfigPath = Join-Path $InstallDirectory "config.json"
 $LogPath = Join-Path $InstallDirectory "bridge.log"
+$DialJournalPath = Join-Path $InstallDirectory "native-dials.log"
 
 function Write-BridgeLog {
     param([string]$Message)
@@ -255,6 +257,7 @@ function Send-Heartbeat {
         nextivaProcessDetected = $Detection.NextivaProcessDetected
         audioSessionActive = $Detection.AudioSessionActive
         bridgeVersion = $BridgeVersion
+        nativeDialProtocol = if ($script:nativeWorker -and $script:nativeWorker.InvocationStateInfo.State -eq "Running" -and (Test-NativeDialHandler)) { 1 } else { 0 }
     } | ConvertTo-Json
 
     Invoke-RestMethod `
@@ -266,7 +269,84 @@ function Send-Heartbeat {
         -TimeoutSec 10 | Out-Null
 }
 
+function Test-NativeDialHandler {
+    try {
+        $choice = Get-ItemProperty -LiteralPath "HKCU:\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\tel\UserChoice" -ErrorAction Stop
+        return [bool]($choice.ProgId -match "(?i)nextiva")
+    } catch { return $false }
+}
+
+function Save-NativeDialReceipt {
+    param([string]$AttemptId)
+    New-Item -ItemType Directory -Path $InstallDirectory -Force | Out-Null
+    $stream = [System.IO.File]::Open($DialJournalPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+    try {
+        $reader = [System.IO.StreamReader]::new($stream, [System.Text.Encoding]::UTF8, $true, 1024, $true)
+        try { $saved = $reader.ReadToEnd() } finally { $reader.Dispose() }
+        if (($saved -split "`r?`n") -contains $AttemptId) { return $false }
+        $null = $stream.Seek(0, [System.IO.SeekOrigin]::End)
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes("$AttemptId`n")
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+        return $true
+    } finally { $stream.Dispose() }
+}
+
+function Invoke-NativeDialPoll {
+    param([pscustomobject]$Config, [string]$Token)
+    $origin = [uri]$Config.backendUrl
+    if (-not $origin.IsAbsoluteUri -or $origin.Scheme -ne "https" -or -not (Test-NativeDialHandler)) { return }
+    $before = Get-NextivaDetection
+    if ($before.State -ne "idle" -or -not $before.NextivaProcessDetected -or $before.AudioSessionActive) { return }
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    $command = Invoke-RestMethod -Method Post -Uri "$($Config.backendUrl)/api/call-bridge/native-dial/claim" `
+        -Headers @{ Authorization = "Bearer $Token"; "X-Business-Id" = $Config.businessId } `
+        -ContentType "application/json" -Body (@{ deviceId = $Config.deviceId } | ConvertTo-Json) -TimeoutSec 3
+    if (-not $command) { return }
+    if ($command.attemptId -notmatch "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$" -or
+        $command.phone -notmatch "^\+[1-9][0-9]{7,14}$" -or $command.validForMs -le 0 -or $command.validForMs -gt 1500 -or
+        $clock.Elapsed.TotalMilliseconds -ge $command.validForMs) { return }
+    $current = Get-NextivaDetection
+    if ($current.State -ne "idle" -or -not $current.NextivaProcessDetected -or $current.AudioSessionActive -or
+        -not (Test-NativeDialHandler)) { return }
+    # Persist before the OS handoff. A crash or lost reply must never replay a dial.
+    if (-not (Save-NativeDialReceipt -AttemptId $command.attemptId)) { return }
+    if ($clock.Elapsed.TotalMilliseconds -ge $command.validForMs) { return }
+    Start-Process -FilePath "tel:$($command.phone)" -WindowStyle Hidden
+    Write-BridgeLog "Native dial handed to the configured Nextiva protocol handler; awaiting call-state confirmation."
+}
+
+function Start-NativeDialWorker {
+    param([pscustomobject]$Config, [string]$Token)
+    $definitions = @{}
+    foreach ($name in @("Get-NextivaDetection", "Test-NativeDialHandler", "Save-NativeDialReceipt", "Invoke-NativeDialPoll", "Write-BridgeLog")) {
+        $definitions[$name] = (Get-Item -LiteralPath "function:$name").Definition
+    }
+    $worker = [PowerShell]::Create()
+    $body = {
+        param($Config, $Token, $InstallDirectory, $DialJournalPath, $LogPath, $Definitions)
+        $ErrorActionPreference = "Stop"
+        $MockStatus = ""
+        foreach ($name in $Definitions.Keys) { . ([scriptblock]::Create("function $name {" + $Definitions[$name] + "}")) }
+        while ($true) {
+            $clock = [System.Diagnostics.Stopwatch]::StartNew()
+            $interval = 1000
+            try { Invoke-NativeDialPoll -Config $Config -Token $Token }
+            catch { $interval = 5000; Write-BridgeLog "Native dial polling unavailable; no fallback dial was attempted." }
+            Start-Sleep -Milliseconds ([int][Math]::Max(50, $interval - $clock.Elapsed.TotalMilliseconds))
+        }
+    }
+    $null = $worker.AddScript($body.ToString()).AddArgument($Config).AddArgument($Token).AddArgument($InstallDirectory).AddArgument($DialJournalPath).AddArgument($LogPath).AddArgument($definitions)
+    $null = $worker.BeginInvoke()
+    return $worker
+}
+
 Initialize-AudioProbe
+
+if ($ProbeOnly) {
+    Get-NextivaDetection | ConvertTo-Json -Depth 4
+    exit 0
+}
 
 if ($Once -and -not (Test-Path -LiteralPath $ConfigPath)) {
     Get-NextivaDetection | ConvertTo-Json -Depth 4
@@ -292,6 +372,7 @@ try {
     $token = Get-PlainTextToken -EncryptedToken $config.encryptedToken
     $reportedState = "unknown"
     $lastHeartbeatAt = [DateTime]::MinValue
+    if (-not $Once -and -not $MockStatus) { $script:nativeWorker = Start-NativeDialWorker -Config $config -Token $token }
 
     do {
         $detection = Get-NextivaDetection
@@ -331,6 +412,7 @@ try {
     Write-BridgeLog "Bridge stopped: $($_.Exception.Message)"
     throw
 } finally {
+    if ($script:nativeWorker) { $script:nativeWorker.Stop(); $script:nativeWorker.Dispose() }
     if ($createdNew) {
         $mutex.ReleaseMutex()
     }

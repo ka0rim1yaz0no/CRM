@@ -11,6 +11,8 @@ export function attendanceEventPresentation(source?: string) {
         case "Off the Phone Out": return { label: "Off the Phone", kind: "off-phone" as const };
         case "Non-Billable Off the Phone Out": return { label: "Non-Billable Off the Phone", kind: "off-phone" as const };
         case "Off the Phone In": return { label: "Off the phone ended", kind: "off-phone" as const };
+        case "Coaching Out": return { label: "Coaching", kind: "off-phone" as const };
+        case "Coaching In": return { label: "Coaching ended", kind: "off-phone" as const };
         default: return { label: "No attendance yet", kind: "unknown" as const };
     }
 }

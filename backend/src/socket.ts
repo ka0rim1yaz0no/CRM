@@ -1,14 +1,14 @@
 import type { Server as HttpServer } from "node:http";
 import { Server, type Socket } from "socket.io";
-import { findConfiguredAdmin, isTrackerOnlyAdminCode } from "./config/adminUsers";
+import { findConfiguredAdmin } from "./config/adminUsers";
 import { getBusinessById, getCurrentBusinessId, getDefaultBusiness, runWithBusiness } from "./config/tenancy";
 import { Conversation } from "./models/Conversation";
 import { Employee } from "./models/Employee";
-import { LiveViewAudit } from "./models/LiveViewAudit";
 import { Message } from "./models/Message";
 import { securityLegacyAuthEnabled } from "./config/rolloutFlags";
 import { signedCrmIdentity, signedEmployeeInBusiness } from "./middleware/legacyAuthentication";
 import { invalidateLeadPhoneSnapshot } from "./services/leadPhoneSnapshotCache";
+import { registerLiveViewDelivery } from "./services/liveViewDelivery";
 
 let socketServer: Server | null = null;
 
@@ -350,127 +350,7 @@ export function createSocketServer(httpServer: HttpServer) {
       if (call.targetSocketId) io.to(call.targetSocketId).emit("voice-call:ended", { callId: call.callId, reason: String(payload.reason || "ended") });
     });
 
-    socket.on(
-      "live-share:request",
-      async (payload: { requestId?: string; employeeId?: string; employeeName?: string; adminName?: string } = {}) => {
-        const requestId = String(payload.requestId || "").trim();
-        const employeeId = String(payload.employeeId || "").trim();
-
-        if (socket.data.authUserType !== "admin") {
-          socket.emit("live-share:error", { requestId, message: "Only an authenticated administrator can request Live View." });
-          return;
-        }
-
-        if (!requestId || !employeeId) {
-          socket.emit("live-share:error", { requestId, message: "Employee and request id are required." });
-          return;
-        }
-
-        if (isTrackerOnlyAdminCode(String(socket.data.authUserCode || ""))) {
-          const isInternalEmployee = await runForSocketBusiness(() => Employee.exists({
-            _id: employeeId,
-            team: /^internal$/i,
-            status: { $ne: "Archived" },
-          }));
-          if (!isInternalEmployee) {
-            socket.emit("live-share:error", { requestId, message: "This administrator can only view Internal employees." });
-            return;
-          }
-        }
-
-        await runForSocketBusiness(() => LiveViewAudit.findOneAndUpdate(
-          { requestId },
-          {
-            $setOnInsert: {
-              requestId,
-              employeeId,
-              employeeName: String(payload.employeeName || "Employee").trim(),
-              adminCode: socket.data.authUserCode,
-              adminName: socket.data.authUserName,
-              status: "requested",
-              requestedAt: new Date(),
-            },
-          },
-          { upsert: true }
-        ));
-
-        socket.join(liveShareRoom(socket.data.businessId, requestId));
-        socket.to(employeeRoom(socket.data.businessId, employeeId)).emit("live-share:requested", {
-          requestId,
-          employeeId,
-          employeeName: String(payload.employeeName || "Employee").trim(),
-          adminName: String(payload.adminName || "Admin").trim(),
-          requestedAt: new Date().toISOString(),
-        });
-      }
-    );
-
-    socket.on("live-share:accept", async (payload: { requestId?: string } = {}) => {
-      const requestId = String(payload.requestId || "").trim();
-      if (!requestId || socket.data.authUserType !== "employee") return;
-
-      await runForSocketBusiness(() => LiveViewAudit.findOneAndUpdate(
-        { requestId, employeeId: socket.data.authEmployeeId },
-        { $set: { status: "active", startedAt: new Date(), reason: "" } }
-      ));
-
-      socket.join(liveShareRoom(socket.data.businessId, requestId));
-      socket.to(liveShareRoom(socket.data.businessId, requestId)).emit("live-share:accepted", {
-        requestId,
-        acceptedAt: new Date().toISOString(),
-      });
-    });
-
-    socket.on("live-share:decline", async (payload: { requestId?: string; reason?: string } = {}) => {
-      const requestId = String(payload.requestId || "").trim();
-      if (!requestId || socket.data.authUserType !== "employee") return;
-
-      await runForSocketBusiness(() => LiveViewAudit.findOneAndUpdate(
-        { requestId, employeeId: socket.data.authEmployeeId },
-        { $set: { status: "declined", endedAt: new Date(), reason: String(payload.reason || "declined").trim() } }
-      ));
-
-      socket.to(liveShareRoom(socket.data.businessId, requestId)).emit("live-share:declined", {
-        requestId,
-        reason: String(payload.reason || "declined").trim(),
-      });
-    });
-
-    socket.on(
-      "live-share:signal",
-      (payload: { requestId?: string; description?: unknown; candidate?: unknown } = {}) => {
-      const requestId = String(payload.requestId || "").trim();
-      if (!requestId) return;
-
-        socket.to(liveShareRoom(socket.data.businessId, requestId)).emit("live-share:signal", {
-          requestId,
-          description: payload.description,
-          candidate: payload.candidate,
-        });
-      }
-    );
-
-    socket.on("live-share:stop", async (payload: { requestId?: string; employeeId?: string; reason?: string } = {}) => {
-      const requestId = String(payload.requestId || "").trim();
-      if (!requestId) return;
-
-      const employeeId = String(payload.employeeId || "").trim();
-      const stopPayload = {
-        requestId,
-        reason: String(payload.reason || "stopped").trim(),
-      };
-
-      await runForSocketBusiness(() => LiveViewAudit.findOneAndUpdate(
-        { requestId },
-        { $set: { status: "ended", endedAt: new Date(), reason: stopPayload.reason } }
-      ));
-
-      io.to(liveShareRoom(socket.data.businessId, requestId)).emit("live-share:stopped", stopPayload);
-
-      if (employeeId) {
-        io.to(employeeRoom(socket.data.businessId, employeeId)).emit("live-share:stopped", stopPayload);
-      }
-    });
+    registerLiveViewDelivery(io, socket, { employeeRoom, liveShareRoom });
 
     socket.on(
       "message:send",
@@ -564,5 +444,5 @@ export function emitLeadChanged(payload: {
   assignedAgentId?: string | null;
 }) {
   invalidateLeadPhoneSnapshot(getCurrentBusinessId());
-  socketServer?.to(businessRoom(getCurrentBusinessId())).emit("lead:changed", payload);
+  socketServer?.to(businessRoom(getCurrentBusinessId())).emit("lead:changed", { ...payload, businessId: getCurrentBusinessId() });
 }

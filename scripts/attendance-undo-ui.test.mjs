@@ -21,7 +21,7 @@ test('latest manual action supports both last-action and row Undo without retarg
 });
 
 test('earlier completed break/lunch can be reversed as one reviewed pair without touching newer events', () => {
-  for (const [out, back] of [['Break Out','Break In'], ['Lunch Break Out','Lunch Break In'], ['Off the Phone Out','Off the Phone In']]) {
+  for (const [out, back] of [['Break Out','Break In'], ['Lunch Break Out','Lunch Break In'], ['Off the Phone Out','Off the Phone In'], ['Coaching Out','Coaching In']]) {
     const records = [event('in','Time In'),event('out',out),event('back',back),event('later','Time Out')], data = snapshot(records);
     for (const target of records.slice(1,3)) {
       const plan = attendanceUndoPlan(data, target, '2026-10-22');

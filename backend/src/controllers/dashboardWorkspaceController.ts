@@ -48,17 +48,23 @@ export async function dashboardWorkspaceSummary(req: Request, res: Response) {
     const fromTime = hubShiftBounds(range.from, shiftSettings).start;
     const toTime = hubShiftBounds(range.to, shiftSettings).end;
     const activityEvents: Array<{ employeeId: string; leadId: string; at: Date | string; comment: boolean }> = [];
+    const trendStart = Date.parse(`${range.previousFrom}T00:00:00+08:00`);
     const query = (from: string, to: string) => ({ month: from.slice(0, 7), dateFrom: from, dateTo: to, callDate: to });
     const [dashboard, config, notes, leads, calls, devices, ledgers, policy] = await Promise.all([
       read<DashboardData>(readAgentLeadDashboard, req, query(range.from, range.to), { start: fromTime, end: toTime, dateFrom: range.from, dateTo: range.to,
-        recordActivity: (employeeId, leadId, at, comment) => activityEvents.push({ employeeId, leadId, at, comment }) }),
+        recordActivity: (employeeId, leadId, at, comment) => {
+          const time = new Date(at).getTime();
+          if (time >= trendStart && time <= toTime.getTime()) activityEvents.push({ employeeId, leadId, at, comment });
+        } }),
       DashboardWorkspace.findOne({ key: "workspace" }).lean(), DashboardHandover.find({ deletedAt: null }).sort({ pinned: -1, createdAt: -1 }).limit(10).lean(),
-      Lead.find({}).select("leadName businessName status assignedAgent followUpAt createdAt comments.authorType comments.createdAt activity.actorType activity.createdAt").lean(),
+      Lead.find({ status: { $in: ["NEW", "Follow up"] } }).select("leadName businessName status assignedAgent followUpAt createdAt comments activity")
+        .slice("comments", 1).slice("activity", 1).lean(),
       LeadCallStat.aggregate<{ calledAt: Date; employee: string; seconds: number }>([
         { $match: { "callLogs.calledAt": { $gte: fromTime, $lte: toTime } } },
         { $unwind: "$callLogs" }, { $match: { "callLogs.calledAt": { $gte: fromTime, $lte: toTime } } },
         { $project: { _id: 0, calledAt: "$callLogs.calledAt", employee: { $toString: "$callLogs.employee" }, seconds: "$callLogs.durationSeconds" } } ]),
-      getCallBridgeDeviceModel().find({}).select("employeeCode lastSeenAt").lean(), AttendanceLedger.find({ businessIds: business }).lean(), attendancePolicy(),
+      getCallBridgeDeviceModel().find({}).select("employeeCode lastSeenAt").lean(),
+      AttendanceLedger.find({ businessIds: business }).select("employeeCode events corrections closures").lean(), attendancePolicy(),
     ]);
     const attendance = { summary: await readDashboardAttendanceSummary(business, range.from, range.to, actor.employeeCode, now) };
     const settings = config || defaults;
@@ -107,7 +113,7 @@ export async function dashboardEmployeeQuickView(req: Request, res: Response) {
   let range: ReturnType<typeof dashboardRange>;
   try { range = dashboardRange(req.query); } catch { res.status(400).json({ message: "Invalid dashboard range." }); return; }
   const attendance = { summary: await readDashboardAttendanceSummary(String(req.business?.id || ""), range.from, range.to, actor.employeeCode, new Date(), code) };
-  const ledger = await AttendanceLedger.findOne({ employeeCode: code, businessIds: req.business?.id }).lean();
+  const ledger = await AttendanceLedger.findOne({ employeeCode: code, businessIds: req.business?.id }).select("events corrections closures").lean();
   if (ledger) employee.availabilityStatus = projectAttendance(ledger.events, ledger.corrections, ledger.closures).active?.mode || "OFFLINE";
   res.json({ employee, attendance });
 }

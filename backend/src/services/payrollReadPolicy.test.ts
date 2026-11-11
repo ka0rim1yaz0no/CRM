@@ -2,12 +2,28 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { savedPayrollPeriod, isConfiguredSavedPayrollPeriod } from "../../../shared/payrollPeriod";
 import { savedPayrollDisplayRates } from "../../../shared/payrollSavedRates";
-import { payrollReadGroups } from "./payrollReadPolicy";
+import { payrollReadGroups, savedPayrollPaymentRecord } from "./payrollReadPolicy";
 import { periodRange } from "../controllers/payrollController";
 
 const period = "Oct 6, 2026 - Oct 20, 2026";
 const record = { _id: "canonical", employeeId: "synthetic", payPeriod: period, grossPay: 15000, deductions: 51.63, netPay: 14948.37,
     basicPay: 15000, status: "Pending", paidOn: "-", lateMinutes: 19, excessBreakMinutes: 0 };
+
+test("saved payment money is invariant across statuses and never taken from an estimate snapshot", () => {
+    const source = { ...record, cutoffEstimate: true, earningsAsOf: "synthetic", savedAmounts: { grossPay: 1, deductions: 0, netPay: 1 } };
+    const before = JSON.stringify(source);
+    for (const status of ["Pending", "Paid", "Completed", "Review"]) {
+        const shown = savedPayrollPaymentRecord({ ...source, status });
+        assert.equal(shown.netPay, record.netPay); assert.equal(shown.deductions, record.deductions); assert.equal(shown.status, status);
+        assert.equal(shown.cutoffEstimate, undefined); assert.equal(shown.savedAmounts, undefined); assert.equal(shown.earningsAsOf, undefined);
+    }
+    assert.equal(JSON.stringify(source), before);
+});
+
+test("invalid saved payment amounts stay unavailable without inventing a replacement", () => {
+    const shown = savedPayrollPaymentRecord({ ...record, netPay: 1 });
+    assert.equal(shown.netPay, 1); assert.equal(shown.earningsUnavailable, true);
+});
 test("ISO, named and legacy month labels normalize without timezone changes or guessed dates", () => {
     assert.deepEqual(savedPayrollPeriod("2026-10-06 - 2026-10-20"), savedPayrollPeriod(period));
     assert.deepEqual(savedPayrollPeriod("October 06, 2026 - October 20, 2026"), savedPayrollPeriod(period));
